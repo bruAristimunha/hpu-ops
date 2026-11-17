@@ -1,0 +1,5 @@
+__pycache__/
+.pytest_cache/
+.benchmarks/
+# local measurement scripts (some use APIs that no longer exist)
+probe/

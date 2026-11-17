@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hpu-ops"
+version = "0.1.0"
+description = "Fixes for what Intel Gaudi's PyTorch stack lacks or gets wrong, at the root or with Habana's own switches (unmodified model code)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Bruno Aristimunha" }]
+requires-python = ">=3.9"
+# torch is intentionally not a dependency: on Gaudi it must come from
+# Intel's Habana installer (a PyPI torch would shadow the fork).
+
+[tool.setuptools]
+packages = ["hpu_ops"]
