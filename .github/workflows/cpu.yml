@@ -1,0 +1,23 @@
+name: cpu
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 2.6.0 is the torch of Habana bridge 1.21; later bridges ship 2.7 and 2.8; then the latest release
+        torch: ["torch==2.6.0", "torch==2.7.1", "torch==2.8.0", "torch"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install pytest numpy .
+      - run: cd /tmp && python -m pytest "$GITHUB_WORKSPACE/tests/test_cpu.py" -q  # the installed package

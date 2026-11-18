@@ -26,15 +26,16 @@ def cpu_as_hpu(install):
         undo()
 
 
-def compiled(f, nodes):
-    """``torch.compile(f)`` through aot_autograd, collecting the forward and backward graph nodes into ``nodes``."""
+def compiled(f, nodes, **options):
+    """``torch.compile(f, **options)`` through aot_autograd, collecting the forward and backward graph nodes into
+    ``nodes``."""
 
     def record(gm, example_inputs):
         nodes.extend(n for n in gm.graph.nodes if n.op == "call_function")
         return make_boxed_func(gm.forward)
 
     torch._dynamo.reset()
-    return torch.compile(f, backend=aot_autograd(fw_compiler=record, bw_compiler=record))
+    return torch.compile(f, backend=aot_autograd(fw_compiler=record, bw_compiler=record), **options)
 
 
 def ops(nodes):
@@ -83,13 +84,28 @@ def test_linear_compiled_graph_keeps_the_native_op(scale, align_corners):
 
 
 def test_linear_new_batch_size_recompiles_through_the_decomposition():
-    """A second shape marks the batch dimension dynamic: torch's decomposition, not a crash."""
+    """A second shape marks the batch dimension dynamic: torch's decomposition with a warning, not a crash."""
     f = lambda x: F.interpolate(x, scale_factor=2.0, mode="linear")  # noqa: E731
-    with cpu_as_hpu(upsample.install_linear):
+    upsample._warn_symbolic.cache_clear()
+    with cpu_as_hpu(upsample.install_linear), pytest.warns(UserWarning, match="dynamic=False") as record:
         g = compiled(f, [])
         for batch in (8, 5, 3):
             x = torch.randn(batch, 5, 3, dtype=torch.float64)
             assert_same(train_step(g, x), train_step(f, x))
+    assert sum(str(w.message) == upsample.SYMBOLIC_HINT for w in record) == 1
+
+
+def test_linear_static_compile_keeps_the_native_op_for_each_batch_size(recwarn):
+    f = lambda x: F.interpolate(x, scale_factor=2.0, mode="linear")  # noqa: E731
+    nodes = []
+    upsample._warn_symbolic.cache_clear()
+    with cpu_as_hpu(upsample.install_linear) as calls:
+        g = compiled(f, nodes, dynamic=False)
+        for batch in (8, 5, 3):
+            x = torch.randn(batch, 5, 3, dtype=torch.float64)
+            assert_same(train_step(g, x), train_step(f, x))
+    assert calls["linear"] >= 3 and not any("index_put" in op for op in ops(nodes)), ops(nodes)
+    assert not [w for w in recwarn if str(w.message) == upsample.SYMBOLIC_HINT]
 
 
 # ---- nearest upsampling: repeats for integer factors, the native op otherwise
@@ -352,6 +368,20 @@ def test_undo_restores_torch():
     assert [dict(op.py_kernels) for op in touched] == before
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
+
+
+@pytest.mark.parametrize("op", ["scaled_dot_product_attention", "_scaled_dot_product_fused_attention_overrideable"])
+def test_attention_check_reads_the_fused_kernel_from_the_dispatcher(op):
+    """Bridges 1.21/1.22 register their fused kernel for the first op at the device's autograd key when the setting is
+    on; 1.23+ always register one for the second (habana_eager/ops/fused_sdpa.cpp, ``AutogradHPU``)."""
+    assert not hpu_ops._attention_fused("cpu")
+    library = torch.library.Library("aten", "IMPL")
+    library.impl(op, lambda *args, **kwargs: None, "AutogradCPU")
+    try:
+        assert hpu_ops._attention_fused("cpu")
+    finally:
+        library._destroy()
+    assert not hpu_ops._attention_fused("cpu")
 
 
 def test_enable_is_a_no_op_off_gaudi(monkeypatch):

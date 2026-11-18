@@ -9,6 +9,7 @@
 """
 import functools
 import struct
+import warnings
 
 import torch
 from torch._C import DispatchKey
@@ -20,14 +21,26 @@ aten = torch.ops.aten
 CIA = DispatchKey.CompositeImplicitAutograd
 CIA_AND_AUTOGRAD = (CIA, DispatchKey.Autograd)  # where torch registers its upsampling decompositions
 MAX_OUTPUT = 2**23  # the native kernels' float32 index arithmetic is exact below this length
+SYMBOLIC_HINT = ("Linear upsampling with symbolic shapes under torch.compile keeps torch's gather/scatter "
+                 "decomposition, whose backward is slow on Gaudi (CodeBrain: 20x). It happens after a new batch size, "
+                 "e.g. a smaller last batch. Compile with dynamic=False, or keep one batch size (drop_last=True).")
+
+
+@functools.cache
+def _warn_symbolic():
+    """Once per process: each trace phase calls the kernel again, and dynamo resets the warnings registry."""
+    warnings.warn(SYMBOLIC_HINT, stacklevel=2)
 
 
 def _native_linear_vec(device_type, decomposition):
     """``upsample_linear1d.vec`` for tracing: the native op on ``device_type`` with static shapes, else
-    ``decomposition``. The native backward has no meta kernel for symbolic sizes."""
+    ``decomposition``. The native backward has no meta kernel for symbolic sizes, so these warn."""
 
     def kernel(input, output_size, align_corners, scale_factors):
-        if input.device.type != device_type or not static(*input.shape, *(output_size or [])):
+        if input.device.type != device_type:
+            return decomposition(input, output_size, align_corners, scale_factors)
+        if not static(*input.shape, *(output_size or [])):
+            _warn_symbolic()
             return decomposition(input, output_size, align_corners, scale_factors)
         count("linear")
         size = upsample_compute_output_size(input.size(), output_size, scale_factors)
