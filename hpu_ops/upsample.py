@@ -26,6 +26,12 @@ SYMBOLIC_HINT = ("Linear upsampling with symbolic shapes under torch.compile kee
                  "e.g. a smaller last batch. Compile with dynamic=False, or keep one batch size (drop_last=True).")
 
 
+@functools.cache
+def _warn_symbolic():
+    """Once per process: each trace phase calls the kernel again, and dynamo resets the warnings registry."""
+    warnings.warn(SYMBOLIC_HINT, stacklevel=2)
+
+
 def _native_linear_vec(device_type, decomposition):
     """``upsample_linear1d.vec`` for tracing: the native op on ``device_type`` with static shapes, else
     ``decomposition``. The native backward has no meta kernel for symbolic sizes, so these warn."""
@@ -34,7 +40,7 @@ def _native_linear_vec(device_type, decomposition):
         if input.device.type != device_type:
             return decomposition(input, output_size, align_corners, scale_factors)
         if not static(*input.shape, *(output_size or [])):
-            warnings.warn(SYMBOLIC_HINT, stacklevel=2)  # the default filter shows it once per call site
+            _warn_symbolic()
             return decomposition(input, output_size, align_corners, scale_factors)
         count("linear")
         size = upsample_compute_output_size(input.size(), output_size, scale_factors)

@@ -64,9 +64,9 @@ def enable():
         import habana_frameworks.torch.core  # noqa: F401  (Habana's kernels first: they are never overridden)
     except ImportError:
         return
-    if not _attention_fused():
-        warnings.warn(ATTENTION_HINT, stacklevel=2)
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"
     _STATE["undo"] = _install("hpu")
+    if not _attention_fused():  # last: under -W error the fixes are already in
+        warnings.warn(ATTENTION_HINT, stacklevel=2)
