@@ -67,6 +67,11 @@ def one_channel_weight_grad(grad_output, input, weight, stride, padding):
     return grad.unsqueeze(1).to(weight.dtype)
 
 
+def _expand(values, n):
+    """A one-element stride or padding list stands for every spatial dim, as in ATen (``F.conv2d(x, w, None, (2,))``)."""
+    return list(values) * n if len(values) == 1 else list(values)
+
+
 def _one_channel_strided(input, weight, stride, dilation, transposed, groups, output_mask):
     return (output_mask[1] and not transposed and groups == 1 and weight.shape[1] == 1 and 3 <= input.dim() <= 5
             and any(s > 1 for s in stride) and all(d == 1 for d in dilation))
@@ -82,9 +87,13 @@ def _weight_grad_kernel(op):
         if not _one_channel_strided(input, weight, stride, dilation, transposed, groups, output_mask):
             return op._op_dk(DispatchKey.Autograd, grad_output, input, weight, *args, output_mask)
         count("conv_weight_grad")
-        grad_input, _, grad_bias = op._op_dk(DispatchKey.Autograd, grad_output, input, weight, *args,
-                                             [output_mask[0], False, output_mask[2]])
-        return grad_input, one_channel_weight_grad(grad_output, input, weight, stride, padding), grad_bias
+        grad_input = grad_bias = None
+        if output_mask[0] or output_mask[2]:  # a first layer without bias needs nothing else from the op
+            grad_input, _, grad_bias = op._op_dk(DispatchKey.Autograd, grad_output, input, weight, *args,
+                                                 [output_mask[0], False, output_mask[2]])
+        n = input.dim() - 2
+        return grad_input, one_channel_weight_grad(grad_output, input, weight, _expand(stride, n),
+                                                   _expand(padding, n)), grad_bias
 
     return kernel
 

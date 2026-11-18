@@ -397,6 +397,8 @@ def test_one_channel_strided_conv_weight_grad_is_a_contraction(mode, make, shape
     (lambda: nn.Conv2d(1, 4, (1, 5)), (2, 1, 4, 40)),  # stride 1
     (lambda: nn.Conv2d(1, 4, (1, 5), (1, 2), dilation=2), (2, 1, 4, 40)),
     (lambda: nn.ConvTranspose2d(1, 4, (1, 5), (1, 2)), (2, 1, 4, 40)),
+    (lambda: nn.Conv2d(4, 4, (1, 5), (1, 2), groups=4), (2, 4, 4, 40)),  # depthwise: weight.shape[1] == 1 too
+    (lambda: nn.ConvTranspose2d(4, 1, (1, 5), (1, 2)), (2, 4, 4, 40)),  # transposed: weight.shape[1] == 1 too
 ])
 def test_other_convolutions_keep_the_native_backward(make, shape):
     torch.manual_seed(0)
@@ -406,6 +408,42 @@ def test_other_convolutions_keep_the_native_backward(make, shape):
         got = module_grads(layer, x)
     assert_same(got, want)
     assert calls["conv_weight_grad"] == 0
+
+
+@pytest.mark.parametrize("stride, padding", [((2,), (1,)), ([4, 2], [1]), ([2, 2], [1]), ([2], [0, 1])])
+def test_one_channel_strided_conv_weight_grad_of_one_element_lists(stride, padding):
+    """F.conv2d passes one-element stride and padding lists through; ATen broadcasts them to every spatial dim."""
+    torch.manual_seed(0)
+    x, w = torch.randn(2, 1, 8, 20, dtype=torch.float64), torch.randn(4, 1, 3, 3, dtype=torch.float64)
+
+    def grads():
+        xr, wr = x.clone().requires_grad_(), w.clone().requires_grad_()
+        F.conv2d(xr, wr, None, stride, padding).square().sum().backward()
+        return [xr.grad, wr.grad]
+
+    want = grads()
+    with cpu_as_hpu(conv.install_weight_grad) as calls:
+        got = grads()
+    assert_same(got, want)
+    assert calls["conv_weight_grad"] > 0
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_one_channel_strided_first_layer_without_bias(mode):
+    """No input gradient and no bias: the weight gradient alone, without calling the native op."""
+    torch.manual_seed(0)
+    layer, x = nn.Conv2d(1, 8, (1, 15), (1, 8), (0, 7), bias=False).double(), torch.randn(3, 1, 8, 200).double()
+
+    def grads(module):
+        layer.zero_grad(set_to_none=True)
+        module(x).square().sum().backward()
+        return [layer.weight.grad]
+
+    want, nodes = grads(layer), []
+    with cpu_as_hpu(conv.install_weight_grad) as calls:
+        got = grads(layer if mode == "eager" else compiled(layer, nodes))
+    assert_same(got, want)
+    assert calls["conv_weight_grad"] > 0
 
 
 def test_one_channel_strided_conv_weight_grad_in_bfloat16():
@@ -545,7 +583,7 @@ def test_undo_restores_torch():
     assert [dict(op.py_kernels) for op in touched] == before
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
-                 "aten::embedding"):
+                 "aten::embedding_dense_backward", "aten::convolution_backward"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 
 
