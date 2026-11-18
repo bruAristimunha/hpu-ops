@@ -125,6 +125,7 @@ CI runs `test_cpu.py` on torch 2.6.0 (Gaudi's) and the latest CPU release.
 
 `run_on_hpu.py` compares outputs and input gradients against torch on the CPU, eager and compiled. It covers:
 - SDPA with boolean, additive and no mask, and `nn.MultiheadAttention`;
+- SDPA under the attention setting at braindecode's shapes (`sdpa_checks.py`, also standalone): q/k/v as strided views and as copies, bfloat16, dropout statistics with a backward on the forward's draws, and fully masked rows (recorded); a known Habana bug with sliced views is probed in separate processes and not counted;
 - CodeBrain's linear upsampling at two batch sizes, and long upsampling;
 - nearest upsampling after a BatchNorm1d, with gradients, under `no_grad` and under `inference_mode`; nearest-exact; a non-integer factor;
 - `padding="valid"` 2-D depthwise and 1-D convolutions;
