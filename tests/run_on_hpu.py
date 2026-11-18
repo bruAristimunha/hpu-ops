@@ -2,6 +2,7 @@
 different callers. One line per check; exits 1 if any check fails.
 Export the attention setting before running (PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 on bridge 1.21)."""
 import copy
+import io
 import math
 import sys
 
@@ -165,6 +166,28 @@ for label, run in (("eager", lambda: torch.renorm(proto, 2, 0, 0.5)), ("compiled
                    ("compiled inference_mode", lambda: torch.inference_mode()(compiled_renorm)(proto))):
     fallbacks = cpu_fallbacks(run)
     expect(f"renorm {label} on the card", not fallbacks, f"CPU fallbacks {fallbacks}")
+
+# ---- torch.save after an optimizer step: conv weights in a permuted layout, eager and compiled
+for mode in ("eager", "compiled"):
+    torch._dynamo.reset()
+    net = torch.nn.Sequential(torch.nn.Conv2d(1, 8, (1, 25)), torch.nn.BatchNorm2d(8), torch.nn.ELU(),
+                              torch.nn.Conv2d(8, 16, (8, 1))).to(hpu)
+    optimizer = torch.optim.SGD(net.parameters(), lr=0.1, momentum=0.9)
+    (net if mode == "eager" else torch.compile(net, backend="hpu_backend"))(
+        torch.randn(16, 1, 8, 1000, device=hpu)).square().mean().backward()
+    optimizer.step()
+    calls.clear()
+    label = f"torch.save after an optimizer step, {mode}"
+    try:
+        buffer = io.BytesIO()
+        torch.save({"model": net.state_dict(), "optimizer": optimizer.state_dict()}, buffer)
+        buffer.seek(0)
+        loaded = torch.load(buffer, weights_only=True)
+        err = max((loaded["model"][k].float() - v.cpu().float()).abs().max().item()
+                  for k, v in net.state_dict().items())
+        expect(label, err == 0 and calls["save"] > 0, f"max|loaded - .cpu()| {err:.1e}, {calls['save']} host copies")
+    except Exception as e:  # noqa: BLE001
+        expect(label, False, f"ERROR {type(e).__name__}: {str(e).splitlines()[0][:300]}")
 
 
 def check_model_compiles(name, model, x, rtol=1e-3):

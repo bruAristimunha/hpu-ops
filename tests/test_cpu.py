@@ -12,7 +12,7 @@ from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 
 import hpu_ops
-from hpu_ops import composite, conv, upsample
+from hpu_ops import composite, conv, serialization, upsample
 
 
 @contextlib.contextmanager
@@ -354,6 +354,29 @@ def test_renorm_elsewhere_stays_renorm():
     assert "aten.renorm.default" in ops(nodes) and not calls["renorm"]
 
 
+# ---- torch.save: tensor-level host copies
+
+
+def test_save_reduces_device_tensors_through_a_host_copy(tmp_path):
+    """A checkpoint after an optimizer step: state dicts, a Parameter and the momentum, loaded with weights_only."""
+    model = nn.Sequential(nn.Conv2d(1, 4, 3), nn.BatchNorm2d(4))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+    model(torch.randn(2, 1, 8, 8)).square().mean().backward()
+    optimizer.step()
+    weight = model[0].weight
+    with cpu_as_hpu(serialization.install) as calls:
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "weight": weight},
+                   tmp_path / "checkpoint.pt")
+    assert calls["save"] >= len(model.state_dict())
+    loaded = torch.load(tmp_path / "checkpoint.pt", weights_only=True)
+    for name, value in model.state_dict().items():
+        assert torch.equal(loaded["model"][name], value), name
+    assert isinstance(loaded["weight"], nn.Parameter) and loaded["weight"].requires_grad
+    assert torch.equal(loaded["weight"], weight)
+    momentum = optimizer.state_dict()["state"][0]["momentum_buffer"]
+    assert torch.equal(loaded["optimizer"]["state"][0]["momentum_buffer"], momentum)
+
+
 # ---- installing and undoing
 
 
@@ -362,10 +385,13 @@ def test_undo_restores_torch():
     touched = [aten.upsample_linear1d.vec, aten.upsample_nearest1d.vec, aten.upsample_nearest1d.default,
                aten._upsample_nearest_exact1d.default, aten.conv2d.padding, aten.glu.default, aten.renorm.default]
     before = [dict(op.py_kernels) for op in touched]
+    reduce = torch.Tensor._reduce_ex_internal
     undo = hpu_ops._install("cpu")
     assert torch._C._dispatch_has_kernel_for_dispatch_key("aten::glu", "AutogradCPU")
+    assert torch.Tensor._reduce_ex_internal is not reduce
     undo()
     assert [dict(op.py_kernels) for op in touched] == before
+    assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 

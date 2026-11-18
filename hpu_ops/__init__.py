@@ -1,7 +1,8 @@
 """hpu_ops: what Intel Gaudi's PyTorch stack lacks or gets wrong, fixed at the root or with Habana's own settings.
 
 Model code and torch stay unmodified. Only HPU tensors are rewritten; other devices run as before. The rewrites live
-in the dispatcher (see ``_dispatch``):
+in the dispatcher (see ``_dispatch``), except ``torch.save``'s, which sits where Habana puts its own in lazy mode,
+at the tensor's pickling:
 
 - 1-D upsampling (``upsample``). Under ``torch.compile``, linear keeps Gaudi's native op instead of torch's
   gather/scatter decomposition (CodeBrain: 56.9 to 3.4 ms forward + backward). Nearest by an integer factor repeats
@@ -10,6 +11,8 @@ in the dispatcher (see ``_dispatch``):
   convolution needs (ATCNet, EEGInceptionERP, EEGITNet).
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
+- ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
+  that an optimizer step left in a permuted layout. Habana pickles HPU tensors the same way in lazy mode.
 - Three Habana compile passes break valid graphs. ``enable()`` turns them off through Habana's own
   ``PT_HPU_DISABLE_<pass>`` switch, read at every compile:
   - ``pass_remove_unnecessary_bmm_view`` strips einsum's views (BIOT: "Can not compile graph"). Unfixed through
@@ -27,14 +30,14 @@ import warnings
 
 import torch
 
-from . import composite, conv, upsample
+from . import composite, conv, serialization, upsample
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_nearest, conv.install, composite.install_glu,
-         composite.install_renorm)
+         composite.install_renorm, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
