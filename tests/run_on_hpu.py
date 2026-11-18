@@ -2,6 +2,7 @@
 different callers. One line per check; exits 1 if any check fails.
 Export the attention setting before running (PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 on bridge 1.21)."""
 import copy
+import io
 import math
 import sys
 
@@ -166,6 +167,34 @@ for label, run in (("eager", lambda: torch.renorm(proto, 2, 0, 0.5)), ("compiled
     fallbacks = cpu_fallbacks(run)
     expect(f"renorm {label} on the card", not fallbacks, f"CPU fallbacks {fallbacks}")
 
+# ---- torch.save after an optimizer step: conv weights in a permuted layout, eager and compiled. The reference is the
+# same step on the CPU, not a host copy of the card's weights (the path under test).
+for mode in ("eager", "compiled"):
+    torch._dynamo.reset()
+    nets = {"cpu": torch.nn.Sequential(torch.nn.Conv2d(1, 8, (1, 25)), torch.nn.BatchNorm2d(8), torch.nn.ELU(),
+                                       torch.nn.Conv2d(8, 16, (8, 1)))}
+    nets["hpu"] = copy.deepcopy(nets["cpu"]).to(hpu)
+    x = torch.randn(16, 1, 8, 1000)
+    optimizers = {}
+    for device, net in nets.items():
+        optimizers[device] = torch.optim.SGD(net.parameters(), lr=0.1, momentum=0.9)
+        (torch.compile(net, backend="hpu_backend") if mode == "compiled" and device == "hpu" else net)(
+            x.to(device)).square().mean().backward()
+        optimizers[device].step()
+    calls.clear()
+    label = f"torch.save after an optimizer step, {mode}"
+    try:
+        buffer = io.BytesIO()
+        torch.save({"model": nets["hpu"].state_dict(), "optimizer": optimizers["hpu"].state_dict()}, buffer)
+        buffer.seek(0)
+        loaded = torch.load(buffer, weights_only=True)
+        devices = {v.device.type for v in loaded["model"].values()}
+        err = max(((loaded["model"][k].cpu().float() - v.float()).abs().max() / v.float().abs().max().clamp_min(1e-12))
+                  .item() for k, v in nets["cpu"].state_dict().items())
+        expect(label, err <= 1e-4 and devices == {"hpu"} and calls["save"] > 0,
+               f"max|loaded - CPU step| / max {err:.1e}, loaded on {devices}, {calls['save']} host copies")
+    except Exception as e:  # noqa: BLE001
+        expect(label, False, f"ERROR {type(e).__name__}: {str(e).splitlines()[0][:300]}")
 
 def check_model_compiles(name, model, x, rtol=1e-3):
     """``model``'s compiled training step runs and matches its eager one on the card: the output, and the parameter
