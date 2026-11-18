@@ -77,27 +77,31 @@ def linear_by_index(input, output_size, align_corners, scales=None):
     16-bit and float32 inputs, in float64 for float64 ones."""
     length, out = input.shape[-1], output_size[0]
     dtype = torch.float64 if input.dtype == torch.float64 else torch.float32
+    rounded = (lambda value: value) if dtype == torch.float64 else _float32  # the scale in the kernel's precision
     with torch.autocast(input.device.type, enabled=False):
-        one = torch.ones((), dtype=dtype)  # the scale in the kernel's precision, on the CPU
+        x = input.to(dtype)
+        if out == length:  # ATen copies whatever scales says, with weights 1 and 0 (an inf gives NaN)
+            return (x * 1 + x * 0).to(input.dtype)
         if align_corners:
-            scale = float(one * (length - 1) / (out - 1)) if out > 1 else 0.0
+            scale = rounded((length - 1) / (out - 1)) if out > 1 else 0.0
         elif scales is not None and scales > 0:
-            scale = float(torch.tensor(1.0 / scales, dtype=dtype))
+            scale = rounded(1.0 / scales)
         else:
-            scale = float(one * length / out)
+            scale = rounded(length / out)
         dst = torch.arange(out, device=input.device, dtype=dtype)
         src = dst * scale if align_corners else ((dst + 0.5) * scale - 0.5).clamp_min(0)
-        first = src.floor().clamp_max(length - 1)
-        weight = (src - first).clamp(0, 1)
-        first = first.long()
+        first = src.floor().long().clamp_max(length - 1)  # in integers: float32(length - 1) can round up
+        weight = (src - first.to(dtype)).clamp(0, 1)
         second = first + (first < length - 1).long()
-        x = input.to(dtype)
         return (x.index_select(-1, first) * (1 - weight) + x.index_select(-1, second) * weight).to(input.dtype)
 
 
 def _linear_index_takes(input, output_size, align_corners, scales=None):
-    return (input.dim() == 3 and static(*input.shape, *output_size)
-            and not native_linear_exact(input, output_size, align_corners, scales))
+    """Valid inputs whose factor Gaudi's kernel gets wrong; everything else reaches the native op (which raises on
+    invalid ones)."""
+    return (input.dim() == 3 and input.is_floating_point() and len(output_size) == 1
+            and static(*input.shape, *output_size) and output_size[0] > 0 and input.shape[1] > 0
+            and input.shape[2] > 0 and not native_linear_exact(input, output_size, align_corners, scales))
 
 
 def _linear_device_kernels(op):

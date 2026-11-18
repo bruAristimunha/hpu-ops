@@ -65,13 +65,19 @@ def _embedding_backward_takes(grad_output, indices, *args, **kwargs):
 
 
 def roll_unshifted(input, shifts, dims=()):
-    """A roll whose every shift is a multiple of its dim's size, as the copy it is. Gaudi's eager kernel reads a
-    strided input of such a roll wrongly (EMG2QwertyNet: a stack's gradient slice rolled back by 0)."""
-    return input.clone()
+    """A roll whose every shift is a multiple of its dim's size, as the copy it is: contiguous, as roll's result.
+    Gaudi's eager kernel reads a strided input of such a roll wrongly (EMG2QwertyNet: a stack's gradient slice rolled
+    back by 0)."""
+    return input.clone(memory_format=torch.contiguous_format)
 
 
 def _roll_takes(input, shifts, dims=()):
-    sizes = [input.numel()] if len(dims) == 0 else [input.shape[d] for d in dims]
+    if len(shifts) == 0 or len(shifts) != max(len(dims), 1) or not all(-input.dim() <= d < max(input.dim(), 1)
+                                                                       for d in dims):
+        return False  # what ATen rejects reaches it
+    if all(isinstance(shift, int) and shift == 0 for shift in shifts):
+        return True  # a copy at any size, symbolic too
+    sizes = [input.numel()] if len(dims) == 0 else [input.shape[d] if input.dim() else 1 for d in dims]
     return static(*sizes, *shifts) and all(size == 0 or shift % size == 0 for size, shift in zip(sizes, shifts))
 
 

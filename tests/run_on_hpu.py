@@ -250,13 +250,22 @@ for length, out, align in ((200, 300, False), (1000, 1009, False), (9920, 10000,
     for mode in ("eager", "compiled"):
         torch._dynamo.reset()
         calls.clear()
-        card = output_and_grad(resize if mode == "eager" else torch.compile(resize, backend="hpu_backend"), hpu)
+        card = output_and_grad(resize if mode == "eager" else torch.compile(resize, backend="hpu_backend",
+                                                                            fullgraph=True), hpu)
         power_of_two = not align and out % length == 0 and (out // length) & (out // length - 1) == 0
         expect(f"linear {length} -> {out}, align_corners {align}, {mode}",
                all(error(card, i) <= 1.5 * error(cpu, i) + 1e-6 for i in (0, 1))
                and (calls["linear_index"] > 0) != power_of_two,
                f"vs float64: output {error(card, 0):.1e} (CPU float32 {error(cpu, 0):.1e}), input grad "
                f"{error(card, 1):.1e} (CPU {error(cpu, 1):.1e}), {'native op' if power_of_two else 'index ops'}")
+x = torch.randn(2, 4, 1000)
+reference = F.interpolate(x.double(), size=1009, mode="linear")
+calls.clear()
+with torch.inference_mode():  # below autograd: the kernel at the HPU key
+    card = F.interpolate(x.to(hpu), size=1009, mode="linear").cpu().double()
+cpu_err, err = (F.interpolate(x, size=1009, mode="linear").double() - reference).abs().max(), (card - reference).abs().max()
+expect("linear 1000 -> 1009 in inference mode", err <= 1.5 * cpu_err + 1e-6 and calls["linear_index"] > 0,
+       f"vs float64 {err:.1e} (CPU float32 {cpu_err:.1e})")
 
 # ---- torch.save after an optimizer step: conv weights in a permuted layout, eager and compiled. The reference is the
 # same step on the CPU, not a host copy of the card's weights (the path under test).
