@@ -358,13 +358,15 @@ def test_renorm_elsewhere_stays_renorm():
 
 
 def test_save_reduces_device_tensors_through_a_host_copy(tmp_path):
-    """A checkpoint after an optimizer step: state dicts, a Parameter and the momentum, loaded with weights_only."""
+    """A checkpoint after an optimizer step: state dicts, a Parameter and the momentum, loaded with weights_only, on
+    the device the tensors came from or where map_location says."""
     model = nn.Sequential(nn.Conv2d(1, 4, 3), nn.BatchNorm2d(4))
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
     model(torch.randn(2, 1, 8, 8)).square().mean().backward()
     optimizer.step()
     weight = model[0].weight
     with cpu_as_hpu(serialization.install) as calls:
+        assert weight.detach().__reduce_ex__(2)[0] is torch._utils._rebuild_device_tensor_from_cpu_tensor
         torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "weight": weight},
                    tmp_path / "checkpoint.pt")
     assert calls["save"] >= len(model.state_dict())
@@ -375,6 +377,19 @@ def test_save_reduces_device_tensors_through_a_host_copy(tmp_path):
     assert torch.equal(loaded["weight"], weight)
     momentum = optimizer.state_dict()["state"][0]["momentum_buffer"]
     assert torch.equal(loaded["optimizer"]["state"][0]["momentum_buffer"], momentum)
+    elsewhere = torch.load(tmp_path / "checkpoint.pt", weights_only=True, map_location="meta")
+    assert {v.device.type for v in elsewhere["model"].values()} == {"meta"}
+
+
+def test_save_keeps_torch_checks_for_device_tensors(tmp_path):
+    """As for XLA tensors: hooks warn that they are not saved, and skip_data refuses a host copy."""
+    x = torch.randn(3, requires_grad=True)
+    x.register_hook(lambda grad: grad)
+    with cpu_as_hpu(serialization.install), pytest.warns(UserWarning, match="hook"):
+        torch.save(x, tmp_path / "x.pt")
+    with cpu_as_hpu(serialization.install), torch.serialization.skip_data(), pytest.raises(RuntimeError,
+                                                                                            match="skip_data"):
+        torch.save(torch.randn(3), tmp_path / "skipped.pt")
 
 
 # ---- installing and undoing

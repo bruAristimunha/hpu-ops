@@ -12,7 +12,8 @@ at the tensor's pickling:
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
-  that an optimizer step left in a permuted layout. Habana pickles HPU tensors the same way in lazy mode.
+  that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
+  lazy mode.
 - Three Habana compile passes break valid graphs. ``enable()`` turns them off through Habana's own
   ``PT_HPU_DISABLE_<pass>`` switch, read at every compile:
   - ``pass_remove_unnecessary_bmm_view`` strips einsum's views (BIOT: "Can not compile graph"). Unfixed through
