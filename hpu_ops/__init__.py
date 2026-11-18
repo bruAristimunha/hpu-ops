@@ -20,9 +20,12 @@ in the dispatcher (see ``_dispatch``):
     2% faster and CodeBrain the same.
 
 Masked attention needs a Habana setting that is read when its library loads, so it must be exported before Python
-starts. The setting is per bridge version, listed in the README.
+starts. The setting is per bridge version, listed in the README; ``enable()`` warns when it did not take effect.
 """
 import os
+import warnings
+
+import torch
 
 from . import composite, conv, upsample
 from ._dispatch import _STATE, chain
@@ -32,11 +35,25 @@ __all__ = ["enable"]
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_nearest, conv.install, composite.install_glu,
          composite.install_renorm)
+ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
+                  "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
+                  "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
+                  "PT_HPU_USE_ATEN_SDPA=0 (1.22).")
 
 
 def _install(device_type):
     """Every rewrite, for tensors of ``device_type`` (the tests pass "cpu" in the role of "hpu"). Returns an undo."""
     return chain([fix(device_type) for fix in FIXES])
+
+
+def _attention_fused(device_type="hpu"):
+    """Whether Habana's attention setting took effect, read from the dispatcher, without touching the device. With
+    the setting, bridges 1.21 and 1.22 register their fused kernel for ``scaled_dot_product_attention`` at the
+    device's autograd key when the library loads. Bridges 1.23+ always register the overrideable backend's kernel,
+    which ``sdpa_kernel([SDPBackend.OVERRIDEABLE])`` picks per call, so there the answer is always True."""
+    key = f"Autograd{device_type.upper()}"
+    return any(torch._C._dispatch_has_kernel_for_dispatch_key(f"aten::{op}", key)
+               for op in ("scaled_dot_product_attention", "_scaled_dot_product_fused_attention_overrideable"))
 
 
 def enable():
@@ -47,6 +64,8 @@ def enable():
         import habana_frameworks.torch.core  # noqa: F401  (Habana's kernels first: they are never overridden)
     except ImportError:
         return
+    if not _attention_fused():
+        warnings.warn(ATTENTION_HINT, stacklevel=2)
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"

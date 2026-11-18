@@ -21,6 +21,10 @@ import hpu_ops
 hpu_ops.enable()
 ```
 
+On 1.21 and 1.22, `enable()` warns when the setting did not take effect: Habana's fused kernel is then not registered in the dispatcher.
+
+Compile with `dynamic=False`, or keep one batch size (`drop_last=True`). A new batch size otherwise makes the shapes symbolic, and linear upsampling falls back to the slow decomposition, with a warning.
+
 ## What it fixes
 
 Only HPU tensors are rewritten; other devices run the original ops. The rewrites sit in PyTorch's dispatcher, in one of two ways:
@@ -114,7 +118,10 @@ python tests/run_on_hpu.py           # on a Gaudi card, with the attention setti
 `test_cpu.py` installs each rewrite with the CPU in the role of HPU and checks:
 - what compiled graphs contain: the native linear op and no `index_put`; no index ops for nearest by an integer factor, and the native nearest op for other factors; full zero padding lists for `"valid"`; no `glu` and no `renorm`;
 - that eager and compiled results match the native ops, with 16-bit and non-contiguous inputs too;
-- that symbolic shapes (a new batch size) and other devices keep torch's own path, and that undoing restores torch.
+- that symbolic shapes (a new batch size) and other devices keep torch's own path, and that undoing restores torch;
+- that the attention check reads the fused kernel's registration, and that symbolic linear upsampling warns while `dynamic=False` keeps the native op.
+
+CI runs `test_cpu.py` on torch 2.6.0 (Gaudi's) and the latest CPU release.
 
 `run_on_hpu.py` compares outputs and input gradients against torch on the CPU, eager and compiled. It covers:
 - SDPA with boolean, additive and no mask, and `nn.MultiheadAttention`;
@@ -134,7 +141,7 @@ It also checks:
 
 - 2-D and 3-D upsampling keep torch's decomposition under compile, and Habana runs its index ops eagerly (NeuroPose).
 - Nearest upsampling by a non-integer factor keeps Gaudi's kernel, so it still fails after a BatchNorm1d. So do integer factors whose float32 index arithmetic is not exact, such as 41: there the native kernels pick the previous sample at some positions, and a repeat would differ from them.
-- Shapes that `torch.compile` treats as symbolic keep torch's decomposition for linear upsampling and non-integer nearest upsampling, because the native backward has no meta kernel for them. After a new batch size, dynamo marks dimensions dynamic. Integer-factor nearest upsampling repeats with a symbolic batch too.
+- Shapes that `torch.compile` treats as symbolic keep torch's decomposition for linear upsampling (with a warning) and non-integer nearest upsampling, because the native backward has no meta kernel for them. After a new batch size, dynamo marks dimensions dynamic; with `dynamic=False` it recompiles with static shapes instead. Integer-factor nearest upsampling repeats with a symbolic batch too.
 - `glu` is rewritten at the autograd key only. Under `torch.inference_mode`, Gaudi's eager kernel runs (it works), and a graph compiled in inference mode keeps it.
 - `renorm_` and `renorm.out` still fall back to the CPU; the functional `renorm` does not.
 - `torch.save` of conv2d weights fails after an optimizer step on HPU (`Number of dims in tensor don't match in permute`), with or without compile, and with `pass_weight_permutation` on or off. Fresh weights, and weights after a forward and backward only, save fine. The `.cpu()` and `copy.deepcopy` copies are correct, so save `{k: v.cpu() for k, v in model.state_dict().items()}`.
