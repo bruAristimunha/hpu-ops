@@ -15,3 +15,6 @@ requires-python = ">=3.9"
 
 [tool.setuptools]
 packages = ["hpu_ops"]
+
+[tool.setuptools.package-data]
+hpu_ops = ["*.txt"]
