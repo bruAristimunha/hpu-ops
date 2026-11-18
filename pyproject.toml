@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hpu-ops"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fixes for what Intel Gaudi's PyTorch stack lacks or gets wrong, at the root or with Habana's own switches (unmodified model code)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
