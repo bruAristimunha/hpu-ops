@@ -169,6 +169,17 @@ for label, run in (("eager", lambda: torch.renorm(proto, 2, 0, 0.5)), ("compiled
     fallbacks = cpu_fallbacks(run)
     expect(f"renorm {label} on the card", not fallbacks, f"CPU fallbacks {fallbacks}")
 
+# ---- the embedding gradient of a 0-d index: Gaudi's kernel sent each one to row 0 (BIOT's channel tokens)
+for mode in ("eager", "compiled"):
+    calls.clear()
+    check("F.embedding of 0-d indices (BIOT channel tokens)",
+          lambda w: torch.stack([F.embedding(torch.arange(6, device=w.device)[i], w) * (i + 1) for i in range(6)]),
+          (torch.randn(6, 4),), atol=1e-5, modes=(mode,))
+    expect(f"embedding gradient of a 0-d index took the one-element index, {mode}", calls["embedding_0d"] > 0,
+           f"{calls['embedding_0d']} times")
+check("F.embedding of a 0-d index with max_norm (embedding_renorm_)",
+      lambda w: F.embedding(torch.tensor(2, device=w.device), w, max_norm=1.0), (3 * torch.randn(5, 4),), atol=1e-5)
+
 # ---- torch.save after an optimizer step: conv weights in a permuted layout, eager and compiled. The reference is the
 # same step on the CPU, not a host copy of the card's weights (the path under test).
 for mode in ("eager", "compiled"):

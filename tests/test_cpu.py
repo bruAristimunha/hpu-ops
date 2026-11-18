@@ -357,6 +357,52 @@ def test_renorm_elsewhere_stays_renorm():
     assert "aten.renorm.default" in ops(nodes) and not calls["renorm"]
 
 
+# ---- the embedding gradient of a 0-d index (BIOT's channel tokens)
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_embedding_gradient_of_a_0d_index_goes_through_the_one_element_index(mode):
+    """BIOT's pattern, one 0-d index per channel from an arange buffer: torch's output and weight gradient; compiled,
+    the backward graph's embedding_dense_backward takes one-element indices."""
+    torch.manual_seed(0)
+    weight, index = torch.randn(6, 4), torch.arange(6)
+
+    def channel_tokens(weight):
+        return torch.stack([F.embedding(index[i], weight) * (i + 1) for i in range(6)])
+
+    want, nodes = train_step(channel_tokens, weight), []
+    with cpu_as_hpu(composite.install_embedding) as calls:
+        got = train_step(channel_tokens if mode == "eager" else compiled(channel_tokens, nodes), weight)
+    assert_same(got, want)
+    assert calls["embedding_0d"] > 0
+    if mode == "compiled":
+        backward = [n for n in nodes if n.target is torch.ops.aten.embedding_dense_backward.default]
+        assert backward and all(n.args[1].meta["val"].dim() == 1 for n in backward)
+
+
+@pytest.mark.parametrize("kwargs", [{"padding_idx": 2}, {"padding_idx": 3}, {"scale_grad_by_freq": True}])
+def test_embedding_gradient_of_a_0d_index_keeps_the_arguments(kwargs):
+    weight = torch.randn(5, 4)
+    f = lambda w: F.embedding(torch.tensor(2), w, **kwargs)  # noqa: E731
+    with cpu_as_hpu(composite.install_embedding) as calls:
+        got = train_step(f, weight)
+    assert_same(got, train_step(f, weight))
+    assert calls["embedding_0d"] == 1
+
+
+def test_embedding_forward_stays_native():
+    """Only the backward changes: a 0-d embedding under no_grad is no view and can be changed in place."""
+    weight = torch.randn(5, 4, requires_grad=True)
+    with cpu_as_hpu(composite.install_embedding) as calls:
+        with torch.no_grad():
+            token = F.embedding(torch.tensor(2), weight)
+        assert token._base is None
+        token.add_(torch.ones(4, requires_grad=True))
+        got = train_step(lambda w: F.embedding(torch.tensor([[1, 2], [3, 4]]), w), weight)
+    assert_same(got, train_step(lambda w: F.embedding(torch.tensor([[1, 2], [3, 4]]), w), weight))
+    assert calls["embedding_0d"] == 0
+
+
 # ---- torch.save: tensor-level host copies
 
 
@@ -436,7 +482,8 @@ def test_undo_restores_torch():
     undo()
     assert [dict(op.py_kernels) for op in touched] == before
     assert torch.Tensor._reduce_ex_internal is reduce
-    for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d"):
+    for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
+                 "aten::embedding"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 
 
