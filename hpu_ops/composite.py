@@ -1,0 +1,78 @@
+"""HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``) or is missing (``renorm``).
+
+Each is registered at ``AutogradHPU``, so eager calls and traced graphs both use it and autograd differentiates the
+composite; ``renorm`` is also registered at ``HPU`` for calls below autograd (inference mode). Cases a composite does
+not take (odd ``glu`` halves, invalid ``renorm`` arguments) go to the op's own kernel, which raises its usual error.
+The composites run with autocast off and return the input dtype, as the native ops do.
+"""
+import torch
+from torch._C import DispatchKey
+
+from ._dispatch import count, register_kernels
+
+aten = torch.ops.aten
+REDUCED = (torch.float16, torch.bfloat16)
+
+
+def _opmath(dtype):
+    return torch.float32 if dtype in REDUCED else dtype
+
+
+def glu(input, dim=-1):
+    """``a * sigmoid(b)`` for the two halves ``a, b`` of ``input`` along ``dim``; float32 math for 16-bit inputs."""
+    half = input.shape[dim] // 2
+    a, b = input.narrow(dim, 0, half), input.narrow(dim, half, half)
+    dtype = _opmath(input.dtype)
+    with torch.autocast(input.device.type, enabled=False):
+        return (a.to(dtype) * torch.sigmoid(b.to(dtype))).to(input.dtype)
+
+
+def _glu_takes(input, dim=-1):
+    return input.is_floating_point() and input.dim() > 0 and input.shape[dim] % 2 == 0
+
+
+def renorm(input, p, dim, maxnorm):
+    """Each slice of ``input`` along ``dim`` scaled to a ``p``-norm of at most ``maxnorm``, as ``aten.renorm`` does
+    it: by ``maxnorm / (norm + 1e-7)`` where ``norm > maxnorm``, else 1, with the norm in float32 for 16-bit inputs."""
+    dim = dim % input.dim()
+    others = [d for d in range(input.dim()) if d != dim]
+    with torch.autocast(input.device.type, enabled=False):
+        norm = torch.linalg.vector_norm(input, p, others, keepdim=True, dtype=_opmath(input.dtype))
+        limit = torch.full_like(norm, maxnorm)
+        factor = torch.where(norm > limit, limit / (norm + 1e-7), 1.0)
+        return input * factor.to(input.dtype)
+
+
+def _renorm_takes(input, p, dim, maxnorm):
+    real = not isinstance(p, complex) and not isinstance(maxnorm, complex)
+    shape = input.is_floating_point() and input.dim() > 1 and -input.dim() <= dim < input.dim()
+    return real and shape and p > 0 and maxnorm >= 0
+
+
+def _kernel(op, name, composite, takes, fallback):
+    """``composite`` for the arguments ``takes`` accepts, else ``op``'s kernel at the ``fallback`` key."""
+
+    def kernel(*args, **kwargs):
+        if takes(*args, **kwargs):
+            count(name)
+            return composite(*args, **kwargs)
+        return op._op_dk(fallback, *args, **kwargs)
+
+    return kernel
+
+
+def install_glu(device_type):
+    """``glu`` on ``device_type`` as ``a * sigmoid(b)``. Returns an undo."""
+    op = aten.glu.default
+    kernel = _kernel(op, "glu", glu, _glu_takes, DispatchKey.Autograd)
+    return register_kernels(device_type, [(op, "Autograd{}", kernel)])
+
+
+def install_renorm(device_type):
+    """``renorm`` on ``device_type`` as norm, scale factor and multiply. Returns an undo."""
+    op = aten.renorm.default
+    below = DispatchKey.CompositeExplicitAutogradNonFunctional  # what the HPU key resolved to: renorm.out, on the CPU
+    return register_kernels(device_type, [
+        (op, "Autograd{}", _kernel(op, "renorm", renorm, _renorm_takes, DispatchKey.Autograd)),
+        (op, "{}", _kernel(op, "renorm", renorm, _renorm_takes, below)),
+    ])

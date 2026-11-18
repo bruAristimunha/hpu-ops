@@ -1,6 +1,7 @@
 """On a Gaudi card: the fixes against torch on the CPU (float32 math), eager and hpu_backend-compiled, through
 different callers. One line per check; exits 1 if any check fails.
 Export the attention setting before running (PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 on bridge 1.21)."""
+import copy
 import math
 import sys
 
@@ -12,6 +13,7 @@ import hpu_ops
 
 hpu_ops.enable()
 hpu = torch.device("hpu")
+calls = hpu_ops._STATE["calls"]
 torch.manual_seed(0)
 failures = []
 
@@ -31,17 +33,21 @@ def max_error(got, ref):
     return math.inf if any(math.isnan(e) for e in errors) else max(errors)  # max() would skip a NaN
 
 
-def check(name, fn, *cpu_input_sets, atol, n_grad=None, modes=("eager", "compiled")):
+def check(name, fn, *cpu_input_sets, atol, n_grad=None, modes=("eager", "compiled"), context=None):
     """fn's outputs and the gradients of its first ``n_grad`` inputs on HPU against the CPU, for each input set
-    (several sets exercise recompilation on new shapes)."""
+    (several sets exercise recompilation on new shapes). With ``context`` (e.g. ``torch.inference_mode``), the
+    forward only, inside it."""
     for mode in modes:
         torch._dynamo.reset()
         f = fn if mode == "eager" else torch.compile(fn, backend="hpu_backend")
         for cpu_inputs in cpu_input_sets:
-            grads = len(cpu_inputs) if n_grad is None else n_grad
+            grads = 0 if context else len(cpu_inputs) if n_grad is None else n_grad
 
             def run(g, device):
                 xs = [t.detach().to(device).requires_grad_(i < grads) for i, t in enumerate(cpu_inputs)]
+                if context:
+                    with context():
+                        return [g(*xs).float().cpu()]
                 out = g(*xs)
                 out.backward(torch.ones_like(out))
                 return [out.detach().float().cpu()] + [x.grad.float().cpu() for x in xs[:grads]]
@@ -50,15 +56,41 @@ def check(name, fn, *cpu_input_sets, atol, n_grad=None, modes=("eager", "compile
             try:
                 err = max_error(run(f, hpu), run(fn, "cpu"))
                 ok = err <= atol
-                print(f"{label:52s} {mode:8s} max|err| {err:.1e} {'OK' if ok else 'FAIL'}", flush=True)
+                print(f"{label:60s} {mode:8s} max|err| {err:.1e} {'OK' if ok else 'FAIL'}", flush=True)
             except Exception as e:  # noqa: BLE001
                 ok = False
                 cause = " | ".join(line for line in str(e).splitlines() if line.strip())[:300] or repr(e)
-                print(f"{label:52s} {mode:8s} ERROR {type(e).__name__}: {cause}", flush=True)
+                print(f"{label:60s} {mode:8s} ERROR {type(e).__name__}: {cause}", flush=True)
             if not ok:
                 failures.append((label, mode))
 
 
+def expect(label, ok, detail=""):
+    print(f"{label}: {detail} {'OK' if ok else 'FAIL'}", flush=True)
+    if not ok:
+        failures.append((label, "-"))
+
+
+def per_device(module, call=None):
+    """A function of the input that runs a CPU or an HPU copy of ``module``. Moving one module between devices would
+    copy compiled-step state back to the CPU reference."""
+    copies = {"cpu": module, "hpu": copy.deepcopy(module).to(hpu)}
+    return lambda x: (call or (lambda m, y: m(y)))(copies[x.device.type], x)
+
+
+def cpu_fallbacks(fn):
+    """Habana's count of the ATen calls that ``fn`` ran on the CPU (op name -> calls)."""
+    from habana_frameworks.torch.hpu.metrics import metric_global
+
+    metric = metric_global("cpu_fallback")
+    before = dict(dict(metric.stats()).get("FallbackOps") or {})
+    fn()
+    torch.hpu.synchronize()
+    after = dict(dict(metric.stats()).get("FallbackOps") or {})
+    return {k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)}
+
+
+# ---- attention (Habana's setting)
 sdpa = lambda q, k, v, m: F.scaled_dot_product_attention(q, k, v, attn_mask=m)  # noqa: E731
 q, k, v = (torch.randn(6, 8, 120, 64) for _ in range(3))
 keep = (torch.arange(120) < torch.tensor([120, 90, 60, 30, 10, 1])[:, None])[:, None, None, :]
@@ -69,31 +101,103 @@ check("F.sdpa, no mask", lambda q, k, v: F.scaled_dot_product_attention(q, k, v)
 mha = torch.nn.MultiheadAttention(64, 4, batch_first=True)
 pad = ~keep[:, 0, 0, :]
 check("nn.MultiheadAttention, key_padding_mask",
-      lambda x: mha.to(x.device)(x, x, x, key_padding_mask=pad.to(x.device), need_weights=False)[0],
+      per_device(mha, lambda m, x: m(x, x, x, key_padding_mask=pad.to(x.device), need_weights=False)[0]),
       (torch.randn(6, 120, 64),), atol=2e-3)
 with Ops() as ops:
     sdpa(*(t.to(hpu) for t in (q, k, v, keep)))
-fused = "hpu.sdpa_fwd" in ops.seen
-print(f"eager attention ops: {sorted(ops.seen)} {'OK' if fused else 'FAIL: not the fused kernel'}", flush=True)
-if not fused:
-    failures.append(("eager attention ops", "eager"))
+expect(f"eager attention ops {sorted(ops.seen)}", "hpu.sdpa_fwd" in ops.seen, "fused kernel")
 
-hpu_ops._STATE["native_calls"] = 0
+# ---- linear upsampling: the native op under compile
+calls.clear()
 check("F.interpolate linear x256 (CodeBrain)", lambda x: F.interpolate(x, scale_factor=256.0, mode="linear"),
       (torch.randn(8, 400, 2),), (torch.randn(5, 400, 2),), atol=1e-4)
-native = hpu_ops._STATE.get("native_calls", 0)
-print(f"compiled upsampling took the native op {native} times {'OK' if native else 'FAIL: override inactive'}",
-      flush=True)
-if not native:
-    failures.append(("upsampling override", "compiled"))
+expect("compiled linear upsampling took the native op", calls["linear"] > 0, f"{calls['linear']} times")
 check("nn.Upsample linear x2, long", torch.nn.Upsample(scale_factor=2.0, mode="linear"), (torch.randn(2, 4, 4096),),
       atol=1e-4)
+
+# ---- nearest upsampling: repeats for integer factors (USleep: BatchNorm1d then nearest x2)
+calls.clear()
+bn_up = torch.nn.Sequential(torch.nn.BatchNorm1d(302), torch.nn.Upsample(scale_factor=2))
+check("BatchNorm1d > nn.Upsample nearest x2 (USleep)", per_device(bn_up), (torch.randn(4, 302, 125),),
+      (torch.randn(4, 302, 1),), atol=1e-4)
+check("BatchNorm1d > nn.Upsample nearest x2, no_grad", per_device(bn_up), (torch.randn(4, 302, 125),), atol=1e-4,
+      context=torch.no_grad)
+check("BatchNorm1d (eval) > nn.Upsample nearest x2, inference_mode", per_device(copy.deepcopy(bn_up).eval()),
+      (torch.randn(4, 302, 125),), atol=1e-4, context=torch.inference_mode)
+expect("nearest x2 took the repeat", calls["nearest"] > 0, f"{calls['nearest']} times")
+check("F.interpolate nearest-exact x3", lambda x: F.interpolate(x, scale_factor=3.0, mode="nearest-exact"),
+      (torch.randn(4, 6, 50),), atol=1e-6)
+check("F.interpolate nearest x2.5 (native op)", lambda x: F.interpolate(x, scale_factor=2.5, mode="nearest"),
+      (torch.randn(4, 6, 40),), atol=1e-6)
+
+# ---- padding="valid" (EEGITNet, ATCNet, EEGInceptionERP)
+calls.clear()
+check('Conv2d padding="valid", depthwise (1, 4) (EEGITNet)',
+      per_device(torch.nn.Conv2d(14, 14, (1, 4), padding="valid", groups=14, bias=False)),
+      (torch.randn(4, 14, 1, 253),), atol=1e-4)
+check('Conv2d padding="valid", depthwise (8, 1) (ATCNet)',
+      per_device(torch.nn.Conv2d(16, 32, (8, 1), padding="valid", groups=16, bias=False)),
+      (torch.randn(4, 16, 8, 250),), atol=1e-4)
+check('Conv1d padding="valid"', per_device(torch.nn.Conv1d(8, 16, 5, padding="valid")), (torch.randn(4, 8, 250),),
+      atol=1e-4)
+expect('compiled padding="valid" took full zero lists', calls["valid_conv"] > 0, f"{calls['valid_conv']} times")
+
+# ---- glu (BrainModule: a convolution, then a gated linear unit over the channels)
+calls.clear()
+check("Conv1d > F.glu (BrainModule)", per_device(torch.nn.Conv1d(8, 640, 3, padding=1), lambda m, x: F.glu(m(x), 1)),
+      (torch.randn(4, 8, 1000),), atol=1e-4)
+expect("glu took a * sigmoid(b)", calls["glu"] > 0, f"{calls['glu']} times")
+
+# ---- renorm (SSTDPN), and none of it on the CPU
+calls.clear()
+check("torch.renorm p=2 dim=0 (SSTDPN)", lambda w: torch.renorm(w, 2, 0, 0.5), (torch.randn(4, 64),), atol=1e-5)
+check("torch.renorm p=2 dim=0, inference_mode", lambda w: torch.renorm(w, 2, 0, 0.5), (torch.randn(4, 64),),
+      atol=1e-5, context=torch.inference_mode)
+proto = torch.randn(4, 64, device=hpu)
+compiled_renorm = torch.compile(lambda w: torch.renorm(w, 2, 0, 0.5), backend="hpu_backend")
+for label, run in (("eager", lambda: torch.renorm(proto, 2, 0, 0.5)), ("compiled", lambda: compiled_renorm(proto)),
+                   ("eager inference_mode", lambda: torch.inference_mode()(torch.renorm)(proto, 2, 0, 0.5)),
+                   ("compiled inference_mode", lambda: torch.inference_mode()(compiled_renorm)(proto))):
+    fallbacks = cpu_fallbacks(run)
+    expect(f"renorm {label} on the card", not fallbacks, f"CPU fallbacks {fallbacks}")
+
+
+def check_model_compiles(name, model, x, rtol=1e-3):
+    """``model``'s compiled training step runs and matches its eager one on the card: the output, and the parameter
+    gradients, each relative to its largest value."""
+    model, x = model.to(hpu).train(), x.to(hpu)
+    results, mode = {}, "eager"
+    try:
+        for mode in ("eager", "compiled"):
+            torch._dynamo.reset()
+            model.zero_grad(set_to_none=True)
+            out = (model if mode == "eager" else torch.compile(model, backend="hpu_backend"))(x)
+            out.square().mean().backward()
+            grads = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+            results[mode] = [out.detach().float().cpu().flatten(), grads.float().cpu()]
+        err = max((a - b).abs().max().item() / b.abs().max().item() for a, b in zip(results["compiled"],
+                                                                                  results["eager"]))
+        expect(f"{name} compiled vs eager", err <= rtol, f"max|err| / max {err:.1e}")
+    except Exception as e:  # noqa: BLE001
+        expect(f"{name} {mode}", False, f"ERROR {type(e).__name__}: {str(e).splitlines()[0][:300]}")
+
+
+# ---- pass_weight_permutation off: FBCNet failed with "create tensor invalid permutation 4 2"
+try:
+    from braindecode.models import FBCNet
+
+    check_model_compiles("braindecode FBCNet", FBCNet(n_chans=8, n_outputs=2, n_times=1000, sfreq=200.0),
+                         torch.randn(4, 8, 1000))
+except ImportError as e:
+    print("braindecode not importable, FBCNet check skipped:", e, flush=True)
+
+# ---- braindecode's BIOT attention block (einsum views)
 try:
     from braindecode.modules.linear_attention import _SelfAttention
 
     block = _SelfAttention(256, 8)
     mask = torch.arange(120) < torch.tensor([120, 100, 80, 60, 40, 20, 10, 1])[:, None]
-    check("braindecode _SelfAttention (BIOT einsums)", lambda x: block.to(x.device)(x, mask.to(x.device)),
+    check("braindecode _SelfAttention (BIOT einsums)", per_device(block, lambda m, x: m(x, mask.to(x.device))),
           (torch.randn(8, 120, 256),), atol=1e-4)
 except ImportError as e:
     print("braindecode not importable, BIOT check skipped:", e, flush=True)
