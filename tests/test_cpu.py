@@ -357,6 +357,34 @@ def test_renorm_elsewhere_stays_renorm():
     assert "aten.renorm.default" in ops(nodes) and not calls["renorm"]
 
 
+# ---- embedding of a 0-d index (BIOT's channel tokens)
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_embedding_of_a_0d_index_goes_through_the_one_element_index(mode):
+    """BIOT's pattern, one 0-d index per channel from an arange buffer: same output and weight gradient as torch."""
+    torch.manual_seed(0)
+    table = nn.Embedding(6, 4)
+    index = torch.arange(6)
+
+    def channel_tokens(weight):
+        return torch.stack([F.embedding(index[i], weight) * (i + 1) for i in range(6)])
+
+    want = train_step(channel_tokens, table.weight)
+    with cpu_as_hpu(composite.install_embedding) as calls:
+        got = train_step(channel_tokens if mode == "eager" else compiled(channel_tokens, []), table.weight)
+    assert_same(got, want)
+    assert calls["embedding_0d"] > 0
+
+
+def test_embedding_of_indices_with_dimensions_is_left_alone():
+    weight, index = torch.randn(6, 4), torch.tensor([[1, 2], [3, 5]])
+    with cpu_as_hpu(composite.install_embedding) as calls:
+        got = train_step(lambda w: F.embedding(index, w), weight)
+    assert_same(got, train_step(lambda w: F.embedding(index, w), weight))
+    assert calls["embedding_0d"] == 0
+
+
 # ---- torch.save: tensor-level host copies
 
 
@@ -436,7 +464,8 @@ def test_undo_restores_torch():
     undo()
     assert [dict(op.py_kernels) for op in touched] == before
     assert torch.Tensor._reduce_ex_internal is reduce
-    for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d"):
+    for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
+                 "aten::embedding"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 
 
