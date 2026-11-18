@@ -1,6 +1,7 @@
 """The rewrites checked on the CPU standing in for HPU: what compiled graphs contain, that eager and compiled results
 match the native ops, and that other devices and symbolic shapes keep torch's own path."""
 import contextlib
+import copy
 import importlib.util
 import os
 import pathlib
@@ -355,6 +356,67 @@ def test_renorm_elsewhere_stays_renorm():
     with cpu_as_hpu(lambda device: composite.install_renorm("hpu")) as calls:
         train_step(compiled(lambda w: torch.renorm(w, 2, 0, 1.0), nodes), renorm_cases())
     assert "aten.renorm.default" in ops(nodes) and not calls["renorm"]
+
+
+# ---- the weight gradient of one-channel strided convolutions (EEGDINO, CodeBrain, LaBraM)
+
+
+def module_grads(module, x):
+    """Output, input gradient and parameter gradients of a sum-of-squares loss."""
+    module.zero_grad(set_to_none=True)
+    x = x.detach().requires_grad_()
+    out = module(x)
+    out.float().square().sum().backward()
+    return [out.detach(), x.grad] + [p.grad for p in module.parameters()]
+
+
+ONE_CHANNEL_STRIDED = [
+    (lambda: nn.Conv2d(1, 25, (1, 49), (1, 25), (0, 24)), (3, 1, 8, 200)),  # EEGDINO / CodeBrain proj_in
+    (lambda: nn.Conv2d(1, 8, (1, 15), (1, 8), (0, 7)), (3, 1, 8, 200)),  # LaBraM temporal conv1
+    (lambda: nn.Conv1d(1, 4, 5, 3, 2), (3, 1, 50)),
+    (lambda: nn.Conv3d(1, 2, (2, 3, 3), (1, 2, 2), (0, 1, 1), bias=False), (2, 1, 4, 9, 9)),
+]
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+@pytest.mark.parametrize("make, shape", ONE_CHANNEL_STRIDED)
+def test_one_channel_strided_conv_weight_grad_is_a_contraction(mode, make, shape):
+    torch.manual_seed(0)
+    layer, x = make().double(), torch.randn(*shape, dtype=torch.float64)
+    want, nodes = module_grads(layer, x), []
+    with cpu_as_hpu(conv.install_weight_grad) as calls:
+        got = module_grads(layer if mode == "eager" else compiled(layer, nodes), x)
+    assert_same(got, want)
+    assert calls["conv_weight_grad"] > 0
+    backward = [n for n in nodes if n.target is torch.ops.aten.convolution_backward.default]
+    assert all(not n.args[-1][1] for n in backward)  # the native backward computes no weight gradient
+
+
+@pytest.mark.parametrize("make, shape", [
+    (lambda: nn.Conv2d(2, 4, (1, 5), (1, 2)), (2, 2, 4, 40)),  # two input channels
+    (lambda: nn.Conv2d(1, 4, (1, 5)), (2, 1, 4, 40)),  # stride 1
+    (lambda: nn.Conv2d(1, 4, (1, 5), (1, 2), dilation=2), (2, 1, 4, 40)),
+    (lambda: nn.ConvTranspose2d(1, 4, (1, 5), (1, 2)), (2, 1, 4, 40)),
+])
+def test_other_convolutions_keep_the_native_backward(make, shape):
+    torch.manual_seed(0)
+    layer, x = make().double(), torch.randn(*shape, dtype=torch.float64)
+    want = module_grads(layer, x)
+    with cpu_as_hpu(conv.install_weight_grad) as calls:
+        got = module_grads(layer, x)
+    assert_same(got, want)
+    assert calls["conv_weight_grad"] == 0
+
+
+def test_one_channel_strided_conv_weight_grad_in_bfloat16():
+    """16-bit inputs are contracted in float32 and the gradient comes back in the weight's dtype."""
+    torch.manual_seed(0)
+    layer, x = nn.Conv2d(1, 8, (1, 15), (1, 8), (0, 7)), torch.randn(3, 1, 8, 200)
+    want = module_grads(copy.deepcopy(layer).double(), x.double())[2]  # .double() converts in place, grads too
+    with cpu_as_hpu(conv.install_weight_grad):
+        got = module_grads(layer.bfloat16(), x.bfloat16())[2]
+    assert got.dtype == torch.bfloat16
+    torch.testing.assert_close(got.double(), want, rtol=2e-2, atol=2e-2 * want.abs().max().item())
 
 
 # ---- the embedding gradient of a 0-d index (BIOT's channel tokens)
