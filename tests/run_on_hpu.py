@@ -9,7 +9,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils._python_dispatch import TorchDispatchMode
 
-import hpu_ops
+import sdpa_checks  # braindecode's attention shapes: strided q/k/v, bfloat16, dropout, fully masked rows
+
+sdpa_checks.probe_sliced_views()  # known Habana bug, in processes of its own, before this one takes the card
+
+import hpu_ops  # noqa: E402
 
 hpu_ops.enable()
 hpu = torch.device("hpu")
@@ -106,6 +110,7 @@ check("nn.MultiheadAttention, key_padding_mask",
 with Ops() as ops:
     sdpa(*(t.to(hpu) for t in (q, k, v, keep)))
 expect(f"eager attention ops {sorted(ops.seen)}", "hpu.sdpa_fwd" in ops.seen, "fused kernel")
+failures.extend(sdpa_checks.run(hpu))
 
 # ---- linear upsampling: the native op under compile
 calls.clear()
