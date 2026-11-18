@@ -112,6 +112,143 @@ def test_linear_static_compile_keeps_the_native_op_for_each_batch_size(recwarn):
     assert not [w for w in recwarn if str(w.message) == upsample.SYMBOLIC_HINT]
 
 
+# ---- linear upsampling: the forward from explicit indices where Gaudi's kernel is inexact
+
+
+def linear(out, align_corners, scale):
+    if scale is not None:
+        return lambda x: F.interpolate(x, scale_factor=scale, mode="linear", align_corners=align_corners)
+    return lambda x: F.interpolate(x, size=out, mode="linear", align_corners=align_corners)
+
+
+def forward_backward(f, x):
+    """Output, and input gradient for a fixed output gradient."""
+    x = x.detach().requires_grad_()
+    out = f(x)
+    out.backward(torch.randn(out.shape, dtype=out.dtype, generator=torch.Generator().manual_seed(1)))
+    return out.detach(), x.grad
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("length, out, align_corners, scale", [
+    (200, 300, False, None), (200, 300, True, None), (1000, 1009, False, None), (9920, 10000, False, None),
+    (1000, 750, False, None), (1000, 750, True, None), (200, None, False, 2.7), (2, 5, True, None),
+])
+def test_linear_index_is_as_accurate_as_atens(length, out, align_corners, scale, dtype):
+    """Source positions in the kernel's precision: output and input gradient against float64, as close as ATen's own
+    float32 kernel (a few positions round to the other side of an integer where a compiler fuses the multiply-add);
+    float64 to rounding."""
+    torch.manual_seed(0)
+    x, f = torch.randn(3, 4, length, dtype=dtype), linear(out, align_corners, scale)
+    want, reference = forward_backward(f, x), forward_backward(f, x.double())
+    with cpu_as_hpu(upsample.install_linear_forward) as calls:
+        got = forward_backward(f, x)
+    assert calls["linear_index"] > 0
+    if dtype == torch.float64:
+        assert_same(got, want, tol=1e-10)
+    else:
+        for ours, atens, exact in zip(got, want, reference):
+            error = lambda a: (a.double() - exact).abs().max().item()  # noqa: E731
+            assert error(ours) <= 1.5 * error(atens) + 1e-7, (error(ours), error(atens))
+
+
+@pytest.mark.parametrize("length, out", [(200, 400), (200, 100), (100, 800), (100, 100)])
+def test_linear_power_of_two_factors_keep_the_native_op(length, out):
+    with cpu_as_hpu(upsample.install_linear_forward) as calls:
+        F.interpolate(torch.randn(3, 4, length), size=out, mode="linear")
+    assert not calls["linear_index"]
+
+
+def test_linear_index_forward_compiled():
+    """Under compile with the native-op path: index ops in the graph instead of the native op."""
+    x, f, nodes = torch.randn(3, 4, 200, dtype=torch.float64), linear(300, False, None), []
+    want = train_step(f, x)
+    with cpu_as_hpu(upsample.install_linear), cpu_as_hpu(upsample.install_linear_forward) as calls:
+        got = train_step(compiled(f, nodes), x)
+    assert_same(got, want)
+    assert "aten.upsample_linear1d.default" not in ops(nodes) and calls["linear_index"], ops(nodes)
+
+
+@pytest.mark.parametrize("align_corners", [False, True])
+def test_linear_index_compiles_in_one_graph(align_corners):
+    """The scale is computed in Python, not read from a tensor: size= and align_corners compile with fullgraph."""
+    x, f = torch.randn(3, 4, 200, dtype=torch.float64), linear(300, align_corners, None)
+    want = train_step(f, x)
+    with cpu_as_hpu(upsample.install_linear), cpu_as_hpu(upsample.install_linear_forward) as calls:
+        got = train_step(compiled(f, [], fullgraph=True), x)
+    assert_same(got, want)
+    assert calls["linear_index"]
+
+
+@pytest.mark.parametrize("scale", [1.3, 0.5])
+def test_linear_same_length_is_atens_copy(scale):
+    """An output as long as the input is ATen's copy whatever the scale, with weights 1 and 0: an inf gives NaN."""
+    x, op = torch.tensor([[[0.0, 1.0, 4.0, float("inf")]]]), torch.ops.aten.upsample_linear1d.default
+    want = op(x, [4], False, scale)
+    with cpu_as_hpu(upsample.install_linear_forward) as calls:
+        got = op(x, [4], False, scale)
+    torch.testing.assert_close(got, want, equal_nan=True)
+    assert calls["linear_index"]
+
+
+@pytest.mark.parametrize("length, out, align_corners, scale", [(200, 400, True, None), (5, 10, False, 2.1),
+                                                               (100, 150, False, -1.0)])
+def test_linear_index_takes_align_corners_other_scales_and_ignores_nonpositive_ones(length, out, align_corners,
+                                                                                      scale):
+    """A power-of-two size is exact on Gaudi only without align_corners and at its own scale; a scale <= 0 means
+    the sizes' ratio, as in ATen."""
+    x, op = torch.randn(3, 4, length, dtype=torch.float64), torch.ops.aten.upsample_linear1d.default
+    want = op(x, [out], align_corners, scale)
+    with cpu_as_hpu(upsample.install_linear_forward) as calls:
+        got = op(x, [out], align_corners, scale)
+    assert_same([got], [want], tol=1e-10)
+    assert calls["linear_index"]
+
+
+@pytest.mark.parametrize("call", [
+    lambda x: torch.ops.aten.upsample_linear1d.default(x, [0], False),
+    lambda x: F.interpolate(x[:, :0], size=150, mode="linear"),
+    lambda x: F.interpolate(x.long(), size=150, mode="linear"),
+    lambda x: torch.ops.aten.upsample_linear1d.default(x, [150, 2], False),
+])
+def test_linear_invalid_inputs_reach_the_native_op(call):
+    x = torch.randn(2, 4, 100)
+    with pytest.raises(Exception) as want:
+        call(x)
+    with cpu_as_hpu(upsample.install_linear_forward) as calls, pytest.raises(type(want.value)):
+        call(x)
+    assert not calls["linear_index"]
+
+
+def test_linear_index_long_input_stays_in_range():
+    """Past 2**24 samples float32(length - 1) rounds up to length: the index is clamped in integers."""
+    x = torch.randn(1, 1, 2**24 + 4)
+    want = F.interpolate(x, size=3, mode="linear", align_corners=True)
+    with cpu_as_hpu(upsample.install_linear_forward) as calls:
+        got = F.interpolate(x, size=3, mode="linear", align_corners=True)
+    torch.testing.assert_close(got, want)
+    assert calls["linear_index"]
+
+
+def test_linear_backend_kernel_below_autograd():
+    """The kernel registered at the device's backend key (inference mode on HPU), called directly on the CPU."""
+    op = torch.ops.aten.upsample_linear1d.default
+    backend = upsample._linear_device_kernels(op)[1]
+    x = torch.randn(4, 3, 100, dtype=torch.float64)
+    with torch.inference_mode():
+        for size in ([200], [150]):  # the native kernel, then the index ops
+            torch.testing.assert_close(backend(x, size, False), op(x, size, False), atol=1e-10, rtol=1e-10)
+
+
+def test_linear_index_forward_in_bfloat16():
+    x = torch.randn(3, 4, 200)
+    want = F.interpolate(x.double(), size=300, mode="linear")
+    with cpu_as_hpu(upsample.install_linear_forward):
+        got = F.interpolate(x.bfloat16(), size=300, mode="linear")
+    assert got.dtype == torch.bfloat16
+    torch.testing.assert_close(got.double(), want, rtol=2e-2, atol=2e-2)
+
+
 # ---- nearest upsampling: repeats for integer factors, the native op otherwise
 
 
@@ -503,6 +640,94 @@ def test_embedding_forward_stays_native():
     assert calls["embedding_0d"] == 0
 
 
+# ---- roll by a multiple of the size as a copy (EMG2QwertyNet's stacked gradient)
+
+
+def strided_roll(shifts, dims):
+    """A roll of a strided slice, as the gradient of a stack's slice is."""
+    return lambda t: t[:, :, 1].roll(shifts, dims) if dims is not None else t[:, :, 1].roll(shifts)
+
+
+@pytest.mark.parametrize("shifts, dims", [(0, 2), (16, 2), (-16, 2), (32, 2), ((0, 0), (1, 2)), ((16, 2), (2, 1)),
+                                          (0, None)])
+def test_roll_by_a_multiple_of_the_size_is_a_copy(shifts, dims):
+    torch.manual_seed(0)
+    x, f = torch.randn(7, 2, 3, 16, 5, dtype=torch.float64), strided_roll(shifts, dims)
+    want = train_step(f, x)
+    with cpu_as_hpu(composite.install_roll) as calls:
+        got = train_step(f, x)
+    assert_same(got, want)
+    assert calls["roll_zero"] > 0
+
+
+@pytest.mark.parametrize("shifts, dims", [(1, 2), (-1, 2), (17, 2), ((0, 1), (1, 2))])
+def test_other_rolls_keep_the_native_op(shifts, dims):
+    torch.manual_seed(0)
+    x, f = torch.randn(7, 2, 3, 16, 5, dtype=torch.float64), strided_roll(shifts, dims)
+    want = train_step(f, x)
+    with cpu_as_hpu(composite.install_roll) as calls:
+        got = train_step(f, x)
+    assert_same(got, want)
+    assert not calls["roll_zero"]
+
+
+def test_roll_copy_is_contiguous_as_roll_is():
+    for x in (torch.randn(3, 4).t(), torch.randn(2, 3, 4, 5).to(memory_format=torch.channels_last)):
+        want = x.roll(0, 0)
+        with cpu_as_hpu(composite.install_roll) as calls:
+            got = x.roll(0, 0)
+        assert got.stride() == want.stride() and torch.equal(got, want) and calls["roll_zero"]
+
+
+@pytest.mark.parametrize("shifts, dims", [((0, 1), ()), ((0,), (1, 2)), ((16, 1), (2,)), ((), ()), ((0,), (3,))])
+def test_roll_arguments_aten_rejects_reach_it(shifts, dims):
+    x = torch.randn(4, 3, 16)
+    with pytest.raises(Exception) as want:
+        x.roll(shifts, dims)
+    with cpu_as_hpu(composite.install_roll) as calls, pytest.raises(type(want.value)):
+        x.roll(shifts, dims)
+    assert not calls["roll_zero"]
+
+
+def test_roll_without_dims_by_other_than_a_multiple_of_the_numel():
+    x, f = torch.randn(7, 2, 3, 16, 5, dtype=torch.float64), strided_roll(5, None)
+    want = train_step(f, x)
+    with cpu_as_hpu(composite.install_roll) as calls:
+        got = train_step(f, x)
+    assert_same(got, want)
+    assert not calls["roll_zero"]
+
+
+def test_roll_of_an_empty_dim_and_of_a_scalar():
+    with cpu_as_hpu(composite.install_roll) as calls:
+        empty, scalar = torch.empty(2, 0, 3).roll(3, 1), torch.tensor(2.0).roll(1, 0)
+    assert empty.shape == (2, 0, 3) and torch.equal(scalar, torch.tensor(2.0)) and calls["roll_zero"] == 2
+
+
+def test_roll_by_zero_with_dynamic_shapes():
+    """A literal 0 is a copy at symbolic sizes too."""
+    x, nodes = torch.randn(4, 3, 16, dtype=torch.float64), []
+    f = lambda t: torch.stack([t.roll(offset, 2) for offset in (-1, 0, 1)], 2)  # noqa: E731
+    want = train_step(f, x)
+    with cpu_as_hpu(composite.install_roll) as calls:
+        got = train_step(compiled(f, nodes, dynamic=True, fullgraph=True), x)
+    assert_same(got, want)
+    assert "aten.clone.default" in ops(nodes) and calls["roll_zero"]
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_roll_of_a_stack_by_zero(mode):
+    """A rotation-invariant MLP's rolls: the backward rolls each slice of the stack's gradient back."""
+    torch.manual_seed(0)
+    x, nodes = torch.randn(4, 3, 16, dtype=torch.float64), []
+    f = lambda t: torch.stack([t.roll(offset, 2) for offset in (-1, 0, 1)], 2)  # noqa: E731
+    want = train_step(f, x)
+    with cpu_as_hpu(composite.install_roll) as calls:
+        got = train_step(f if mode == "eager" else compiled(f, nodes), x)
+    assert_same(got, want)
+    assert calls["roll_zero"] > 0
+
+
 # ---- torch.save: tensor-level host copies
 
 
@@ -583,7 +808,8 @@ def test_undo_restores_torch():
     assert [dict(op.py_kernels) for op in touched] == before
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
-                 "aten::embedding_dense_backward", "aten::convolution_backward"):
+                 "aten::embedding_dense_backward", "aten::convolution_backward", "aten::roll",
+                 "aten::upsample_linear1d"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 
 

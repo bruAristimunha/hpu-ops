@@ -5,8 +5,10 @@ in the dispatcher (see ``_dispatch``), except ``torch.save``'s, which sits where
 at the tensor's pickling:
 
 - 1-D upsampling (``upsample``). Under ``torch.compile``, linear keeps Gaudi's native op instead of torch's
-  gather/scatter decomposition (CodeBrain: 56.9 to 3.4 ms forward + backward). Nearest by an integer factor repeats
-  each sample, eager and compiled: Gaudi's nearest kernel fails after a BatchNorm1d (USleep).
+  gather/scatter decomposition (CodeBrain: 56.9 to 3.4 ms forward + backward). Linear's forward by a factor other
+  than a power of two comes from explicit indices, eager and compiled: Gaudi's kernel drifts with the length there
+  (NeuroPose: 34% off). Nearest by an integer factor repeats each sample, eager and compiled: Gaudi's nearest kernel
+  fails after a BatchNorm1d (USleep).
 - ``padding="valid"`` convolutions under compile (``conv``): passed as full zero lists, which Habana's compiled
   convolution needs (ATCNet, EEGInceptionERP, EEGITNet).
 - The weight gradient of one-channel convolutions with a stride (``conv``): Gaudi's compiled
@@ -15,6 +17,8 @@ at the tensor's pickling:
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
+- ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
+  roll wrongly (EMG2QwertyNet's input gradient).
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -41,8 +45,9 @@ from ._dispatch import _STATE, chain
 __all__ = ["enable"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
-FIXES = (upsample.install_linear, upsample.install_nearest, conv.install, conv.install_weight_grad,
-         composite.install_glu, composite.install_renorm, composite.install_embedding, serialization.install)
+FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
+         conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
+         composite.install_roll, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
