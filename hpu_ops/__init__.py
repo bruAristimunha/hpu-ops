@@ -9,6 +9,8 @@ at the tensor's pickling:
   each sample, eager and compiled: Gaudi's nearest kernel fails after a BatchNorm1d (USleep).
 - ``padding="valid"`` convolutions under compile (``conv``): passed as full zero lists, which Habana's compiled
   convolution needs (ATCNet, EEGInceptionERP, EEGITNet).
+- The weight gradient of one-channel convolutions with a stride (``conv``): Gaudi's compiled
+  ``convolution_backward`` returns about half of it plus an unrelated part (EEGDINO, CodeBrain, LaBraM).
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's
@@ -39,8 +41,8 @@ from ._dispatch import _STATE, chain
 __all__ = ["enable"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
-FIXES = (upsample.install_linear, upsample.install_nearest, conv.install, composite.install_glu,
-         composite.install_renorm, composite.install_embedding, serialization.install)
+FIXES = (upsample.install_linear, upsample.install_nearest, conv.install, conv.install_weight_grad,
+         composite.install_glu, composite.install_renorm, composite.install_embedding, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "

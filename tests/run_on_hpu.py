@@ -169,6 +169,35 @@ for label, run in (("eager", lambda: torch.renorm(proto, 2, 0, 0.5)), ("compiled
     fallbacks = cpu_fallbacks(run)
     expect(f"renorm {label} on the card", not fallbacks, f"CPU fallbacks {fallbacks}")
 
+# ---- the weight gradient of one-channel strided convolutions: about half of it compiled (EEGDINO, CodeBrain, LaBraM)
+for label, make in (("EEGDINO/CodeBrain proj_in", lambda: torch.nn.Conv2d(1, 25, (1, 49), (1, 25), (0, 24))),
+                    ("LaBraM temporal conv1", lambda: torch.nn.Conv2d(1, 8, (1, 15), (1, 8), (0, 7))),
+                    ("Conv2d(1, 25, (1, 3), stride (1, 2))", lambda: torch.nn.Conv2d(1, 25, (1, 3), (1, 2)))):
+    torch.manual_seed(0)
+    layer, x = make(), torch.randn(8, 1, 64, 200)
+    g = torch.randn(layer(x).shape)
+    # With an input gradient (the op computes it and the bias gradient), and as a first layer without bias (the op is
+    # not called).
+    for bias, input_grad in ((True, True), (False, False)):
+        if not bias:
+            layer.bias = None
+        ref, xr = copy.deepcopy(layer).double(), x.double().requires_grad_(input_grad)
+        (ref(xr) * g.double()).sum().backward()
+        for mode in ("eager", "compiled"):
+            torch._dynamo.reset()
+            calls.clear()
+            card, xh = copy.deepcopy(layer).to(hpu), x.to(hpu, copy=True).requires_grad_(input_grad)
+            step = card if mode == "eager" else torch.compile(card, backend="hpu_backend")
+            step(xh).mul(g.to(hpu)).sum().backward()
+            w, r = card.weight.grad.cpu().double(), ref.weight.grad
+            err = ((w - r).abs().max() / r.abs().max()).item()
+            others = ([(card.bias.grad, ref.bias.grad)] if bias else []) + ([(xh.grad, xr.grad)] if input_grad else [])
+            other = max([((a.cpu().double() - b).abs().max() / b.abs().max()).item() for a, b in others] or [0.0])
+            expect(f"{label} weight grad, {'bias and input grad' if bias else 'first layer without bias'}, {mode}",
+                   err <= 1e-4 and other <= 1e-4 and calls["conv_weight_grad"] > 0,
+                   f"max|err| / max {err:.1e}, scale {((w * r).sum() / (r * r).sum()).item():.4f}, "
+                   f"bias/input {other:.1e}")
+
 # ---- the embedding gradient of a 0-d index: Gaudi's kernel sent each one to row 0 (BIOT's channel tokens)
 for mode in ("eager", "compiled"):
     calls.clear()
