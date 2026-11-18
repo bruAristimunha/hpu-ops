@@ -5,6 +5,7 @@ import importlib.util
 import os
 import pathlib
 import re
+import shlex
 
 import pytest
 import torch
@@ -398,20 +399,26 @@ def test_save_keeps_torch_checks_for_device_tensors(tmp_path):
 
 
 def test_autocast_files_hold_torchs_cuda_lists():
-    """The installed torch's CUDA lists (rms_norm joined the float32 one after 2.6), named by the exports."""
+    """The installed torch's CUDA lists, composed as hpu_ops.autocast says (rms_norm joined CUDA's float32 list after
+    2.6), in the files that the quoted exports name."""
     header = pathlib.Path(torch.__file__).parent / "include" / "ATen" / "autocast_mode.h"
     if not header.exists():
         pytest.skip("torch installed without its C++ headers")
     text = header.read_text()
 
-    def listed(macro):
-        return set(re.findall(r"_\(([a-z0-9_]+)", re.search(rf"#define {macro}\(_\)(.*?)\n\n", text, re.S).group(1)))
+    def listed(macro, entry=r"_\(([a-z0-9_]+)"):
+        body = re.search(rf"#define {macro}\(_\)((?:.*\\\n)*.*)", text)
+        assert body, f"{macro} not in {header}"
+        return set(re.findall(entry, body.group(1)))
 
-    files = dict(line.removeprefix("export ").split("=", 1) for line in autocast.exports())
-    lower, fp32 = (set(pathlib.Path(files[name]).read_text().split()) for name in autocast.LISTS)
+    files = autocast.paths()
+    lower, fp32 = (set(pathlib.Path(files[name]).read_text().split()) for name in autocast.FILES)
     assert lower == listed("AT_FORALL_LOWER_PRECISION_FP")
-    cuda_fp32 = listed("AT_FORALL_FP32") | listed("AT_FORALL_FP32_SET_OPT_DTYPE")
+    cuda_fp32 = (listed("AT_FORALL_FP32") | listed("AT_FORALL_FP32_SET_OPT_DTYPE")
+                 | listed("AT_FORALL_DIFFERENT_REDISPATCH_SIGNATURE", r"ADD_NS\(([a-z0-9_]+)\)")
+                 | (listed("AT_FORALL_PROMOTE") - autocast.HABANA_PROMOTE) | autocast.REFUSED_BY_CUDA)
     assert cuda_fp32 <= fp32 <= cuda_fp32 | {"rms_norm"}, fp32 ^ cuda_fp32
+    assert autocast.exports() == [f"export {name}={shlex.quote(path)}" for name, path in files.items()]
 
 
 # ---- installing and undoing

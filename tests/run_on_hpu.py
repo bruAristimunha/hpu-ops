@@ -198,20 +198,29 @@ for mode in ("eager", "compiled"):
     except Exception as e:  # noqa: BLE001
         expect(label, False, f"ERROR {type(e).__name__}: {str(e).splitlines()[0][:300]}")
 # ---- bfloat16 autocast: CUDA's dtypes once hpu_ops.autocast's lists are exported; Habana's are only printed
-x = torch.randn(4, 16, 32, device=hpu)
-with torch.autocast("hpu", dtype=torch.bfloat16):
-    got = {"linear": F.linear(x, torch.randn(32, 32, device=hpu)), "sdpa": F.scaled_dot_product_attention(x, x, x),
-           "layer_norm": F.layer_norm(x, (32,)), "group_norm": F.group_norm(x, 4), "batch_norm": F.batch_norm(
-               x, None, None, training=True), "softmax": x.softmax(-1), "log_softmax": x.log_softmax(-1),
-           "sum": x.sum(), "mean": x.mean(), "mul": x * x}
-dtypes = {op: str(out.dtype).replace("torch.", "") for op, out in got.items()}
-if all(os.environ.get(name) for name in autocast.LISTS):
-    cuda = {op: "bfloat16" if op in ("linear", "sdpa") else "float32" for op in got}
-    expect("bfloat16 autocast with CUDA's lists", dtypes == cuda, str(dtypes))
-else:
-    print(f"bfloat16 autocast with Habana's lists (not checked; export hpu_ops.autocast's for CUDA's): {dtypes}",
-          flush=True)
-
+exported = {name: os.environ.get(name) for name in autocast.FILES}
+label = "bfloat16 autocast with CUDA's lists"
+try:
+    x, h = torch.randn(4, 16, 32, device=hpu), torch.randn(32, device=hpu)
+    with torch.autocast("hpu", dtype=torch.bfloat16):
+        low = F.linear(x, torch.randn(32, 32, device=hpu))
+        got = {"linear": low, "sdpa": F.scaled_dot_product_attention(x, x, x), "layer_norm": F.layer_norm(x, (32,)),
+               "group_norm": F.group_norm(x, 4), "batch_norm": F.batch_norm(x, None, None, training=True),
+               "softmax": x.softmax(-1), "log_softmax": x.log_softmax(-1), "sum": x.sum(), "mean": x.mean(),
+               "mul": x * x, "dot, bfloat16 and float32": torch.dot(low[0, 0], h),
+               "atan2, bfloat16 and float32": torch.atan2(low, x),
+               "binary_cross_entropy": F.binary_cross_entropy(low.sigmoid(), torch.rand_like(x))}
+    dtypes = {op: str(out.dtype).replace("torch.", "") for op, out in got.items()}
+    if exported == autocast.paths():
+        cuda = {op: "bfloat16" if op in ("linear", "sdpa") else "float32" for op in got}
+        expect(label, dtypes == cuda, str(dtypes))
+    elif not any(exported.values()):
+        print(f"bfloat16 autocast with Habana's lists (not checked; export hpu_ops.autocast's for CUDA's): {dtypes}",
+              flush=True)
+    else:
+        expect(label, False, f"not hpu_ops.autocast's pair of lists: {exported}")
+except Exception as e:  # noqa: BLE001
+    expect(label, False, f"ERROR {type(e).__name__}: {str(e).splitlines()[0][:300]}")
 
 def check_model_compiles(name, model, x, rtol=1e-3):
     """``model``'s compiled training step runs and matches its eager one on the card: the output, and the parameter

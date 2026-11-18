@@ -5,21 +5,28 @@ _upsample_nearest_exact2d
 _upsample_nearest_exact3d
 acos
 asin
+atan2
+bilinear
+binary_cross_entropy
 binary_cross_entropy_with_logits
 cdist
 cosh
 cosine_embedding_loss
 cosine_similarity
+cross
 cumprod
 cumsum
 dist
+dot
 erfinv
 exp
 expm1
 frobenius_norm
+grid_sampler
 group_norm
 hinge_embedding_loss
 huber_loss
+index_put
 kl_div
 l1_loss
 layer_norm
@@ -38,6 +45,7 @@ multilabel_margin_loss
 native_layer_norm
 nll_loss
 nll_loss2d
+norm
 nuclear_norm
 pdist
 poisson_nll_loss
@@ -47,6 +55,7 @@ reciprocal
 renorm
 rms_norm
 rsqrt
+scatter_add
 sinh
 smooth_l1_loss
 soft_margin_loss
@@ -54,6 +63,7 @@ softmax
 softplus
 sum
 tan
+tensordot
 triplet_margin_loss
 upsample_bicubic2d
 upsample_bilinear2d
@@ -62,3 +72,4 @@ upsample_nearest1d
 upsample_nearest2d
 upsample_nearest3d
 upsample_trilinear3d
+vdot

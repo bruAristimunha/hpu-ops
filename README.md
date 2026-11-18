@@ -27,7 +27,7 @@ Compile with `dynamic=False`, or keep one batch size (`drop_last=True`). A new b
 
 ### bfloat16 autocast with CUDA's op lists (optional)
 
-Under `torch.autocast("hpu", torch.bfloat16)`, Habana's default lists put norms, softmax, `mean` and `mul` in bfloat16, even for float32 inputs. CUDA keeps them in float32. The lists are the same in bridges 1.21 to 1.24. Habana reads its two lists from files when its library loads. For torch's CUDA lists (`ATen/autocast_mode.h`), export them before Python starts:
+Under `torch.autocast("hpu", torch.bfloat16)`, Habana's default lists put norms, softmax, `mean` and `mul` in bfloat16, even for float32 inputs. CUDA keeps them in float32. The lists are the same in bridges 1.21 to 1.24. Habana reads its two lists from files when its library loads. For torch's CUDA lists (`ATen/autocast_mode.h`), export them before Python starts. CUDA's promote ops that Habana's fixed promote list lacks (`atan2`, `bilinear`, `cross`, `dot`, `vdot`, `grid_sampler`, `index_put`, `tensordot`, `scatter_add`) join the float32 list: float32 is CUDA's result for mixed inputs, and mixed inputs would otherwise fail. So does `binary_cross_entropy`, which CUDA refuses under autocast.
 
 ```bash
 eval "$(python -m hpu_ops.autocast)"
