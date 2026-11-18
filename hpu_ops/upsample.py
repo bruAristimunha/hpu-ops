@@ -2,6 +2,10 @@
 
 - Linear, under ``torch.compile``: the native op instead of torch's gather/scatter decomposition, whose scatter
   backward is slow on Gaudi.
+- Linear, eager and compiled: from explicit source indices and weights unless the factor is a power of two without
+  ``align_corners``, differentiated by autograd. Gaudi's forward kernel drifts with the length elsewhere (NeuroPose's
+  last resize, 9920 to 10000 samples: 34% off), and its backward is less exact than the CPU's at some sizes (1000 to
+  1009 samples: 1.4e-04 against float64, the CPU's float32 kernel 4.3e-05); the index ops are as exact as the CPU's.
 - Nearest and nearest-exact by an integer factor, eager and compiled: each sample repeated (``repeat_interleave``
   along the last dim). Gaudi's nearest kernel fails after a BatchNorm1d (graph compiler, ``layout.h:75 permute``), and
   under compile torch's decomposition leaves index ops that Habana runs eagerly. Other factors keep the native op,
@@ -54,6 +58,72 @@ def install_linear(device_type):
     """Swap torch's decomposition of ``upsample_linear1d.vec`` for the native-op kernel. Returns an undo."""
     return replace_py_kernels(aten.upsample_linear1d.vec, CIA_AND_AUTOGRAD,
                               lambda original: _native_linear_vec(device_type, original))
+
+
+def native_linear_exact(input, output_size, align_corners, scales=None):
+    """Whether Gaudi's linear kernel is exact: a power-of-two factor up or down, without ``align_corners``. Its other
+    results drift with the length (1000 samples to 1500: 1.6e-03; 9920 to 10000: 0.1)."""
+    length, out = input.shape[-1], output_size[0]
+    if align_corners or not length or not out:
+        return False
+    big, small = max(length, out), min(length, out)
+    factor = big // small
+    return big % small == 0 and factor & (factor - 1) == 0 and scales in (None, out / length)
+
+
+def linear_by_index(input, output_size, align_corners, scales=None):
+    """``upsample_linear1d`` from explicit source indices and weights, computed as ATen's CPU kernel computes them
+    (``area_pixel_compute_scale``, ``area_pixel_compute_source_index``, ``guard_index_and_lambda``): in float32 for
+    16-bit and float32 inputs, in float64 for float64 ones."""
+    length, out = input.shape[-1], output_size[0]
+    dtype = torch.float64 if input.dtype == torch.float64 else torch.float32
+    with torch.autocast(input.device.type, enabled=False):
+        one = torch.ones((), dtype=dtype)  # the scale in the kernel's precision, on the CPU
+        if align_corners:
+            scale = float(one * (length - 1) / (out - 1)) if out > 1 else 0.0
+        elif scales is not None and scales > 0:
+            scale = float(torch.tensor(1.0 / scales, dtype=dtype))
+        else:
+            scale = float(one * length / out)
+        dst = torch.arange(out, device=input.device, dtype=dtype)
+        src = dst * scale if align_corners else ((dst + 0.5) * scale - 0.5).clamp_min(0)
+        first = src.floor().clamp_max(length - 1)
+        weight = (src - first).clamp(0, 1)
+        first = first.long()
+        second = first + (first < length - 1).long()
+        x = input.to(dtype)
+        return (x.index_select(-1, first) * (1 - weight) + x.index_select(-1, second) * weight).to(input.dtype)
+
+
+def _linear_index_takes(input, output_size, align_corners, scales=None):
+    return (input.dim() == 3 and static(*input.shape, *output_size)
+            and not native_linear_exact(input, output_size, align_corners, scales))
+
+
+def _linear_device_kernels(op):
+    """The kernels of ``upsample_linear1d.default`` at the device's autograd and backend keys."""
+
+    def autograd(input, output_size, align_corners, scales=None):  # autograd differentiates the index ops
+        if _linear_index_takes(input, output_size, align_corners, scales):
+            count("linear_index")
+            return linear_by_index(input, output_size, align_corners, scales)
+        return op._op_dk(DispatchKey.Autograd, input, output_size, align_corners, scales)
+
+    def backend(input, output_size, align_corners, scales=None):  # inference mode, and anything else below autograd
+        if _linear_index_takes(input, output_size, align_corners, scales):
+            count("linear_index")
+            return linear_by_index(input, output_size, align_corners, scales)
+        return op._op_dk(DispatchKey.CompositeExplicitAutogradNonFunctional, input, output_size, align_corners, scales)
+
+    return autograd, backend
+
+
+def install_linear_forward(device_type):
+    """Linear 1-D upsampling on ``device_type`` from explicit indices where Gaudi's kernel is inexact, eager and traced.
+    Returns an undo."""
+    op = aten.upsample_linear1d.default
+    autograd, backend = _linear_device_kernels(op)
+    return register_kernels(device_type, [(op, "Autograd{}", autograd), (op, "{}", backend)])
 
 
 def _float32(value):

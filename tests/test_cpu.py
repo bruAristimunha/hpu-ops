@@ -112,6 +112,72 @@ def test_linear_static_compile_keeps_the_native_op_for_each_batch_size(recwarn):
     assert not [w for w in recwarn if str(w.message) == upsample.SYMBOLIC_HINT]
 
 
+# ---- linear upsampling: the forward from explicit indices where Gaudi's kernel is inexact
+
+
+def linear(out, align_corners, scale):
+    if scale is not None:
+        return lambda x: F.interpolate(x, scale_factor=scale, mode="linear", align_corners=align_corners)
+    return lambda x: F.interpolate(x, size=out, mode="linear", align_corners=align_corners)
+
+
+def forward_backward(f, x):
+    """Output, and input gradient for a fixed output gradient."""
+    x = x.detach().requires_grad_()
+    out = f(x)
+    out.backward(torch.randn(out.shape, dtype=out.dtype, generator=torch.Generator().manual_seed(1)))
+    return out.detach(), x.grad
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("length, out, align_corners, scale", [
+    (200, 300, False, None), (200, 300, True, None), (1000, 1009, False, None), (9920, 10000, False, None),
+    (1000, 750, False, None), (1000, 750, True, None), (200, None, False, 2.7), (2, 5, True, None),
+])
+def test_linear_index_is_as_accurate_as_atens(length, out, align_corners, scale, dtype):
+    """Source positions in the kernel's precision: output and input gradient against float64, as close as ATen's own
+    float32 kernel (a few positions round to the other side of an integer where a compiler fuses the multiply-add);
+    float64 to rounding."""
+    torch.manual_seed(0)
+    x, f = torch.randn(3, 4, length, dtype=dtype), linear(out, align_corners, scale)
+    want, reference = forward_backward(f, x), forward_backward(f, x.double())
+    with cpu_as_hpu(upsample.install_linear_forward) as calls:
+        got = forward_backward(f, x)
+    assert calls["linear_index"] > 0
+    if dtype == torch.float64:
+        assert_same(got, want, tol=1e-10)
+    else:
+        for ours, atens, exact in zip(got, want, reference):
+            error = lambda a: (a.double() - exact).abs().max().item()  # noqa: E731
+            assert error(ours) <= 1.01 * error(atens) + 1e-7, (error(ours), error(atens))
+
+
+@pytest.mark.parametrize("length, out", [(200, 400), (200, 100), (100, 800), (100, 100)])
+def test_linear_power_of_two_factors_keep_the_native_op(length, out):
+    with cpu_as_hpu(upsample.install_linear_forward) as calls:
+        F.interpolate(torch.randn(3, 4, length), size=out, mode="linear")
+    assert not calls["linear_index"]
+
+
+def test_linear_index_forward_compiled():
+    """Under compile with the native-op path: index ops in the graph instead of the native op."""
+    x, f, nodes = torch.randn(3, 4, 200, dtype=torch.float64), linear(300, False, None), []
+    want = train_step(f, x)
+    with cpu_as_hpu(upsample.install_linear), cpu_as_hpu(upsample.install_linear_forward) as calls:
+        got = train_step(compiled(f, nodes), x)
+    assert_same(got, want)
+    assert "aten.upsample_linear1d.default" not in ops(nodes) and calls["linear_index"], ops(nodes)
+
+
+def test_linear_index_forward_in_bfloat16():
+    x = torch.randn(3, 4, 200)
+    want = F.interpolate(x.double(), size=300, mode="linear")
+    with cpu_as_hpu(upsample.install_linear_forward):
+        got = F.interpolate(x.bfloat16(), size=300, mode="linear")
+    assert got.dtype == torch.bfloat16
+    torch.testing.assert_close(got.double(), want, rtol=2e-2, atol=2e-2)
+
+
 # ---- nearest upsampling: repeats for integer factors, the native op otherwise
 
 
@@ -503,6 +569,50 @@ def test_embedding_forward_stays_native():
     assert calls["embedding_0d"] == 0
 
 
+# ---- roll by a multiple of the size as a copy (EMG2QwertyNet's stacked gradient)
+
+
+def strided_roll(shifts, dims):
+    """A roll of a strided slice, as the gradient of a stack's slice is."""
+    return lambda t: t[:, :, 1].roll(shifts, dims) if dims is not None else t[:, :, 1].roll(shifts)
+
+
+@pytest.mark.parametrize("shifts, dims", [(0, 2), (16, 2), (-16, 2), (32, 2), ((0, 0), (1, 2)), ((16, 2), (2, 1)),
+                                          (0, None)])
+def test_roll_by_a_multiple_of_the_size_is_a_copy(shifts, dims):
+    torch.manual_seed(0)
+    x, f = torch.randn(7, 2, 3, 16, 5, dtype=torch.float64), strided_roll(shifts, dims)
+    want = train_step(f, x)
+    with cpu_as_hpu(composite.install_roll) as calls:
+        got = train_step(f, x)
+    assert_same(got, want)
+    assert calls["roll_zero"] > 0
+
+
+@pytest.mark.parametrize("shifts, dims", [(1, 2), (-1, 2), (17, 2), ((0, 1), (1, 2))])
+def test_other_rolls_keep_the_native_op(shifts, dims):
+    torch.manual_seed(0)
+    x, f = torch.randn(7, 2, 3, 16, 5, dtype=torch.float64), strided_roll(shifts, dims)
+    want = train_step(f, x)
+    with cpu_as_hpu(composite.install_roll) as calls:
+        got = train_step(f, x)
+    assert_same(got, want)
+    assert not calls["roll_zero"]
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_roll_of_a_stack_by_zero(mode):
+    """A rotation-invariant MLP's rolls: the backward rolls each slice of the stack's gradient back."""
+    torch.manual_seed(0)
+    x, nodes = torch.randn(4, 3, 16, dtype=torch.float64), []
+    f = lambda t: torch.stack([t.roll(offset, 2) for offset in (-1, 0, 1)], 2)  # noqa: E731
+    want = train_step(f, x)
+    with cpu_as_hpu(composite.install_roll) as calls:
+        got = train_step(f if mode == "eager" else compiled(f, nodes), x)
+    assert_same(got, want)
+    assert calls["roll_zero"] > 0
+
+
 # ---- torch.save: tensor-level host copies
 
 
@@ -583,7 +693,8 @@ def test_undo_restores_torch():
     assert [dict(op.py_kernels) for op in touched] == before
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
-                 "aten::embedding_dense_backward", "aten::convolution_backward"):
+                 "aten::embedding_dense_backward", "aten::convolution_backward", "aten::roll",
+                 "aten::upsample_linear1d"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 
 

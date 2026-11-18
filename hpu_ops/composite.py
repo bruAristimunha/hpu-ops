@@ -1,5 +1,5 @@
 """HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``), is missing (``renorm``) or is
-wrong (``embedding_dense_backward`` of a 0-d index).
+wrong (``embedding_dense_backward`` of a 0-d index, ``roll`` of a strided input by a multiple of the size).
 
 Each is registered at ``AutogradHPU``, so eager calls and traced graphs both use it and autograd differentiates the
 composite; ``renorm`` is also registered at ``HPU`` for calls below autograd (inference mode). Cases a composite does
@@ -10,7 +10,7 @@ return the input dtype, as the native ops do.
 import torch
 from torch._C import DispatchKey
 
-from ._dispatch import count, register_kernels
+from ._dispatch import count, register_kernels, static
 
 aten = torch.ops.aten
 REDUCED = (torch.float16, torch.bfloat16)
@@ -64,6 +64,17 @@ def _embedding_backward_takes(grad_output, indices, *args, **kwargs):
     return indices.dim() == 0
 
 
+def roll_unshifted(input, shifts, dims=()):
+    """A roll whose every shift is a multiple of its dim's size, as the copy it is. Gaudi's eager kernel reads a
+    strided input of such a roll wrongly (EMG2QwertyNet: a stack's gradient slice rolled back by 0)."""
+    return input.clone()
+
+
+def _roll_takes(input, shifts, dims=()):
+    sizes = [input.numel()] if len(dims) == 0 else [input.shape[d] for d in dims]
+    return static(*sizes, *shifts) and all(size == 0 or shift % size == 0 for size, shift in zip(sizes, shifts))
+
+
 def _kernel(op, name, composite, takes, fallback):
     """``composite`` for the arguments ``takes`` accepts, else ``op``'s kernel at the ``fallback`` key."""
 
@@ -98,3 +109,11 @@ def install_embedding(device_type):
     op = aten.embedding_dense_backward.default
     return register_kernels(device_type, [(op, "Autograd{}", _kernel(
         op, "embedding_0d", embedding_dense_backward_one, _embedding_backward_takes, DispatchKey.Autograd))])
+
+
+def install_roll(device_type):
+    """Rolls by a multiple of the size on ``device_type`` as copies. Returns an undo. Below autograd (inference mode)
+    they keep Habana's kernel, which hpu-ops does not override."""
+    op = aten.roll.default
+    return register_kernels(device_type, [(op, "Autograd{}", _kernel(
+        op, "roll_zero", roll_unshifted, _roll_takes, DispatchKey.Autograd))])

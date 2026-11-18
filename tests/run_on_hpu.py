@@ -209,6 +209,55 @@ for mode in ("eager", "compiled"):
 check("F.embedding of a 0-d index with max_norm (embedding_renorm_)",
       lambda w: F.embedding(torch.tensor(2, device=w.device), w, max_norm=1.0), (3 * torch.randn(5, 4),), atol=1e-5)
 
+# ---- roll by a multiple of the size: Gaudi's eager kernel read a strided input of one wrongly (EMG2QwertyNet's
+# rotation-invariant MLP, whose backward rolls each slice of the stack's gradient back). Random output gradients: a
+# misread roll of ones is still ones.
+slices = torch.randn(497, 2, 3, 16, 33)
+for shift in (0, 16, -16, 1):
+    calls.clear()
+    err = (slices.to(hpu)[:, :, 1].roll(shift, 2).cpu() - slices[:, :, 1].roll(shift, 2)).abs().max().item()
+    expect(f"roll of a strided slice by {shift:+d} (size 16)", err == 0 and (calls["roll_zero"] > 0) == (shift % 16 == 0),
+           f"max|err| {err:.1e}")
+x, g = torch.randn(4, 3, 16), torch.randn(4, 3, 3, 16)
+for mode in ("eager", "compiled"):
+    torch._dynamo.reset()
+    calls.clear()
+    rotations = lambda t: torch.stack([t.roll(offset, 2) for offset in (-1, 0, 1)], 2)  # noqa: E731
+    step = rotations if mode == "eager" else torch.compile(rotations, backend="hpu_backend")
+    xh, xc = x.to(hpu).requires_grad_(), x.clone().requires_grad_()
+    step(xh).backward(g.to(hpu))
+    rotations(xc).backward(g)
+    err = (xh.grad.cpu() - xc.grad).abs().max().item()
+    expect(f"input gradient of a stack of rolls by -1, 0, +1, {mode}", err <= 1e-6 and calls["roll_zero"] > 0,
+           f"max|err| {err:.1e}")
+
+# ---- linear upsampling by other than a power of two: Gaudi's forward kernel drifts with the length (NeuroPose's
+# 9920 to 10000: 34% off), and its backward is less exact than the CPU's at some sizes. Output and input gradient as
+# close to float64 as the CPU's float32 kernel.
+for length, out, align in ((200, 300, False), (1000, 1009, False), (9920, 10000, False), (9920, 7440, True),
+                           (1000, 2000, False)):
+    x, g = torch.randn(2, 4, length), torch.randn(2, 4, out)
+    resize = lambda t: F.interpolate(t, size=out, mode="linear", align_corners=align)  # noqa: E731
+
+    def output_and_grad(step, device, dtype=torch.float32):
+        xr = x.to(device, dtype, copy=True).requires_grad_()
+        y = step(xr)
+        y.backward(g.to(device, dtype))
+        return y.detach().cpu().double(), xr.grad.cpu().double()
+
+    reference, cpu = output_and_grad(resize, "cpu", torch.float64), output_and_grad(resize, "cpu")
+    error = lambda pair, i: ((pair[i] - reference[i]).abs().max() / reference[i].abs().max()).item()  # noqa: E731
+    for mode in ("eager", "compiled"):
+        torch._dynamo.reset()
+        calls.clear()
+        card = output_and_grad(resize if mode == "eager" else torch.compile(resize, backend="hpu_backend"), hpu)
+        power_of_two = not align and out % length == 0 and (out // length) & (out // length - 1) == 0
+        expect(f"linear {length} -> {out}, align_corners {align}, {mode}",
+               all(error(card, i) <= 1.5 * error(cpu, i) + 1e-6 for i in (0, 1))
+               and (calls["linear_index"] > 0) != power_of_two,
+               f"vs float64: output {error(card, 0):.1e} (CPU float32 {error(cpu, 0):.1e}), input grad "
+               f"{error(card, 1):.1e} (CPU {error(cpu, 1):.1e}), {'native op' if power_of_two else 'index ops'}")
+
 # ---- torch.save after an optimizer step: conv weights in a permuted layout, eager and compiled. The reference is the
 # same step on the CPU, not a host copy of the card's weights (the path under test).
 for mode in ("eager", "compiled"):
