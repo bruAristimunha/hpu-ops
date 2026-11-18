@@ -3,6 +3,8 @@ match the native ops, and that other devices and symbolic shapes keep torch's ow
 import contextlib
 import importlib.util
 import os
+import pathlib
+import re
 
 import pytest
 import torch
@@ -12,7 +14,7 @@ from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 
 import hpu_ops
-from hpu_ops import composite, conv, serialization, upsample
+from hpu_ops import autocast, composite, conv, serialization, upsample
 
 
 @contextlib.contextmanager
@@ -390,6 +392,26 @@ def test_save_keeps_torch_checks_for_device_tensors(tmp_path):
     with cpu_as_hpu(serialization.install), torch.serialization.skip_data(), pytest.raises(RuntimeError,
                                                                                             match="skip_data"):
         torch.save(torch.randn(3), tmp_path / "skipped.pt")
+
+
+# ---- CUDA's autocast lists for Habana
+
+
+def test_autocast_files_hold_torchs_cuda_lists():
+    """The installed torch's CUDA lists (rms_norm joined the float32 one after 2.6), named by the exports."""
+    header = pathlib.Path(torch.__file__).parent / "include" / "ATen" / "autocast_mode.h"
+    if not header.exists():
+        pytest.skip("torch installed without its C++ headers")
+    text = header.read_text()
+
+    def listed(macro):
+        return set(re.findall(r"_\(([a-z0-9_]+)", re.search(rf"#define {macro}\(_\)(.*?)\n\n", text, re.S).group(1)))
+
+    files = dict(line.removeprefix("export ").split("=", 1) for line in autocast.exports())
+    lower, fp32 = (set(pathlib.Path(files[name]).read_text().split()) for name in autocast.LISTS)
+    assert lower == listed("AT_FORALL_LOWER_PRECISION_FP")
+    cuda_fp32 = listed("AT_FORALL_FP32") | listed("AT_FORALL_FP32_SET_OPT_DTYPE")
+    assert cuda_fp32 <= fp32 <= cuda_fp32 | {"rms_norm"}, fp32 ^ cuda_fp32
 
 
 # ---- installing and undoing

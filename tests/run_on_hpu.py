@@ -4,6 +4,7 @@ Export the attention setting before running (PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 on 
 import copy
 import io
 import math
+import os
 import sys
 
 import torch
@@ -15,6 +16,7 @@ import sdpa_checks  # braindecode's attention shapes: strided q/k/v, bfloat16, d
 sdpa_checks.probe_sliced_views()  # known Habana bug, in processes of its own, before this one takes the card
 
 import hpu_ops  # noqa: E402
+from hpu_ops import autocast  # noqa: E402
 
 hpu_ops.enable()
 hpu = torch.device("hpu")
@@ -195,6 +197,21 @@ for mode in ("eager", "compiled"):
                f"max|loaded - CPU step| / max {err:.1e}, loaded on {devices}, {calls['save']} host copies")
     except Exception as e:  # noqa: BLE001
         expect(label, False, f"ERROR {type(e).__name__}: {str(e).splitlines()[0][:300]}")
+# ---- bfloat16 autocast: CUDA's dtypes once hpu_ops.autocast's lists are exported; Habana's are only printed
+x = torch.randn(4, 16, 32, device=hpu)
+with torch.autocast("hpu", dtype=torch.bfloat16):
+    got = {"linear": F.linear(x, torch.randn(32, 32, device=hpu)), "sdpa": F.scaled_dot_product_attention(x, x, x),
+           "layer_norm": F.layer_norm(x, (32,)), "group_norm": F.group_norm(x, 4), "batch_norm": F.batch_norm(
+               x, None, None, training=True), "softmax": x.softmax(-1), "log_softmax": x.log_softmax(-1),
+           "sum": x.sum(), "mean": x.mean(), "mul": x * x}
+dtypes = {op: str(out.dtype).replace("torch.", "") for op, out in got.items()}
+if all(os.environ.get(name) for name in autocast.LISTS):
+    cuda = {op: "bfloat16" if op in ("linear", "sdpa") else "float32" for op in got}
+    expect("bfloat16 autocast with CUDA's lists", dtypes == cuda, str(dtypes))
+else:
+    print(f"bfloat16 autocast with Habana's lists (not checked; export hpu_ops.autocast's for CUDA's): {dtypes}",
+          flush=True)
+
 
 def check_model_compiles(name, model, x, rtol=1e-3):
     """``model``'s compiled training step runs and matches its eager one on the card: the output, and the parameter

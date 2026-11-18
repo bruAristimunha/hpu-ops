@@ -3,3 +3,5 @@ __pycache__/
 .benchmarks/
 # local measurement scripts (some use APIs that no longer exist)
 probe/
+build/
+*.egg-info/

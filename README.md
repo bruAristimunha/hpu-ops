@@ -25,6 +25,25 @@ On 1.21 and 1.22, `enable()` warns when the setting did not take effect: Habana'
 
 Compile with `dynamic=False`, or keep one batch size (`drop_last=True`). A new batch size otherwise makes the shapes symbolic, and linear upsampling falls back to the slow decomposition, with a warning.
 
+### bfloat16 autocast with CUDA's op lists (optional)
+
+Under `torch.autocast("hpu", torch.bfloat16)`, Habana's default lists put norms, softmax, `mean` and `mul` in bfloat16, even for float32 inputs. CUDA keeps them in float32. The lists are the same in bridges 1.21 to 1.24. Habana reads its two lists from files when its library loads. For torch's CUDA lists (`ATen/autocast_mode.h`), export them before Python starts:
+
+```bash
+eval "$(python -m hpu_ops.autocast)"
+```
+
+Output dtypes from float32 inputs under bfloat16 autocast, on Gaudi2 (bridge 1.21.4):
+
+| op | Habana's lists | CUDA's lists |
+|---|---|---|
+| `linear`, `matmul`, convolutions, SDPA | bfloat16 | bfloat16 |
+| `layer_norm`, `group_norm`, `softmax`, `log_softmax` | bfloat16 | float32 |
+| `batch_norm`, `mean`, `mul` | bfloat16 | float32 (the input's) |
+| `sum`, `exp`, `div`, `interpolate` | float32 | float32 |
+
+Compiled production steps (bfloat16 autocast, one card) take 2.2% longer for EEGPT (0.629 to 0.642 s) and 0.9% longer for LaBraM (1.813 to 1.829 s), each the mean of two interleaved runs.
+
 ## What it fixes
 
 Only HPU tensors are rewritten; other devices run the original ops. The rewrites sit in PyTorch's dispatcher, in one of two ways:
@@ -124,6 +143,7 @@ python tests/run_on_hpu.py           # on a Gaudi card, with the attention setti
 - that symbolic shapes (a new batch size) and other devices keep torch's own path, and that undoing restores torch;
 - that the attention check reads the fused kernel's registration, and that symbolic linear upsampling warns while `dynamic=False` keeps the native op;
 - that a checkpoint after an optimizer step (state dicts, a `Parameter`, momentum) goes through the host copies and loads with `weights_only=True`, on its device or where `map_location` says; that hooks still warn and `skip_data` raises.
+- that the autocast files hold the installed torch's CUDA lists, and that the installed package ships them.
 
 CI runs `test_cpu.py` on torch 2.6.0 (Gaudi's) and the latest CPU release.
 
@@ -141,6 +161,7 @@ It also checks:
 - that eager attention runs `hpu.sdpa_fwd`, and that each rewrite ran;
 - that `renorm` leaves Habana's CPU-fallback counter at zero, eager, compiled and in inference mode;
 - that `torch.save` works after an eager and after a compiled optimizer step, and loads, on the card, the values of the same step run on the CPU;
+- with `hpu_ops.autocast`'s lists exported, CUDA's output dtypes under bfloat16 autocast (without them, Habana's are printed);
 - that braindecode's FBCNet compiles (the weight-permutation switch), and that its output and parameter gradients match eager mode.
 
 ## Limits
