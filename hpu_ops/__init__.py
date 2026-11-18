@@ -11,8 +11,8 @@ at the tensor's pickling:
   convolution needs (ATCNet, EEGInceptionERP, EEGITNet).
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
-- ``embedding`` of a 0-d index through the one-element index (``composite``): Gaudi's backward sends a 0-d
-  index's gradient to row 0, eager and compiled (BIOT's channel tokens).
+- The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's
+  ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.

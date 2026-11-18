@@ -1,10 +1,11 @@
-"""HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``), is missing (``renorm``) or
-differentiates wrongly (``embedding`` of a 0-d index).
+"""HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``), is missing (``renorm``) or is
+wrong (``embedding_dense_backward`` of a 0-d index).
 
 Each is registered at ``AutogradHPU``, so eager calls and traced graphs both use it and autograd differentiates the
 composite; ``renorm`` is also registered at ``HPU`` for calls below autograd (inference mode). Cases a composite does
-not take (odd ``glu`` halves, invalid ``renorm`` arguments, indices with dimensions) go to the op's own kernel, which
-raises its usual error. The composites run with autocast off and return the input dtype, as the native ops do.
+not take (odd ``glu`` halves, invalid ``renorm`` arguments) go to the op's own kernel, which raises its usual error;
+so do embedding gradients of indices with dimensions, which Gaudi gets right. The composites run with autocast off and
+return the input dtype, as the native ops do.
 """
 import torch
 from torch._C import DispatchKey
@@ -50,14 +51,16 @@ def _renorm_takes(input, p, dim, maxnorm):
     return real and shape and p > 0 and maxnorm >= 0
 
 
-def embedding_one(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
-    """``embedding`` of a 0-d index as that of the one-element index, squeezed. Gaudi's ``embedding_dense_backward``
-    sends a 0-d index's gradient to row 0 (BIOT's channel tokens: every channel's gradient to the first token)."""
-    return aten.embedding.default._op_dk(DispatchKey.Autograd, weight, indices.reshape(1), padding_idx,
-                                         scale_grad_by_freq, sparse).squeeze(0)
+def embedding_dense_backward_one(grad_output, indices, num_weights, padding_idx, scale_grad_by_freq):
+    """The weight gradient of a 0-d index's embedding as that of the one-element index, the shapes ATen's own kernels
+    flatten to. Gaudi's kernel sends a 0-d index's gradient to row 0 (BIOT's channel tokens: every channel's gradient
+    to the first token)."""
+    return aten.embedding_dense_backward.default._op_dk(DispatchKey.Autograd, grad_output.reshape(1, -1),
+                                                        indices.reshape(1), num_weights, padding_idx,
+                                                        scale_grad_by_freq)
 
 
-def _embedding_takes(weight, indices, *args, **kwargs):
+def _embedding_backward_takes(grad_output, indices, *args, **kwargs):
     return indices.dim() == 0
 
 
@@ -91,7 +94,7 @@ def install_renorm(device_type):
 
 
 def install_embedding(device_type):
-    """``embedding`` of a 0-d index on ``device_type`` through the one-element index. Returns an undo."""
-    op = aten.embedding.default
-    return register_kernels(device_type, [
-        (op, "Autograd{}", _kernel(op, "embedding_0d", embedding_one, _embedding_takes, DispatchKey.Autograd))])
+    """The embedding gradient of a 0-d index on ``device_type`` through the one-element index. Returns an undo."""
+    op = aten.embedding_dense_backward.default
+    return register_kernels(device_type, [(op, "Autograd{}", _kernel(
+        op, "embedding_0d", embedding_dense_backward_one, _embedding_backward_takes, DispatchKey.Autograd))])
