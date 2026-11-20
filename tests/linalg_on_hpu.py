@@ -1,5 +1,5 @@
 """On a Gaudi card: the linalg composites through their public torch calls, against torch on the CPU in float64.
-    PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_on_hpu.py [--baseline] [--with-eigh]
+    PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_on_hpu.py [--baseline]
 Per op and n in 16, 22, 64, 128 (batch 32, float32): forward, and backward where differentiable. A case fails when
 the bridge ``cpu_fallback`` delta is not empty, when a warning says "runs on the CPU" (hpu_complex's boxed fallback
 does not move the bridge metric, so both are read), when an error or its CPU float32 bar is not finite, or when the
@@ -8,9 +8,9 @@ float32 on the CPU): no worse than 10x CPU float32. One float64 case per op: eve
 native CPU float64 result to 1e-12, and hpu-ops#16's warning comes once. Two probes of Gaudi behavior: argmax returns
 the first index among ties, and int64 argsort stays on the card.
 One ``RESULT {json}`` line per case; the last line counts them; exits 1 if any case failed.
-eigh is opt-in (not in hpu_ops.FIXES): its two cases are "expected fallback" rows, timed and never failed on the
-fallback, unless ``--with-eigh`` installs it and checks it strictly (n <= 22 in lazy mode: n = 64 caused a device
-critical error).
+eigh and eigvalsh go through the TPC Jacobi kernel for n <= hpu_ops.tpc.EIGH_MAXN and are checked strictly there; past
+it (n = 64, 128) Habana's fallback is expected and recorded. ``--with-eigh`` is accepted and ignored (eigh is in
+hpu_ops.FIXES).
 ``--baseline`` skips ``hpu_ops.enable()`` to time the stock stack: fallbacks are then recorded (status "fallback")
 and do not fail a case, and the float64 cases are skipped (no warning to expect)."""
 from __future__ import annotations
@@ -44,9 +44,9 @@ CPU_TEXT = "runs on the CPU"
 F64_TEXT = "hpu-ops#16"
 BASELINE = False
 EIGH_FALLBACKS = []  # baseline: the fallback deltas seen for eigh (the positive control)
-EIGH_STRICT = False  # eigh and eigvalsh are checked like the others (installed, or --with-eigh)
 ops_linalg = None  # hpu_ops.linalg, imported in main
 tpc_maxn = 32  # hpu_ops.tpc.MAXN, set in main
+eigh_maxn = 32  # hpu_ops.tpc.EIGH_MAXN, set in main
 SINGULAR_N = 22
 L = torch.linalg
 
@@ -191,10 +191,9 @@ class Case(NamedTuple):
     err: Callable = err_all
     loss: Callable | None = loss_sum  # None: not differentiable
     scope: str = "all"  # "bwd": only the backward must stay on the card (the forward is not ours)
-    opt_in: bool = False  # eigh: not in hpu_ops.FIXES, so its fallback is expected unless --with-eigh
     float64: bool = True  # one of the ops that warns for float64 (hpu-ops#16)
     factor: int = CPU32_FACTOR  # the card may be this many times worse than CPU float32 on this op
-    tpc: bool = False  # routed through the TPC kernel (n <= hpu_ops.tpc.MAXN); past it Habana's fallback is expected
+    tpc: bool = False  # routed through a TPC kernel (n <= hpu_ops.tpc.MAXN, EIGH_MAXN for eigh); past it Habana's fallback is expected
 
 
 CASES = (
@@ -205,8 +204,8 @@ CASES = (
     Case("linalg.inv", make_pivoting, lambda x: L.inv(x), tpc=True),
     Case("linalg.det", make_pivoting, lambda x: L.det(x), tpc=True),
     Case("linalg.slogdet", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, tpc=True),
-    Case("linalg.eigh", make_spd, lambda x: L.eigh(x), err_eigh, loss_eigh, opt_in=True),
-    Case("linalg.eigvalsh", make_spd, lambda x: L.eigvalsh(x), opt_in=True),
+    Case("linalg.eigh", make_spd, lambda x: L.eigh(x), err_eigh, loss_eigh, tpc=True),
+    Case("linalg.eigvalsh", make_spd, lambda x: L.eigvalsh(x), tpc=True),
     Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False),
     # factor 20: the forward is Habana's native qr, not an hpu_ops kernel (measured 10.2x at n=16)
     Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20),
@@ -300,8 +299,9 @@ def run_case(case, n):
             soft += ["backward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
-    # fallbacks recorded, not failed: baseline, opt-in eigh, and the TPC ops past the kernel's n limit
-    expected = BASELINE or (case.opt_in and not EIGH_STRICT) or (case.tpc and n > tpc_maxn)
+    # fallbacks recorded, not failed: baseline, and the TPC ops past the kernel's n limit
+    limit = eigh_maxn if case.name in ("linalg.eigh", "linalg.eigvalsh") else tpc_maxn
+    expected = BASELINE or (case.tpc and n > limit)
     problems = hard + ([] if expected else soft)
     row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft)
     emit(**row)
@@ -311,8 +311,8 @@ def run_case(case, n):
 def run_float64(case):
     """float64 on the card: declined, run on the CPU, with one warning naming hpu-ops#16 on the first call."""
     row = {"op": case.name, "n": F64_N, "batch": BATCH, "dtype": "float64", "lazy": LAZY, "baseline": BASELINE}
-    if BASELINE or (case.opt_in and not EIGH_STRICT):
-        emit(**row, status="skipped", problems=["no hpu_ops install for this op, no warning to check"])
+    if BASELINE:
+        emit(**row, status="skipped", problems=["baseline: no hpu_ops install, no warning to check"])
         return True
     problems = []
     try:
@@ -433,23 +433,19 @@ def probe_argsort_int64():
 
 
 def main():
-    global BASELINE, EIGH_STRICT, ops_linalg, tpc_maxn
+    global BASELINE, ops_linalg, tpc_maxn, eigh_maxn
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--baseline", action="store_true", help="skip hpu_ops.enable()")
     parser.add_argument("--with-eigh", action="store_true",
-                        help="install hpu_ops.eigh.install_eigh and check eigh and eigvalsh strictly "
-                             "(n <= 22 in lazy mode)")
+                        help="no-op: eigh is installed by hpu_ops.enable()")
     args = parser.parse_args()
     BASELINE = args.baseline
     import hpu_ops
     from hpu_ops import linalg as ops_linalg
     from hpu_ops import tpc
-    tpc_maxn = tpc.MAXN
+    tpc_maxn, eigh_maxn = tpc.MAXN, tpc.EIGH_MAXN
     if not BASELINE:
         hpu_ops.enable()
-        if args.with_eigh and hpu_ops.eigh.install_eigh not in hpu_ops.FIXES:
-            hpu_ops.eigh.install_eigh("hpu")
-        EIGH_STRICT = args.with_eigh or hpu_ops.eigh.install_eigh in hpu_ops.FIXES
     complex_state = "skipped (baseline)"
     if not BASELINE:
         try:
@@ -462,8 +458,7 @@ def main():
           BASELINE, "lazy", LAZY, flush=True)
     results = [probe_argmax_ties(), probe_argsort_int64()]
     for case in CASES:
-        sizes = [n for n in SIZES if n <= 22] if case.opt_in and EIGH_STRICT and LAZY else SIZES  # n=64: device error
-        results += [run_case(case, n) for n in sizes]
+        results += [run_case(case, n) for n in SIZES]
         if case.float64:
             results.append(run_float64(case))
     if not BASELINE:

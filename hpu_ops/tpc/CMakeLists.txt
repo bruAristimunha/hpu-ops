@@ -7,11 +7,12 @@ set(TPC_INCLUDE_DIR "/usr/lib/habanatools/include" CACHE STRING "TPC includes")
 add_library(linalg_tpc SHARED glue.cpp)
 target_include_directories(linalg_tpc PRIVATE ${TPC_INCLUDE_DIR})
 
-# One source, two kernels: gj_solve (A, B) and gj_inv (A alone, B = identity, -DIDENTITY_B).
-set(SOURCE gj_solve_f32_gaudi2)
-foreach(KERNEL gj_solve_f32_gaudi2 gj_inv_f32_gaudi2)
+# gj_solve (A, B) and gj_inv (A alone, B = identity, -DIDENTITY_B) share one source; jacobi_eigh has its own.
+foreach(KERNEL gj_solve_f32_gaudi2 gj_inv_f32_gaudi2 jacobi_eigh_f32_gaudi2)
+    set(SOURCE ${KERNEL})
     set(DEFINES "")
     if(KERNEL STREQUAL "gj_inv_f32_gaudi2")
+        set(SOURCE gj_solve_f32_gaudi2)
         set(DEFINES -DIDENTITY_B)
     endif()
     add_custom_command(

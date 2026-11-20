@@ -4,6 +4,11 @@
 member, rows in local memory, partial pivoting. ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign (-1)^swaps
 of the row permutation, ``S[:, 1]`` LAPACK's info.
 
+``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
+n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Eager, batch 32: n = 22
+0.42 ms against 3.67 ms for the CPU fallback, n = 32 0.60 ms, batch 1024 5.1 ms against about 52 ms; w and orthogonality
+errors 4.1e-7 and 2.4e-7 against float64.
+
 The torch-op composites of ``hpu_ops.linalg`` are correct but 3-25x slower than Habana's CPU fallback on Gaudi2 (one
 launch per op). The kernel, eager, batch 32: n = 22 solve 0.20 ms against 4.7 ms for the fallback, n = 32 0.28 ms,
 batch 1024 1.9 ms against 20 ms; the pivots equal LAPACK's U diagonal to 6e-6, the determinant to 9e-6.
@@ -16,9 +21,11 @@ import os
 import pathlib
 import warnings
 
+import numpy as np
 import torch
 
 MAXN = 32
+EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
 LATE_WARNING = ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off for this process "
@@ -28,7 +35,8 @@ BUILD_WARNING = ("hpu_ops: building the TPC linalg extension failed ({error}); s
 _INSTALLED = False
 _LATE_WARNED = False
 
-# The registration strings are those measured on Gaudi2, plus gj_inv (A alone, identity right-hand side). CPP: the
+# The registration strings are those measured on Gaudi2, plus gj_inv (A alone, identity right-hand side) and
+# jacobi_eigh (A alone; W [batch, n], Vt [batch, n, n]). CPP: the
 # eager and compile API (bridge 2), CPP_LAZY: the legacy API of lazy mode. S is [batch, 2]: sign and info.
 CPP = r"""
 #include <torch/extension.h>
@@ -48,7 +56,13 @@ static habana::PartialOutputMetaDataVector inv_meta(const at::Stack& inputs) {
           habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
           habana::PartialOutputMetaData{a.scalar_type(), {batch, 2}}};
 }
+static habana::PartialOutputMetaDataVector eigh_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1)}},
+          habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()}};
+}
 static bool registered = [] {
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", eigh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", solve_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", inv_meta, nullptr);
   return true;
@@ -66,17 +80,31 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto out = desc.execute(inputs);
   return {out[0], out[1], out[2]};
 }
+std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_eigh");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
 }
-TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) { m.impl("gj_solve", gj_solve); m.impl("gj_inv", gj_inv); }
+TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
+  m.impl("gj_solve", gj_solve);
+  m.impl("gj_inv", gj_inv);
+  m.impl("jacobi_eigh", jacobi_eigh);
+}
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
     return std::make_tuple(b.new_empty(b.sizes()), b.new_empty({a.size(0), a.size(1)}), b.new_empty({a.size(0), 2}));
   });
   m.impl("gj_inv", [](at::Tensor a) {
     return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), a.size(1)}), a.new_empty({a.size(0), 2}));
+  });
+  m.impl("jacobi_eigh", [](at::Tensor a) {
+    return std::make_tuple(a.new_empty({a.size(0), a.size(1)}), a.new_empty(a.sizes()));
   });
 }
 """
@@ -110,6 +138,18 @@ static bool registered_inv = [] {
   return true;
 }();
 
+static auto wshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  return std::vector<int64_t>{a.size(0), a.size(1)};
+};
+static bool registered_eigh = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, wshape},
+                                                 {1, c10::ScalarType::Float, xshape_a}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor b) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_solve");
   std::vector<c10::IValue> inputs{a, b};
@@ -122,11 +162,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto out = op.execute(inputs);
   return {out[0], out[1], out[2]};
 }
+std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_eigh");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
 }
-TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) { m.impl("gj_solve", gj_solve); m.impl("gj_inv", gj_inv); }
+TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
+  m.impl("gj_solve", gj_solve);
+  m.impl("gj_inv", gj_inv);
+  m.impl("jacobi_eigh", jacobi_eigh);
+}
 """
 
 
@@ -215,6 +266,12 @@ def _inv_op():
     return torch.ops.linalg_tpc.gj_inv
 
 
+def _eigh_op():
+    """``torch.ops.linalg_tpc.jacobi_eigh``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_eigh
+
+
 # Lazy mode on bridge 1.21.4 can drop the unused outputs of a multi-output custom op (the callers use some of X, D and
 # S), and the next graph then fails at mark_step with "ValidateSyncInputTensors tensor_data is empty". A mark_step
 # before and after each call keeps the op alone in its graph. The cost is two graph boundaries per call; eager mode
@@ -270,6 +327,29 @@ def gj_inv(A):
     batch = A.shape[:-2]
     X, D, S = _call(_inv_op(), A.reshape(-1, n, n).to(torch.float32).contiguous())
     return X.reshape(*batch, n, n), D.reshape(*batch, n), S.reshape(*batch, 2)
+
+
+def eigh(A, upper):
+    """``(w, V)`` of the symmetric matrix held in one triangle of ``A[..., n, n]`` (float32, n <= ``EIGH_MAXN``) from
+    the TPC kernel: ``w`` ascending, the columns of ``V`` the eigenvectors. The kernel returns ``w`` unsorted and the
+    eigenvectors as rows; the sort and the gather of the float data run on the card."""
+    n = A.shape[-1]
+    if n > EIGH_MAXN or A.shape[-2] != n:
+        raise ValueError(f"hpu_ops.tpc.eigh takes square A with n <= {EIGH_MAXN}, got {tuple(A.shape)}")
+    batch = A.shape[:-2]
+    # a fresh tensor, never a view of the caller's input: views break lazy mode
+    S = torch.triu(A) + torch.triu(A, 1).mT if upper else torch.tril(A) + torch.tril(A, -1).mT
+    W, Vt = _call(_eigh_op(), S.reshape(-1, n, n).to(torch.float32).contiguous())
+    w, order = W.sort(-1)
+    V = Vt.gather(-2, order[..., :, None].expand_as(Vt)).mT
+    return w.reshape(*batch, n), V.reshape(*batch, n, n)
+
+
+def eigh_reference(A, upper):
+    """``eigh`` through numpy's LAPACK, the contract of the kernel path (torch's own ``linalg.eigh`` is what the CPU
+    tests override). Detached: no autograd through the kernel. For the CPU tests."""
+    w, V = np.linalg.eigh(A.detach().cpu().numpy(), UPLO="U" if upper else "L")
+    return torch.from_numpy(w).to(A.device), torch.from_numpy(V).to(A.device)
 
 
 def gj_solve_reference(A, B):

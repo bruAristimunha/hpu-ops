@@ -424,10 +424,110 @@ def test_det_slogdet_with_row_swaps(fn, perm):
 
 
 # ---- eigh
-def test_enable_does_not_install_eigh():
-    # measured on Gaudi2 (1.21.4): slower than the CPU fallback, and a device error in lazy mode at n >= 64
-    assert jacobi.install_eigh not in hpu_ops.FIXES
+def test_enable_installs_eigh():
+    # it declines without the TPC kernel (n > EIGH_MAXN, kernel not ready), so it cannot be slower than the fallback
+    assert jacobi.install_eigh in hpu_ops.FIXES
 
+
+@pytest.fixture
+def eigh_hook(monkeypatch):
+    """``eigh._EIGH`` set to the reference; the list collects one entry per call."""
+    calls = []
+
+    def hook(A, upper):  # detached, like the real op: no autograd through the kernel
+        calls.append((tuple(A.shape), upper))
+        return tpc.eigh_reference(A.detach(), upper)
+
+    monkeypatch.setattr(jacobi, "_EIGH", hook)
+    return calls
+
+
+def test_eigh_reference_contract():
+    torch.manual_seed(0)
+    S = spd(3, n=5)
+    for upper in (False, True):
+        w, V = tpc.eigh_reference(S, upper)
+        torch.testing.assert_close(w, torch.linalg.eigvalsh(S))
+        torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S)
+    assert tpc.EIGH_MAXN == 32
+
+
+@pytest.mark.parametrize("n", [1, 3, 22])
+def test_eigh_routes_through_the_hook(n, eigh_hook):
+    torch.manual_seed(0)
+    S = spd(3, n=n)
+    with cpu_as_hpu(jacobi.install_eigh) as calls:
+        w, V = torch.linalg.eigh(S)
+        assert calls["eigh"] >= 1, dict(calls)
+    assert eigh_hook == [((3, n, n), False)]
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(S), rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S, rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(V.mT @ V, torch.eye(n, dtype=S.dtype).expand_as(V), rtol=0, atol=1e-10)
+
+
+def test_eigvalsh_routes_through_the_hook_and_skips_v(eigh_hook):
+    torch.manual_seed(0)
+    S = spd(2, n=6)
+    with cpu_as_hpu(jacobi.install_eigh) as calls, torch.no_grad():
+        w = torch.linalg.eigvalsh(S)
+        assert calls["eigh"] >= 1, dict(calls)
+        w2, V = jacobi.Eigh.compute(S, "L", False)
+    assert len(eigh_hook) == 2 and V.numel() == 0
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(S), rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(w2, w)
+
+
+@pytest.mark.parametrize("uplo", ["L", "U"])
+def test_eigh_hook_uses_the_chosen_triangle(uplo, eigh_hook):
+    torch.manual_seed(0)
+    S = spd(3, n=8)
+    junk = S + (torch.tril(torch.randn_like(S), -1) if uplo == "U" else torch.triu(torch.randn_like(S), 1)) * 100
+    with cpu_as_hpu(jacobi.install_eigh):
+        w, V = torch.linalg.eigh(junk, UPLO=uplo)
+    assert eigh_hook[0][1] == (uplo == "U")
+    torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S, rtol=1e-10, atol=1e-10)
+
+
+def test_eigh_grad_through_the_hook(eigh_hook):
+    torch.manual_seed(0)
+    S = spd(3, n=8) / 8
+
+    def f(S):
+        w, V = torch.linalg.eigh(S)
+        return V @ torch.diag_embed(w.exp()) @ V.mT, w  # sign-invariant in V
+
+    compare(f, jacobi.install_eigh, S, name="eigh", rtol=1e-8, atol=1e-8)
+    assert eigh_hook
+
+
+def test_eigh_hook_degenerate(eigh_hook):
+    D = torch.diag(torch.tensor([1.0, 1.0, 2.0], dtype=torch.float64))
+    with cpu_as_hpu(jacobi.install_eigh):
+        w, V = torch.linalg.eigh(D)
+    assert eigh_hook
+    assert torch.equal(w, torch.tensor([1.0, 1.0, 2.0], dtype=torch.float64))
+    torch.testing.assert_close(V @ torch.diag(w) @ V.mT, D, rtol=0, atol=1e-12)
+
+
+def test_eigh_is_declined_past_maxn_on_hpu_and_without_the_kernel(monkeypatch):
+    A = torch.randn(2, 4, 4)
+    takes = jacobi._tpc_takes("hpu")
+    monkeypatch.setattr(tpc, "ready", lambda: False)
+    assert takes(A, "L", True) is False
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    assert takes(A, "L", True) is True
+    assert takes(torch.randn(tpc.EIGH_MAXN + 1, tpc.EIGH_MAXN + 1), "L", True) is False
+    assert takes(torch.randn(tpc.EIGH_MAXN, tpc.EIGH_MAXN), "L", True) is True
+    cpu = jacobi._tpc_takes("cpu")
+    monkeypatch.setattr(tpc, "ready", lambda: False)
+    assert cpu(torch.randn(tpc.EIGH_MAXN + 1, tpc.EIGH_MAXN + 1), "L", True) is True  # the stand-in keeps the composite
+
+
+def test_eigh_hook_not_used_past_maxn(eigh_hook):
+    torch.manual_seed(0)
+    with cpu_as_hpu(jacobi.install_eigh):
+        torch.linalg.eigvalsh(spd(1, n=tpc.EIGH_MAXN + 1))
+    assert eigh_hook == []
 
 
 @pytest.mark.parametrize("n", [2, 4, 22, 64])
