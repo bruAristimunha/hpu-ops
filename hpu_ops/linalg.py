@@ -255,19 +255,17 @@ def _is_vector_rhs(A, B):
 
 
 class SolveEx(torch.autograd.Function):
-    """``linalg._linalg_solve_ex`` from the masked LU, with torch's backward (``linalg_solve_backward``) over the
-    composite. ``LU``, ``pivots`` and ``info`` are not differentiable."""
+    """``aten._linalg_solve_ex`` from the masked LU, with torch's backward (``linalg_solve_backward``) over the
+    composite. ``LU``, ``pivots`` and ``info`` are not differentiable. ``LU`` and ``pivots`` are those of A (native's
+    CPU kernel returns those of A^T); only torch's own derivative reads them, and this kernel replaces it."""
 
     @staticmethod
     def compute(A, B, left, check_errors):
         vector = _is_vector_rhs(A, B)
-        if vector and not left:
-            raise RuntimeError("linalg.solve: Vector broadcasting of the left hand side is not supported for left=False. "
-                               "In this case linalg.solve is equivalent to B / A.squeeze(-1)")
         LU, pivots = lu(A)
         info = lu_info(LU)
         if check_errors:
-            torch.ops.aten._linalg_check_errors(info, "linalg.solve", is_matrix=A.dim() == 2)
+            torch.ops.aten._linalg_check_errors(info, "torch.linalg.solve_ex", is_matrix=A.dim() == 2)
         result = lu_solve(LU, pivots, B.unsqueeze(-1) if vector else B, left)
         return (result.squeeze(-1) if vector else result), LU, pivots, info
 
@@ -296,4 +294,13 @@ def install_solve(device_type):
     """``linalg.solve`` (``_linalg_solve_ex``) on ``device_type`` as the masked LU and two triangular matmuls. Returns
     an undo."""
     op = aten._linalg_solve_ex.default
-    return register_kernels(device_type, _kernels(device_type, op, "solve", SolveEx, _takes(device_type, "solve")))
+    base = _takes(device_type, "solve")
+
+    def takes(A, B, left=True, check_errors=False):
+        if not base(A, B):
+            return False
+        if _is_vector_rhs(A, B):
+            return left and B.shape[-1] == A.shape[-1]
+        return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
+
+    return register_kernels(device_type, _kernels(device_type, op, "solve", SolveEx, takes))

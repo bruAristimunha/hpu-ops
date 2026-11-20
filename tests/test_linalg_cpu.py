@@ -297,3 +297,24 @@ def test_solve_compiled_has_no_native_op():
         got = compiled(torch.linalg.solve, nodes)(A, B)
     torch.testing.assert_close(got, torch.linalg.solve(A, B))
     assert "aten._linalg_solve_ex.default" not in ops(nodes), ops(nodes)
+
+
+@pytest.mark.parametrize("b_shape, left", [((5,), False), ((3,), True)])
+def test_solve_bad_shapes_raise_like_torch(b_shape, left):
+    A, B = torch.randn(5, 5, dtype=torch.float64), torch.randn(*b_shape, dtype=torch.float64)
+    with pytest.raises(RuntimeError) as native:
+        torch.linalg.solve(A, B, left=left)
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
+            torch.linalg.solve(A, B, left=left)
+    assert calls["solve"] == 0, dict(calls)
+
+
+def test_solve_ex_check_errors_raises_like_torch():
+    A, B = torch.zeros(4, 4, dtype=torch.float64), torch.ones(4, 2, dtype=torch.float64)
+    with pytest.raises(RuntimeError) as native:
+        torch.linalg.solve_ex(A, B, check_errors=True)
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
+            torch.linalg.solve_ex(A, B, check_errors=True)
+        assert calls["solve"] >= 1, dict(calls)
