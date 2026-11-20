@@ -61,7 +61,7 @@ SHAPE_CASES = {
     "batched": lambda: (general(2, 3, n=N), torch.randn(2, 3, N, 5, dtype=torch.float64)),
     "broadcast": lambda: (general(3, n=N), torch.randn(2, 1, N, 4, dtype=torch.float64)),
     "transposed": lambda: (general(n=N).mT, torch.randn(N, 4, dtype=torch.float64)),
-    "expanded": lambda: (general(5, n=N), torch.randn(1, N, 4, dtype=torch.float64).expand(5, N, 4)),
+    "expanded": lambda: (general(5, n=N), torch.randn(1, N, 4, dtype=torch.float64)),  # expanded to 5 inside f
 }
 
 
@@ -74,7 +74,12 @@ def test_solve_triangular_matches_torch(shape_case, upper, left, unitriangular):
     A, B = SHAPE_CASES[shape_case]()
     if not left:
         B = B.mT  # (..., k, n) so that B @ A^-1 is defined
-    f = lambda a, b: torch.linalg.solve_triangular(a, b, upper=upper, left=left, unitriangular=unitriangular)  # noqa: E731
+
+    def f(a, b):
+        if shape_case == "expanded":
+            b = b.expand(5, *b.shape[1:])  # stride 0 in the kernel; the gradient flows back through the expand
+        return torch.linalg.solve_triangular(a, b, upper=upper, left=left, unitriangular=unitriangular)
+
     compare(f, linalg.install_solve_triangular, A, B, name="solve_triangular")
 
 
@@ -119,5 +124,6 @@ def test_takes_declines_float64_on_hpu_and_warns_once():
         assert takes(A) is False
     assert linalg._takes("cpu", "x")(A) is True
     for bad in (torch.randn(3, 3, dtype=torch.complex64), torch.ones(3, 3, dtype=torch.int64),
+                torch.randn(3, 3, dtype=torch.float16), torch.randn(3, 3, dtype=torch.bfloat16),
                 torch.randn(0, 3, 3), torch.randn(3, 4), torch.randn(3)):
         assert linalg._takes("cpu", "x")(bad) is False

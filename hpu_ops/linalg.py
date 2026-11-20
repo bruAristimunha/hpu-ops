@@ -33,7 +33,8 @@ def _bind(op, args, kwargs):
 
 def _takes(device_type, name, matrix_at=0):
     """A predicate on a call's arguments: the positional tensor at ``matrix_at`` is a square matrix and every tensor
-    argument is a real float of static, non-empty shape (float64 only off ``hpu``, with one warning per ``name``)."""
+    argument is a float32 (or float64, only off ``hpu``, with one warning per ``name``) tensor of static, non-empty
+    shape."""
 
     def takes(*args, **kwargs):
         tensors = [x for x in (*args, *kwargs.values()) if isinstance(x, torch.Tensor)]
@@ -42,7 +43,8 @@ def _takes(device_type, name, matrix_at=0):
                 _WARNED.add(name)
                 warnings.warn(FLOAT64_WARNING.format(name=name), stacklevel=2)
             return False
-        if not all(t.is_floating_point() and static(*t.shape) and t.numel() > 0 for t in tensors):
+        allowed = (torch.float32,) if device_type == "hpu" else (torch.float32, torch.float64)
+        if not all(t.dtype in allowed and static(*t.shape) and t.numel() > 0 for t in tensors):
             return False
         matrix = args[matrix_at]
         return matrix.dim() >= 2 and matrix.shape[-1] == matrix.shape[-2]
@@ -89,8 +91,10 @@ def tri_inverse(T, upper, unitriangular=False):
     L = torch.tril(T, -1 if unitriangular else 0)
     L = F.pad(L, (0, m - n, 0, m - n))
     ones = torch.ones(m, dtype=T.dtype, device=T.device)
-    L = L + torch.diag_embed(ones if unitriangular else F.pad(ones[:n] * 0, (0, m - n), value=1.0))  # unit diagonal where implied or padded
-    X = (1.0 / torch.diagonal(L, dim1=-2, dim2=-1)).unsqueeze(-1).unsqueeze(-1)  # [..., m, 1, 1]: inverses of the 1x1 diagonal blocks
+    # unit diagonal where implied or padded
+    L = L + torch.diag_embed(ones if unitriangular else F.pad(ones[:n] * 0, (0, m - n), value=1.0))
+    # [..., m, 1, 1]: inverses of the 1x1 diagonal blocks
+    X = (1.0 / torch.diagonal(L, dim1=-2, dim2=-1)).unsqueeze(-1).unsqueeze(-1)
     s = 1
     while s < m:  # blocks of size s -> 2s
         k = m // (2 * s)
