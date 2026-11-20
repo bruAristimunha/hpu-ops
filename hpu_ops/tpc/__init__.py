@@ -215,13 +215,32 @@ def _inv_op():
     return torch.ops.linalg_tpc.gj_inv
 
 
+# Lazy mode on bridge 1.21.4 can drop the unused outputs of a multi-output custom op (the callers use some of X, D and
+# S), and the next graph then fails at mark_step with "ValidateSyncInputTensors tensor_data is empty". A mark_step
+# before and after each call keeps the op alone in its graph. The cost is two graph boundaries per call; eager mode
+# needs none.
+def _flush():
+    if os.environ.get("PT_HPU_LAZY_MODE", "1") != "0":
+        import habana_frameworks.torch.core as htcore
+
+        htcore.mark_step()
+
+
+def _call(op, *args):
+    """``op(*args)`` as a graph of its own in lazy mode."""
+    _flush()
+    out = op(*args)
+    _flush()
+    return out
+
+
 def _chunked(A, B):
     """The kernel on ``A[b, n, n]`` and ``B[b, n, m]`` for any ``m``: columns of ``B`` in contiguous chunks of at most
     ``MAXN``, ``X`` concatenated, ``D`` and ``S`` from the first chunk (they depend on ``A`` alone)."""
     op = _op()
     if B.shape[-1] <= MAXN:
-        return op(A, B)
-    parts = [op(A, chunk.contiguous()) for chunk in B.split(MAXN, -1)]
+        return _call(op, A, B)
+    parts = [_call(op, A, chunk.contiguous()) for chunk in B.split(MAXN, -1)]
     return torch.cat([p[0] for p in parts], -1), parts[0][1], parts[0][2]
 
 
@@ -249,7 +268,7 @@ def gj_inv(A):
     n = A.shape[-1]
     _check(A, n)
     batch = A.shape[:-2]
-    X, D, S = _inv_op()(A.reshape(-1, n, n).to(torch.float32).contiguous())
+    X, D, S = _call(_inv_op(), A.reshape(-1, n, n).to(torch.float32).contiguous())
     return X.reshape(*batch, n, n), D.reshape(*batch, n), S.reshape(*batch, 2)
 
 

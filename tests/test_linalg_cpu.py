@@ -2,6 +2,8 @@
 compiled graphs contain."""
 import os
 import re
+import sys
+import types
 import warnings
 
 import pytest
@@ -546,6 +548,12 @@ def f32(*batch, n):
     return 0.3 * torch.randn(*batch, n, n) + 2 * torch.eye(n)
 
 
+@pytest.fixture(autouse=True)
+def eager_tpc(monkeypatch):
+    """No habana on the CPU: the TPC op's lazy flush stays off unless a test turns it on."""
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "0")
+
+
 @pytest.fixture
 def gj_hook(monkeypatch):
     """``linalg._GJ`` set to the reference; the list collects one entry per call."""
@@ -810,3 +818,23 @@ def test_install_kernel_path(monkeypatch):
     assert len(record) == 1
     assert str(record[0].message) == ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off "
                                       "for this process (call enable() before the first HPU op)")
+
+
+@pytest.mark.parametrize("lazy, flushes", [("1", 2), ("0", 0)])
+def test_tpc_flushes_the_lazy_graph_around_the_op(monkeypatch, lazy, flushes):
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    torch_mod = types.SimpleNamespace(core=core)
+    hf = types.SimpleNamespace(torch=torch_mod)
+    for name, mod in (("habana_frameworks", hf), ("habana_frameworks.torch", torch_mod),
+                      ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", lazy)
+    monkeypatch.setattr(tpc, "_op", lambda: tpc.gj_solve_reference)
+    monkeypatch.setattr(tpc, "_inv_op",
+                        lambda: lambda A: tpc.gj_solve_reference(A, torch.eye(A.shape[-1]).expand_as(A)))
+    tpc.gj_solve(f32(2, n=4), torch.randn(2, 4, 3))
+    assert len(marks) == flushes
+    marks.clear()
+    tpc.gj_inv(f32(2, n=4))
+    assert len(marks) == flushes
