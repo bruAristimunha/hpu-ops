@@ -249,9 +249,12 @@ def mask_assign(t):
     y[y <= 0] = 0
     return y
 check("boolean-mask index_put_ (scalar)", mask_assign, (torch.randn(8, 18),), atol=1e-5)
+expect("boolean-mask index_put_ took torch.where", calls["bool_index_put_"] > 0, f"{calls['bool_index_put_']} times")
+calls.clear()  # inference mode reaches only the HPU-key kernel: a registration skipped there would show as 0 calls
 check("boolean-mask index_put_ (inference_mode)", mask_assign, (torch.randn(8, 18),), atol=1e-5,
       context=torch.inference_mode)
-expect("boolean-mask index_put_ took torch.where", calls["bool_index_put_"] > 0, f"{calls['bool_index_put_']} times")
+expect("boolean-mask index_put_ at the HPU key (inference_mode)", calls["bool_index_put_"] > 0,
+       f"{calls['bool_index_put_']} times")
 
 class _MaskInBwd(torch.autograd.Function):
     @staticmethod

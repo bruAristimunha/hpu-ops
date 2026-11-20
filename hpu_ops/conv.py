@@ -147,7 +147,10 @@ def _large_kernel_takes(input, weight, bias, stride, padding, dilation, transpos
 
 def _split_conv(op, fallback, input, weight, bias, stride, padding, dilation, groups):
     """Evaluate a non-transposed convolution by partitioning spatial kernel dims above ``MAX_KERNEL`` into chunks
-    of at most ``MAX_KERNEL`` with exact input slices and ``F.pad`` (``conv_pad = 0`` on split dims)."""
+    of at most ``MAX_KERNEL`` with exact input slices and ``F.pad`` (``conv_pad = 0`` on split dims). For 16-bit
+    inputs each chunk's convolution runs and rounds in the input dtype; only the rounded chunk outputs are summed in
+    float32, so the result is rounded twice (measured on the CPU, bf16 conv1d 3x1000 by 300: max error 0.50 against
+    float64, the native op's 0.25). float32 and float64 splits match the native op to rounding."""
     n = input.dim() - 2
     strd, pad, dil = _expand(stride, n), _expand(padding, n), _expand(dilation, n)
     out_sizes = [(l_in + 2 * p - d * (k - 1) - 1) // s + 1
