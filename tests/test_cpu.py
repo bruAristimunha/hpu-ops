@@ -16,7 +16,7 @@ from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 
 import hpu_ops
-from hpu_ops import autocast, composite, conv, index, serialization, upsample
+from hpu_ops import autocast, composite, conv, im2col, index, serialization, upsample
 
 
 @contextlib.contextmanager
@@ -933,6 +933,224 @@ def test_index_elsewhere_stays_native():
     assert "aten.index.Tensor" in ops(nodes) and not calls["index"]
 
 
+# ---- im2col / col2im (F.unfold / F.fold): 4-D non-overlapping fast path and index_select / index_add general path
+
+
+SPD_PATCH_SHAPES = [
+    ((32, 16, 513, 1), (128, 1), (128, 1)),  # SSGCNet (513 % 128 = 1 remainder)
+    ((32, 20, 514, 1), (257, 1), (257, 1)),  # MAtt (514 % 257 = 0 exact)
+    ((32, 20, 513, 1), (85, 1), (85, 1)),    # GyroAtt / SPDMetaFormer / CorAtt (513 % 85 = 3 remainder)
+]
+
+
+@pytest.mark.parametrize("shape, kernel_size, stride", SPD_PATCH_SHAPES)
+def test_im2col_col2im_spd_model_shapes_tier1(shape, kernel_size, stride):
+    """All 5 affected SPD model PatchEmbeddingLayer shapes hit Tier 1 and match F.unfold / F.fold fwd+bwd."""
+    torch.manual_seed(0)
+    x = torch.randn(*shape, dtype=torch.float64)
+    unfold_fn = lambda t: F.unfold(t, kernel_size, stride=stride)  # noqa: E731
+    want_unfold = train_step(unfold_fn, x)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_unfold = train_step(unfold_fn, x)
+        assert calls["im2col"] == 1
+        out_shape = want_unfold[0].shape
+    assert_same(got_unfold, want_unfold)
+
+    y = torch.randn(*out_shape, dtype=torch.float64)
+    fold_fn = lambda t: F.fold(t, shape[-2:], kernel_size, stride=stride)  # noqa: E731
+    want_fold = train_step(fold_fn, y)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_fold = train_step(fold_fn, y)
+        assert calls["col2im"] == 1
+    assert_same(got_fold, want_fold)
+
+
+@pytest.mark.parametrize("shape, kernel_size, dilation, padding, stride", [
+    ((2, 3, 1, 17), (1, 5), (1, 1), (0, 0), (1, 5)),   # Tier 1 horizontal (H==1, kh==1, non-divisible)
+    ((2, 3, 1, 12), (1, 4), (1, 1), (0, 0), (1, 4)),   # Tier 1 horizontal exact
+    ((4, 3, 10, 12), (3, 5), (1, 1), (0, 0), (1, 1)),  # Tier 2 overlapping Issue #14 pattern
+    ((2, 4, 15, 19), (3, 4), (2, 2), (1, 2), (2, 3)),  # Tier 2 dilation + asymmetric pad + stride
+    ((2, 3, 11, 13), (3, 5), (1, 1), (1, 1), (4, 4)),  # Tier 2 non-divisible stride
+    ((2, 3, 5, 6), (2, 3), (1, 1), (3, 4), (1, 1)),    # Tier 2 padding >= kernel_size
+    ((0, 3, 7, 9), (3, 4), (1, 1), (1, 1), (2, 2)),    # zero batch size N=0 (Tier 2)
+    ((0, 3, 9, 1), (4, 1), (1, 1), (0, 0), (4, 1)),    # zero batch size N=0 (Tier 1)
+])
+def test_im2col_col2im_general_shapes_and_orientations(shape, kernel_size, dilation, padding, stride):
+    torch.manual_seed(0)
+    x = torch.randn(*shape, dtype=torch.float64)
+    kw_args = dict(kernel_size=kernel_size, dilation=dilation, padding=padding, stride=stride)
+    unfold_fn = lambda t: F.unfold(t, **kw_args)  # noqa: E731
+    want_u = train_step(unfold_fn, x)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_u = train_step(unfold_fn, x)
+        assert calls["im2col"] == 1
+    assert_same(got_u, want_u)
+
+    y = torch.randn(*want_u[0].shape, dtype=torch.float64)
+    fold_fn = lambda t: F.fold(t, shape[-2:], **kw_args)  # noqa: E731
+    want_f = train_step(fold_fn, y)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_f = train_step(fold_fn, y)
+        assert calls["col2im"] == 1
+    assert_same(got_f, want_f)
+
+
+def test_im2col_3d_col2im_2d_and_non_contiguous():
+    torch.manual_seed(0)
+    x3d = torch.randn(3, 8, 6, dtype=torch.float64).transpose(1, 2)  # non-contiguous 3D
+    y2d = torch.randn(12, 12, dtype=torch.float64).t()               # non-contiguous 2D (3*2*2, 3*4)
+    im_op = lambda t: torch.ops.aten.im2col.default(t, [2, 2], [1, 1], [0, 0], [2, 2])  # noqa: E731
+    col_op = lambda t: torch.ops.aten.col2im.default(t, [6, 8], [2, 2], [1, 1], [0, 0], [2, 2])  # noqa: E731
+    want_im, want_col = train_step(im_op, x3d), train_step(col_op, y2d)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_im, got_col = train_step(im_op, x3d), train_step(col_op, y2d)
+        assert calls["im2col"] == 1 and calls["col2im"] == 1
+    assert_same(got_im, want_im)
+    assert_same(got_col, want_col)
+
+    # Non-contiguous 4D Tier 1
+    x4d = torch.randn(2, 1, 11, 4, dtype=torch.float64).permute(0, 3, 2, 1)  # (2, 4, 11, 1) non-contiguous
+    u4 = lambda t: F.unfold(t, (5, 1), stride=(5, 1))  # noqa: E731
+    want_u4 = train_step(u4, x4d)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_u4 = train_step(u4, x4d)
+        assert calls["im2col"] == 1
+    assert_same(got_u4, want_u4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16, torch.float16, torch.bool,
+                                   torch.complex64])
+def test_im2col_col2im_dtypes_and_autocast(dtype):
+    torch.manual_seed(0)
+    if dtype == torch.bool:
+        x = torch.randint(0, 2, (2, 3, 7, 9), dtype=dtype)
+        y = torch.randint(0, 2, (2, 3 * 6, 24), dtype=dtype)
+    else:
+        x = torch.randn(2, 3, 7, 9, dtype=dtype)
+        y = torch.randn(2, 3 * 6, 24, dtype=dtype)
+    # Tier 2
+    want_im = torch.ops.aten.im2col.default(x, [2, 3], [1, 1], [0, 0], [1, 2])
+    want_col = torch.ops.aten.col2im.default(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2])
+    with cpu_as_hpu(im2col.install) as calls:
+        got_im = torch.ops.aten.im2col.default(x, [2, 3], [1, 1], [0, 0], [1, 2])
+        got_col = torch.ops.aten.col2im.default(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2])
+        if dtype == torch.float32:
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                auto_im = F.unfold(x, (2, 3), stride=(1, 2))
+                auto_col = F.fold(y, (7, 9), (2, 3), stride=(1, 2))
+            assert auto_im.dtype == torch.float32 and auto_col.dtype == torch.float32
+            torch.testing.assert_close(auto_im, want_im, atol=0, rtol=0)
+            torch.testing.assert_close(auto_col, want_col, atol=1e-5, rtol=1e-5)
+    assert got_im.dtype == dtype and got_col.dtype == dtype
+    assert calls["im2col"] >= 1 and calls["col2im"] >= 1
+    tol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else (1e-5 if dtype in (torch.float32, torch.complex64) else 0)
+    torch.testing.assert_close(got_im, want_im, atol=tol, rtol=tol)
+    torch.testing.assert_close(got_col, want_col, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("tier, shape, kernel, stride", [
+    ("tier1", (4, 16, 513, 1), (128, 1), (128, 1)),
+    ("tier2", (4, 4, 10, 12), (3, 5), (1, 1)),
+])
+def test_im2col_col2im_compiled_fullgraph_dynamic(tier, shape, kernel, stride):
+    torch.manual_seed(0)
+    unfold_fn = lambda t: F.unfold(t, kernel, stride=stride)  # noqa: E731
+    fold_fn = lambda t: F.fold(t, shape[-2:], kernel, stride=stride)  # noqa: E731
+
+    x1 = torch.randn(*shape, dtype=torch.float64)
+    x2 = torch.randn(8, *shape[1:], dtype=torch.float64)
+    y_shape = unfold_fn(x1).shape
+    y1 = torch.randn(*y_shape, dtype=torch.float64)
+    y2 = torch.randn(8, *y_shape[1:], dtype=torch.float64)
+
+    want_u1, want_u2 = train_step(unfold_fn, x1), train_step(unfold_fn, x2)
+    want_f1, want_f2 = train_step(fold_fn, y1), train_step(fold_fn, y2)
+
+    nodes_u, nodes_f = [], []
+    with cpu_as_hpu(im2col.install) as calls:
+        gu = compiled(unfold_fn, nodes_u, fullgraph=True, dynamic=True)
+        gf = compiled(fold_fn, nodes_f, fullgraph=True, dynamic=True)
+        got_u1, got_u2 = train_step(gu, x1), train_step(gu, x2)
+        got_f1, got_f2 = train_step(gf, y1), train_step(gf, y2)
+        assert calls["im2col"] >= 1 and calls["col2im"] >= 1
+    assert_same(got_u1, want_u1)
+    assert_same(got_u2, want_u2)
+    assert_same(got_f1, want_f1)
+    assert_same(got_f2, want_f2)
+    assert not any("im2col" in op or "col2im" in op for op in ops(nodes_u)), ops(nodes_u)
+    assert not any("im2col" in op or "col2im" in op for op in ops(nodes_f)), ops(nodes_f)
+
+
+def test_im2col_col2im_backend_and_out_kernels_below_autograd():
+    """Backend (.default) and .out kernels (inference_mode / below autograd on HPU), tested directly on CPU."""
+    im_def, im_out = torch.ops.aten.im2col.default, torch.ops.aten.im2col.out
+    col_def, col_out = torch.ops.aten.col2im.default, torch.ops.aten.col2im.out
+    im_be = im2col._im2col_kernel("cpu", im_def)
+    im_out_be = im2col._im2col_out_kernel("cpu", im_out)
+    col_be = im2col._col2im_kernel("cpu", col_def)
+    col_out_be = im2col._col2im_out_kernel("cpu", col_out)
+
+    x = torch.randn(2, 3, 7, 9, dtype=torch.float64)
+    y = torch.randn(2, 18, 24, dtype=torch.float64)
+    with torch.inference_mode():
+        want_im = im_def(x, [2, 3], [1, 1], [0, 0], [1, 2])
+        torch.testing.assert_close(im_be(x, [2, 3], [1, 1], [0, 0], [1, 2]), want_im, atol=0, rtol=0)
+        out_buf = torch.empty(1, dtype=torch.float64)
+        ret = im_out_be(x, [2, 3], [1, 1], [0, 0], [1, 2], out=out_buf)
+        assert ret is out_buf and out_buf.shape == want_im.shape
+        torch.testing.assert_close(out_buf, want_im, atol=0, rtol=0)
+
+        want_col = col_def(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2])
+        torch.testing.assert_close(col_be(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2]), want_col, atol=0, rtol=0)
+        out_col = torch.empty(1, dtype=torch.float64)
+        ret_c = col_out_be(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2], out=out_col)
+        assert ret_c is out_col and out_col.shape == want_col.shape
+        torch.testing.assert_close(out_col, want_col, atol=0, rtol=0)
+
+        # Fallback path inside .out when dtype mismatches
+        with pytest.raises(RuntimeError):
+            im_out_be(x, [2, 3], [1, 1], [0, 0], [1, 2], out=torch.empty(1, dtype=torch.float32))
+        with pytest.raises(RuntimeError):
+            im_be(x.int(), [2, 3], [1, 1], [0, 0], [1, 2])
+
+
+@pytest.mark.parametrize("bad_call", [
+    lambda: F.unfold(torch.randint(0, 5, (2, 3, 6, 6), dtype=torch.int32), (3, 3)),
+    lambda: F.unfold(torch.randint(0, 5, (2, 3, 6, 6), dtype=torch.int64), (3, 3)),
+    lambda: F.fold(torch.randint(0, 5, (2, 27, 16), dtype=torch.int32), (6, 6), (3, 3)),
+    lambda: F.unfold(torch.randn(4, 6), (2, 2)),
+    lambda: torch.ops.aten.im2col.default(torch.randn(4, 6), [2, 2], [1, 1], [0, 0], [1, 1]),
+    lambda: F.fold(torch.randn(12), (4, 4), (2, 2)),
+    lambda: F.unfold(torch.randn(2, 3, 6, 6), (0, 3)),
+    lambda: F.unfold(torch.randn(2, 3, 6, 6), (3, 3), padding=(-1, 0)),
+    lambda: F.unfold(torch.randn(2, 3, 6, 6), (3, 3), dilation=(0, 1)),
+    lambda: F.unfold(torch.randn(2, 3, 6, 6), (3, 3), stride=(1, 0)),
+    lambda: F.unfold(torch.randn(2, 0, 6, 6), (3, 3)),
+    lambda: F.unfold(torch.randn(2, 3, 2, 2), (3, 3)),
+    lambda: F.fold(torch.randn(2, 27, 15), (6, 6), (3, 3)),   # mismatched L (15 != 16)
+    lambda: F.fold(torch.randn(2, 26, 16), (6, 6), (3, 3)),   # non-divisible C*kh*kw
+    lambda: F.fold(torch.randn(2, 0, 16), (6, 6), (3, 3)),    # C == 0
+    lambda: F.fold(torch.randn(2, 27, 16), (2, 2), (3, 3)),   # oh <= 0
+])
+def test_im2col_col2im_invalid_inputs_reach_aten(bad_call):
+    with pytest.raises(Exception) as want:
+        bad_call()
+    with cpu_as_hpu(im2col.install) as calls, pytest.raises(type(want.value)):
+        bad_call()
+    assert not calls["im2col"] and not calls["col2im"]
+
+
+def test_im2col_col2im_elsewhere_stays_native():
+    x = torch.randn(2, 3, 7, 9)
+    y = torch.randn(2, 12, 48)
+    nodes = []
+    with cpu_as_hpu(lambda device: im2col.install("hpu")) as calls:
+        train_step(compiled(lambda t: F.unfold(t, (2, 2)), nodes), x)
+        train_step(compiled(lambda t: F.fold(t, (7, 9), (2, 2)), nodes), y)
+    assert {"aten.im2col.default", "aten.col2im.default"} <= ops(nodes)
+    assert not calls["im2col"] and not calls["col2im"]
+
+
 # ---- installing and undoing
 
 
@@ -950,7 +1168,7 @@ def test_undo_restores_torch():
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
                  "aten::embedding_dense_backward", "aten::convolution_backward", "aten::roll",
-                 "aten::upsample_linear1d", "aten::index.Tensor"):
+                 "aten::upsample_linear1d", "aten::index.Tensor", "aten::im2col", "aten::col2im"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 
 
