@@ -7,8 +7,8 @@ LAPACK's, and is nonzero exactly when a pivot is exactly zero.
 
 ``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
 n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Eager, batch 32: n = 22
-0.42 ms against 3.67 ms for the CPU fallback, n = 32 0.60 ms, batch 1024 5.1 ms against about 52 ms; w and orthogonality
-errors 4.1e-7 and 2.4e-7 against float64.
+0.30 ms against 3.7 ms for the CPU fallback, n = 32 0.54 ms against 5.0 ms, batch 1024 3.1 ms against 52 ms; accuracy
+within 3.2x of CPU float32.
 
 The torch-op composites of ``hpu_ops.linalg`` are correct but 3-25x slower than Habana's CPU fallback on Gaudi2 (one
 launch per op). The kernel, eager, batch 32: n = 22 solve 0.20 ms against 4.7 ms for the fallback, n = 32 0.28 ms,

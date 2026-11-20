@@ -341,7 +341,9 @@ def run_case(case, n):
             EIGH_FALLBACKS.append(rec["fallback"])
         row["max_rel_err"], notes = case.err(out, ref, ref_in)
         row["err_cpu32"], _ = case.err(as_tensors(case.fn(*cpu_in)), ref, ref_in)
-        hard += notes + over_bar("error", row["max_rel_err"], row["err_cpu32"], case.factor)
+        hard += notes
+        if case.scope == "all":  # a "bwd" case's forward is Habana's native op, not ours: recorded, not gated
+            hard += over_bar("error", row["max_rel_err"], row["err_cpu32"], case.factor)
         if case.scope == "all":
             soft += ["forward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
         if case.loss:

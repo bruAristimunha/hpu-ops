@@ -1,13 +1,13 @@
-/* Batched symmetric eigendecomposition on Gaudi2 TPC: one-sided (Hestenes) Jacobi, one matrix per index-space member.
+/* Batched symmetric eigendecomposition on Gaudi2 TPC: one-sided (Hestenes) Jacobi, 2-matrix SIMD half-vector packing.
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
  *   A [n, n, batch]  f32 (symmetric; the lower triangle is mirrored by the caller)
  *   W [n, batch]     f32: eigenvalues, unsorted          V [n, n, batch]  f32: row j = eigenvector of W[j]
  * A is normalized by 1/sigma (sigma = Gershgorin bound) and shifted to S = A/sigma + 1.001 I so S is strictly
- * positive definite with O(1) entries. For n <= 32, lanes 32..63 are unused, so two disjoint round-robin pairs
- * are packed into lanes 0..31 and 32..63 with a LUT-free 32-lane half-vector reduction (reduce_add_half32),
- * and two packed units (K=4 pairs) are interleaved per loop step. Rayleigh quotient W[j] = v_j^T A v_j is
- * tiled in 8-column VRF blocks using v_broadcast_element_i32 (O(n) global loads and O(n) reduce_add calls).
+ * positive definite with O(1) entries. Two matrices (bt in lanes 0..31, bt+1 in lanes 32..63 when has2) are
+ * packed side-by-side into u[0..n-1] (8 KB VLM total) and solved simultaneously with LUT-free reduce_add_half32
+ * and K=3 interleaved round-robin pairs (+ K=2, K=1 tails). Rayleigh quotient W[j] = v_j^T A v_j is tiled in
+ * 8-column VRF blocks using v_broadcast_element_i32.
  */
 #define MAXN 32  // u[32] = 8 KB of 16 KB LUT-mode VLM, leaving 8 KB for register spills
 
@@ -59,6 +59,7 @@ void main(tensor A, tensor W, tensor V)
 {
     const int n = get_dim_size(A, 0);
     const uint64 lane = read_lane_id_4b_b();
+    const uint64 lane_mod32 = lane & 31u;
     const int5 off = get_index_space_offset();
     const int5 size = get_index_space_size();
     const int n_even = (n + 1) & ~1;
@@ -66,27 +67,35 @@ void main(tensor A, tensor W, tensor V)
     const int half_n = n_even >> 1;
     const int k_start = n & 1;  // when n is odd, k==0 has q == m == n (padding) and is skipped
     const int sweeps = (n <= 4) ? 4 : (n <= 16) ? 6 : (n <= 22) ? 7 : 8;
+    const float shift_norm = 1.001f;
 
-    for (int bt = off[0]; bt < off[0] + size[0]; bt++)
+    // Unified 2-matrix SIMD half-vector packed path: bt in lanes 0..31, bt+1 (if has2) in lanes 32..63
+    for (int bt = off[0]; bt < off[0] + size[0]; bt += 2)
     {
+        const int has2 = (bt + 1 < off[0] + size[0]);
         float64 sigma = 0.0f;
         for (int i = 0; i < n; i++)
         {
-            int5 c = {0, i, bt, 0, 0};
-            float64 row = v_f32_ld_tnsr_b(c, A);
-            row = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, row);  // lanes past n are padding
-            u[i] = row;
-            sigma = v_f32_max_b(sigma, v_f32_reduce_add(v_f32_abs_b(row)));
+            int5 c0 = {0, i, bt, 0, 0};
+            float64 r0 = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, v_f32_ld_tnsr_b(c0, A));
+            float64 r1 = 0.0f;
+            if (has2)
+            {
+                int5 c1 = {0, i, bt + 1, 0, 0};
+                r1 = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, v_f32_ld_tnsr_b(c1, A));
+            }
+            float64 packed = pack_halves(r0, r1);
+            u[i] = packed;
+            sigma = v_f32_max_b(sigma, reduce_add_half32(v_f32_abs_b(packed)));
         }
-        // Normalize A by 1/sigma (safe when sigma == 0) and shift diagonal by 1.001f
+        // Per-half safe normalization by 1/sigma and diagonal shift 1.001f
         float64 safe_sigma = v_f32_sel_eq_f32_b(sigma, 0.0f, 1.0f, sigma);
         float64 inv_sigma = v_reciprocal_f32(safe_sigma);
         inv_sigma = v_f32_mul_b(inv_sigma, v_f32_sub_b(2.0f, v_f32_mul_b(safe_sigma, inv_sigma)));
-        const float shift_norm = 1.001f;
         for (int i = 0; i < n; i++)
         {
             float64 row = v_f32_mul_b(u[i], inv_sigma);
-            u[i] = v_f32_sel_eq_u32_b(lane, (unsigned)i, v_f32_add_b(row, shift_norm), row);
+            u[i] = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)i, v_f32_add_b(row, shift_norm), row);
         }
 
         for (int sweep = 0; sweep < sweeps; sweep++)
@@ -94,76 +103,86 @@ void main(tensor A, tensor W, tensor V)
             for (int r = 0; r < m; r++)
             {
                 int k = k_start;
-                for (; k + 3 < half_n; k += 4)
+                for (; k + 2 < half_n; k += 3)
                 {
-                    int p0, q0, p1, q1, p2, q2, p3, q3;
+                    int p0, q0, p1, q1, p2, q2;
                     RR_PAIR(r, k, m, p0, q0);
                     RR_PAIR(r, k + 1, m, p1, q1);
                     RR_PAIR(r, k + 2, m, p2, q2);
-                    RR_PAIR(r, k + 3, m, p3, q3);
 
-                    float64 up_a = pack_halves(u[p0], u[p1]);
-                    float64 uq_a = pack_halves(u[q0], u[q1]);
-                    float64 up_b = pack_halves(u[p2], u[p3]);
-                    float64 uq_b = pack_halves(u[q2], u[q3]);
+                    float64 up0 = u[p0], uq0 = u[q0];
+                    float64 up1 = u[p1], uq1 = u[q1];
+                    float64 up2 = u[p2], uq2 = u[q2];
 
-                    float64 alpha_a = reduce_add_half32(v_f32_mul_b(up_a, up_a));
-                    float64 beta_a = reduce_add_half32(v_f32_mul_b(uq_a, uq_a));
-                    float64 gamma_a = reduce_add_half32(v_f32_mul_b(up_a, uq_a));
-                    float64 alpha_b = reduce_add_half32(v_f32_mul_b(up_b, up_b));
-                    float64 beta_b = reduce_add_half32(v_f32_mul_b(uq_b, uq_b));
-                    float64 gamma_b = reduce_add_half32(v_f32_mul_b(up_b, uq_b));
+                    float64 alpha0 = reduce_add_half32(v_f32_mul_b(up0, up0));
+                    float64 beta0 = reduce_add_half32(v_f32_mul_b(uq0, uq0));
+                    float64 gamma0 = reduce_add_half32(v_f32_mul_b(up0, uq0));
+                    float64 alpha1 = reduce_add_half32(v_f32_mul_b(up1, up1));
+                    float64 beta1 = reduce_add_half32(v_f32_mul_b(uq1, uq1));
+                    float64 gamma1 = reduce_add_half32(v_f32_mul_b(up1, uq1));
+                    float64 alpha2 = reduce_add_half32(v_f32_mul_b(up2, up2));
+                    float64 beta2 = reduce_add_half32(v_f32_mul_b(uq2, uq2));
+                    float64 gamma2 = reduce_add_half32(v_f32_mul_b(up2, uq2));
 
-                    float64 d_a = v_f32_sub_b(beta_a, alpha_a);
-                    float64 d_b = v_f32_sub_b(beta_b, alpha_b);
-                    float64 g2_a = v_f32_add_b(gamma_a, gamma_a);
-                    float64 g2_b = v_f32_add_b(gamma_b, gamma_b);
-                    float64 r2_a = v_f32_mac_b(g2_a, g2_a, v_f32_mul_b(d_a, d_a));
-                    float64 r2_b = v_f32_mac_b(g2_b, g2_b, v_f32_mul_b(d_b, d_b));
-                    float64 sr2_a = v_f32_sel_eq_f32_b(r2_a, 0.0f, 1.0f, r2_a);
-                    float64 sr2_b = v_f32_sel_eq_f32_b(r2_b, 0.0f, 1.0f, r2_b);
+                    float64 d0 = v_f32_sub_b(beta0, alpha0);
+                    float64 d1 = v_f32_sub_b(beta1, alpha1);
+                    float64 d2 = v_f32_sub_b(beta2, alpha2);
+                    float64 g20 = v_f32_add_b(gamma0, gamma0);
+                    float64 g21 = v_f32_add_b(gamma1, gamma1);
+                    float64 g22 = v_f32_add_b(gamma2, gamma2);
+                    float64 r20 = v_f32_mac_b(g20, g20, v_f32_mul_b(d0, d0));
+                    float64 r21 = v_f32_mac_b(g21, g21, v_f32_mul_b(d1, d1));
+                    float64 r22 = v_f32_mac_b(g22, g22, v_f32_mul_b(d2, d2));
+                    float64 sr20 = v_f32_sel_eq_f32_b(r20, 0.0f, 1.0f, r20);
+                    float64 sr21 = v_f32_sel_eq_f32_b(r21, 0.0f, 1.0f, r21);
+                    float64 sr22 = v_f32_sel_eq_f32_b(r22, 0.0f, 1.0f, r22);
 
-                    float64 inv_r_a = v_rsqrt_f32(sr2_a);
-                    float64 inv_r_b = v_rsqrt_f32(sr2_b);
+                    float64 inv_r0 = v_rsqrt_f32(sr20);
+                    float64 inv_r1 = v_rsqrt_f32(sr21);
+                    float64 inv_r2 = v_rsqrt_f32(sr22);
 
-                    float64 c2_a = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d_a), inv_r_a, 1.0f));
-                    float64 c2_b = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d_b), inv_r_b, 1.0f));
+                    float64 c20 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d0), inv_r0, 1.0f));
+                    float64 c21 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d1), inv_r1, 1.0f));
+                    float64 c22 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d2), inv_r2, 1.0f));
 
-                    float64 inv_c_a = v_rsqrt_f32(c2_a);
-                    float64 inv_c_b = v_rsqrt_f32(c2_b);
+                    float64 inv_c0 = v_rsqrt_f32(c20);
+                    float64 inv_c1 = v_rsqrt_f32(c21);
+                    float64 inv_c2 = v_rsqrt_f32(c22);
 
-                    float64 c_a = v_f32_mul_b(c2_a, inv_c_a);
-                    float64 c_b = v_f32_mul_b(c2_b, inv_c_b);
-                    float64 s_a = v_f32_mul_b(v_f32_mul_b(0.5f, g2_a), v_f32_mul_b(inv_r_a, inv_c_a));
-                    float64 s_b = v_f32_mul_b(v_f32_mul_b(0.5f, g2_b), v_f32_mul_b(inv_r_b, inv_c_b));
-                    s_a = v_f32_sel_less_f32_b(d_a, 0.0f, v_f32_sub_b(0.0f, s_a), s_a);
-                    s_b = v_f32_sel_less_f32_b(d_b, 0.0f, v_f32_sub_b(0.0f, s_b), s_b);
+                    float64 c0 = v_f32_mul_b(c20, inv_c0);
+                    float64 c1 = v_f32_mul_b(c21, inv_c1);
+                    float64 c2 = v_f32_mul_b(c22, inv_c2);
+                    float64 s0 = v_f32_mul_b(v_f32_mul_b(0.5f, g20), v_f32_mul_b(inv_r0, inv_c0));
+                    float64 s1 = v_f32_mul_b(v_f32_mul_b(0.5f, g21), v_f32_mul_b(inv_r1, inv_c1));
+                    float64 s2 = v_f32_mul_b(v_f32_mul_b(0.5f, g22), v_f32_mul_b(inv_r2, inv_c2));
+                    s0 = v_f32_sel_less_f32_b(d0, 0.0f, v_f32_sub_b(0.0f, s0), s0);
+                    s1 = v_f32_sel_less_f32_b(d1, 0.0f, v_f32_sub_b(0.0f, s1), s1);
+                    s2 = v_f32_sel_less_f32_b(d2, 0.0f, v_f32_sub_b(0.0f, s2), s2);
 
-                    c_a = v_f32_sel_eq_f32_b(gamma_a, 0.0f, 1.0f, c_a);
-                    s_a = v_f32_sel_eq_f32_b(gamma_a, 0.0f, 0.0f, s_a);
-                    c_a = v_f32_sel_eq_f32_b(r2_a, 0.0f, 1.0f, c_a);
-                    s_a = v_f32_sel_eq_f32_b(r2_a, 0.0f, 0.0f, s_a);
+                    c0 = v_f32_sel_eq_f32_b(gamma0, 0.0f, 1.0f, c0);
+                    s0 = v_f32_sel_eq_f32_b(gamma0, 0.0f, 0.0f, s0);
+                    c0 = v_f32_sel_eq_f32_b(r20, 0.0f, 1.0f, c0);
+                    s0 = v_f32_sel_eq_f32_b(r20, 0.0f, 0.0f, s0);
 
-                    c_b = v_f32_sel_eq_f32_b(gamma_b, 0.0f, 1.0f, c_b);
-                    s_b = v_f32_sel_eq_f32_b(gamma_b, 0.0f, 0.0f, s_b);
-                    c_b = v_f32_sel_eq_f32_b(r2_b, 0.0f, 1.0f, c_b);
-                    s_b = v_f32_sel_eq_f32_b(r2_b, 0.0f, 0.0f, s_b);
+                    c1 = v_f32_sel_eq_f32_b(gamma1, 0.0f, 1.0f, c1);
+                    s1 = v_f32_sel_eq_f32_b(gamma1, 0.0f, 0.0f, s1);
+                    c1 = v_f32_sel_eq_f32_b(r21, 0.0f, 1.0f, c1);
+                    s1 = v_f32_sel_eq_f32_b(r21, 0.0f, 0.0f, s1);
 
-                    float64 ns_a = v_f32_sub_b(0.0f, s_a);
-                    float64 ns_b = v_f32_sub_b(0.0f, s_b);
-                    float64 np_a = v_f32_mac_b(uq_a, ns_a, v_f32_mul_b(up_a, c_a));
-                    float64 nq_a = v_f32_mac_b(up_a, s_a, v_f32_mul_b(uq_a, c_a));
-                    float64 np_b = v_f32_mac_b(uq_b, ns_b, v_f32_mul_b(up_b, c_b));
-                    float64 nq_b = v_f32_mac_b(up_b, s_b, v_f32_mul_b(uq_b, c_b));
+                    c2 = v_f32_sel_eq_f32_b(gamma2, 0.0f, 1.0f, c2);
+                    s2 = v_f32_sel_eq_f32_b(gamma2, 0.0f, 0.0f, s2);
+                    c2 = v_f32_sel_eq_f32_b(r22, 0.0f, 1.0f, c2);
+                    s2 = v_f32_sel_eq_f32_b(r22, 0.0f, 0.0f, s2);
 
-                    u[p0] = v_f32_sel_geq_u32_b(lane, 32u, 0.0f, np_a);
-                    u[q0] = v_f32_sel_geq_u32_b(lane, 32u, 0.0f, nq_a);
-                    u[p1] = unpack_hi_half(np_a);
-                    u[q1] = unpack_hi_half(nq_a);
-                    u[p2] = v_f32_sel_geq_u32_b(lane, 32u, 0.0f, np_b);
-                    u[q2] = v_f32_sel_geq_u32_b(lane, 32u, 0.0f, nq_b);
-                    u[p3] = unpack_hi_half(np_b);
-                    u[q3] = unpack_hi_half(nq_b);
+                    float64 ns0 = v_f32_sub_b(0.0f, s0);
+                    float64 ns1 = v_f32_sub_b(0.0f, s1);
+                    float64 ns2 = v_f32_sub_b(0.0f, s2);
+                    u[p0] = v_f32_mac_b(uq0, ns0, v_f32_mul_b(up0, c0));
+                    u[q0] = v_f32_mac_b(up0, s0, v_f32_mul_b(uq0, c0));
+                    u[p1] = v_f32_mac_b(uq1, ns1, v_f32_mul_b(up1, c1));
+                    u[q1] = v_f32_mac_b(up1, s1, v_f32_mul_b(uq1, c1));
+                    u[p2] = v_f32_mac_b(uq2, ns2, v_f32_mul_b(up2, c2));
+                    u[q2] = v_f32_mac_b(up2, s2, v_f32_mul_b(uq2, c2));
                 }
                 if (k + 1 < half_n)
                 {
@@ -172,52 +191,72 @@ void main(tensor A, tensor W, tensor V)
                     RR_PAIR(r, k + 1, m, p1, q1);
                     k += 2;
 
-                    float64 up_a = pack_halves(u[p0], u[p1]);
-                    float64 uq_a = pack_halves(u[q0], u[q1]);
+                    float64 up0 = u[p0], uq0 = u[q0];
+                    float64 up1 = u[p1], uq1 = u[q1];
 
-                    float64 alpha_a = reduce_add_half32(v_f32_mul_b(up_a, up_a));
-                    float64 beta_a = reduce_add_half32(v_f32_mul_b(uq_a, uq_a));
-                    float64 gamma_a = reduce_add_half32(v_f32_mul_b(up_a, uq_a));
+                    float64 alpha0 = reduce_add_half32(v_f32_mul_b(up0, up0));
+                    float64 beta0 = reduce_add_half32(v_f32_mul_b(uq0, uq0));
+                    float64 gamma0 = reduce_add_half32(v_f32_mul_b(up0, uq0));
+                    float64 alpha1 = reduce_add_half32(v_f32_mul_b(up1, up1));
+                    float64 beta1 = reduce_add_half32(v_f32_mul_b(uq1, uq1));
+                    float64 gamma1 = reduce_add_half32(v_f32_mul_b(up1, uq1));
 
-                    float64 d_a = v_f32_sub_b(beta_a, alpha_a);
-                    float64 g2_a = v_f32_add_b(gamma_a, gamma_a);
-                    float64 r2_a = v_f32_mac_b(g2_a, g2_a, v_f32_mul_b(d_a, d_a));
-                    float64 sr2_a = v_f32_sel_eq_f32_b(r2_a, 0.0f, 1.0f, r2_a);
-                    float64 inv_r_a = v_rsqrt_f32(sr2_a);
-                    float64 c2_a = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d_a), inv_r_a, 1.0f));
-                    float64 inv_c_a = v_rsqrt_f32(c2_a);
-                    float64 c_a = v_f32_mul_b(c2_a, inv_c_a);
-                    float64 s_a = v_f32_mul_b(v_f32_mul_b(0.5f, g2_a), v_f32_mul_b(inv_r_a, inv_c_a));
-                    s_a = v_f32_sel_less_f32_b(d_a, 0.0f, v_f32_sub_b(0.0f, s_a), s_a);
+                    float64 d0 = v_f32_sub_b(beta0, alpha0);
+                    float64 d1 = v_f32_sub_b(beta1, alpha1);
+                    float64 g20 = v_f32_add_b(gamma0, gamma0);
+                    float64 g21 = v_f32_add_b(gamma1, gamma1);
+                    float64 r20 = v_f32_mac_b(g20, g20, v_f32_mul_b(d0, d0));
+                    float64 r21 = v_f32_mac_b(g21, g21, v_f32_mul_b(d1, d1));
+                    float64 sr20 = v_f32_sel_eq_f32_b(r20, 0.0f, 1.0f, r20);
+                    float64 sr21 = v_f32_sel_eq_f32_b(r21, 0.0f, 1.0f, r21);
 
-                    c_a = v_f32_sel_eq_f32_b(gamma_a, 0.0f, 1.0f, c_a);
-                    s_a = v_f32_sel_eq_f32_b(gamma_a, 0.0f, 0.0f, s_a);
-                    c_a = v_f32_sel_eq_f32_b(r2_a, 0.0f, 1.0f, c_a);
-                    s_a = v_f32_sel_eq_f32_b(r2_a, 0.0f, 0.0f, s_a);
+                    float64 inv_r0 = v_rsqrt_f32(sr20);
+                    float64 inv_r1 = v_rsqrt_f32(sr21);
 
-                    float64 ns_a = v_f32_sub_b(0.0f, s_a);
-                    float64 np_a = v_f32_mac_b(uq_a, ns_a, v_f32_mul_b(up_a, c_a));
-                    float64 nq_a = v_f32_mac_b(up_a, s_a, v_f32_mul_b(uq_a, c_a));
+                    float64 c20 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d0), inv_r0, 1.0f));
+                    float64 c21 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d1), inv_r1, 1.0f));
 
-                    u[p0] = v_f32_sel_geq_u32_b(lane, 32u, 0.0f, np_a);
-                    u[q0] = v_f32_sel_geq_u32_b(lane, 32u, 0.0f, nq_a);
-                    u[p1] = unpack_hi_half(np_a);
-                    u[q1] = unpack_hi_half(nq_a);
+                    float64 inv_c0 = v_rsqrt_f32(c20);
+                    float64 inv_c1 = v_rsqrt_f32(c21);
+
+                    float64 c0 = v_f32_mul_b(c20, inv_c0);
+                    float64 c1 = v_f32_mul_b(c21, inv_c1);
+                    float64 s0 = v_f32_mul_b(v_f32_mul_b(0.5f, g20), v_f32_mul_b(inv_r0, inv_c0));
+                    float64 s1 = v_f32_mul_b(v_f32_mul_b(0.5f, g21), v_f32_mul_b(inv_r1, inv_c1));
+                    s0 = v_f32_sel_less_f32_b(d0, 0.0f, v_f32_sub_b(0.0f, s0), s0);
+                    s1 = v_f32_sel_less_f32_b(d1, 0.0f, v_f32_sub_b(0.0f, s1), s1);
+
+                    c0 = v_f32_sel_eq_f32_b(gamma0, 0.0f, 1.0f, c0);
+                    s0 = v_f32_sel_eq_f32_b(gamma0, 0.0f, 0.0f, s0);
+                    c0 = v_f32_sel_eq_f32_b(r20, 0.0f, 1.0f, c0);
+                    s0 = v_f32_sel_eq_f32_b(r20, 0.0f, 0.0f, s0);
+
+                    c1 = v_f32_sel_eq_f32_b(gamma1, 0.0f, 1.0f, c1);
+                    s1 = v_f32_sel_eq_f32_b(gamma1, 0.0f, 0.0f, s1);
+                    c1 = v_f32_sel_eq_f32_b(r21, 0.0f, 1.0f, c1);
+                    s1 = v_f32_sel_eq_f32_b(r21, 0.0f, 0.0f, s1);
+
+                    float64 ns0 = v_f32_sub_b(0.0f, s0);
+                    float64 ns1 = v_f32_sub_b(0.0f, s1);
+                    u[p0] = v_f32_mac_b(uq0, ns0, v_f32_mul_b(up0, c0));
+                    u[q0] = v_f32_mac_b(up0, s0, v_f32_mul_b(uq0, c0));
+                    u[p1] = v_f32_mac_b(uq1, ns1, v_f32_mul_b(up1, c1));
+                    u[q1] = v_f32_mac_b(up1, s1, v_f32_mul_b(uq1, c1));
                 }
                 if (k < half_n)
                 {
                     int p, q;
                     RR_PAIR(r, k, m, p, q);
                     float64 up = u[p], uq = u[q];
-                    float64 alpha = v_f32_reduce_add(v_f32_mul_b(up, up));
-                    float64 beta = v_f32_reduce_add(v_f32_mul_b(uq, uq));
-                    float64 gamma = v_f32_reduce_add(v_f32_mul_b(up, uq));
+                    float64 alpha = reduce_add_half32(v_f32_mul_b(up, up));
+                    float64 beta = reduce_add_half32(v_f32_mul_b(uq, uq));
+                    float64 gamma = reduce_add_half32(v_f32_mul_b(up, uq));
 
                     float64 d = v_f32_sub_b(beta, alpha);
                     float64 g2 = v_f32_add_b(gamma, gamma);
                     float64 r2 = v_f32_mac_b(g2, g2, v_f32_mul_b(d, d));
-                    float64 safe_r2 = v_f32_sel_eq_f32_b(r2, 0.0f, 1.0f, r2);
-                    float64 inv_r = v_rsqrt_f32(safe_r2);
+                    float64 sr2 = v_f32_sel_eq_f32_b(r2, 0.0f, 1.0f, r2);
+                    float64 inv_r = v_rsqrt_f32(sr2);
                     float64 c2 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d), inv_r, 1.0f));
                     float64 inv_c = v_rsqrt_f32(c2);
                     float64 c = v_f32_mul_b(c2, inv_c);
@@ -236,36 +275,52 @@ void main(tensor A, tensor W, tensor V)
             }
         }
 
+        // Normalize both matrices in parallel and store V rows
         int j = 0;
         for (; j + 1 < n; j += 2)
         {
-            float64 up = pack_halves(u[j], u[j + 1]);
-            float64 sq = reduce_add_half32(v_f32_mul_b(up, up));
-            float64 rn = v_rsqrt_f32(sq);
-            // 1 Newton-Raphson step on rn = 1/sqrt(sq)
-            rn = v_f32_mul_b(rn, v_f32_mac_b(v_f32_mul_b(-0.5f, sq), v_f32_mul_b(rn, rn), 1.5f));
-            float64 vp = v_f32_mul_b(up, rn);
-            float64 vj0 = v_f32_sel_geq_u32_b(lane, 32u, 0.0f, vp);
-            float64 vj1 = unpack_hi_half(vp);
+            float64 u0 = u[j], u1 = u[j + 1];
+            float64 sq0 = reduce_add_half32(v_f32_mul_b(u0, u0));
+            float64 sq1 = reduce_add_half32(v_f32_mul_b(u1, u1));
+            float64 rn0 = v_rsqrt_f32(sq0);
+            float64 rn1 = v_rsqrt_f32(sq1);
+            rn0 = v_f32_mul_b(rn0, v_f32_mac_b(v_f32_mul_b(-0.5f, sq0), v_f32_mul_b(rn0, rn0), 1.5f));
+            rn1 = v_f32_mul_b(rn1, v_f32_mac_b(v_f32_mul_b(-0.5f, sq1), v_f32_mul_b(rn1, rn1), 1.5f));
+            float64 vj0 = v_f32_mul_b(u0, rn0);
+            float64 vj1 = v_f32_mul_b(u1, rn1);
             u[j] = vj0;
             u[j + 1] = vj1;
-            int5 c0 = {0, j, bt, 0, 0};
-            int5 c1 = {0, j + 1, bt, 0, 0};
-            v_f32_st_tnsr_partial(c0, V, vj0, n - 1, 0);
-            v_f32_st_tnsr_partial(c1, V, vj1, n - 1, 0);
+            int5 c0a = {0, j, bt, 0, 0};
+            int5 c1a = {0, j + 1, bt, 0, 0};
+            v_f32_st_tnsr_partial(c0a, V, vj0, n - 1, 0);
+            v_f32_st_tnsr_partial(c1a, V, vj1, n - 1, 0);
+            if (has2)
+            {
+                int5 c0b = {0, j, bt + 1, 0, 0};
+                int5 c1b = {0, j + 1, bt + 1, 0, 0};
+                v_f32_st_tnsr_partial(c0b, V, unpack_hi_half(vj0), n - 1, 0);
+                v_f32_st_tnsr_partial(c1b, V, unpack_hi_half(vj1), n - 1, 0);
+            }
         }
         if (j < n)
         {
-            float64 sq = v_f32_reduce_add(v_f32_mul_b(u[j], u[j]));
-            float64 rn = v_rsqrt_f32(sq);
-            rn = v_f32_mul_b(rn, v_f32_mac_b(v_f32_mul_b(-0.5f, sq), v_f32_mul_b(rn, rn), 1.5f));
-            float64 vj = v_f32_mul_b(u[j], rn);
-            u[j] = vj;
-            int5 c = {0, j, bt, 0, 0};
-            v_f32_st_tnsr_partial(c, V, vj, n - 1, 0);
+            float64 u0 = u[j];
+            float64 sq0 = reduce_add_half32(v_f32_mul_b(u0, u0));
+            float64 rn0 = v_rsqrt_f32(sq0);
+            rn0 = v_f32_mul_b(rn0, v_f32_mac_b(v_f32_mul_b(-0.5f, sq0), v_f32_mul_b(rn0, rn0), 1.5f));
+            float64 vj0 = v_f32_mul_b(u0, rn0);
+            u[j] = vj0;
+            int5 ca = {0, j, bt, 0, 0};
+            v_f32_st_tnsr_partial(ca, V, vj0, n - 1, 0);
+            if (has2)
+            {
+                int5 cb = {0, j, bt + 1, 0, 0};
+                v_f32_st_tnsr_partial(cb, V, unpack_hi_half(vj0), n - 1, 0);
+            }
         }
-        // Rayleigh quotient W[j] = v_j^T A v_j in 8-column VRF blocks using v_broadcast_element_i32
-        float64 w = 0.0f;
+
+        // Paired Rayleigh quotient W[j] = v_j^T A v_j in 8-column VRF blocks
+        float64 w_packed = 0.0f;
         for (int j0 = 0; j0 < n; j0 += 8)
         {
             const int c0 = j0;
@@ -282,36 +337,71 @@ void main(tensor A, tensor W, tensor V)
             float64 av4 = 0.0f, av5 = 0.0f, av6 = 0.0f, av7 = 0.0f;
             for (int i = 0; i < n; i++)
             {
-                int5 c = {0, i, bt, 0, 0};
-                float64 row = v_f32_ld_tnsr_b(c, A);
-                row = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, row);
-                av0 = v_f32_mac_b(row, as_float64(v_broadcast_element_i32(as_int64(v0), i)), av0);
-                av1 = v_f32_mac_b(row, as_float64(v_broadcast_element_i32(as_int64(v1), i)), av1);
-                av2 = v_f32_mac_b(row, as_float64(v_broadcast_element_i32(as_int64(v2), i)), av2);
-                av3 = v_f32_mac_b(row, as_float64(v_broadcast_element_i32(as_int64(v3), i)), av3);
-                av4 = v_f32_mac_b(row, as_float64(v_broadcast_element_i32(as_int64(v4), i)), av4);
-                av5 = v_f32_mac_b(row, as_float64(v_broadcast_element_i32(as_int64(v5), i)), av5);
-                av6 = v_f32_mac_b(row, as_float64(v_broadcast_element_i32(as_int64(v6), i)), av6);
-                av7 = v_f32_mac_b(row, as_float64(v_broadcast_element_i32(as_int64(v7), i)), av7);
+                int5 ca = {0, i, bt, 0, 0};
+                float64 r0 = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, v_f32_ld_tnsr_b(ca, A));
+                float64 r1 = 0.0f;
+                if (has2)
+                {
+                    int5 cb = {0, i, bt + 1, 0, 0};
+                    r1 = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, v_f32_ld_tnsr_b(cb, A));
+                }
+                float64 arow = pack_halves(r0, r1);
+                float64 b0 = v_f32_sel_less_u32_b(lane, 32u,
+                                                  as_float64(v_broadcast_element_i32(as_int64(v0), i)),
+                                                  as_float64(v_broadcast_element_i32(as_int64(v0), i + 32)));
+                float64 b1 = v_f32_sel_less_u32_b(lane, 32u,
+                                                  as_float64(v_broadcast_element_i32(as_int64(v1), i)),
+                                                  as_float64(v_broadcast_element_i32(as_int64(v1), i + 32)));
+                float64 b2 = v_f32_sel_less_u32_b(lane, 32u,
+                                                  as_float64(v_broadcast_element_i32(as_int64(v2), i)),
+                                                  as_float64(v_broadcast_element_i32(as_int64(v2), i + 32)));
+                float64 b3 = v_f32_sel_less_u32_b(lane, 32u,
+                                                  as_float64(v_broadcast_element_i32(as_int64(v3), i)),
+                                                  as_float64(v_broadcast_element_i32(as_int64(v3), i + 32)));
+                float64 b4 = v_f32_sel_less_u32_b(lane, 32u,
+                                                  as_float64(v_broadcast_element_i32(as_int64(v4), i)),
+                                                  as_float64(v_broadcast_element_i32(as_int64(v4), i + 32)));
+                float64 b5 = v_f32_sel_less_u32_b(lane, 32u,
+                                                  as_float64(v_broadcast_element_i32(as_int64(v5), i)),
+                                                  as_float64(v_broadcast_element_i32(as_int64(v5), i + 32)));
+                float64 b6 = v_f32_sel_less_u32_b(lane, 32u,
+                                                  as_float64(v_broadcast_element_i32(as_int64(v6), i)),
+                                                  as_float64(v_broadcast_element_i32(as_int64(v6), i + 32)));
+                float64 b7 = v_f32_sel_less_u32_b(lane, 32u,
+                                                  as_float64(v_broadcast_element_i32(as_int64(v7), i)),
+                                                  as_float64(v_broadcast_element_i32(as_int64(v7), i + 32)));
+                av0 = v_f32_mac_b(arow, b0, av0);
+                av1 = v_f32_mac_b(arow, b1, av1);
+                av2 = v_f32_mac_b(arow, b2, av2);
+                av3 = v_f32_mac_b(arow, b3, av3);
+                av4 = v_f32_mac_b(arow, b4, av4);
+                av5 = v_f32_mac_b(arow, b5, av5);
+                av6 = v_f32_mac_b(arow, b6, av6);
+                av7 = v_f32_mac_b(arow, b7, av7);
             }
-            float64 w0 = v_f32_reduce_add(v_f32_mul_b(v0, av0));
-            float64 w1 = v_f32_reduce_add(v_f32_mul_b(v1, av1));
-            float64 w2 = v_f32_reduce_add(v_f32_mul_b(v2, av2));
-            float64 w3 = v_f32_reduce_add(v_f32_mul_b(v3, av3));
-            float64 w4 = v_f32_reduce_add(v_f32_mul_b(v4, av4));
-            float64 w5 = v_f32_reduce_add(v_f32_mul_b(v5, av5));
-            float64 w6 = v_f32_reduce_add(v_f32_mul_b(v6, av6));
-            float64 w7 = v_f32_reduce_add(v_f32_mul_b(v7, av7));
-            w = v_f32_sel_eq_u32_b(lane, (unsigned)(j0 + 0), w0, w);
-            if (j0 + 1 < n) w = v_f32_sel_eq_u32_b(lane, (unsigned)(j0 + 1), w1, w);
-            if (j0 + 2 < n) w = v_f32_sel_eq_u32_b(lane, (unsigned)(j0 + 2), w2, w);
-            if (j0 + 3 < n) w = v_f32_sel_eq_u32_b(lane, (unsigned)(j0 + 3), w3, w);
-            if (j0 + 4 < n) w = v_f32_sel_eq_u32_b(lane, (unsigned)(j0 + 4), w4, w);
-            if (j0 + 5 < n) w = v_f32_sel_eq_u32_b(lane, (unsigned)(j0 + 5), w5, w);
-            if (j0 + 6 < n) w = v_f32_sel_eq_u32_b(lane, (unsigned)(j0 + 6), w6, w);
-            if (j0 + 7 < n) w = v_f32_sel_eq_u32_b(lane, (unsigned)(j0 + 7), w7, w);
+            float64 w0 = reduce_add_half32(v_f32_mul_b(v0, av0));
+            float64 w1 = reduce_add_half32(v_f32_mul_b(v1, av1));
+            float64 w2 = reduce_add_half32(v_f32_mul_b(v2, av2));
+            float64 w3 = reduce_add_half32(v_f32_mul_b(v3, av3));
+            float64 w4 = reduce_add_half32(v_f32_mul_b(v4, av4));
+            float64 w5 = reduce_add_half32(v_f32_mul_b(v5, av5));
+            float64 w6 = reduce_add_half32(v_f32_mul_b(v6, av6));
+            float64 w7 = reduce_add_half32(v_f32_mul_b(v7, av7));
+            w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 0), w0, w_packed);
+            if (j0 + 1 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 1), w1, w_packed);
+            if (j0 + 2 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 2), w2, w_packed);
+            if (j0 + 3 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 3), w3, w_packed);
+            if (j0 + 4 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 4), w4, w_packed);
+            if (j0 + 5 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 5), w5, w_packed);
+            if (j0 + 6 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 6), w6, w_packed);
+            if (j0 + 7 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 7), w7, w_packed);
         }
-        int5 cw = {0, bt, 0, 0, 0};
-        v_f32_st_tnsr_partial(cw, W, w, n - 1, 0);
+        int5 cwa = {0, bt, 0, 0, 0};
+        v_f32_st_tnsr_partial(cwa, W, w_packed, n - 1, 0);
+        if (has2)
+        {
+            int5 cwb = {0, bt + 1, 0, 0, 0};
+            v_f32_st_tnsr_partial(cwb, W, unpack_hi_half(w_packed), n - 1, 0);
+        }
     }
 }

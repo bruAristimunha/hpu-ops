@@ -31,9 +31,9 @@ at the tensor's pickling:
   compiles, so ``enable()`` must run before the first HPU op, else the kernel is off (one warning) and these calls
   keep Habana's CPU fallback, as they do for n > 32.
 - ``linalg.eigh`` and ``eigvalsh`` of float32 matrices with n <= 32 run through a TPC one-sided Jacobi kernel
-  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32: n = 22 0.42 ms against
-  3.67 ms for the fallback, n = 32 0.60 ms, batch 1024 5.1 ms against about 52 ms; eigenvalue error 4.1e-7 and
-  orthogonality error 2.4e-7 against float64. Without the kernel, or past n = 32, the call is declined and keeps
+  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32: n = 22 0.30 ms against
+  3.7 ms for the fallback, n = 32 0.54 ms against 5.0 ms, batch 1024 3.1 ms against 52 ms; accuracy within 3.2x of
+  CPU float32. Without the kernel, or past n = 32, the call is declined and keeps
   Habana's CPU fallback: the parallel-Jacobi composite of ``eigh`` is exact but 100x slower than the fallback on Gaudi2,
   so it only serves the CPU stand-in.
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
