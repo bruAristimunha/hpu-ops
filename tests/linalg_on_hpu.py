@@ -1,6 +1,9 @@
 """On a Gaudi card: the linalg composites through their public torch calls, against torch on the CPU in float64.
     PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_on_hpu.py [--baseline]
-Per op and n in 16, 22, 64, 128 (batch 32, float32): forward, and backward where differentiable. A case fails when
+Per op and n in 16, 22, 64, 128 (batch 32, float32): forward, and backward where differentiable. The eight kernel ops
+(solve, inv, det, slogdet, solve_triangular, cholesky_solve, eigh, eigvalsh) also run at the kernel's edges, n in
+1, 3, 21, 31, 32, for correctness and fallback only (no timing loop), and eigh and eigvalsh on an indefinite
+(G + G^T) / 2 at n = 3, 22, 32. A case fails when
 the bridge ``cpu_fallback`` delta is not empty, when a warning says "runs on the CPU" (hpu_complex's boxed fallback
 does not move the bridge metric, so both are read), when an error or its CPU float32 bar is not finite, or when the
 relative error ``max|x - ref| / max|ref|``, in forward or backward, exceeds max(1e-6, 10 * the error of the same op in
@@ -35,6 +38,8 @@ HPU = torch.device("hpu")
 torch.manual_seed(0)
 
 SIZES = (16, 22, 64, 128)
+GATE_SIZES = (1, 3, 21, 31, 32)  # the kernels' edges: n = 1, odd sizes, one below, at the limit; no timing
+INDEFINITE_SIZES = (3, 22, 32)
 BATCH = 32
 F64_N = 22
 TOL32 = 1e-6  # floor of the float32 bar
@@ -89,6 +94,11 @@ def make_spd(b, n, dtype):
     return [spd(b, n, dtype, "cpu")]
 
 
+def make_indefinite(b, n, dtype):
+    g = torch.randn(b, n, n, dtype=dtype)
+    return [(g + g.mT) / 2]
+
+
 def make_spd_unit(b, n, dtype):
     g = torch.randn(b, n, n, dtype=dtype)
     return [torch.eye(n, dtype=dtype) + 0.05 * (g @ g.mT) / n]
@@ -102,7 +112,8 @@ def pivoting(b, n, dtype):
     pivots = L.lu_factor(A).pivots
     swaps = int((pivots != torch.arange(1, n + 1, dtype=pivots.dtype)).sum())
     signs = L.slogdet(A).sign
-    assert swaps > 0 and bool((signs > 0).any()) and bool((signs < 0).any()), (
+    # n = 1 has nothing to swap and one sign
+    assert n < 2 or (swaps > 0 and bool((signs > 0).any()) and bool((signs < 0).any())), (
         f"inputs do not exercise pivoting: {swaps} swaps, signs {signs.unique().tolist()}")
     return A
 
@@ -229,18 +240,24 @@ class Case(NamedTuple):
     sizes: tuple | None = None  # only these n (the variants run at n = 22)
     # routed through a TPC kernel (n <= hpu_ops.tpc.MAXN, EIGH_MAXN for eigh); past it Habana's fallback is expected
     tpc: bool = False
+    gate: bool = False  # also run at GATE_SIZES, without timing
 
 
 CASES = (
     Case("linalg.solve_triangular", make_triangular, lambda a, b: L.solve_triangular(a, b, upper=False),
-         tpc=True),
-    Case("cholesky_solve", make_cholesky_solve, lambda b, c: torch.cholesky_solve(b, c), tpc=True),
-    Case("linalg.solve", make_solve, lambda a, b: L.solve(a, b), tpc=True),
-    Case("linalg.inv", make_pivoting, lambda x: L.inv(x), tpc=True),
-    Case("linalg.det", make_pivoting, lambda x: L.det(x), tpc=True),
-    Case("linalg.slogdet", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, tpc=True),
-    Case("linalg.eigh", make_spd, lambda x: L.eigh(x), err_eigh, loss_eigh, tpc=True),
-    Case("linalg.eigvalsh", make_spd, lambda x: L.eigvalsh(x), tpc=True),
+         tpc=True, gate=True),
+    Case("cholesky_solve", make_cholesky_solve, lambda b, c: torch.cholesky_solve(b, c), tpc=True,
+         gate=True),
+    Case("linalg.solve", make_solve, lambda a, b: L.solve(a, b), tpc=True, gate=True),
+    Case("linalg.inv", make_pivoting, lambda x: L.inv(x), tpc=True, gate=True),
+    Case("linalg.det", make_pivoting, lambda x: L.det(x), tpc=True, gate=True),
+    Case("linalg.slogdet", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, tpc=True, gate=True),
+    Case("linalg.eigh", make_spd, lambda x: L.eigh(x), err_eigh, loss_eigh, tpc=True, gate=True),
+    Case("linalg.eigvalsh", make_spd, lambda x: L.eigvalsh(x), tpc=True, gate=True),
+    Case("linalg.eigh.indefinite", make_indefinite, lambda x: L.eigh(x), err_eigh, loss_eigh, float64=False, tpc=True,
+         sizes=INDEFINITE_SIZES),
+    Case("linalg.eigvalsh.indefinite", make_indefinite, lambda x: L.eigvalsh(x), float64=False, tpc=True,
+         sizes=INDEFINITE_SIZES),
     Case("linalg.solve.left_false", make_solve_right, lambda a, b: L.solve(a, b, left=False), float64=False,
          tpc=True, sizes=(22,)),
     Case("linalg.solve.vector_rhs", make_solve_vector, lambda a, b: L.solve(a, b), float64=False, tpc=True,
@@ -282,16 +299,19 @@ def cpu_warnings(rec, allow=None):
     return [m for _, m in rec["caught"] if CPU_TEXT in m and not (allow and allow in m)]
 
 
-def forward(case, h_in):
-    """The first call (the warm-up) and five timed calls, synced. Returns the first output and the ms per call."""
+def forward(case, h_in, timed=True):
+    """The first call (the warm-up) and, if ``timed``, five timed calls, synced. Returns the first output and the ms
+    per call (None when not timed)."""
+    ms = None
     with watch() as rec:
         out = as_tensors(case.fn(*h_in))
         sync()
-        t = time.perf_counter()
-        for _ in range(5):
-            case.fn(*h_in)
-        sync()
-        ms = (time.perf_counter() - t) / 5 * 1e3
+        if timed:
+            t = time.perf_counter()
+            for _ in range(5):
+                case.fn(*h_in)
+            sync()
+            ms = (time.perf_counter() - t) / 5 * 1e3
     return out, ms, rec
 
 
@@ -328,14 +348,15 @@ def over_bar(what, err, err_cpu32, factor=CPU32_FACTOR):
     return [f"{what} {err:.3g} > {tol:.3g}"] * (not err <= tol)
 
 
-def run_case(case, n):
-    row = {"op": case.name, "n": n, "batch": BATCH, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE}
+def run_case(case, n, timed=True):
+    row = {"op": case.name, "n": n, "batch": BATCH, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE,
+           "timed": timed}
     hard, soft = [], []  # wrong results or errors; CPU fallbacks
     try:
         cpu_in = case.make(BATCH, n, torch.float32)
         ref_in = [x.double() for x in cpu_in]
         ref = as_tensors(case.fn(*ref_in))
-        out, row["hpu_ms"], rec = forward(case, [x.to(HPU) for x in cpu_in])
+        out, row["hpu_ms"], rec = forward(case, [x.to(HPU) for x in cpu_in], timed)
         row["fwd_fallback"] = rec["fallback"]
         if BASELINE and case.name == "linalg.eigh" and rec["fallback"]:
             EIGH_FALLBACKS.append(rec["fallback"])
@@ -612,6 +633,8 @@ def main():
         results.append(check_tpc(tpc))
     for case in CASES:
         results += [run_case(case, n) for n in case.sizes or SIZES]
+        if case.gate:
+            results += [run_case(case, n, timed=False) for n in GATE_SIZES]
         if case.float64:
             results.append(run_float64(case))
     if not BASELINE:

@@ -73,9 +73,9 @@ One fix is outside the dispatcher: `torch.save` pickles HPU tensors through a te
 | LaBraM fails to compile (`used before defined`). | `batch_as_strided` puts a `getitem` before the node it reads. Fixed in bridge 1.22. | `enable()` sets `PT_HPU_DISABLE_pass_batch_as_strided_groups`. | LaBraM compiles. |
 | FBCNet and FBMSNet fail to compile (`create tensor invalid permutation 4 2`), EEGNet and Deep4Net at times. | `pass_weight_permutation` puts an `hpu.weight_permutation` before every 2-D and 3-D convolution weight. The backward of some graphs then fails to create a tensor. | `enable()` sets `PT_HPU_DISABLE_pass_weight_permutation`. | All four compile (EEGNet and Deep4Net: 8 of 8 times). CBraMod steps 2.2% faster, CodeBrain the same. |
 | `linalg.solve_triangular` and `cholesky_solve` run on the CPU, and so do the backward passes of `cholesky` and `qr` (#12). | No HPU kernel; Habana's CPU fallback. The backward of Cholesky and QR is made of these two solves. | A TPC kernel (below) for float32 matrices with n <= 32. The backward passes of `cholesky` and `qr` reach it through the two solves. | `solve_triangular`, n = 22, batch 32: 0.49 ms lazy, 0.46 ms eager, against about 1.4 and 1.5 ms for the fallback. |
-| `linalg.solve`, `solve_ex`, `det` and `slogdet` run on the CPU (#10). | No HPU kernel. Rebuilt from torch ops, they were 3 to 25 times slower than the fallback: one launch per op. | A TPC Gauss-Jordan kernel with partial pivoting, n <= 32, right-hand sides in chunks of 32. Gradients are torch's formulas; double backward works. | n = 22, batch 32, lazy / eager: `solve` 0.57 / 2.7 ms against about 2.2 / 4.5; `det` 0.51 / 0.82 against about 1.4 / 2.7. `solve_ex`, eager: 0.46 ms against about 4.5. |
+| `linalg.solve`, `solve_ex`, `det` and `slogdet` run on the CPU (#10). | No HPU kernel. Rebuilt from torch ops, they were measured 3 to 25 times slower than the fallback per call: one launch per op. | A TPC Gauss-Jordan kernel with partial pivoting, n <= 32, right-hand sides in chunks of 32. Gradients are torch's formulas; double backward works. | n = 22, batch 32, lazy / eager: `solve` 0.57 / 2.7 ms against about 2.2 / 4.5; `det` 0.51 / 0.82 against about 1.4 / 2.7. `solve_ex`, eager: 0.46 ms against about 4.5. |
 | `linalg.inv` runs on the CPU (#11). | No HPU kernel. | The same Gauss-Jordan kernel. | n = 22, batch 32, lazy / eager: 0.48 / 1.8 ms against about 2.2 / 4.6. |
-| `linalg.eigh` and `eigvalsh` run on the CPU (#8; 21 of 21 SPD models). | No HPU kernel. The parallel-Jacobi composite is exact but about 100 times slower than the fallback, so it only serves the CPU stand-in. | A TPC one-sided Jacobi kernel, n <= 32. | n = 22, batch 32, lazy / eager: 0.80 / 1.27 ms against about 1.4 / 3.7 (the raw kernel takes 0.19 ms). Batch 1024: 3.7 ms against 52 ms. Training steps: see below. |
+| `linalg.eigh` and `eigvalsh` run on the CPU (#8; 21 of 21 SPD models). | No HPU kernel. The parallel-Jacobi composite was measured slower than the fallback, so it only serves the CPU stand-in. | A TPC one-sided Jacobi kernel, n <= 32. | n = 22, batch 32, lazy / eager: 0.80 / 1.27 ms against about 1.4 / 3.7 (the raw kernel takes 0.19 ms). Batch 1024: 3.7 ms against 52 ms. Training steps: see below. |
 
 The pass switches are read at every compile. A non-empty setting in your environment wins (`PT_HPU_DISABLE_<pass>=0` keeps a pass on).
 
@@ -84,10 +84,13 @@ The pass switches are read at every compile. A non-empty setting in your environ
 The linalg rows above run as single TPC kernels, one matrix per index-space member. They live in `hpu_ops/tpc/`. The library, `liblinalg_tpc.so`, is prebuilt. To rebuild it inside the Habana image, run `hpu_ops/tpc/build.sh`.
 
 - **Kernels:** Gauss-Jordan with partial pivoting for `solve`, `inv`, `det`, `slogdet`, `solve_triangular` and `cholesky_solve`; one-sided Jacobi for `eigh` and `eigvalsh`.
-- **Limit:** float32 matrices with n <= 32. Larger n keeps Habana's CPU fallback; float64 runs on the CPU (see "float64").
-- **Order:** call `hpu_ops.enable()` before the first HPU op. Habana reads the kernel path when the device initialises; later, the kernels are off, with one warning, and the calls use the fallback.
+- **Limit:** float32 matrices with n <= 32 on a Gaudi2. Calls the kernels do not take (n > 32, float64, kernels off) run through hpu-ops' own CPU route (`hpu_ops.linalg._on_cpu`: the tensors are copied to the CPU, the op runs there, the result is copied back). That is not Habana's fallback, and its cost is not the fallback's. Float64: see "float64".
+- **Order:** call `hpu_ops.enable()` before the first HPU op. Habana reads the kernel path when the device initialises; later, the kernels are off, with one warning, and the calls take the CPU route above.
+- **Opt-out:** `HPU_OPS_TPC=0` in the environment keeps the kernels off. They are also off on a device that is not a Gaudi2, and when `liblinalg_tpc.so` is missing (one warning).
+- **Transforms:** under `torch.func` transforms (`vmap`, `grad`, `jacrev`, `jvp`, ...) and forward-mode AD these ops keep torch's own kernel.
+- **Singular triangles:** `solve_triangular` and `cholesky_solve` of a matrix with an exactly zero pivot return NaN for that matrix, as torch's give non-finite values. `det` of a singular matrix is 0; its gradient on the card: to be measured on Gaudi2 and filled in here.
 - **Lazy mode:** works. Each kernel call ends its lazy graph.
-- **Accuracy:** within 10x of CPU float32 against float64 (`eigh` within about 3.8x), also with dense repeated eigenvalues, condition 1e6 and inputs scaled by 1e30.
+- **Accuracy:** within 10x of CPU float32 against float64 (`eigh` within about 3.8x), also with dense repeated eigenvalues, condition 1e6 and inputs scaled by 1e30. Measured at n = 16 and 22. The gate also runs n = 1, 3, 21, 31 and 32 and an indefinite `eigh` at n = 3, 22 and 32 (`tests/linalg_on_hpu.py`); their results: to be added after the run.
 
 ## Measured on Gaudi2 (habana 1.21.4 / torch 2.6.0)
 
@@ -102,7 +105,7 @@ Same pod, batch 32, ms per training step, `origin/main` to this branch.
 | EEGSPDNet | 65.6 to 61.0 | 220.7 to 226.2 |
 | TSMNet | 38.1 to 48.0 | 159.9 to 175.1 |
 
-TSMNet got slower: its `solve` has n = 40, above the kernel limit, so it takes the fallback.
+TSMNet got slower: its `solve` has n = 40, above the kernel limit, so it takes hpu-ops' own CPU route, not Habana's fallback.
 
 ### braindecode models
 
@@ -205,10 +208,11 @@ It also checks:
 
 ## Known gaps
 
-- TSMNet's `solve` has n = 40, above the kernel limit of 32. It runs on Habana's fallback and its training step is slower than on `origin/main` (table above). The limit is being raised to 64.
+- TSMNet's `solve` has n = 40, above the kernel limit of 32. It runs through hpu-ops' own CPU route, not Habana's fallback, and its training step is slower than on `origin/main` (table above). The limit is being raised to 64.
 - `info`, the index of a singular pivot, follows the kernel's own elimination order and can differ from LAPACK's.
 - The backward of `qr` at n = 16 is less accurate than CPU float32. A substitution kernel is being written for it.
 - float64 linalg runs on the CPU (see "float64").
+- Calls the kernels decline (n > 32, kernels off, another Gaudi generation) take hpu-ops' own CPU route, which is not Habana's fallback. Its per-call cost against the fallback is not measured.
 
 ## Limits
 

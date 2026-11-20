@@ -10,10 +10,11 @@ op's own kernel, which raises its usual error.
 
 Composites contain no host sync: loops run over Python ints from static shapes.
 
-On Gaudi2 these composites lose to Habana's CPU fallback (one launch per op), so with the TPC Gauss-Jordan kernel of
-``hpu_ops.tpc`` loaded, float32 matrices of n <= ``tpc.MAXN`` go through it instead (solve, inv, det, slogdet and both
-triangular solves). Without the kernel, or past ``MAXN``, the call on ``hpu`` is declined and Habana's fallback runs.
-The composites stay the path of the CPU stand-in.
+On Gaudi2 these composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
+with the TPC Gauss-Jordan kernel of ``hpu_ops.tpc`` loaded, float32 matrices of n <= ``tpc.MAXN`` go through it
+instead (solve, inv, det, slogdet and both triangular solves). Without the kernel, or past ``MAXN``, the call on
+``hpu`` is declined and runs through hpu-ops' own CPU route (``_on_cpu``), which is not Habana's fallback. The
+composites stay the path of the CPU stand-in.
 """
 import warnings
 
@@ -23,7 +24,7 @@ import torch.utils._pytree as pytree
 from torch._C import DispatchKey
 
 from . import tpc
-from ._dispatch import count, register_kernels, static
+from ._dispatch import count, register_paired, static
 
 aten = torch.ops.aten
 FLOAT64_WARNING = ("hpu_ops: {name} of float64 HPU tensors runs on the CPU: Gaudi2 computes float64 at float32 "
@@ -41,12 +42,20 @@ def _bind(op, args, kwargs):
     return tuple(args) + tuple(kwargs[a.name] if a.name in kwargs else a.default_value for a in rest)
 
 
+def _transformed():
+    """Whether a functorch transform (vmap, grad, jvp, jacrev, ...) or forward-mode AD is active. The Functions here
+    define no ``setup_context`` and no jvp, so those calls keep the op's own kernel."""
+    return torch._C._functorch.peek_interpreter_stack() is not None or torch.autograd.forward_ad._current_level >= 0
+
+
 def _takes(device_type, name, matrix_at=0):
-    """A predicate on a call's arguments: the positional tensor at ``matrix_at`` is a square matrix and every tensor
-    argument is a float32 (or float64, only off ``hpu``, with one warning per ``name``) tensor of static, non-empty
-    shape."""
+    """A predicate on a call's arguments: no functorch transform or forward-mode AD is active, the positional tensor
+    at ``matrix_at`` is a square matrix and every tensor argument is a float32 (or float64, only off ``hpu``, with one
+    warning per ``name``) tensor of static, non-empty shape."""
 
     def takes(*args, **kwargs):
+        if _transformed():
+            return False
         tensors = [x for x in (*args, *kwargs.values()) if isinstance(x, torch.Tensor)]
         if device_type == "hpu" and any(t.dtype == torch.float64 for t in tensors):
             if name not in _WARNED:
@@ -63,8 +72,9 @@ def _takes(device_type, name, matrix_at=0):
 
 
 def _tpc_takes(device_type, takes, matrix_at=0):
-    """``takes``, and on ``hpu`` also: n <= ``tpc.MAXN`` and the TPC kernel ready (path installed, extension built).
-    Otherwise Habana's CPU fallback runs, which is faster than the composites on Gaudi2."""
+    """``takes``, and on ``hpu`` also: n <= ``tpc.MAXN`` and the TPC kernel ready (path installed, Gaudi2, extension
+    built). Otherwise the call is declined and takes hpu-ops' own CPU route (``_on_cpu``), which beats the composites
+    on Gaudi2."""
 
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
@@ -115,6 +125,13 @@ def _gj_info(S, batch):
         info = info[(0,) * (info.dim() - len(batch))]
         info = info[tuple(slice(0, 1) if a == 1 else slice(None) for a in batch)]
     return info
+
+
+def _nan_if_singular(X, S):
+    """``X`` with NaN where the kernel's info (``S[..., 1]``, one per matrix) is nonzero, as torch's triangular solves
+    give non-finite values for a zero diagonal: the kernel zeroes a zero pivot's row, which would leave finite
+    garbage. No host sync."""
+    return torch.where((S[..., 1] != 0)[..., None, None], float("nan"), X)
 
 
 def _unused_factors(A):
@@ -203,7 +220,8 @@ class SolveTriangular(torch.autograd.Function):
     @staticmethod
     def compute(A, B, upper, left, unitriangular):
         if _use_tpc(A):
-            return _gj_solve(_triangle(A, upper, unitriangular), B, left)[0]
+            X, _, S = _gj_solve(_triangle(A, upper, unitriangular), B, left)
+            return _nan_if_singular(X, S)
         return solve_triangular(A, B, upper, left, unitriangular)
 
     @staticmethod
@@ -231,7 +249,7 @@ def install_solve_triangular(device_type):
     """``linalg.solve_triangular`` on ``device_type`` as a matmul with the block-recursive inverse. Returns an undo."""
     op = aten.linalg_solve_triangular.default
     takes = _tpc_takes(device_type, _takes(device_type, "solve_triangular"))
-    return register_kernels(device_type, _kernels(device_type, op, "solve_triangular", SolveTriangular, takes))
+    return register_paired(device_type, [_kernels(device_type, op, "solve_triangular", SolveTriangular, takes)])
 
 
 def cholesky_solve(B, L, upper=False):
@@ -247,7 +265,8 @@ class CholeskySolve(torch.autograd.Function):
     def compute(B, L, upper):
         if _use_tpc(L):
             L = torch.triu(L) if upper else torch.tril(L)
-            return _gj(L.mH @ L if upper else L @ L.mH, B)[0]
+            X, _, S = _gj(L.mH @ L if upper else L @ L.mH, B)
+            return _nan_if_singular(X, S)
         return cholesky_solve(B, L, upper)
 
     @staticmethod
@@ -277,7 +296,7 @@ def install_cholesky_solve(device_type):
     autograd = _kernels(device_type, aten.cholesky_solve.default, "cholesky_solve", CholeskySolve, takes)[0]
     # The other two entries are dropped: the helper is the backend key of the same op, so each key gets one kernel.
     backend = _kernels(device_type, aten._cholesky_solve_helper.default, "cholesky_solve", CholeskySolve, takes)[1]
-    return register_kernels(device_type, [autograd, backend])
+    return register_paired(device_type, [[autograd, backend]])
 
 
 def lu(A):
@@ -408,7 +427,7 @@ def install_solve(device_type):
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
     takes = _tpc_takes(device_type, shapes_ok)
-    return register_kernels(device_type, _kernels(device_type, op, "solve", SolveEx, takes))
+    return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes)])
 
 
 def _inverse(LU, pivots):
@@ -456,9 +475,11 @@ class InvEx(torch.autograd.Function):
 
 class Det(torch.autograd.Function):
     """``aten._linalg_det`` as the signed product of U's diagonal, with torch's backward (``g det A^-H``), the inverse
-    recomputed from A, so double backward works. A singular matrix has det 0 and a non-finite gradient. ``LU`` and
+    recomputed from A, so double backward works. A singular matrix has det 0; the gradient of a singular matrix
+    through the TPC kernel is measured on Gaudi2: see README. ``LU`` and
     ``pivots`` are not differentiable; they are those of A (native's CPU kernel returns those of A^T). Through the TPC
-    kernel D and S come from the identity kernel (``_gj_inv``), X discarded."""
+    kernel D and S come from the identity kernel (``_gj_inv``), X discarded; the kernel zeroes a zero pivot's row,
+    as LAPACK does, and the pivots after it stay finite."""
 
     @staticmethod
     def compute(A):
@@ -513,8 +534,8 @@ class Slogdet(torch.autograd.Function):
 def install_inv_det(device_type):
     """``linalg.inv``/``inv_ex``, ``det`` and ``slogdet`` on ``device_type`` from the masked LU and two triangular
     matmuls. Returns an undo."""
-    entries = []
+    groups = []
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
-        entries += _kernels(device_type, op, name, function, _tpc_takes(device_type, _takes(device_type, name)))
-    return register_kernels(device_type, entries)
+        groups.append(_kernels(device_type, op, name, function, _tpc_takes(device_type, _takes(device_type, name))))
+    return register_paired(device_type, groups)

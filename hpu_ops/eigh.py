@@ -7,16 +7,16 @@ convergence test, so the op count is static and nothing syncs with the host. The
 static shape, float64 off ``hpu`` only.
 
 On Gaudi2 the composite loses to Habana's CPU fallback (760-7600 ms per call against 2.8-35 ms, batch 32, n = 16-128,
-and a Synapse critical device error in lazy mode at n = 64), so float32 matrices of n <= ``tpc.EIGH_MAXN`` go through the
-TPC one-sided Jacobi kernel of ``hpu_ops.tpc`` (n = 22, batch 32: about 0.3 ms against 3.7 ms for the fallback).
-Without the kernel, or past ``EIGH_MAXN``, the call on ``hpu`` is declined and Habana's fallback runs. The composite stays the path
-of the CPU stand-in.
+and a Synapse critical device error in lazy mode at n = 64), so float32 matrices of n <= ``tpc.EIGH_MAXN`` go through
+the TPC one-sided Jacobi kernel of ``hpu_ops.tpc`` (n = 22, batch 32, eager: 1.27 ms against about 3.7 ms for the
+fallback). Without the kernel, or past ``EIGH_MAXN``, the call on ``hpu`` is declined and runs through hpu-ops' own
+CPU route (``linalg._on_cpu``), which is not Habana's fallback. The composite stays the path of the CPU stand-in.
 """
 import torch
 import torch.nn.functional as F
 
 from . import tpc
-from ._dispatch import register_kernels
+from ._dispatch import register_paired
 from .linalg import _kernels, _takes
 
 aten = torch.ops.aten
@@ -35,8 +35,8 @@ def _use_tpc(A):
 
 
 def _tpc_takes(device_type):
-    """``_takes`` for eigh, and on ``hpu`` also: n <= ``tpc.EIGH_MAXN`` and the TPC kernel ready. Otherwise Habana's CPU
-    fallback runs, which is faster than the composite on Gaudi2."""
+    """``_takes`` for eigh, and on ``hpu`` also: n <= ``tpc.EIGH_MAXN`` and the TPC kernel ready. Otherwise the call is
+    declined and takes hpu-ops' own CPU route, which beats the composite on Gaudi2."""
     takes = _takes(device_type, "eigh")
 
     def tpc_takes(*args, **kwargs):
@@ -127,7 +127,7 @@ class Eigh(torch.autograd.Function):
 
 
 def install_eigh(device_type):
-    """``linalg.eigh`` and ``eigvalsh`` on ``device_type``: the TPC Jacobi kernel on HPU (declined without it), parallel
-    Jacobi composites on the CPU stand-in. Returns an undo."""
+    """``linalg.eigh`` and ``eigvalsh`` on ``device_type``: the TPC Jacobi kernel on HPU (declined without it, then
+    hpu-ops' CPU route), parallel Jacobi composites on the CPU stand-in. Returns an undo."""
     op = aten._linalg_eigh.default
-    return register_kernels(device_type, _kernels(device_type, op, "eigh", Eigh, _tpc_takes(device_type)))
+    return register_paired(device_type, [_kernels(device_type, op, "eigh", Eigh, _tpc_takes(device_type))])

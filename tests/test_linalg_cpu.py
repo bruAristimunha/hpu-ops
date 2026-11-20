@@ -857,6 +857,7 @@ def test_chunks_and_flat_inv_contract(monkeypatch):
 
 def test_ready_declines_after_a_build_failure(monkeypatch):
     monkeypatch.setattr(tpc, "_INSTALLED", True)
+    monkeypatch.setattr(tpc, "_device_name", lambda: "GAUDI2")
     tpc._built.cache_clear()
 
     def boom():
@@ -919,7 +920,8 @@ def test_install_kernel_path(monkeypatch):
         assert tpc.install_kernel_path() is False  # warned once
     assert len(record) == 1
     assert str(record[0].message) == ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off "
-                                      "for this process (call enable() before the first HPU op)")
+                                      "for this process (call enable() before the first HPU op). The linalg ops then "
+                                      "run through hpu-ops' own CPU route, not Habana's fallback.")
 
 
 @pytest.mark.parametrize("lazy, flushes", [("1", 2), ("0", 0)])
@@ -972,3 +974,116 @@ def test_lazy_cpp_registers_eigh_with_the_legacy_api():
     assert "UserCustomOpDescriptor" not in tpc.CPP_LAZY
     assert "HabanaCustomOpDescriptor::getCustomOpDescriptor(\"linalg_tpc::jacobi_eigh\")" in tpc.CPP_LAZY
     assert "UserCustomOpDescriptor::getUserCustomOpDescriptor(\"linalg_tpc::jacobi_eigh\")" in tpc.CPP
+
+
+# ---- final-review fixes: device check, opt-out, key coupling, functorch, singular triangles, numpy-free import
+
+
+@pytest.mark.parametrize("name, ok", [("GAUDI2", True), ("Gaudi2", True), ("GAUDI3", False), ("GAUDI", False)])
+def test_ready_requires_a_gaudi2(monkeypatch, name, ok):
+    monkeypatch.setattr(tpc, "_INSTALLED", True)
+    monkeypatch.setattr(tpc, "_built", lambda: True)
+    monkeypatch.setattr(tpc, "_device_name", lambda: name)
+    assert tpc.ready() is ok
+
+
+def test_non_gaudi2_declines_so_the_ops_keep_the_native_path(monkeypatch):
+    monkeypatch.setattr(tpc, "_INSTALLED", True)
+    monkeypatch.setattr(tpc, "_built", lambda: True)
+    monkeypatch.setattr(tpc, "_device_name", lambda: "GAUDI3")
+    takes = linalg._tpc_takes("hpu", linalg._takes("hpu", "solve"))
+    assert takes(torch.randn(2, 4, 4)) is False
+
+
+def test_import_hpu_ops_does_not_need_numpy():
+    import subprocess
+    code = "import sys; sys.modules['numpy'] = None; import hpu_ops"
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=os.path.dirname(os.path.dirname(__file__)))
+
+
+def test_opt_out_env_turns_the_kernels_off(monkeypatch):
+    monkeypatch.setattr(tpc, "_INSTALLED", True)
+    monkeypatch.setattr(tpc, "_initialized", lambda: False)
+    monkeypatch.setenv("HPU_OPS_TPC", "0")
+    assert tpc.install_kernel_path() is False and tpc.available() is False
+
+
+def test_install_kernel_path_declines_without_the_library(monkeypatch, tmp_path):
+    monkeypatch.setattr(tpc, "_INSTALLED", False)
+    monkeypatch.setattr(tpc, "_LATE_WARNED", False)
+    monkeypatch.setattr(tpc, "_initialized", lambda: False)
+    monkeypatch.setattr(tpc, "LIB", tmp_path / "missing.so")
+    monkeypatch.delenv("HPU_OPS_TPC", raising=False)
+    with pytest.warns(UserWarning, match="not found"):
+        assert tpc.install_kernel_path() is False
+    assert tpc.available() is False
+
+
+def test_backend_kernel_is_registered_only_with_its_autograd_kernel(monkeypatch):
+    from hpu_ops import _dispatch
+
+    op = torch.ops.aten.linalg_inv_ex.default
+    groups = [[(op, "Autograd{}", lambda *a, **k: None), (op, "{}", lambda *a, **k: None)]]
+    taken, seen = set(), []
+    monkeypatch.setattr(torch._C, "_dispatch_has_kernel_for_dispatch_key", lambda name, key: key in taken)
+    monkeypatch.setattr(torch.library.Library, "impl", lambda self, op, fn, key: seen.append(key))
+    _dispatch.register_paired("cpu", groups)
+    assert sorted(seen) == ["AutogradCPU", "CPU"]
+    seen.clear()
+    taken.add("AutogradCPU")  # Habana's own autograd kernel: ours would split the two keys, so neither is registered
+    _dispatch.register_paired("cpu", groups)
+    assert seen == []
+    taken.clear()
+    taken.add("CPU")  # a taken backend key alone only skips that key (the CPU stand-in's case)
+    _dispatch.register_paired("cpu", groups)
+    assert seen == ["AutogradCPU"]
+
+
+def test_functorch_jacrev_and_vmap_take_the_native_path(gj_hook):  # the kernel hook may serve calls below the transform
+    A, b = general(3, n=4, dtype=torch.float32), torch.randn(3, 4)
+    want = torch.func.jacrev(torch.linalg.solve)(A, b)
+    with cpu_as_hpu(linalg.install_solve):
+        got = torch.func.jacrev(torch.linalg.solve)(A, b)  # the transformed call is declined: no setup_context error
+        v = torch.func.vmap(torch.linalg.solve)(A, b)
+    torch.testing.assert_close(got, want)
+    torch.testing.assert_close(v, torch.linalg.solve(A, b))
+
+
+def test_forward_ad_takes_the_native_path(gj_hook):
+    import torch.autograd.forward_ad as fwAD
+    A = general(n=4, dtype=torch.float32)
+    t = torch.randn(4, 4)
+    with fwAD.dual_level():
+        want = fwAD.unpack_dual(torch.linalg.det(fwAD.make_dual(A, t))).tangent
+    with cpu_as_hpu(linalg.install_inv_det):
+        with fwAD.dual_level():
+            got = fwAD.unpack_dual(torch.linalg.det(fwAD.make_dual(A, t))).tangent
+        jv = torch.func.jvp(torch.linalg.det, (A,), (t,))[1]
+    torch.testing.assert_close(got, want)
+    torch.testing.assert_close(jv, want)
+    assert gj_hook == []
+
+
+def zeroing_hook(A, B):
+    """The kernel's contract on a singular triangle: the pivot row is zeroed (a zero row in X), info is nonzero."""
+    X, D, S = tpc.gj_solve_reference(A.detach(), B.detach())
+    zero = (D == 0)
+    X = torch.where(zero.any(-1)[..., None, None], torch.zeros_like(X), X)
+    return X, D, S
+
+
+def test_singular_triangle_gives_nan_like_torch(monkeypatch):
+    monkeypatch.setattr(linalg, "_GJ", zeroing_hook)
+    A = torch.tril(torch.randn(2, 4, 4)) + 3 * torch.eye(4)
+    A[1, 2] = 0  # a zero row: an exact zero pivot
+    B = torch.randn(2, 4, 3)
+    want = torch.linalg.solve_triangular(A, B, upper=False)
+    assert torch.isnan(want[1]).any() or torch.isinf(want[1]).any()
+    with cpu_as_hpu(linalg.install_solve_triangular):
+        got = torch.linalg.solve_triangular(A, B, upper=False)
+    assert not torch.isfinite(got[1]).all() and torch.isfinite(got[0]).all()
+    torch.testing.assert_close(got[0], want[0])
+    L = A.clone()
+    with cpu_as_hpu(linalg.install_cholesky_solve):
+        out = torch.cholesky_solve(B, L, upper=False)
+    assert not torch.isfinite(out[1]).all() and torch.isfinite(out[0]).all()

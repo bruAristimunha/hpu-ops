@@ -22,20 +22,21 @@ at the tensor's pickling:
 - ``linalg.solve_triangular`` and ``cholesky_solve`` (``linalg``): they have no HPU kernel and ran on the CPU; float64
   stays on the CPU, as Gaudi2 stores it at float32 precision (hpu-ops#16). Cholesky's and QR's backward use them.
 - ``linalg.inv``, ``det`` and ``slogdet`` from the masked LU and triangular matmuls (``linalg``), as ``linalg.solve``.
-- On Gaudi2 those composites are 3-25x slower than Habana's CPU fallback (one launch per op), so ``linalg.solve``,
-  ``inv``, ``det``, ``slogdet``, ``solve_triangular`` and ``cholesky_solve`` of float32 matrices with n <= 32 run
-  through a TPC Gauss-Jordan kernel with partial pivoting (``tpc``), one matrix per index-space member. Eager, batch
-  32, n = 22: solve 2.7 ms against about 4.5 ms for the fallback, inv 1.8 against 4.6, det 0.82 against 2.7 (lazy:
-  0.57, 0.48, 0.51 against about 2.2, 2.2, 1.4). Habana reads the kernel path when the first graph
-  compiles, so ``enable()`` must run before the first HPU op, else the kernel is off (one warning) and these calls
-  keep Habana's CPU fallback, as they do for n > 32.
+- On Gaudi2 those composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
+  ``linalg.solve``, ``inv``, ``det``, ``slogdet``, ``solve_triangular`` and ``cholesky_solve`` of float32 matrices
+  with n <= 32 run through a TPC Gauss-Jordan kernel with partial pivoting (``tpc``), one matrix per index-space
+  member. Eager, batch 32, n = 22: solve 2.7 ms against about 4.5 ms for the fallback, inv 1.8 against 4.6, det 0.82
+  against 2.7 (lazy: 0.57, 0.48, 0.51 against about 2.2, 2.2, 1.4). Habana reads the kernel path when the device
+  initialises, so ``enable()`` must run before the first HPU op, else the kernel is off (one warning). The kernels
+  are off too on a device that is not a Gaudi2 and with ``HPU_OPS_TPC=0`` in the environment. Calls the kernel does
+  not take (n > 32, kernel off) run through hpu-ops' own CPU route, which is not Habana's fallback.
 - ``linalg.eigh`` and ``eigvalsh`` of float32 matrices with n <= 32 run through a TPC one-sided Jacobi kernel
   (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32, n = 22: 1.27 ms
   against about 3.7 ms for the fallback (lazy 0.80 against about 1.4); batch 1024 3.7 ms against 52 ms; within about
   3.8x of CPU float32 accuracy, also on repeated eigenvalues, condition 1e6 and inputs scaled by 1e30.
-  Without the kernel, or past n = 32, the call is declined and keeps
-  Habana's CPU fallback: the parallel-Jacobi composite of ``eigh`` is exact but 100x slower than the fallback on Gaudi2,
-  so it only serves the CPU stand-in.
+  Without the kernel, or past n = 32, the call is declined and runs through hpu-ops' own CPU route, not Habana's
+  fallback: the parallel-Jacobi composite of ``eigh`` was measured slower than the fallback on Gaudi2, so it only
+  serves the CPU stand-in.
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.

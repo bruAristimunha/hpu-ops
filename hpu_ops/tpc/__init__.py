@@ -3,26 +3,27 @@
 ``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel) for float32, n and m <= 32. One matrix per index-space
 member, rows in local memory, partial pivoting. ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign (-1)^swaps
 of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can differ from
-LAPACK's, and is nonzero exactly when a pivot is exactly zero.
+LAPACK's, and is nonzero exactly when a pivot is exactly zero. A zero pivot gives a zero pivot row (as in LAPACK) and
+the pivots after it stay finite.
 
 ``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
-n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Eager, batch 32: n = 22
-about 0.3 ms against 3.7 ms for the CPU fallback, batch 1024 3.7 ms against 52 ms; within 4x of CPU float32 accuracy,
-also on repeated eigenvalues, condition 1e6 and extreme scales.
+n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Batch 32, n = 22,
+eager: 1.27 ms per call against about 3.7 ms for Habana's CPU fallback (the raw kernel takes 0.19 ms); batch 1024:
+3.7 ms against 52 ms. Accuracy within about 3.8x of CPU float32's, also on repeated eigenvalues, condition 1e6 and
+inputs scaled by 1e30.
 
-The torch-op composites of ``hpu_ops.linalg`` are correct but 3-25x slower than Habana's CPU fallback on Gaudi2 (one
-launch per op). The kernel, eager, batch 32: n = 22 solve 0.20 ms against 4.7 ms for the fallback, n = 32 0.28 ms,
-batch 1024 1.9 ms against 20 ms; the pivots equal LAPACK's U diagonal to 6e-6, the determinant to 9e-6.
+The torch-op composites of ``hpu_ops.linalg`` are correct but were measured 3-25x slower than Habana's CPU fallback
+per call on Gaudi2 (one launch per op). The solve kernel, batch 32, n = 22, eager: 2.7 ms against about 4.5 ms for
+the fallback (lazy 0.57 against about 2.2).
 
-Habana reads ``GC_KERNEL_PATH`` when the first graph compiles, so ``install_kernel_path`` must run before the first HPU
-op of the process; ``hpu_ops.enable()`` calls it.
+Habana reads ``GC_KERNEL_PATH`` when the device initialises, so ``install_kernel_path`` must run before the first HPU
+op of the process; ``hpu_ops.enable()`` calls it. ``HPU_OPS_TPC=0`` in the environment keeps the kernels off.
 """
 import functools
 import os
 import pathlib
 import warnings
 
-import numpy as np
 import torch
 
 MAXN = 32
@@ -30,11 +31,17 @@ EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
 LATE_WARNING = ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off for this process "
-                "(call enable() before the first HPU op)")
-BUILD_WARNING = ("hpu_ops: building the TPC linalg extension failed ({error}); solve, inv, det, slogdet and the "
-                 "triangular solves keep Habana's CPU fallback.")
+                "(call enable() before the first HPU op). The linalg ops then run through hpu-ops' own CPU route, "
+                "not Habana's fallback.")
+BUILD_WARNING = ("hpu_ops: building the TPC linalg extension failed ({error}); solve, inv, det, slogdet, the "
+                 "triangular solves and eigh run through hpu-ops' own CPU route, not Habana's fallback.")
+MISSING_WARNING = ("hpu_ops: {path} not found; TPC linalg kernels are off for this process. The linalg ops run "
+                   "through hpu-ops' own CPU route, not Habana's fallback.")
+OPT_OUT = "HPU_OPS_TPC"
 _INSTALLED = False
 _LATE_WARNED = False
+_MISSING_WARNED = False
+_DEVICE = None
 
 # The registration strings are those measured on Gaudi2, plus gj_inv (A alone, identity right-hand side) and
 # jacobi_eigh (A alone; W [batch, n], Vt [batch, n, n]). CPP: the
@@ -203,8 +210,18 @@ def _habana_hpu():
 def install_kernel_path():
     """Put ``LIB`` first on ``GC_KERNEL_PATH`` (default ``DEFAULT_KERNELS`` when unset or empty, never duplicated) if
     the HPU is not initialized yet and return True; otherwise warn once and return False, as Habana reads the path
-    when the first graph compiles: set later, the kernel's graph fails to compile."""
-    global _INSTALLED, _LATE_WARNED
+    when the device initialises: set later, the kernel's graph fails to compile. Also False, silently, with
+    ``HPU_OPS_TPC=0`` in the environment, and, with one warning, when ``LIB`` does not exist."""
+    global _INSTALLED, _LATE_WARNED, _MISSING_WARNED
+    if os.environ.get(OPT_OUT) == "0":
+        _INSTALLED = False
+        return False
+    if not _lib_exists(LIB):
+        _INSTALLED = False
+        if not _MISSING_WARNED:
+            _MISSING_WARNED = True
+            warnings.warn(MISSING_WARNING.format(path=LIB), stacklevel=2)
+        return False
     if _initialized():
         _INSTALLED = False
         if not _LATE_WARNED:
@@ -218,15 +235,43 @@ def install_kernel_path():
     return True
 
 
+@functools.cache
+def _lib_exists(path):
+    return path.exists()
+
+
 def available():
-    """True when ``install_kernel_path`` succeeded in this process and the library is there."""
-    return _INSTALLED and LIB.exists()
+    """True when ``install_kernel_path`` succeeded in this process and the library is there (the file check is cached
+    per path)."""
+    return _INSTALLED and _lib_exists(LIB)
+
+
+def _device_name():
+    """The name of the HPU device (cached once read): ``habana_frameworks.torch.hpu.get_device_name()``, else
+    ``torch.hpu.get_device_name()``; "" if neither answers."""
+    global _DEVICE
+    if _DEVICE is None:
+        for module in (_habana_hpu(), getattr(torch, "hpu", None)):
+            try:
+                _DEVICE = str(module.get_device_name())
+                break
+            except Exception:  # noqa: BLE001  (no such module or name: try the next, else decline)
+                continue
+        else:
+            return ""
+    return _DEVICE
+
+
+def _gaudi2():
+    """The kernels are compiled for Gaudi2 only: on another generation they would fail or run wrong."""
+    return "GAUDI2" in _device_name().upper()
 
 
 def ready():
-    """``available()`` and the C++ extension built. The build happens on the first call; if it fails, one warning,
-    then False for the rest of the process (the ops keep Habana's CPU fallback, with no retry mid-forward)."""
-    return available() and _built()
+    """``available()``, a Gaudi2 device and the C++ extension built. The build happens on the first call; if it
+    fails, one warning, then False for the rest of the process (the ops run through hpu-ops' own CPU route, with no
+    retry mid-forward)."""
+    return available() and _gaudi2() and _built()
 
 
 @functools.cache
@@ -354,14 +399,16 @@ def eigh(A, upper):
 def eigh_reference(A, upper):
     """``eigh`` through numpy's LAPACK, the contract of the kernel path (torch's own ``linalg.eigh`` is what the CPU
     tests override). Detached: no autograd through the kernel. For the CPU tests."""
+    import numpy as np  # only here: ``import hpu_ops`` does not need numpy
+
     w, V = np.linalg.eigh(A.detach().cpu().numpy(), UPLO="U" if upper else "L")
     return torch.from_numpy(w).to(A.device), torch.from_numpy(V).to(A.device)
 
 
 def gj_solve_reference(A, B):
     """``gj_solve`` in plain torch, the contract of the kernel: ``lu`` and ``lu_solve`` of ``hpu_ops.linalg``, ``D``
-    the diagonal of U (a zero pivot leaves later pivots finite, as in the kernel), ``S[..., 0]`` the parity of the
-    pivots and ``S[..., 1]`` the info. For the CPU tests."""
+    the diagonal of U (a zero pivot leaves later pivots finite; the kernel also zeroes the pivot's row, which this
+    reference does not), ``S[..., 0]`` the parity of the pivots and ``S[..., 1]`` the info. For the CPU tests."""
     from .. import linalg
 
     LU, pivots = linalg.lu(A)
