@@ -16,7 +16,7 @@ from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 
 import hpu_ops
-from hpu_ops import autocast, composite, conv, perf, serialization, upsample
+from hpu_ops import autocast, composite, conv, serialization, upsample
 
 
 @contextlib.contextmanager
@@ -792,147 +792,6 @@ def test_autocast_files_hold_torchs_cuda_lists():
     assert autocast.exports() == [f"export {name}={shlex.quote(path)}" for name, path in files.items()]
 
 
-# ---- logsumexp as ATen's composite, in lazy mode
-
-
-def lazy_logsumexp(device_type):
-    return perf.install_logsumexp(device_type, lazy=True)
-
-
-@pytest.mark.parametrize("shape,dim,keepdim", [((64, 22, 22), -1, False), ((4096,), 0, False), ((64, 22, 22), 0, True),
-                                               ((4, 5, 6), (0, 2), False), ((4, 5, 6), [-1, 1], True),
-                                               ((1, 1), 1, False), ((), 0, False), ((), -1, True)])
-def test_logsumexp_is_a_composite_eager_and_compiled(shape, dim, keepdim):
-    f = lambda x: torch.logsumexp(x, dim, keepdim)  # noqa: E731
-    x = torch.randn(shape, dtype=torch.float64)
-    want = train_step(f, x)
-    nodes = []
-    with cpu_as_hpu(lazy_logsumexp) as calls:
-        eager = train_step(f, x)
-        assert calls["logsumexp"] == 1
-        got = train_step(compiled(f, nodes), x)
-    assert_same(eager, want)
-    assert_same(got, want)
-    assert eager[0].shape == want[0].shape
-    assert "aten.exp.default" in ops(nodes) and not any("logsumexp" in op for op in ops(nodes)), ops(nodes)
-    assert not any("amax" in str(n.target) and "backward" in str(n.target) for n in nodes)
-
-
-def test_logsumexp_infinities_and_nan_as_aten():
-    inf, nan = float("inf"), float("nan")
-    x = torch.tensor([[-inf, -inf, -inf], [inf, 1.0, 2.0], [inf, -inf, 0.0], [nan, 1.0, 2.0], [1e30, 1e30, -1e30],
-                      [-1e30, 0.0, 88.0]])
-    want = torch.logsumexp(x, 1)
-    with cpu_as_hpu(lazy_logsumexp) as calls:
-        got = torch.logsumexp(x.requires_grad_(), 1)
-    assert calls["logsumexp"] == 1
-    torch.testing.assert_close(got.detach(), want, equal_nan=True)
-
-
-def test_logsumexp_forward_only_keeps_the_native_kernel():
-    """Measured: forward + backward is faster as the composite in lazy mode, forward alone is not (0.97x), so calls
-    that record no gradient (no_grad, inputs without requires_grad, inference mode) keep the device's kernel."""
-    x = torch.randn(6, 5)
-    with cpu_as_hpu(lazy_logsumexp) as calls:
-        plain = torch.logsumexp(x, 1)
-        with torch.no_grad():
-            no_grad = torch.logsumexp(x.clone().requires_grad_(), 1)
-        assert not calls["logsumexp"]
-        torch.logsumexp(x.clone().requires_grad_(), 1)
-        assert calls["logsumexp"] == 1
-    torch.testing.assert_close(plain, torch.logsumexp(x, 1))
-    torch.testing.assert_close(no_grad, torch.logsumexp(x, 1))
-
-
-def test_logsumexp_gradient_of_infinite_and_large_slices():
-    x = torch.tensor([[1e4, 1e4 - 1.0, -1e4], [0.0, 0.0, float("-inf")]], dtype=torch.float64)
-    want = train_step(lambda x: torch.logsumexp(x, -1), x)
-    with cpu_as_hpu(lazy_logsumexp):
-        got = train_step(lambda x: torch.logsumexp(x, -1), x)
-    assert_same(got, want)
-
-
-def test_logsumexp_dtypes_layouts_and_what_it_does_not_take():
-    x = torch.randn(8, 6, 4, requires_grad=True)
-    permuted = torch.randn(4, 6, 8, requires_grad=True).permute(2, 1, 0)
-    offset = torch.randn(100, requires_grad=True)[3:3 + 48].view(8, 6)
-    with cpu_as_hpu(lazy_logsumexp) as calls:
-        half = torch.logsumexp(x.bfloat16(), 1)
-        with torch.autocast("cpu", dtype=torch.bfloat16):
-            autocast = torch.logsumexp(x, 1)
-        strided = torch.logsumexp(permuted, 1)
-        view = torch.logsumexp(offset, -1)
-        taken = calls["logsumexp"]
-        ints = torch.logsumexp(torch.arange(6).view(2, 3), 1)
-        empty = torch.logsumexp(torch.randn(3, 0, requires_grad=True), 1)
-        empty_rows = torch.logsumexp(torch.randn(0, 3, requires_grad=True), 1)
-        with pytest.raises(RuntimeError, match="broadcast shape"):  # torch's own error for an empty dim list
-            torch.logsumexp(x, ())
-        with pytest.raises(IndexError):
-            torch.logsumexp(x, 3)
-        with pytest.raises(RuntimeError):
-            torch.logsumexp(x, (1, 1))
-        out = torch.empty(8, 4)
-        torch.logsumexp(x.detach(), 1, out=out)
-        untaken = calls["logsumexp"] - taken
-    assert taken == 4 and untaken == 1, (taken, untaken)  # after the snapshot, only the (0, 3) input over dim 1 is taken
-    x, permuted, offset = x.detach(), permuted.detach(), offset.detach()
-    assert half.dtype == torch.bfloat16 and (half.float() - torch.logsumexp(x, 1)).abs().max() < 5e-2
-    assert autocast.dtype == torch.float32
-    torch.testing.assert_close(strided.detach(), torch.logsumexp(permuted, 1))
-    torch.testing.assert_close(view.detach(), torch.logsumexp(offset, -1))
-    torch.testing.assert_close(ints, torch.logsumexp(torch.arange(6).view(2, 3), 1))
-    assert torch.equal(empty.detach(), torch.logsumexp(torch.randn(3, 0), 1)) and empty_rows.shape == (0,)
-    torch.testing.assert_close(out, torch.logsumexp(x, 1))
-
-
-def test_logsumexp_backend_kernel_below_autograd():
-    x = torch.randn(6, 5)
-    with cpu_as_hpu(lazy_logsumexp) as calls, torch.inference_mode():
-        got = torch.logsumexp(x, 1)
-    torch.testing.assert_close(got, torch.logsumexp(x, 1))
-    assert not calls["logsumexp"]  # inference mode keeps the device's own kernel
-
-
-def test_logsumexp_reduces_with_kept_dims_then_reshapes():
-    """A 1-D input's logsumexp summed into a loss: lazy Gaudi fails on the backward of a dim reduction to 0-d that is
-    then summed, so the composite's graph has no reduction without keepdim."""
-    nodes = []
-    f = lambda x: torch.logsumexp(x, 0).sum()  # noqa: E731
-    x = torch.randn(22, dtype=torch.float64)
-    with cpu_as_hpu(lazy_logsumexp):
-        got = train_step(compiled(f, nodes), x)
-    assert_same(got, train_step(f, x))
-    reductions = [n for n in nodes if str(n.target) in ("aten.sum.dim_IntList", "aten.amax.default")]
-    assert reductions and all(n.args[2] is True for n in reductions), [n.args for n in reductions]
-
-
-@pytest.mark.parametrize("setting", ["0", "", None])
-def test_logsumexp_eager_mode_keeps_the_native_kernel(monkeypatch, setting):
-    """Off a Gaudi stack the mode is read from PT_HPU_LAZY_MODE; unset is eager, as bridge 1.21.4 runs unset."""
-    if importlib.util.find_spec("habana_frameworks"):
-        pytest.skip("Gaudi stack present: the bridge reports its mode")
-    if setting is None:
-        monkeypatch.delenv("PT_HPU_LAZY_MODE", raising=False)
-    else:
-        monkeypatch.setenv("PT_HPU_LAZY_MODE", setting)
-    with cpu_as_hpu(perf.install_logsumexp) as calls:
-        torch.logsumexp(torch.randn(4, 6, requires_grad=True), 1)
-    assert not calls["logsumexp"]
-    assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::logsumexp", "AutogradCPU")
-    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
-    with cpu_as_hpu(perf.install_logsumexp) as calls:
-        torch.logsumexp(torch.randn(4, 6, requires_grad=True), 1)
-    assert calls["logsumexp"] == 1
-
-
-def test_logsumexp_elsewhere_stays_logsumexp():
-    nodes = []
-    with cpu_as_hpu(lambda device: perf.install_logsumexp("hpu", lazy=True)) as calls:
-        train_step(compiled(lambda x: torch.logsumexp(x, 1), nodes), torch.randn(4, 6))
-    assert not calls["logsumexp"]
-
-
 # ---- installing and undoing
 
 
@@ -950,7 +809,7 @@ def test_undo_restores_torch():
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
                  "aten::embedding_dense_backward", "aten::convolution_backward", "aten::roll",
-                 "aten::upsample_linear1d", "aten::logsumexp"):
+                 "aten::upsample_linear1d"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 
 
@@ -974,3 +833,17 @@ def test_enable_is_a_no_op_off_gaudi(monkeypatch):
     monkeypatch.delenv("PT_HPU_DISABLE_pass_weight_permutation", raising=False)
     hpu_ops.enable()
     assert hpu_ops._STATE.get("undo") is None and "PT_HPU_DISABLE_pass_weight_permutation" not in os.environ
+
+
+@pytest.mark.parametrize("row", [[float("inf"), 100.0, 0.0], [3e38, 3e38, 0.0]])
+def test_logsumexp_keeps_aten_gradient_with_every_fix_in_lazy_mode(monkeypatch, row):
+    """Issue #21's lazy logsumexp composite was dropped (round 2: no gain in a training step, and a NaN gradient next
+    to +inf / a softmax gradient where the result rounds to the max). No fix may register logsumexp, in lazy mode too."""
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    x = torch.tensor([row], requires_grad=True)
+    (want,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
+    with cpu_as_hpu(hpu_ops._install) as calls:
+        assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::logsumexp", "AutogradCPU")
+        (got,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
+    assert not calls.get("logsumexp")
+    torch.testing.assert_close(got, want, equal_nan=True)
