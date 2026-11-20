@@ -33,12 +33,31 @@ _WARNED = set()
 # ``tpc.gj_solve`` on HPU with the kernel ready; the CPU tests set it to ``tpc.gj_solve_reference`` to exercise the
 # wiring.
 _GJ = None
+# The Jacobi SVD hook ``(A, compute_uv) -> (U, S, Vh)`` for CPU tests; None means ``tpc.jacobi_svd`` /
+# ``tpc.jacobi_svdvals`` on HPU, or ``tpc.svd_reference`` on CPU when unset.
+_SVD = None
+
+
+def _is_fake(t):
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    return isinstance(t, FakeTensor) or torch.compiler.is_compiling()
 
 
 def _bind(op, args, kwargs):
     """The arguments of a call to ``op`` in schema order, defaults filled in."""
     rest = op._schema.arguments[len(args):]
     return tuple(args) + tuple(kwargs[a.name] if a.name in kwargs else a.default_value for a in rest)
+
+
+def _takes_tensors(device_type, name, tensors):
+    if device_type == "hpu" and any(t.dtype == torch.float64 for t in tensors):
+        if name not in _WARNED:
+            _WARNED.add(name)
+            warnings.warn(FLOAT64_WARNING.format(name=name), stacklevel=2)
+        return False
+    allowed = (torch.float32,) if device_type == "hpu" else (torch.float32, torch.float64)
+    return all(t.dtype in allowed and static(*t.shape) and t.numel() > 0 for t in tensors)
 
 
 def _takes(device_type, name, matrix_at=0):
@@ -48,13 +67,7 @@ def _takes(device_type, name, matrix_at=0):
 
     def takes(*args, **kwargs):
         tensors = [x for x in (*args, *kwargs.values()) if isinstance(x, torch.Tensor)]
-        if device_type == "hpu" and any(t.dtype == torch.float64 for t in tensors):
-            if name not in _WARNED:
-                _WARNED.add(name)
-                warnings.warn(FLOAT64_WARNING.format(name=name), stacklevel=2)
-            return False
-        allowed = (torch.float32,) if device_type == "hpu" else (torch.float32, torch.float64)
-        if not all(t.dtype in allowed and static(*t.shape) and t.numel() > 0 for t in tensors):
+        if not _takes_tensors(device_type, name, tensors):
             return False
         matrix = args[matrix_at]
         return matrix.dim() >= 2 and matrix.shape[-1] == matrix.shape[-2]
@@ -133,7 +146,7 @@ def _on_cpu(op, args, kwargs):
     return pytree.tree_map(lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, out)
 
 
-def _kernels(device_type, op, name, function, takes):
+def _kernels(device_type, op, name, function, takes, backend=True):
     """The ``(op, key, kernel)`` entries for ``register_kernels``: ``function`` for the calls ``takes`` accepts, else
     ``op``'s own kernel at autograd, and the CPU below it."""
 
@@ -149,7 +162,10 @@ def _kernels(device_type, op, name, function, takes):
             return function.compute(*_bind(op, args, kwargs))
         return _on_cpu(op, args, kwargs)
 
-    return [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
+    entries = [(op, "Autograd{}", autograd_kernel)]
+    if backend or device_type != "cpu":
+        entries.append((op, "{}", backend_kernel))
+    return entries
 
 
 def tri_inverse(T, upper, unitriangular=False):
@@ -516,4 +532,494 @@ def install_inv_det(device_type):
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
         entries += _kernels(device_type, op, name, function, _tpc_takes(device_type, _takes(device_type, name)))
+    return register_kernels(device_type, entries)
+
+
+# ---- SVD family (#9): svd, svdvals, pinv, lstsq, matrix_norm(2/-2/'nuc'), matrix_rank
+
+
+def _tol_tensor_ok(tol, batch_shape):
+    if not (tol.is_floating_point() and static(*tol.shape) and tol.numel() > 0):
+        return False
+    if tol.dim() > len(batch_shape):
+        return False
+    try:
+        torch.broadcast_shapes(batch_shape, tol.shape)
+    except RuntimeError:
+        return False
+    return True
+
+
+def _svd_takes(device_type, name="svd"):
+    def takes(A, full_matrices=False, compute_uv=True, driver=None, **_out):
+        if driver is not None or not _takes_tensors(device_type, name, [A]):
+            return False
+        if A.dim() < 2 or A.shape[-2] > tpc.MAXN or A.shape[-1] > tpc.MAXN:
+            return False
+        return device_type != "hpu" or tpc.ready()
+
+    return takes
+
+
+def _pinv_takes(device_type, name="pinv"):
+    def takes(A, *, atol=None, rtol=None, hermitian=False):
+        if hermitian or not _takes_tensors(device_type, name, [A]):
+            return False
+        if A.dim() < 2 or A.shape[-2] > tpc.MAXN or A.shape[-1] > tpc.MAXN:
+            return False
+        if device_type == "hpu" and not tpc.ready():
+            return False
+        for tol in (atol, rtol):
+            if tol is not None and not _tol_tensor_ok(tol, A.shape[:-2]):
+                return False
+        return True
+
+    return takes
+
+
+def _lstsq_takes(device_type, name="lstsq"):
+    def takes(A, B, rcond=None, *, driver=None):
+        if driver not in (None, "gels", "gelsy", "gelsd", "gelss"):
+            return False
+        if rcond is not None and (isinstance(rcond, bool) or not isinstance(rcond, (int, float))):
+            return False
+        if not _takes_tensors(device_type, name, [A, B]) or A.dtype != B.dtype:
+            return False
+        if A.dim() < 2 or A.shape[-2] > tpc.MAXN or A.shape[-1] > tpc.MAXN:
+            return False
+        if device_type == "hpu" and not tpc.ready():
+            return False
+        if B.dim() == A.dim() - 1:
+            return B.shape == A.shape[:-1]
+        if B.dim() != A.dim() or B.shape[-2] != A.shape[-2]:
+            return False
+        try:
+            torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+        except RuntimeError:
+            return False
+        return True
+
+    return takes
+
+
+def _run_svd(A, compute_uv, full_matrices=False, sort=True, flush=True):
+    if _SVD is not None:
+        return _SVD(A.detach(), compute_uv)
+    if A.device.type == "hpu":
+        if compute_uv:
+            return tpc.jacobi_svd(A, full_matrices=full_matrices, sort=sort, flush=flush)
+        return A.new_empty(0), tpc.jacobi_svdvals(A, sort=sort, flush=flush), A.new_empty(0)
+    return tpc.svd_reference(A, compute_uv=compute_uv, full_matrices=full_matrices)
+
+
+def _complete_orthogonal(U, S):
+    m, k = U.shape[-2], U.shape[-1]
+    eye = torch.eye(m, dtype=U.dtype, device=U.device)
+    unull = _run_svd(eye - U @ U.mT, True)[0]
+    return torch.cat([U, unull[..., :m - k]], -1)
+
+
+class Svd(torch.autograd.Function):
+    """``aten._linalg_svd`` via the Gaudi2 one-sided Jacobi TPC kernel, with torch's SVD backward."""
+
+    @staticmethod
+    def compute(A, full_matrices, compute_uv, driver=None, sort=True, flush=True):
+        U, S, Vh = _run_svd(A, compute_uv, full_matrices=full_matrices, sort=sort, flush=flush)
+        if compute_uv and full_matrices and A.shape[-2] != A.shape[-1]:
+            if A.shape[-2] > A.shape[-1] and U.shape[-1] != A.shape[-2]:
+                U = _complete_orthogonal(U, S)
+            elif A.shape[-2] < A.shape[-1] and Vh.shape[-2] != A.shape[-1]:
+                Vh = _complete_orthogonal(Vh.mT, S).mT
+        return U, S, Vh
+
+    @staticmethod
+    def forward(ctx, A, full_matrices, compute_uv, driver):
+        need_uv = compute_uv or ctx.needs_input_grad[0]
+        U, S, Vh = Svd.compute(A, full_matrices, need_uv, driver)
+        ctx.save_for_backward(U, S, Vh)
+        ctx.set_materialize_grads(False)
+        if not compute_uv:
+            return A.new_empty(0), S, A.new_empty(0)
+        return U, S, Vh
+
+    @staticmethod
+    def backward(ctx, gU, gS, gVh):
+        if not ctx.needs_input_grad[0]:
+            return None, None, None, None
+        U, S, Vh = ctx.saved_tensors
+        m, n, k = U.shape[-2], Vh.shape[-1], S.shape[-1]
+        if k == 0 or (gU is None and gS is None and gVh is None):
+            return U.new_zeros(*S.shape[:-1], m, n), None, None, None
+        Uk, Vhk = U[..., :k], Vh[..., :k, :]
+        gA = (Uk * gS.unsqueeze(-2)) @ Vhk if gS is not None else U.new_zeros(*S.shape[:-1], m, n)
+        if gU is not None or gVh is not None:
+            S_scale = S.amax(-1, keepdim=True).clamp(min=1e-36)
+            s = S / S_scale
+            s2 = s * s
+            ds2 = s2.unsqueeze(-2) - s2.unsqueeze(-1)
+            F = torch.where(ds2 != 0, 1.0 / torch.where(ds2 != 0, ds2, 1.0), 0.0)
+            s_over_scale = s / S_scale
+            S_inv = torch.where(S != 0, 1.0 / torch.where(S != 0, S, 1.0), 0.0)
+            if gU is not None:
+                gUk = gU[..., :k]
+                UhgU = Uk.mH @ gUk
+                gA = gA + (Uk @ ((F * (UhgU - UhgU.mH)) * s_over_scale.unsqueeze(-2))) @ Vhk
+                if m > k:
+                    gA = gA + ((gUk - Uk @ UhgU) * S_inv.unsqueeze(-2)) @ Vhk
+            if gVh is not None:
+                gVhk = gVh[..., :k, :]
+                gVhV = gVhk @ Vhk.mH
+                gA = gA + (Uk @ ((-F) * (gVhV - gVhV.mH) * s_over_scale.unsqueeze(-1))) @ Vhk
+                if n > k:
+                    gA = gA + (Uk * S_inv.unsqueeze(-2)) @ (gVhk - gVhV @ Vhk)
+        return gA, None, None, None
+
+
+def install_svd(device_type):
+    """``linalg.svd``, ``svdvals`` and ``matrix_norm(2/-2/'nuc')`` via ``aten._linalg_svd``. Returns an undo."""
+    takes = _svd_takes(device_type)
+    entries = _kernels(device_type, aten._linalg_svd.default, "svd", Svd, takes)
+
+    def svd_u_backend(A, full_matrices=False, compute_uv=True, *, driver=None, U, S, Vh):
+        if takes(A, full_matrices, compute_uv, driver=driver):
+            count("svd")
+            u, s, vh = Svd.compute(A, full_matrices, compute_uv, driver)
+        else:
+            u, s, vh = _on_cpu(aten._linalg_svd.U, (A, full_matrices, compute_uv),
+                               {"driver": driver, "U": U, "S": S, "Vh": Vh})
+        S.resize_(s.shape).copy_(s)
+        if compute_uv:
+            U.resize_(u.shape).copy_(u)
+            Vh.resize_(vh.shape).copy_(vh)
+        return U, S, Vh
+
+    entries.append((aten._linalg_svd.U, "{}", svd_u_backend))
+
+    svdvals_op = aten.linalg_svdvals.default
+
+    def svdvals_run(A):
+        count("svd")
+        if torch.is_grad_enabled() and A.requires_grad:
+            return Svd.apply(A, False, True, None)[1]
+        return _run_svd(A.detach(), False, sort=True, flush=False)[1]
+
+    def svdvals_ag(A, driver=None):
+        if takes(A, driver=driver):
+            return svdvals_run(A)
+        return svdvals_op._op_dk(DispatchKey.CompositeImplicitAutograd, A, driver=driver)
+
+    def svdvals_be(A, driver=None):
+        if takes(A, driver=driver):
+            return svdvals_run(A)
+        return _on_cpu(svdvals_op, (A,), {"driver": driver})
+
+    entries.append((svdvals_op, "Autograd{}", svdvals_ag))
+    if device_type != "cpu":
+        entries.append((svdvals_op, "{}", svdvals_be))
+
+    def _norm_dims(A, dim):
+        if len(dim) != 2 or A.dim() < 2:
+            return None
+        d0, d1 = dim[0] % A.dim(), dim[1] % A.dim()
+        return None if d0 == d1 else (d0, d1)
+
+    def _norm_run(A, ord_, d0, d1, keepdim):
+        count("svd")
+        tail = d0 == A.dim() - 2 and d1 == A.dim() - 1
+        A_mat = A if tail else A.movedim((d0, d1), (-2, -1))
+        if torch.is_grad_enabled() and A_mat.requires_grad:
+            S = Svd.apply(A_mat, False, True, None)[1]
+        else:
+            S = _run_svd(A_mat.detach(), False, sort=False, flush=False)[1]
+        out = S.amax(-1) if ord_ == 2 else S.amin(-1) if ord_ == -2 else S.sum(-1)
+        if keepdim:
+            out = out.unsqueeze(-1).unsqueeze(-1)
+            if not tail:
+                out = out.movedim((-2, -1), (d0, d1))
+        return out
+
+    for norm_op, check_ord in (
+        (aten.linalg_matrix_norm.default, lambda o: not isinstance(o, bool) and o in (2, -2)),
+        (aten.linalg_matrix_norm.str_ord, lambda o: o == "nuc"),
+    ):
+        def _make_norm(op_, pred_):
+            def ag(*args, **kwargs):
+                A, ord_, dim, keepdim, dtype = _bind(op_, args, kwargs)
+                dims = _norm_dims(A, dim) if dtype is None and pred_(ord_) else None
+                if dims is not None and _takes_tensors(device_type, "svd", [A]) and \
+                        A.shape[dims[0]] <= tpc.MAXN and A.shape[dims[1]] <= tpc.MAXN and \
+                        (device_type != "hpu" or tpc.ready()):
+                    return _norm_run(A, ord_, dims[0], dims[1], keepdim)
+                return op_._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
+
+            def be(*args, **kwargs):
+                A, ord_, dim, keepdim, dtype = _bind(op_, args, kwargs)
+                dims = _norm_dims(A, dim) if dtype is None and pred_(ord_) else None
+                if dims is not None and _takes_tensors(device_type, "svd", [A]) and \
+                        A.shape[dims[0]] <= tpc.MAXN and A.shape[dims[1]] <= tpc.MAXN and \
+                        (device_type != "hpu" or tpc.ready()):
+                    return _norm_run(A, ord_, dims[0], dims[1], keepdim)
+                return _on_cpu(op_, args, kwargs)
+
+            return ag, be
+
+        ag_n, be_n = _make_norm(norm_op, check_ord)
+        entries.append((norm_op, "Autograd{}", ag_n))
+        if device_type != "cpu":
+            entries.append((norm_op, "{}", be_n))
+
+    return register_kernels(device_type, entries)
+
+
+def _pinv_tol(S, m, n, atol=None, rtol=None):
+    S_max = S[..., :1] if S.shape[-1] == 0 else S.amax(-1, keepdim=True)
+    if atol is None and rtol is None:
+        return S_max * (max(m, n) * torch.finfo(S.dtype).eps)
+    t_atol = atol.to(device=S.device, dtype=S.dtype).unsqueeze(-1) if atol is not None else S.new_zeros(())
+    t_rtol = rtol.to(device=S.device, dtype=S.dtype).unsqueeze(-1) if rtol is not None else S.new_zeros(())
+    return torch.maximum(t_atol, t_rtol * S_max)
+
+
+def _pinv_tol_scalar(S, m, n, atol=None, rtol=None):
+    S_max = S[..., :1] if S.shape[-1] == 0 else S.amax(-1, keepdim=True)
+    if atol is None and rtol is None:
+        return S_max * (max(m, n) * torch.finfo(S.dtype).eps)
+    t_atol = S.new_full((), atol) if atol is not None else S.new_zeros(())
+    t_rtol = S.new_full((), rtol) if rtol is not None else S.new_zeros(())
+    return torch.maximum(t_atol, t_rtol * S_max)
+
+
+def _pinv_backward(A, P, gP):
+    Pt, gPt = P.mH, gP.mH
+    return -(Pt @ gP @ Pt) + (gPt - A @ (P @ gPt)) @ (P @ Pt) + (Pt @ P) @ (gPt - (gPt @ P) @ A)
+
+
+class Pinv(torch.autograd.Function):
+    """``aten.linalg_pinv.atol_rtol_tensor`` via ``Svd`` with analytical pseudoinverse backward."""
+
+    @staticmethod
+    def compute(A, atol, rtol, hermitian):
+        U, S, Vh = Svd.compute(A, False, True, sort=False)
+        tol = _pinv_tol(S, A.shape[-2], A.shape[-1], atol, rtol)
+        S_inv = torch.where(S > tol, S.reciprocal(), 0.0)
+        return (Vh.mH * S_inv.unsqueeze(-2)) @ U.mH
+
+    @staticmethod
+    def forward(ctx, A, atol, rtol, hermitian):
+        P = Pinv.compute(A, atol, rtol, hermitian)
+        ctx.save_for_backward(A, P)
+        return P
+
+    @staticmethod
+    def backward(ctx, gP):
+        A, P = ctx.saved_tensors
+        return _pinv_backward(A, P, gP), None, None, None
+
+
+def install_pinv(device_type):
+    """``linalg.pinv`` (``hermitian=False``) on ``device_type`` via ``Svd``. Returns an undo."""
+    op = aten.linalg_pinv.atol_rtol_tensor
+    takes = _pinv_takes(device_type)
+    return register_kernels(device_type, _kernels(device_type, op, "pinv", Pinv, takes, backend=False))
+
+
+def _lstsq_eval(A, B, rcond, driver):
+    m, n = A.shape[-2], A.shape[-1]
+    k = min(m, n)
+    need_sort = driver in ("gelsd", "gelss")
+    U, S, Vh = Svd.compute(A, False, True, sort=need_sort)
+    eps = torch.finfo(S.dtype).eps
+    rtol_val = max(m, n) * eps if (rcond is None or rcond < 0) else (
+        0.5 * eps if rcond == 0 and driver == "gelsd" else float(rcond))
+    fake = _is_fake(S)
+    S_max = S[..., :1] if need_sort else S.amax(-1, keepdim=True)
+    if fake:
+        S_inv = torch.where(S > S_max * rtol_val, S.reciprocal(), 0.0)
+        bad = None
+    else:
+        S_min = S[..., -1:] if need_sort else S.amin(-1, keepdim=True)
+        bad = (S_min <= S_max * rtol_val).any()
+        S_inv = S.reciprocal()
+    vector = B.dim() == A.dim() - 1
+    B_mat = B.unsqueeze(-1) if vector else B
+    sol_mat = Vh.mH @ (S_inv.unsqueeze(-1) * (U.mH @ B_mat))
+    sol = sol_mat.squeeze(-1) if vector else sol_mat
+    if m > n and driver in ("gels", "gelsd", "gelss"):
+        residuals = (B_mat - A @ sol_mat).square().sum(-2)
+    else:
+        residuals = A.new_empty(0)
+    rank_out = A.new_empty(0, dtype=torch.int64) if driver == "gels" else A.new_full(
+        (), k, dtype=torch.int64).expand(A.shape[:-2])
+    sv_out = S if driver in ("gelsd", "gelss") else A.new_empty(0)
+    if bad is not None and bool(bad):
+        return None
+    return sol, U, S_inv, Vh, residuals, rank_out, sv_out, rtol_val, vector
+
+
+class _Lstsq(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, A, B, sol, U, S_inv, Vh, residuals, rank_out, sv_out, rtol_val, vector):
+        ctx.save_for_backward(A, B, U, S_inv, Vh)
+        ctx.options = (rtol_val, vector)
+        ctx.mark_non_differentiable(residuals, rank_out, sv_out)
+        return sol, residuals, rank_out, sv_out
+
+    @staticmethod
+    def backward(ctx, g_sol, *_):
+        A, B, U, S_inv, Vh = ctx.saved_tensors
+        rtol_val, vector = ctx.options
+        if torch.is_grad_enabled():
+            P = Pinv.apply(A, None, A.new_full((), rtol_val), False)
+        else:
+            P = (Vh.mH * S_inv.unsqueeze(-2)) @ U.mH
+        g_sol_mat = g_sol.unsqueeze(-1) if vector else g_sol
+        gA = None
+        if ctx.needs_input_grad[0]:
+            B_mat = B.unsqueeze(-1) if vector else B
+            gA = _pinv_backward(A, P, g_sol_mat @ B_mat.mH).sum_to_size(A.shape)
+        gB = None
+        if ctx.needs_input_grad[1]:
+            gB = P.mH @ g_sol_mat
+            gB = (gB.squeeze(-1) if vector else gB).sum_to_size(B.shape)
+        return gA, gB, None, None, None, None, None, None, None, None, None
+
+
+def install_lstsq(device_type):
+    """``linalg.lstsq`` on ``device_type`` via ``pinv`` for full-rank inputs (else declines). Returns an undo."""
+    op = aten.linalg_lstsq.default
+    takes = _lstsq_takes(device_type)
+
+    def autograd_kernel(*args, **kwargs):
+        if takes(*args, **kwargs):
+            A, B, rcond, driver = _bind(op, args, kwargs)
+            res = _lstsq_eval(A, B, rcond, driver)
+            if res is not None:
+                count("lstsq")
+                if torch.is_grad_enabled() and (A.requires_grad or B.requires_grad):
+                    return _Lstsq.apply(A, B, *res)
+                sol, _, _, _, residuals, rank_out, sv_out, _, _ = res
+                return sol, residuals, rank_out, sv_out
+        return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
+
+    def backend_kernel(*args, **kwargs):
+        if takes(*args, **kwargs):
+            A, B, rcond, driver = _bind(op, args, kwargs)
+            res = _lstsq_eval(A, B, rcond, driver)
+            if res is not None:
+                count("lstsq")
+                sol, _, _, _, residuals, rank_out, sv_out, _, _ = res
+                return sol, residuals, rank_out, sv_out
+        return _on_cpu(op, args, kwargs)
+
+    entries = [(op, "Autograd{}", autograd_kernel)]
+    if device_type != "cpu":
+        entries.append((op, "{}", backend_kernel))
+    return register_kernels(device_type, entries)
+
+
+def install_matrix_rank(device_type):
+    """``linalg.matrix_rank`` (``hermitian=False``) on ``device_type`` via ``Svd`` without float64 promotion.
+    Returns an undo."""
+    svd_takes = _svd_takes(device_type, name="svd")
+
+    def make_float(op):
+        def run(A, tol):
+            count("svd")
+            S = Svd.compute(A.detach(), False, False, sort=False, flush=False)[1]
+            return (S > tol).sum(-1, dtype=torch.int64)
+
+        def kernel(*args, **kwargs):
+            A, tol, hermitian = _bind(op, args, kwargs)
+            if not hermitian and svd_takes(A):
+                return run(A, tol)
+            return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
+
+        def backend(*args, **kwargs):
+            A, tol, hermitian = _bind(op, args, kwargs)
+            if not hermitian and svd_takes(A):
+                return run(A, tol)
+            return _on_cpu(op, args, kwargs)
+
+        return kernel, backend
+
+    def make_tol_tensor(op):
+        def takes(A, tol, hermitian=False):
+            return not hermitian and svd_takes(A) and _tol_tensor_ok(tol, A.shape[:-2])
+
+        def run(A, tol):
+            count("svd")
+            S = Svd.compute(A.detach(), False, False, sort=False, flush=False)[1]
+            t = tol.to(device=S.device, dtype=S.dtype).unsqueeze(-1)
+            return (S > t).sum(-1, dtype=torch.int64)
+
+        def kernel(*args, **kwargs):
+            A, tol, hermitian = _bind(op, args, kwargs)
+            if takes(A, tol, hermitian):
+                return run(A, tol)
+            return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
+
+        def backend(*args, **kwargs):
+            A, tol, hermitian = _bind(op, args, kwargs)
+            if takes(A, tol, hermitian):
+                return run(A, tol)
+            return _on_cpu(op, args, kwargs)
+
+        return kernel, backend
+
+    def make_atol_rtol_tensor(op):
+        def takes(A, atol=None, rtol=None, hermitian=False):
+            if hermitian or not svd_takes(A):
+                return False
+            return all(t is None or _tol_tensor_ok(t, A.shape[:-2]) for t in (atol, rtol))
+
+        def run(A, atol, rtol):
+            count("svd")
+            S = Svd.compute(A.detach(), False, False, sort=False, flush=False)[1]
+            tol = _pinv_tol(S, A.shape[-2], A.shape[-1], atol, rtol)
+            return (S > tol).sum(-1, dtype=torch.int64)
+
+        def kernel(*args, **kwargs):
+            A, atol, rtol, hermitian = _bind(op, args, kwargs)
+            if takes(A, atol, rtol, hermitian):
+                return run(A, atol, rtol)
+            return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
+
+        def backend(*args, **kwargs):
+            A, atol, rtol, hermitian = _bind(op, args, kwargs)
+            if takes(A, atol, rtol, hermitian):
+                return run(A, atol, rtol)
+            return _on_cpu(op, args, kwargs)
+
+        return kernel, backend
+
+    def make_atol_rtol_float(op):
+        def run(A, atol, rtol):
+            count("svd")
+            S = Svd.compute(A.detach(), False, False, sort=False, flush=False)[1]
+            tol = _pinv_tol_scalar(S, A.shape[-2], A.shape[-1], atol, rtol)
+            return (S > tol).sum(-1, dtype=torch.int64)
+
+        def kernel(*args, **kwargs):
+            A, atol, rtol, hermitian = _bind(op, args, kwargs)
+            if not hermitian and svd_takes(A):
+                return run(A, atol, rtol)
+            return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
+
+        def backend(*args, **kwargs):
+            A, atol, rtol, hermitian = _bind(op, args, kwargs)
+            if not hermitian and svd_takes(A):
+                return run(A, atol, rtol)
+            return _on_cpu(op, args, kwargs)
+
+        return kernel, backend
+
+    entries = []
+    for op, maker in ((aten.linalg_matrix_rank.default, make_float),
+                      (aten.linalg_matrix_rank.tol_tensor, make_tol_tensor),
+                      (aten.linalg_matrix_rank.atol_rtol_tensor, make_atol_rtol_tensor),
+                      (aten.linalg_matrix_rank.atol_rtol_float, make_atol_rtol_float)):
+        ag, be = maker(op)
+        entries.append((op, "Autograd{}", ag))
+        if device_type != "cpu":
+            entries.append((op, "{}", be))
     return register_kernels(device_type, entries)

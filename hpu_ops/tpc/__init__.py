@@ -48,9 +48,31 @@ static habana::PartialOutputMetaDataVector inv_meta(const at::Stack& inputs) {
           habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
           habana::PartialOutputMetaData{a.scalar_type(), {batch, 2}}};
 }
+static habana::PartialOutputMetaDataVector svd_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto b = a.size(0), n = a.size(1), m = a.size(2);
+  return {habana::PartialOutputMetaData{a.scalar_type(), {b, n, m}},
+          habana::PartialOutputMetaData{a.scalar_type(), {b, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {b, n, n}}};
+}
+static habana::PartialOutputMetaDataVector svd_full_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto b = a.size(0), n = a.size(1), m = a.size(2);
+  return {habana::PartialOutputMetaData{a.scalar_type(), {b, m, m}},
+          habana::PartialOutputMetaData{a.scalar_type(), {b, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {b, n, n}}};
+}
+static habana::PartialOutputMetaDataVector svdvals_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1)}}};
+}
 static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", solve_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", inv_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_svd", "jacobi_svd_f32_gaudi2", svd_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_svd_full", "jacobi_svd_full_f32_gaudi2", svd_full_meta,
+                                          nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_svdvals", "jacobi_svdvals_f32_gaudi2", svdvals_meta, nullptr);
   return true;
 }();
 
@@ -66,17 +88,55 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto out = desc.execute(inputs);
   return {out[0], out[1], out[2]};
 }
+std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_svd");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd_full(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_svd_full");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+at::Tensor jacobi_svdvals(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_svdvals");
+  auto out = desc.execute(inputs);
+  return out[0];
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_svdvals(Tensor a) -> Tensor");
 }
-TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) { m.impl("gj_solve", gj_solve); m.impl("gj_inv", gj_inv); }
+TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
+  m.impl("gj_solve", gj_solve);
+  m.impl("gj_inv", gj_inv);
+  m.impl("jacobi_svd", jacobi_svd);
+  m.impl("jacobi_svd_full", jacobi_svd_full);
+  m.impl("jacobi_svdvals", jacobi_svdvals);
+}
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
     return std::make_tuple(b.new_empty(b.sizes()), b.new_empty({a.size(0), a.size(1)}), b.new_empty({a.size(0), 2}));
   });
   m.impl("gj_inv", [](at::Tensor a) {
     return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), a.size(1)}), a.new_empty({a.size(0), 2}));
+  });
+  m.impl("jacobi_svd", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(1), m = a.size(2);
+    return std::make_tuple(a.new_empty({b, n, m}), a.new_empty({b, n}), a.new_empty({b, n, n}));
+  });
+  m.impl("jacobi_svd_full", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(1), m = a.size(2);
+    return std::make_tuple(a.new_empty({b, m, m}), a.new_empty({b, n}), a.new_empty({b, n, n}));
+  });
+  m.impl("jacobi_svdvals", [](at::Tensor a) {
+    return a.new_empty({a.size(0), a.size(1)});
   });
 }
 """
@@ -91,6 +151,14 @@ static auto dshape = [](const at::Stack& s) {
   return std::vector<int64_t>{a.size(0), a.size(1)};
 };
 static auto sshape = [](const at::Stack& s) { return std::vector<int64_t>{s[0].toTensor().size(0), 2}; };
+static auto vhshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  return std::vector<int64_t>{a.size(0), a.size(1), a.size(1)};
+};
+static auto utfullshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  return std::vector<int64_t>{a.size(0), a.size(2), a.size(2)};
+};
 
 static bool registered_solve = [] {
   std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
@@ -109,6 +177,28 @@ static bool registered_inv = [] {
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", in, out, nullptr);
   return true;
 }();
+static bool registered_svd = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_a},
+                                                 {1, c10::ScalarType::Float, dshape},
+                                                 {2, c10::ScalarType::Float, vhshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_svd", "jacobi_svd_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static bool registered_svd_full = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, utfullshape},
+                                                 {1, c10::ScalarType::Float, dshape},
+                                                 {2, c10::ScalarType::Float, vhshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_svd_full", "jacobi_svd_full_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static bool registered_svdvals = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, dshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_svdvals", "jacobi_svdvals_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor b) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_solve");
@@ -122,11 +212,38 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto out = op.execute(inputs);
   return {out[0], out[1], out[2]};
 }
+std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_svd");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd_full(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_svd_full");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+at::Tensor jacobi_svdvals(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_svdvals");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return out[0];
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_svdvals(Tensor a) -> Tensor");
 }
-TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) { m.impl("gj_solve", gj_solve); m.impl("gj_inv", gj_inv); }
+TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
+  m.impl("gj_solve", gj_solve);
+  m.impl("gj_inv", gj_inv);
+  m.impl("jacobi_svd", jacobi_svd);
+  m.impl("jacobi_svd_full", jacobi_svd_full);
+  m.impl("jacobi_svdvals", jacobi_svdvals);
+}
 """
 
 
@@ -215,6 +332,24 @@ def _inv_op():
     return torch.ops.linalg_tpc.gj_inv
 
 
+def _svd_op():
+    """``torch.ops.linalg_tpc.jacobi_svd``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_svd
+
+
+def _svd_full_op():
+    """``torch.ops.linalg_tpc.jacobi_svd_full``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_svd_full
+
+
+def _svdvals_op():
+    """``torch.ops.linalg_tpc.jacobi_svdvals``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_svdvals
+
+
 # Lazy mode on bridge 1.21.4 can drop the unused outputs of a multi-output custom op (the callers use some of X, D and
 # S), and the next graph then fails at mark_step with "ValidateSyncInputTensors tensor_data is empty". A mark_step
 # before and after each call keeps the op alone in its graph. The cost is two graph boundaries per call; eager mode
@@ -283,3 +418,185 @@ def gj_solve_reference(A, B):
     D = torch.diagonal(LU, dim1=-2, dim2=-1)
     S = torch.stack([linalg._parity(pivots).to(A.dtype), linalg.lu_info_of_diagonal(D).to(A.dtype)], -1)
     return X, D, S
+
+
+def _check_svd(A):
+    if A.dim() < 2 or A.shape[-2] > MAXN or A.shape[-1] > MAXN:
+        raise ValueError(f"hpu_ops.tpc takes 2D+ A with m, n <= {MAXN}, got {tuple(A.shape)}")
+
+
+def jacobi_svd(A, full_matrices=False, sort=True, flush=True):
+    """SVD ``(U, S, Vh)`` for ``A[..., m, n]`` (float32, m, n <= ``MAXN``) from the Gaudi2 one-sided Jacobi kernel."""
+    _check_svd(A)
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k = min(m, n)
+    full = full_matrices and m != n
+    if A.numel() == 0:
+        return (A.new_empty(*batch, m, m if full else k, dtype=torch.float32),
+                A.new_empty(*batch, k, dtype=torch.float32),
+                A.new_empty(*batch, n if full else k, n, dtype=torch.float32))
+    swap = m < n or (m == n and A.is_contiguous())
+    big = max(m, n)
+    A_t = (A if swap else A.mT).reshape(-1, k, big).to(torch.float32).contiguous()
+    op = _svd_full_op() if full else _svd_op()
+    Ut, S, Vh = _call(op, A_t) if flush else op(A_t)
+    if swap:
+        U, Vh = Vh.mT.reshape(*batch, m, k), Ut.reshape(*batch, n if full else k, n)
+    else:
+        U, Vh = Ut.mT.reshape(*batch, m, m if full else k), Vh.reshape(*batch, k, n)
+    S = S.reshape(*batch, k)
+    if not sort:
+        return U, S, Vh
+    S, order = S.sort(-1, descending=True)
+    if full:
+        full_order = torch.cat([order, torch.arange(k, big, device=order.device).expand(*batch, big - k)], -1)
+        u_ord, v_ord = (order, full_order) if swap else (full_order, order)
+    else:
+        u_ord = v_ord = order
+    return U.gather(-1, u_ord[..., None, :].expand_as(U)), S, Vh.gather(-2, v_ord[..., :, None].expand_as(Vh))
+
+
+def jacobi_svdvals(A, sort=True, flush=True):
+    """Singular values ``S`` for ``A[..., m, n]`` (float32, m, n <= ``MAXN``) from ``-DNO_UV``."""
+    _check_svd(A)
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k = min(m, n)
+    if A.numel() == 0:
+        return A.new_empty(*batch, k, dtype=torch.float32)
+    no_t = m < n or (m == n and A.is_contiguous())
+    A_t = (A if no_t else A.mT).reshape(-1, k, max(m, n)).to(torch.float32).contiguous()
+    S = (_call(_svdvals_op(), A_t) if flush else _svdvals_op()(A_t)).reshape(*batch, k)
+    return S.sort(-1, descending=True).values if sort else S
+
+
+def svd_reference(A, compute_uv=True, full_matrices=False):
+    """``jacobi_svd`` / ``jacobi_svdvals`` in plain torch, matching the kernel contract (1/sigma scaling, MGS
+    completion for zero/degenerate columns, optional full orthogonal extension, descending ``S``). For the CPU tests."""
+    _check_svd(A)
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k = min(m, n)
+    full = full_matrices and m != n
+    if A.numel() == 0:
+        S = A.new_empty(*batch, k)
+        if not compute_uv:
+            return A.new_empty(0), S, A.new_empty(0)
+        return A.new_empty(*batch, m, m if full else k), S, A.new_empty(*batch, n if full else k, n)
+
+    swap = m < n
+    big = max(m, n)
+    W = (A if swap else A.mT).reshape(-1, k, big).clone()
+    b = W.shape[0]
+    sigma = W.abs().amax((-2, -1), keepdim=True)
+    safe_sigma = torch.where(sigma == 0, 1.0, sigma)
+    W = W / safe_sigma
+    V = torch.eye(k, dtype=A.dtype, device=A.device).expand(b, k, k).clone() if compute_uv else None
+
+    if k > 1:
+        k_even = (k + 1) & ~1
+        rr_m = k_even - 1
+        rounds = []
+        for r in range(rr_m):
+            ps, qs = [], []
+            for j in range(k & 1, k_even >> 1):
+                if j == 0:
+                    p, q = r, rr_m
+                else:
+                    p, q = (r + j) % rr_m, (r - j) % rr_m
+                    if p > q:
+                        p, q = q, p
+                ps.append(p)
+                qs.append(q)
+            rounds.append((torch.tensor(ps, device=A.device), torch.tensor(qs, device=A.device)))
+        sweeps = 6 if k <= 4 else 10 if k <= 16 else 12
+        tol_scale = 1e-30 if A.dtype == torch.float64 else 1e-14
+        for _ in range(sweeps):
+            for ps, qs in rounds:
+                wp, wq = W[:, ps], W[:, qs]
+                alpha = (wp * wp).sum(-1)
+                beta = (wq * wq).sum(-1)
+                gamma = (wp * wq).sum(-1)
+                d = beta - alpha
+                g2 = 2.0 * gamma
+                r = torch.hypot(d, g2)
+                skip = (gamma == 0) | (r == 0) | (gamma * gamma <= tol_scale * alpha * beta)
+                sr = torch.where(skip, 1.0, r)
+                c2 = 0.5 * (1.0 + d.abs() / sr)
+                c = torch.where(skip, 1.0, c2.sqrt())
+                s = torch.where(skip, 0.0, torch.where(d < 0, -1.0, 1.0) * 0.5 * g2 / (sr * torch.where(skip, 1.0, c)))
+                c_, s_ = c.unsqueeze(-1), s.unsqueeze(-1)
+                W[:, ps], W[:, qs] = c_ * wp - s_ * wq, s_ * wp + c_ * wq
+                if compute_uv:
+                    vp, vq = V[:, ps], V[:, qs]
+                    V[:, ps], V[:, qs] = c_ * vp - s_ * vq, s_ * vp + c_ * vq
+
+    sq = (W * W).sum(-1)
+    norm = sq.sqrt()
+    S = norm * safe_sigma.squeeze(-1)
+    S = torch.where(sigma.squeeze(-1) == 0, 0.0, S)
+    if not compute_uv:
+        return A.new_empty(0), S.reshape(*batch, k).sort(-1, descending=True).values, A.new_empty(0)
+
+    thresh = torch.clamp(1e-10 * sq.amax(-1, keepdim=True), min=1e-36)
+    U_t = W / torch.where(norm.unsqueeze(-1) > 0, norm.unsqueeze(-1), 1.0)
+    bad_mask = sq < thresh
+    if bad_mask.any():
+        for bi in range(b):
+            if not bad_mask[bi].any():
+                continue
+            done = [j for j in range(k) if not bad_mask[bi, j]]
+            for j in range(k):
+                if not bad_mask[bi, j]:
+                    continue
+                accepted = False
+                if norm[bi, j] > 0:
+                    cand = U_t[bi, j].clone()
+                    for _ in range(2):
+                        for d_idx in done:
+                            cand = cand - (cand @ U_t[bi, d_idx]) * U_t[bi, d_idx]
+                    cn = cand.norm()
+                    if cn > 0.5:
+                        U_t[bi, j] = cand / cn
+                        done.append(j)
+                        accepted = True
+                if not accepted:
+                    for e in range(big):
+                        cand = torch.zeros(big, dtype=A.dtype, device=A.device)
+                        cand[e] = 1.0
+                        for _ in range(2):
+                            for d_idx in done:
+                                cand = cand - (cand @ U_t[bi, d_idx]) * U_t[bi, d_idx]
+                        cn = cand.norm()
+                        if cn > 1e-2:
+                            U_t[bi, j] = cand / cn
+                            done.append(j)
+                            break
+
+    if full:
+        U_full = torch.empty(b, big, big, dtype=A.dtype, device=A.device)
+        U_full[:, :k] = U_t
+        for bi in range(b):
+            diag_p = 1.0 - (U_full[bi, :k] * U_full[bi, :k]).sum(0)
+            for j in range(k, big):
+                e = int(diag_p.argmax())
+                cand = torch.zeros(big, dtype=A.dtype, device=A.device)
+                cand[e] = 1.0
+                for _ in range(2):
+                    for prev in range(j):
+                        uk = U_full[bi, prev]
+                        cand = cand - (cand @ uk) * uk
+                cand = cand / cand.norm().clamp(min=1e-36)
+                U_full[bi, j] = cand
+                diag_p = diag_p - cand * cand
+        U_t = U_full
+
+    if swap:
+        U, Vh = V.mT.reshape(*batch, m, k), U_t.reshape(*batch, n if full else k, n)
+    else:
+        U, Vh = U_t.mT.reshape(*batch, m, m if full else k), V.reshape(*batch, k, n)
+    S, order = S.reshape(*batch, k).sort(-1, descending=True)
+    if full:
+        full_order = torch.cat([order, torch.arange(k, big, device=order.device).expand(*batch, big - k)], -1)
+        u_ord, v_ord = (order, full_order) if swap else (full_order, order)
+    else:
+        u_ord = v_ord = order
+    return U.gather(-1, u_ord[..., None, :].expand_as(U)), S, Vh.gather(-2, v_ord[..., :, None].expand_as(Vh))

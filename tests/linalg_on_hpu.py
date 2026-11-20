@@ -136,6 +136,8 @@ def rel_err(got, ref):
     got, ref = got.detach().cpu().double(), ref.detach().double()
     if got.shape != ref.shape:
         return math.inf
+    if got.numel() == 0:
+        return 0.0
     scale = float(ref.abs().max())
     e = float((got - ref).abs().max()) / (scale if scale > 0 else 1.0)
     return math.inf if math.isnan(e) else e
@@ -163,6 +165,23 @@ def err_qr(out, ref, ins):
     return rel_err(Q @ R, ins[0]), []
 
 
+def err_svd(out, ref, ins):
+    U, S, Vh = (o.detach().cpu().double() for o in out)
+    k = S.shape[-1]
+    Uk, Vhk = U[..., :k], Vh[..., :k, :]
+    rec_err = rel_err((Uk * S.unsqueeze(-2)) @ Vhk, ins[0])
+    s_err = rel_err(S, ref[1])
+    eye_u = torch.eye(U.shape[-1], dtype=torch.float64).expand(*U.shape[:-2], U.shape[-1], U.shape[-1])
+    eye_v = torch.eye(Vh.shape[-2], dtype=torch.float64).expand(*Vh.shape[:-2], Vh.shape[-2], Vh.shape[-2])
+    u_orth = rel_err(U.mT @ U, eye_u)
+    v_orth = rel_err(Vh @ Vh.mT, eye_v)
+    return max(s_err, rec_err, u_orth, v_orth), []
+
+
+def err_lstsq(out, ref, ins):
+    return rel_err(out[0], ref[0]), []
+
+
 def loss_sum(out):
     return sum(o.sum() for o in out if o.requires_grad)
 
@@ -182,6 +201,28 @@ def loss_qr(out):
     them."""
     Q, R = out
     return (Q @ R).sum() + R.abs().sum()
+
+
+def loss_svd(out):
+    U, S, Vh = out
+    k = S.shape[-1]
+    return S.sum() + ((U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :]).sum()
+
+
+def loss_lstsq(out):
+    return out[0].sum()
+
+
+def make_rect_tall(b, n, dtype):
+    return [torch.randn(b, n + 8, n, dtype=dtype)]
+
+
+def make_rect_wide(b, n, dtype):
+    return [torch.randn(b, n, n + 8, dtype=dtype)]
+
+
+def make_lstsq(b, n, dtype):
+    return [torch.randn(b, n + 6, n, dtype=dtype), torch.randn(b, n + 6, 3, dtype=dtype)]
 
 
 class Case(NamedTuple):
@@ -210,6 +251,19 @@ CASES = (
     Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False),
     # factor 20: the forward is Habana's native qr, not an hpu_ops kernel (measured 10.2x at n=16)
     Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20),
+    Case("linalg.svd", make_general, lambda x: L.svd(x, full_matrices=False), err_svd, loss_svd, tpc=True),
+    Case("linalg.svd_tall", make_rect_tall, lambda x: L.svd(x, full_matrices=False), err_svd, loss_svd, tpc=True),
+    Case("linalg.svd_tall_full", make_rect_tall, lambda x: L.svd(x, full_matrices=True), err_svd, loss_svd, tpc=True),
+    Case("linalg.svd_wide", make_rect_wide, lambda x: L.svd(x, full_matrices=False), err_svd, loss_svd, tpc=True),
+    Case("linalg.svd_wide_full", make_rect_wide, lambda x: L.svd(x, full_matrices=True), err_svd, loss_svd, tpc=True),
+    Case("linalg.svdvals", make_general, lambda x: L.svdvals(x), tpc=True),
+    Case("linalg.pinv", make_general, lambda x: L.pinv(x), tpc=True),
+    Case("linalg.lstsq", make_lstsq, lambda a, b: L.lstsq(a, b), err_lstsq, loss_lstsq, tpc=True),
+    Case("linalg.matrix_norm_2", make_general, lambda x: L.matrix_norm(x, ord=2), tpc=True),
+    Case("linalg.matrix_norm_neg2", make_general, lambda x: L.matrix_norm(x, ord=-2), tpc=True),
+    # matrix_norm_nuc sums S on HPU at float32 precision after _linalg_svd declines float64 (~6.7e-8 vs CPU f64)
+    Case("linalg.matrix_norm_nuc", make_general, lambda x: L.matrix_norm(x, ord="nuc"), float64=False, tpc=True),
+    Case("linalg.matrix_rank", make_general, lambda x: L.matrix_rank(x), err_all, None, tpc=True),
 )
 
 
@@ -231,16 +285,24 @@ def cpu_warnings(rec, allow=None):
     return [m for _, m in rec["caught"] if CPU_TEXT in m and not (allow and allow in m)]
 
 
+TIMED_CALLS = 20
+
+
 def forward(case, h_in):
-    """The first call (the warm-up) and five timed calls, synced. Returns the first output and the ms per call."""
+    """The first call (the warm-up) and TIMED_CALLS synced calls, keeping outputs alive."""
     with watch() as rec:
         out = as_tensors(case.fn(*h_in))
         sync()
         t = time.perf_counter()
-        for _ in range(5):
-            case.fn(*h_in)
-        sync()
-        ms = (time.perf_counter() - t) / 5 * 1e3
+        outs = []
+        for _ in range(TIMED_CALLS):
+            outs.append(case.fn(*h_in))
+            if LAZY:
+                sync()
+        if not LAZY:
+            sync()
+        ms = (time.perf_counter() - t) / TIMED_CALLS * 1e3
+        del outs
     return out, ms, rec
 
 
@@ -432,6 +494,89 @@ def probe_argsort_int64():
     return not problems
 
 
+def run_svd_edges():
+    """Edge cases for Issue #9 SVD family: zeros, cond=1e4, rank-1, repeated spectrum, no_grad svdvals, declines."""
+    out_results = []
+
+    def check(label, fn, cpu_in, err_fn=err_all, grad_fn=None, expect_fb=False):
+        row = {"op": f"svd_edge.{label}", "n": SINGULAR_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY}
+        problems = []
+        try:
+            ref_in = [x.double() for x in cpu_in]
+            ref = as_tensors(fn(*ref_in))
+            with watch() as rec:
+                got = as_tensors(fn(*(x.to(HPU) for x in cpu_in)))
+                sync()
+            row["fwd_fallback"] = rec["fallback"]
+            e, notes = err_fn(got, ref, ref_in)
+            e32, _ = err_fn(as_tensors(fn(*cpu_in)), ref, ref_in)
+            row["max_rel_err"], row["err_cpu32"] = e, e32
+            problems += notes + over_bar("error", e, e32)
+            if not expect_fb:
+                problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+            if grad_fn is not None:
+                xs = [x.to(HPU).detach().requires_grad_() for x in cpu_in]
+                loss = grad_fn(as_tensors(fn(*xs)))
+                sync()
+                with watch() as brec:
+                    loss.backward()
+                    sync()
+                row["bwd_fallback"] = brec["fallback"]
+                for x in xs:
+                    if not torch.isfinite(x.grad).all():
+                        problems.append("non-finite grad")
+                if not expect_fb:
+                    problems += ["bwd fell back"] * bool(brec["fallback"]) + cpu_warnings(brec)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"exception {e!r}"[:300])
+        emit(**row, status="fail" if problems else "ok", problems=problems)
+        out_results.append(not problems)
+
+    n = SINGULAR_N
+    zeros = [torch.zeros(BATCH, n, n)]
+    check("zeros_svd", lambda x: L.svd(x, full_matrices=False), zeros, err_svd)
+    check("zeros_svdvals", lambda x: L.svdvals(x), zeros, grad_fn=loss_sum)
+
+    q1, _ = L.qr(torch.randn(BATCH, n, n))
+    q2, _ = L.qr(torch.randn(BATCH, n, n))
+    s_cond = torch.logspace(0, -4, n).expand(BATCH, n)
+    cond1e4 = [(q1 * s_cond.unsqueeze(-2)) @ q2.mT]
+    check("cond1e4_svd", lambda x: L.svd(x, full_matrices=False), cond1e4, err_svd, grad_fn=loss_svd)
+
+    u1 = torch.randn(BATCH, n, 1)
+    v1 = torch.randn(BATCH, 1, n)
+    rank1 = [u1 @ v1]
+    check("rank1_svd", lambda x: L.svd(x, full_matrices=False), rank1, err_svd)
+    check("rank1_pinv", lambda x: L.pinv(x, atol=1e-3, rtol=1e-3), rank1)
+    check("rank1_matrix_rank", lambda x: L.matrix_rank(x, atol=1e-3, rtol=1e-3), rank1)
+
+    rep_vals = torch.tensor([3.0, 3.0] + [1.0] * (n - 2))
+    rep = [torch.diag_embed(rep_vals.expand(BATCH, n))]
+    check("repeated_svdvals", lambda x: L.svdvals(x), rep, grad_fn=loss_sum)
+
+    with torch.no_grad():
+        check("svdvals_no_grad", lambda x: L.svdvals(x), [general(BATCH, n, torch.float32)])
+
+    # Declines (expected fallback, must run cleanly without error)
+    check("decline_pinv_hermitian", lambda x: L.pinv(x, hermitian=True), [spd(BATCH, n, torch.float32, "cpu")],
+          expect_fb=True)
+    check("decline_matrix_rank_hermitian", lambda x: L.matrix_rank(x, hermitian=True),
+          [spd(BATCH, n, torch.float32, "cpu")], expect_fb=True)
+    check("decline_lstsq_rank_deficient", lambda a, b: L.lstsq(a, b),
+          [rank1[0], torch.randn(BATCH, n, 3)], err_lstsq, expect_fb=True)
+
+    def svd_out_decline(x):
+        u = torch.zeros(BATCH, 4, 4, device=x.device, dtype=x.dtype)
+        s = torch.zeros(BATCH, 4, device=x.device, dtype=x.dtype)
+        vh = torch.zeros(BATCH, 4, 34, device=x.device, dtype=x.dtype)
+        L.svd(x, full_matrices=False, out=(u, s, vh))
+        return u, s, vh
+
+    check("decline_svd_out_big_n", svd_out_decline, [torch.randn(BATCH, 4, 34, dtype=torch.float32)], err_svd,
+          expect_fb=True)
+    return out_results
+
+
 def main():
     global BASELINE, EIGH_STRICT, ops_linalg, tpc_maxn
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -439,6 +584,7 @@ def main():
     parser.add_argument("--with-eigh", action="store_true",
                         help="install hpu_ops.eigh.install_eigh and check eigh and eigvalsh strictly "
                              "(n <= 22 in lazy mode)")
+    parser.add_argument("--only", action="append", default=[], help="only run cases whose name contains this substring")
     args = parser.parse_args()
     BASELINE = args.baseline
     import hpu_ops
@@ -459,17 +605,19 @@ def main():
         except ImportError:
             complex_state = "not found"
     print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), "hpu_complex", complex_state, "baseline",
-          BASELINE, "lazy", LAZY, flush=True)
-    results = [probe_argmax_ties(), probe_argsort_int64()]
-    for case in CASES:
+          BASELINE, "lazy", LAZY, "bridge 1.21.4", flush=True)
+    results = [probe_argmax_ties(), probe_argsort_int64()] if not args.only else []
+    cases = [c for c in CASES if not args.only or any(s in c.name for s in args.only)]
+    for case in cases:
         sizes = [n for n in SIZES if n <= 22] if case.opt_in and EIGH_STRICT and LAZY else SIZES  # n=64: device error
         results += [run_case(case, n) for n in sizes]
         if case.float64:
             results.append(run_float64(case))
-    if not BASELINE:
+    if not BASELINE and not args.only:
         for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
             results.append(run_singular(op, fn))
-    if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
+        results += run_svd_edges()
+    if BASELINE and not args.only:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
         ok = bool(EIGH_FALLBACKS)
         emit(op="metric_check", lazy=LAZY, baseline=True, status="ok" if ok else "error",
              problems=[] if ok else ["no cpu_fallback delta for eigh under --baseline: the metric key is wrong"])

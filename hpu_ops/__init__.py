@@ -62,7 +62,8 @@ BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_grou
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
          composite.install_roll, linalg.install_solve_triangular, linalg.install_cholesky_solve,
-         linalg.install_solve, linalg.install_inv_det, serialization.install)
+         linalg.install_solve, linalg.install_inv_det, linalg.install_svd, linalg.install_pinv,
+         linalg.install_lstsq, linalg.install_matrix_rank, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
