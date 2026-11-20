@@ -10,7 +10,7 @@
  *
  * Pass 2 (-DREFINE_PASS, jacobi_eigh_refine_f32_gaudi2): takes A and Pass-1 eigenvector rows V1 as read-only inputs,
  * forms T = V1^T (A * prescale) V1 in u[0..n-1], computes T's Gershgorin lower bound g_min / sigma_T, applies an
- * adaptive shift (0 when g_norm > 1e-4, else max(0, 0.01 - g_norm)), runs 2/4 refinement sweeps to get U2, composes
+ * adaptive shift max(0, 0.01 - g_norm), runs 2/4 refinement sweeps to get U2, composes
  * V = V1 @ U2, renormalizes, and computes Rayleigh quotient W[j] = v_j^T (A * prescale) v_j * inv_prescale.
  */
 #define MAXN 32  // u[32] = 8 KB of 16 KB LUT-mode VLM, leaving 8 KB for register spills
@@ -335,10 +335,10 @@ void main(tensor A, tensor W, tensor V)
         // Per-half branchless overflow/subnormal prescaling from max_abs
         float64 prescale = v_f32_sel_grt_f32_b(max_abs, 1e33f, 0x1p-20f, 1.0f);
         float64 inv_prescale = v_f32_sel_grt_f32_b(max_abs, 1e33f, 0x1p+20f, 1.0f);
-        float64 sub_prescale = v_f32_sel_eq_f32_b(max_abs, 0.0f, prescale, 0x1p+20f);
-        float64 sub_inv_prescale = v_f32_sel_eq_f32_b(max_abs, 0.0f, inv_prescale, 0x1p-20f);
-        prescale = v_f32_sel_less_f32_b(max_abs, 1e-35f, sub_prescale, prescale);
-        inv_prescale = v_f32_sel_less_f32_b(max_abs, 1e-35f, sub_inv_prescale, inv_prescale);
+        float64 sub_prescale = v_f32_sel_eq_f32_b(max_abs, 0.0f, prescale, 0x1p+40f);
+        float64 sub_inv_prescale = v_f32_sel_eq_f32_b(max_abs, 0.0f, inv_prescale, 0x1p-40f);
+        prescale = v_f32_sel_less_f32_b(max_abs, 1e-20f, sub_prescale, prescale);
+        inv_prescale = v_f32_sel_less_f32_b(max_abs, 1e-20f, sub_inv_prescale, inv_prescale);
 
 #ifdef REFINE_PASS
         // Form T = V1^T (A * prescale) V1 directly into u[0..n-1] in 8-column VRF blocks
@@ -481,8 +481,7 @@ void main(tensor A, tensor W, tensor V)
         float64 inv_sigma = v_reciprocal_f32(safe_sigma);
         inv_sigma = v_f32_mul_b(inv_sigma, v_f32_sub_b(2.0f, v_f32_mul_b(safe_sigma, inv_sigma)));
         float64 g_norm = v_f32_mul_b(g_min, inv_sigma);
-        float64 min_shift = v_f32_max_b(0.0f, v_f32_sub_b(0.01f, g_norm));
-        float64 shift_norm = v_f32_sel_grt_f32_b(g_norm, 1e-4f, 0.0f, min_shift);
+        float64 shift_norm = v_f32_max_b(0.0f, v_f32_sub_b(0.01f, g_norm));
         for (int i = 0; i < n; i++)
         {
             float64 row = v_f32_mul_b(u[i], inv_sigma);
