@@ -444,10 +444,17 @@ def _flush():
     htcore.mark_step()
 
 
+# Measured on Gaudi2, bridge 1.21.4, lazy mode (repro/lazy_custom_op_output_cpu.py): the output of a custom op read
+# with ``.cpu()`` and no ATen op after it comes back wrong (relative error about 1); one ATen op after it gives the
+# right values. So in lazy mode each output is cloned: a copy, no extra graph boundary.
 def _call(op, *args):
-    """``op(*args)`` after a lazy graph boundary (``mark_step`` before the op only)."""
+    """``op(*args)`` after a lazy graph boundary (``mark_step`` before the op only); in lazy mode the outputs are
+    copies, so an ATen node always follows the custom op."""
     _flush()
-    return op(*args)
+    out = op(*args)
+    if not _lazy():
+        return out
+    return tuple(t.clone() for t in out) if isinstance(out, tuple) else out.clone()
 
 
 def _fresh(t):

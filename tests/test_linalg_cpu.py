@@ -1231,6 +1231,24 @@ def test_tri_bad_shapes_raise_like_torch(tri_hook):
     assert tri_hook == []
 
 
+@pytest.mark.parametrize("lazy", ["1", "0"])
+def test_tpc_call_copies_outputs_in_lazy_mode(monkeypatch, lazy):
+    """Lazy mode: a custom op's output read with no ATen op after it is wrong on bridge 1.21.4, so _call clones."""
+    core = types.SimpleNamespace(mark_step=lambda: None)
+    torch_mod = types.SimpleNamespace(core=core)
+    hf = types.SimpleNamespace(torch=torch_mod)
+    for name, mod in (("habana_frameworks", hf), ("habana_frameworks.torch", torch_mod),
+                      ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", lazy)
+    x, y = torch.randn(3), torch.randn(2)
+    one = tpc._call(lambda: x)
+    pair = tpc._call(lambda: (x, y))
+    copied = lazy == "1"
+    assert (one is not x) is copied and torch.equal(one, x)
+    assert all((a is not b) is copied and torch.equal(a, b) for a, b in zip(pair, (x, y)))
+
+
 def test_tpc_call_skips_mark_step_while_compiling(monkeypatch):
     marks = []
     core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
