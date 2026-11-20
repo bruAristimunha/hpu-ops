@@ -872,7 +872,7 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
     return U.gather(-1, u_ord[..., None, :].expand_as(U)), S, Vh.gather(-2, v_ord[..., :, None].expand_as(Vh))
 
 
-def householder_product(A, tau, flush=False):
+def householder_product(A, tau, flush=True):
     """Householder product ``Q`` for ``A[..., m, n]`` and ``tau[..., k]`` (float32, m <= ``MAXHH``, m >= n >= k)."""
     if A.dim() < 2:
         raise ValueError(f"hpu_ops.tpc takes 2D+ A, got {tuple(A.shape)}")
@@ -913,7 +913,7 @@ def householder_product_reference(A, tau):
     return Q.reshape(*batch, m, n)
 
 
-def matrix_exp(A, flush=False):
+def matrix_exp(A, flush=True):
     """Matrix exponential ``exp(A)`` for ``A[..., n, n]`` (float32, n <= ``MAXN``) from the Gaudi2 TPC kernel."""
     n = A.shape[-1]
     _check(A, n)
@@ -926,7 +926,7 @@ def matrix_exp(A, flush=False):
     return Y.reshape(*batch, n, n)
 
 
-def matrix_exp_frechet(A, G, flush=False):
+def matrix_exp_frechet(A, G, flush=True):
     """Adjoint Fréchet derivative ``L_exp(A^T, G)`` for ``A, G[..., n, n]`` (float32, n <= ``MAXN``) on Gaudi2 TPC."""
     n = A.shape[-1]
     _check(A, n)

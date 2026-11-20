@@ -1028,6 +1028,26 @@ def test_tpc_svd_flushes_lazy_graph(monkeypatch, lazy, flushes):
     assert len(marks) == flushes
 
 
+@pytest.mark.parametrize("lazy, flushes", [("1", 1), ("0", 0)])
+def test_tpc_expm_and_householder_flush_before_the_op(monkeypatch, lazy, flushes):
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    torch_mod = types.SimpleNamespace(core=core)
+    for name, mod in (("habana_frameworks", types.SimpleNamespace(torch=torch_mod)),
+                      ("habana_frameworks.torch", torch_mod), ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", lazy)
+    monkeypatch.setattr(tpc, "_expm_op", lambda: torch.linalg.matrix_exp)
+    monkeypatch.setattr(tpc, "_expm_frechet_op", lambda: lambda a, g: g)
+    monkeypatch.setattr(tpc, "_hh_op", lambda: lambda a_t, t: a_t)
+    A = torch.randn(2, 4, 4)
+    for call in (lambda: tpc.matrix_exp(A), lambda: tpc.matrix_exp_frechet(A, A),
+                 lambda: tpc.householder_product(torch.randn(2, 5, 3), torch.randn(2, 3))):
+        marks.clear()
+        call()
+        assert len(marks) == flushes
+
+
 def test_svd_declined_past_maxn_and_without_kernel(monkeypatch, svd_hook):
     A = torch.randn(2, 4, 4)
     takes = linalg._svd_takes("hpu")

@@ -747,7 +747,7 @@ def install_svd(device_type):
         count("svd")
         if torch.is_grad_enabled() and A.requires_grad:
             return Svd.apply(A, False, True, None)[1]
-        return _run_svd(A.detach(), False, sort=True, flush=False)[1]
+        return _run_svd(A.detach(), False, sort=True)[1]
 
     def svdvals_ag(A, driver=None):
         if takes(A, driver=driver):
@@ -776,7 +776,7 @@ def install_svd(device_type):
         if torch.is_grad_enabled() and A_mat.requires_grad:
             S = Svd.apply(A_mat, False, True, None)[1]
         else:
-            S = _run_svd(A_mat.detach(), False, sort=False, flush=False)[1]
+            S = _run_svd(A_mat.detach(), False, sort=False)[1]
         out = S.amax(-1) if ord_ == 2 else S.amin(-1) if ord_ == -2 else S.sum(-1)
         if keepdim:
             out = out.unsqueeze(-1).unsqueeze(-1)
@@ -971,7 +971,7 @@ def install_matrix_rank(device_type):
     def make_float(op):
         def run(A, tol):
             count("svd")
-            S = Svd.compute(A.detach(), False, False, sort=False, flush=False)[1]
+            S = Svd.compute(A.detach(), False, False, sort=False)[1]
             return (S > tol).sum(-1, dtype=torch.int64)
 
         def kernel(*args, **kwargs):
@@ -994,7 +994,7 @@ def install_matrix_rank(device_type):
 
         def run(A, tol):
             count("svd")
-            S = Svd.compute(A.detach(), False, False, sort=False, flush=False)[1]
+            S = Svd.compute(A.detach(), False, False, sort=False)[1]
             t = tol.to(device=S.device, dtype=S.dtype).unsqueeze(-1)
             return (S > t).sum(-1, dtype=torch.int64)
 
@@ -1020,7 +1020,7 @@ def install_matrix_rank(device_type):
 
         def run(A, atol, rtol):
             count("svd")
-            S = Svd.compute(A.detach(), False, False, sort=False, flush=False)[1]
+            S = Svd.compute(A.detach(), False, False, sort=False)[1]
             tol = _pinv_tol(S, A.shape[-2], A.shape[-1], atol, rtol)
             return (S > tol).sum(-1, dtype=torch.int64)
 
@@ -1041,7 +1041,7 @@ def install_matrix_rank(device_type):
     def make_atol_rtol_float(op):
         def run(A, atol, rtol):
             count("svd")
-            S = Svd.compute(A.detach(), False, False, sort=False, flush=False)[1]
+            S = Svd.compute(A.detach(), False, False, sort=False)[1]
             tol = _pinv_tol_scalar(S, A.shape[-2], A.shape[-1], atol, rtol)
             return (S > tol).sum(-1, dtype=torch.int64)
 
@@ -1335,7 +1335,7 @@ class HouseholderProduct(torch.autograd.Function):
         tpc_ok = m <= tpc.MAXHH and (_HOUSEHOLDER is not None or (A.device.type == "hpu" and tpc.ready()))
         if _HH_FORWARD == "wy":
             return _compact_wy_forward(A, tau)
-        flush = _HH_FORWARD == "tpc"
+        flush = _HH_FORWARD != "tpc_noflush"  # lazy mode: mark_step before the TPC op (measured race otherwise)
         return _run_householder_tpc(A, tau, flush=flush) if tpc_ok else _compact_wy_forward(A, tau)
 
     @staticmethod
