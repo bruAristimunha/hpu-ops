@@ -1,7 +1,7 @@
 """Adversarial fuzz of hpu-ops' linalg rewrites (PR #23, the TPC path): every routed op against torch on the CPU.
 
     ../.venv-t26/bin/python tests/adversarial_linalg.py                  # CPU stands in for HPU (reference hooks)
-    HPU_OPS_TPC_EIGH=1 PT_HPU_LAZY_MODE=0|1 python3 tests/adversarial_linalg.py --hpu   # on a Gaudi2 card
+    PT_HPU_LAZY_MODE=0|1 python3 tests/adversarial_linalg.py --hpu   # on a Gaudi2 card
 
 Routed ops: linalg.solve / solve_ex, inv / inv_ex, det, slogdet (and logdet), solve_triangular, cholesky_solve,
 eigh, eigvalsh. CPU mode installs the rewrites with "cpu" in the role of "hpu" (``cpu_as_hpu``) and sets the
@@ -44,7 +44,6 @@ ARGS.add_argument("--verbose", action="store_true", help="print tracebacks of un
 OPTS = ARGS.parse_args()
 
 if OPTS.hpu:
-    os.environ.setdefault("HPU_OPS_TPC_EIGH", "1")  # asked for by the controller; hpu_ops does not read it
     import habana_frameworks.torch.core as htcore  # noqa: E402
 
 import torch  # noqa: E402
@@ -130,7 +129,7 @@ NOT_INSTALLED = {"solve_triangular", "cholesky_solve"}
 
 def install_linalg(device_type):
     from hpu_ops._dispatch import chain
-    # solve_triangular / cholesky_solve are not in hpu_ops.FIXES (accuracy): their calls stay native; eigh is opt-in
+    # solve_triangular / cholesky_solve are not in hpu_ops.FIXES (accuracy): their calls stay native
     # in enable() but fuzzed here
     return chain([fix(device_type) for fix in (linalg.install_solve, linalg.install_inv_det, jacobi.install_eigh)])
 
@@ -984,7 +983,7 @@ def family_errors(cases):
 def family_enable(cases):
     """enable() twice, the undo, and enable() after the undo."""
     key = "AutogradHPU"
-    ops_ = ("aten::_linalg_solve_ex", "aten::linalg_inv_ex")  # the default install (eigh is opt-in, triangular off)
+    ops_ = ("aten::_linalg_solve_ex", "aten::linalg_inv_ex")  # the default install (triangular off)
 
     def has():
         return [torch._C._dispatch_has_kernel_for_dispatch_key(o, key) for o in ops_]
