@@ -1,9 +1,9 @@
 /* Batched solve A X = B on Gaudi2 TPC: Gauss-Jordan with partial pivoting, one matrix per index-space member.
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
- *   A [n, n, batch]  f32     B [m, n, batch]  f32     X [m, n, batch]  f32
- *   D [n, batch]  f32: the pivot at each step (U's diagonal of P A = L U)
- *   S [2, batch]  f32: lane 0 = (-1)^swaps, lane 1 = info (1 + first zero pivot, kernel's order)
+ *   A [n, n, batch]  f32     B [m, n, batch]  f32     P [m + 2, n, batch]  f32: the ONE output, row i =
+ *   lanes 0..m-1 X[i], lane m = D[i] (the pivot at step i, U's diagonal of P A = L U), lane m + 1 = (-1)^swaps in
+ *   row 0, info (1 + first zero pivot, kernel's order) in row 1, 0 in the other rows.
  * D and S give det = S0 * prod(D) and slogdet. A zero pivot zeroes the pivot row, so later pivots stay finite.
  * With -DIDENTITY_B the kernel takes A alone and solves against the identity (inv): m = n, no B tensor.
  * Row i of A and of B is one 64-lane vector in local memory (lane j = column j), so n, m <= MAXN.
@@ -21,12 +21,17 @@ float64 lane_bcast(float64 v, uint64 lane, int k)
 }
 
 #ifdef IDENTITY_B
-void main(tensor A, tensor X, tensor D, tensor S)
+void main(tensor A, tensor P)
 #else
-void main(tensor A, tensor B, tensor X, tensor D, tensor S)
+void main(tensor A, tensor B, tensor P)
 #endif
 {
     const int n = get_dim_size(A, 0);
+#ifdef IDENTITY_B
+    const int m = n;
+#else
+    const int m = get_dim_size(B, 0);
+#endif
     const uint64 lane = read_lane_id_4b_b();
     const int5 off = get_index_space_offset();
     const int5 size = get_index_space_size();
@@ -95,10 +100,10 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
         for (int i = 0; i < n; i++)
         {
             int5 c = {0, i, bt, 0, 0};
-            v_f32_st_tnsr(c, X, b[i]);
+            float64 row = v_f32_sel_eq_u32_b(lane, (unsigned)m, lane_bcast(dv, lane, i), b[i]);
+            float64 extra = (i == 0) ? sv : ((i == 1) ? infov : 0.0f);
+            row = v_f32_sel_eq_u32_b(lane, (unsigned)(m + 1), extra, row);
+            v_f32_st_tnsr(c, P, row);
         }
-        int5 cd = {0, bt, 0, 0, 0};
-        v_f32_st_tnsr(cd, D, dv);
-        v_f32_st_tnsr_partial(cd, S, v_f32_sel_eq_u32_b(lane, 1u, infov, sv), 1, 0);
     }
 }
