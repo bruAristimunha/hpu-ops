@@ -10,16 +10,21 @@
   slice separates them), with the linear index of the broadcast indices; its backward is ``index_add``, which is right.
   Index tensors on the CPU (spd_learn's ``triu_indices``) are checked against the sizes on the host, and an index out of
   range goes to ATen's kernel, which raises; an index tensor already on the device is wrapped for negative values but
-  not checked against the sizes (that would need a host sync). Eager and lazy mode only: while ``torch.compile`` traces,
-  the index tensors are fake, their values cannot be checked, and the traced graph keeps ATen's ``index`` and its
-  accumulating ``index_put`` backward (hpu_backend does not run the lazy-mode kernel this works around).
+  not checked against the sizes (that would need a host sync). Under ``torch.compile`` it depends on where the index
+  tensors are: CPU index tensors are fake while dynamo traces, their values cannot be checked, and the graph keeps
+  ATen's ``index`` and its accumulating ``index_put`` backward (negative values then stay 1.0 off on Gaudi); index
+  tensors on the device are not read on the host either way, so the rewrite is traced (forward ``index_select``,
+  backward ``sort``, ``gather`` and ``scatter_add``), and measured right on Gaudi2, negative indices too.
   Two other forms were measured right on ``vech`` and SPDResNet but not everywhere: a leading-index ``index`` of a
   permuted view (CorNet's gradient stayed 0.44 off), and rewriting the backward's ``_index_put_impl_`` through a
   permuted view (SPNN's launch failed, see the next item).
 - A boolean-mask put of one value, ``m[..., mask] = c`` (vech's sqrt(2) scale): in one lazy graph with index puts into
   a fresh matrix and index reads of it (``vech(vec_to_sym(v))``, SPNN's SPDLinear) Habana's launch fails, "synLaunch
   failed ... Sections' validation failure" (``repro/lazy_section_validation.py``, without hpu-ops). It is rewritten at
-  ``AutogradHPU`` as ``self.copy_(where(mask, c, self))``: equal values, and no ``nonzero`` and host sync.
+  ``AutogradHPU`` as ``self.copy_(where(mask, c, self))``: equal values, and no ``nonzero`` and host sync. A value of
+  another dtype is converted on the host with ATen's checked cast; one that ATen rejects (overflow, complex into real),
+  one on the device or with a gradient, and a destination whose elements overlap or leave gaps (an expanded or
+  ``as_strided`` view) keep the native op.
 
 ``index_put_`` with integer indices, and calls below autograd (inference mode), keep the native kernels.
 """
@@ -86,10 +91,34 @@ def index_select_flat(self, indices):
     return out.unflatten(start, lin.shape) if lin.dim() != 1 else out
 
 
+def _dense(t):
+    """True when no two elements of ``t`` share memory and it has no gaps (``copy_`` then writes it as ATen's put)."""
+    try:
+        return torch._debug_has_internal_overlap(t) == 0
+    except Exception:  # noqa: BLE001  (a tensor subclass without strides)
+        return False
+
+
+def _value(self, values):
+    """The put value in ``self``'s dtype, or None for the native op. A value of another dtype is converted as ATen
+    converts it (``value.item()`` with its checked cast: overflow and complex into real raise), which needs it on the
+    host and without a gradient."""
+    if values.dtype == self.dtype:
+        return values
+    if values.device.type != "cpu" or values.requires_grad:
+        return None
+    try:
+        return torch.full((), values.item(), dtype=self.dtype)
+    except Exception:  # noqa: BLE001  (ATen's overflow error, or no value while tracing)
+        return None
+
+
 def _mask_takes(self, indices, values, accumulate=False):
     pos = _positions(indices)
     if accumulate or len(pos) != 1 or values.numel() != 1 or values.dim() > 1 or self.is_complex():
         return False
+    if _value(self, values) is None or not _dense(self):
+        return False  # ATen raises on the value's cast (overflow, complex to real); and writes into overlapping views
     mask, p = indices[pos[0]], pos[0]
     if mask.dtype not in MASK or len(indices) > self.dim():
         return False
@@ -102,7 +131,7 @@ def mask_fill(self, indices, values, accumulate=False):
     mask = indices[p]
     mask = mask.to(self.device, torch.bool).reshape((1,) * p + tuple(mask.shape)
                                                     + (1,) * (self.dim() - p - mask.dim()))
-    return self.copy_(torch.where(mask, values.reshape(()).to(self.device, self.dtype), self))
+    return self.copy_(torch.where(mask, _value(self, values).reshape(()).to(self.device), self))
 
 
 def install_index(device_type):

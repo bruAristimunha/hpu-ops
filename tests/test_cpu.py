@@ -890,7 +890,7 @@ def test_index_compiled():
     with cpu_as_hpu(hpu_ops._install):
         got = train_step(compiled(_vech_scaled, nodes), x)
     assert_same(got, want, tol=0)
-    # the index rewrite does not reach a traced graph (fake index values); the mask put does
+    # CPU index tensors: the index rewrite does not reach a traced graph (fake index values); the mask put does
     assert {"aten.index.Tensor", "aten.index_put.default", "aten.where.self"} <= ops(nodes)
     assert not ops(nodes) & {"aten.index_select.default", "aten.index_add.default"}
 
