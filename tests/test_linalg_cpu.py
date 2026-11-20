@@ -145,16 +145,16 @@ def test_cholesky_solve_matches_torch(shape_case, upper):
             b = b.expand(5, *b.shape[1:])  # stride 0 in the kernel; the gradient flows back through the expand
         return torch.cholesky_solve(b, l, upper=upper)
 
-    compare(f, linalg.install_cholesky_solve, B, L, name="cholesky_solve", rtol=1e-6, atol=1e-6)
+    compare(f, linalg.install_cholesky_solve, B, L, name="cholesky_solve")
 
 
-def test_cholesky_solve_inference_mode_uses_backend_kernel():
-    # The `{}` key is not registered on the CPU stand-in, so this asserts the result only; the backend path is
-    # checked on Gaudi (Task 8).
+def test_cholesky_solve_inference_mode_matches_torch():
     torch.manual_seed(0)
     L = torch.linalg.cholesky(spd(3, n=N))
     B = torch.randn(3, N, 4, dtype=torch.float64)
     want = torch.cholesky_solve(B, L)
-    with cpu_as_hpu(linalg.install_cholesky_solve), torch.inference_mode():
+    with cpu_as_hpu(linalg.install_cholesky_solve) as calls, torch.inference_mode():
         got = torch.cholesky_solve(B, L)
+    # The CPU stand-in never registers the `{}` key; the backend kernel is checked on Gaudi in Task 7.
+    assert not calls, dict(calls)
     torch.testing.assert_close(got, want)

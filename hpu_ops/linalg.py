@@ -1,5 +1,5 @@
-"""HPU composites for the linalg ops Gaudi lacks (``linalg_solve_triangular``) or runs on the CPU, built from matmuls
-that stay on the card and compile into the step graph.
+"""HPU composites for the linalg ops Gaudi lacks (``linalg_solve_triangular``, ``cholesky_solve``) or
+runs on the CPU, built from matmuls that stay on the card and compile into the step graph.
 
 Each is a ``torch.autograd.Function`` registered at ``Autograd{}``: its backward is torch's formula over the same
 composites, so gradients match torch's. Its forward is also registered at the backend key, for calls below autograd

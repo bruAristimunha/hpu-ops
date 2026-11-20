@@ -19,9 +19,9 @@ at the tensor's pickling:
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
   roll wrongly (EMG2QwertyNet's input gradient).
-- ``linalg.solve_triangular`` as a matmul with a block-recursive inverse (``linalg``): it has no HPU kernel and ran
-  on the CPU; float64 stays on the CPU, as Gaudi2 computes it at float32 precision (hpu-ops#16). Cholesky's and QR's
-  backward use it.
+- ``linalg.solve_triangular`` and ``cholesky_solve`` as matmuls with a block-recursive inverse (``linalg``): they have
+  no HPU kernel and ran on the CPU; float64 stays on the CPU, as Gaudi2 computes it at float32 precision
+  (hpu-ops#16). Cholesky's and QR's backward use the first.
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
