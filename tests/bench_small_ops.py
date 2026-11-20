@@ -195,6 +195,18 @@ def cumprod_log(x, dim):
     return x.log().cumsum(dim).exp()
 
 
+def histc_onehot(x, bins, lo, hi):
+    """histc with explicit bounds as a one-hot sum (no host sync); the last bin includes ``hi``."""
+    pos = ((x - lo) * (bins / (hi - lo))).floor().clamp(max=bins - 1)
+    inside = (x >= lo) & (x <= hi)
+    onehot = (pos.unsqueeze(-1) == torch.arange(bins, device=x.device, dtype=x.dtype)) & inside.unsqueeze(-1)
+    return onehot.to(x.dtype).sum(0)
+
+
+def lerp_composite(a, b, w):
+    return a + w * (b - a)
+
+
 # ---- the cases ----------------------------------------------------------------------------------------------------
 
 V, B = 4096, (64, 22, 22)
@@ -247,6 +259,19 @@ def cases():
         x = vec(*shape).abs() + 0.5
         out.setdefault("cumprod", []).append((f"{shape} dim-1", lambda x: torch.cumprod(x, -1), (x,),
                                               {"exp_cumsum_log": lambda x: cumprod_log(x, -1)}))
+    for n in (V, 100 * V):
+        x = vec(n)
+        out.setdefault("histc", []).append((f"({n},) 64 bins [-3,3]", lambda x: torch.histc(x, 64, -3, 3), (x,),
+                                            {"onehot": lambda x: histc_onehot(x, 64, -3.0, 3.0)}))
+    a, b = vec(*B), vec(*B)
+    out["lerp"] = [(f"{B} w=0.3", lambda a, b: torch.lerp(a, b, 0.3), (a, b),
+                    {"a+w(b-a)": lambda a, b: lerp_composite(a, b, 0.3)})]
+    out["median"] = [(f"{B} dim-1", lambda x: torch.median(x, -1).values, (vec(*B),), {}),
+                     (f"({V},)", lambda x: torch.median(x), (vec(V),), {})]
+    out["topk"] = [(f"{B} k=5 dim-1", lambda x: torch.topk(x, 5, -1).values, (vec(*B),), {}),
+                   (f"({V},) k=10", lambda x: torch.topk(x, 10).values, (vec(V),), {})]
+    out["where"] = [(f"{B}", lambda x: torch.where(x > 0, x, 0.0), (vec(*B),), {})]
+    out["matmul"] = [(f"{B} @ {B}", lambda x: x @ x, (vec(*B),), {})]
     return out
 
 
