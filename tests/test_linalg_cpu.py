@@ -8,6 +8,7 @@ import torch
 import torch.utils._pytree as pytree
 from test_cpu import compiled, cpu_as_hpu, ops
 
+from hpu_ops import eigh as jacobi
 from hpu_ops import linalg
 
 
@@ -396,3 +397,96 @@ def test_det_slogdet_with_row_swaps(fn, perm):
     assert torch.equal(det.sign(), torch.linalg.det(A).sign())
     if perm[0] == 1 and perm[1] == 0:
         assert (det < 0).all()
+
+
+# ---- eigh
+
+
+@pytest.mark.parametrize("n", [2, 4, 22, 64])
+def test_schedule_pairs_every_index_once_per_round_and_every_pair_once(n):
+    rounds = jacobi._schedule(n)
+    assert rounds.shape == (n - 1, n // 2, 2)
+    assert (rounds[..., 0] < rounds[..., 1]).all()
+    for r in rounds:
+        assert sorted(r.flatten().tolist()) == list(range(n))
+    pairs = {tuple(p) for p in rounds.reshape(-1, 2).tolist()}
+    assert len(pairs) == n * (n - 1) // 2
+
+
+@pytest.mark.parametrize("batch", [(), (3,)])
+@pytest.mark.parametrize("n", [1, 2, 3, 8, 22, 64])
+def test_eigh_matches_torch(n, batch):
+    torch.manual_seed(0)
+    S = spd(*batch, n=n)
+    with cpu_as_hpu(jacobi.install_eigh) as calls:
+        w, V = torch.linalg.eigh(S)
+        assert calls["eigh"] >= 1, dict(calls)
+    eye = torch.eye(n, dtype=S.dtype)
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(S), rtol=0, atol=1e-10)
+    torch.testing.assert_close(V.mT @ V, eye.expand_as(V), rtol=0, atol=1e-10)
+    torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S, rtol=0, atol=1e-10)
+
+
+def test_eigh_float32_converges():
+    torch.manual_seed(0)
+    S = spd(32, n=22, dtype=torch.float32)
+    with cpu_as_hpu(jacobi.install_eigh):
+        w, V = torch.linalg.eigh(S)
+    T = V.mT @ S @ V
+    off = (T - torch.diag_embed(T.diagonal(dim1=-2, dim2=-1))).flatten(-2).norm(dim=-1)
+    assert (off / S.flatten(-2).norm(dim=-1) < 1e-5).all()
+    want = torch.linalg.eigvalsh(S)
+    assert ((w - want).abs().amax(-1) < 1e-4 * S.flatten(-2).norm(dim=-1)).all()
+
+
+def test_eigh_grad_matches_torch():
+    torch.manual_seed(0)
+    S = spd(3, n=8) / 8  # distinct eigenvalues
+
+    def f(S):
+        w, V = torch.linalg.eigh(S)
+        return V @ torch.diag_embed(w.exp()) @ V.mT, w  # sign-invariant in V
+
+    compare(f, jacobi.install_eigh, S, name="eigh")
+
+
+def test_eigvalsh_without_grad():
+    torch.manual_seed(0)
+    S = spd(3, n=8)
+    with cpu_as_hpu(jacobi.install_eigh) as calls, torch.no_grad():
+        got = torch.linalg.eigvalsh(S)
+        assert calls["eigh"] >= 1, dict(calls)
+    torch.testing.assert_close(got, torch.linalg.eigvalsh(S), rtol=0, atol=1e-10)
+
+
+def test_eigh_upper_ignores_the_lower_triangle():
+    torch.manual_seed(0)
+    S = spd(3, n=8)
+    garbage = S + torch.tril(torch.randn_like(S), -1) * 100
+    with cpu_as_hpu(jacobi.install_eigh) as calls:
+        w, V = torch.linalg.eigh(garbage, UPLO="U")
+        assert calls["eigh"] >= 1, dict(calls)
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(garbage, UPLO="U"), rtol=0, atol=1e-10)
+    torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S, rtol=0, atol=1e-10)
+
+
+@pytest.mark.parametrize("diagonal", [[1.0] * 5, [1.0, 1.0, 2.0], [3.0, 3.0, 3.0, 1.0]], ids=["I5", "112", "3331"])
+def test_eigh_degenerate(diagonal):
+    D = torch.diag(torch.tensor(diagonal, dtype=torch.float64))
+    n = len(diagonal)
+    with cpu_as_hpu(jacobi.install_eigh) as calls:
+        w, V = torch.linalg.eigh(D)
+        assert calls["eigh"] >= 1, dict(calls)
+    assert torch.equal(w, torch.tensor(sorted(diagonal), dtype=torch.float64))
+    torch.testing.assert_close(V.mT @ V, torch.eye(n, dtype=D.dtype), rtol=0, atol=1e-12)
+    torch.testing.assert_close(V @ torch.diag(w) @ V.mT, D, rtol=0, atol=1e-12)
+
+
+def test_eigh_compiled_has_no_native_op():
+    torch.manual_seed(0)
+    S = spd(3, n=8)
+    nodes = []
+    with cpu_as_hpu(jacobi.install_eigh):
+        w, _ = compiled(torch.linalg.eigh, nodes)(S)
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(S), rtol=0, atol=1e-10)
+    assert "aten._linalg_eigh.default" not in ops(nodes), ops(nodes)
