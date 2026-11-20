@@ -346,8 +346,8 @@ class InvEx(torch.autograd.Function):
 
 class Det(torch.autograd.Function):
     """``aten._linalg_det`` as the signed product of U's diagonal, with torch's backward (``g det A^-H``), the inverse
-    recomputed from the saved factors. A singular matrix has det 0 and a non-finite gradient. ``LU`` and ``pivots``
-    are not differentiable."""
+    recomputed from A, so double backward works. A singular matrix has det 0 and a non-finite gradient. ``LU`` and
+    ``pivots`` are not differentiable; they are those of A (native's CPU kernel returns those of A^T)."""
 
     @staticmethod
     def compute(A):
@@ -358,20 +358,20 @@ class Det(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A):
         det, LU, pivots = Det.compute(A)
-        ctx.save_for_backward(det, LU, pivots)
+        ctx.save_for_backward(A, det)
         ctx.mark_non_differentiable(LU, pivots)
         return det, LU, pivots
 
     @staticmethod
     def backward(ctx, grad, *_):
-        det, LU, pivots = ctx.saved_tensors
-        return (grad * det)[..., None, None] * _inverse(LU, pivots).mH
+        A, det = ctx.saved_tensors
+        return (grad * det)[..., None, None] * InvEx.apply(A, False)[0].mH
 
 
 class Slogdet(torch.autograd.Function):
     """``aten._linalg_slogdet`` as the sign and log of U's diagonal, with torch's backward (``g A^-H``) for
-    ``logabsdet``, the inverse recomputed from the saved factors. ``sign``, ``LU`` and ``pivots`` are not
-    differentiable."""
+    ``logabsdet``, the inverse recomputed from A, so double backward works. ``sign``, ``LU`` and ``pivots`` are
+    not differentiable; ``LU`` and ``pivots`` are those of A (native's CPU kernel returns those of A^T)."""
 
     @staticmethod
     def compute(A):
@@ -383,14 +383,14 @@ class Slogdet(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A):
         sign, logabsdet, LU, pivots = Slogdet.compute(A)
-        ctx.save_for_backward(LU, pivots)
+        ctx.save_for_backward(A)
         ctx.mark_non_differentiable(sign, LU, pivots)
         return sign, logabsdet, LU, pivots
 
     @staticmethod
     def backward(ctx, _sign, grad, *_):
-        LU, pivots = ctx.saved_tensors
-        return grad[..., None, None] * _inverse(LU, pivots).mH
+        (A,) = ctx.saved_tensors
+        return grad[..., None, None] * InvEx.apply(A, False)[0].mH
 
 
 def install_inv_det(device_type):

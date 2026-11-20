@@ -374,3 +374,25 @@ def test_inv_compiled_has_no_native_op():
         got = compiled(torch.linalg.inv, nodes)(A)
     torch.testing.assert_close(got, torch.linalg.inv(A))
     assert "aten.linalg_inv_ex.default" not in ops(nodes), ops(nodes)
+
+
+@pytest.mark.parametrize("fn", [torch.linalg.det, lambda A: torch.linalg.slogdet(A).logabsdet], ids=["det", "slogdet"])
+def test_det_slogdet_double_backward(fn):
+    torch.manual_seed(0)
+    A = general(2, n=3).requires_grad_()
+    with cpu_as_hpu(linalg.install_inv_det) as calls:
+        assert torch.autograd.gradgradcheck(fn, (A,))
+        assert calls["det"] + calls["slogdet"] >= 1, dict(calls)
+
+
+@pytest.mark.parametrize("perm", [[1, 0, 2, 3, 4], [1, 2, 0, 3, 4]], ids=["odd", "even"])
+@pytest.mark.parametrize("fn", ["det", "slogdet"])
+def test_det_slogdet_with_row_swaps(fn, perm):
+    torch.manual_seed(0)
+    A = general(4, n=5)[:, perm]
+    compare(INV_DET_FNS[fn], linalg.install_inv_det, A, name=fn)
+    with cpu_as_hpu(linalg.install_inv_det):
+        det = torch.linalg.det(A)
+    assert torch.equal(det.sign(), torch.linalg.det(A).sign())
+    if perm[0] == 1 and perm[1] == 0:
+        assert (det < 0).all()
