@@ -31,12 +31,16 @@ at the tensor's pickling:
   are off too on a device that is not a Gaudi2 and with ``HPU_OPS_TPC=0`` in the environment. Calls the kernel does
   not take (n > 32, kernel off) run through hpu-ops' own CPU route, which is not Habana's fallback.
 - ``linalg.eigh`` and ``eigvalsh`` of float32 matrices with n <= 32 run through a TPC one-sided Jacobi kernel
-  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32, n = 22: 1.27 ms
+  (``tpc``, ``eigh``), but only with ``HPU_OPS_TPC_EIGH=1`` in the environment when ``enable()`` runs. It is opt-in
+  because its gradients inside models are less accurate than the CPU fallback's (Gaudi2, eager, batch 32,
+  BNCI2014_001, relative error against float64: SPDNet's BiMap weight gradient 8.2e-5 to 1.25e-3, SPDResNet 1.5e-4
+  to 5.1e-3; losses and 50-step training curves still match); a fix is in progress. By default ``aten::_linalg_eigh``
+  gets no hpu-ops kernel, as on ``origin/main``. Opted in, eager, batch 32, n = 22: 1.27 ms
   against about 3.7 ms for the fallback (lazy 0.80 against about 1.4); batch 1024 3.7 ms against 52 ms; within about
-  3.8x of CPU float32 accuracy, also on repeated eigenvalues, condition 1e6 and inputs scaled by 1e30.
-  Without the kernel, or past n = 32, the call is declined and runs through hpu-ops' own CPU route, not Habana's
-  fallback: the parallel-Jacobi composite of ``eigh`` was measured slower than the fallback on Gaudi2, so it only
-  serves the CPU stand-in.
+  3.8x of CPU float32 accuracy on single calls, also on repeated eigenvalues, condition 1e6 and inputs scaled by 1e30.
+  Opted in, without the kernel, or past n = 32, the call is declined and runs through hpu-ops' own CPU route, not
+  Habana's fallback: the parallel-Jacobi composite of ``eigh`` was measured slower than the fallback on Gaudi2, so it
+  only serves the CPU stand-in.
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -75,7 +79,8 @@ ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled
 
 def _install(device_type):
     """Every rewrite, for tensors of ``device_type`` (the tests pass "cpu" in the role of "hpu"). Returns an undo."""
-    return chain([fix(device_type) for fix in FIXES])
+    optin = os.environ.get("HPU_OPS_TPC_EIGH") == "1"  # read when enable() runs; eigh is opt-in
+    return chain([fix(device_type) for fix in FIXES if optin or fix is not eigh.install_eigh])
 
 
 def _attention_fused(device_type="hpu"):

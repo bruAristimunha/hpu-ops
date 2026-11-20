@@ -11,6 +11,12 @@ and a Synapse critical device error in lazy mode at n = 64), so float32 matrices
 the TPC one-sided Jacobi kernel of ``hpu_ops.tpc`` (n = 22, batch 32, eager: 1.27 ms against about 3.7 ms for the
 fallback). Without the kernel, or past ``EIGH_MAXN``, the call on ``hpu`` is declined and runs through hpu-ops' own
 CPU route (``linalg._on_cpu``), which is not Habana's fallback. The composite stays the path of the CPU stand-in.
+
+The TPC path is opt-in: ``hpu_ops.enable()`` installs this rewrite only with ``HPU_OPS_TPC_EIGH=1`` in the environment,
+because the kernel's gradients inside models are less accurate than the CPU fallback's (Gaudi2, eager, batch 32,
+BNCI2014_001, relative error against float64: SPDNet's BiMap weight gradient 8.2e-5 to 1.25e-3, SPDResNet 1.5e-4 to
+5.1e-3; losses and 50-step curves still match). A fix is in progress. By default ``aten::_linalg_eigh`` has no
+hpu-ops kernel, as on ``origin/main``.
 """
 import torch
 import torch.nn.functional as F

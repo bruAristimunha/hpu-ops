@@ -424,9 +424,26 @@ def test_det_slogdet_with_row_swaps(fn, perm):
 
 
 # ---- eigh
-def test_enable_installs_eigh():
-    # it declines without the TPC kernel (n > EIGH_MAXN, kernel not ready), so it cannot be slower than the fallback
-    assert jacobi.install_eigh in hpu_ops.FIXES
+def _eigh_registered(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("HPU_OPS_TPC_EIGH", raising=False)
+    else:
+        monkeypatch.setenv("HPU_OPS_TPC_EIGH", value)
+    undo = hpu_ops._install("cpu")
+    try:
+        return torch._C._dispatch_has_kernel_for_dispatch_key("aten::_linalg_eigh", "AutogradCPU")
+    finally:
+        undo()
+
+
+def test_enable_leaves_eigh_unregistered_by_default(monkeypatch):
+    assert jacobi.install_eigh in hpu_ops.FIXES  # still reachable
+    assert not _eigh_registered(monkeypatch, None)
+    assert not _eigh_registered(monkeypatch, "0")
+
+
+def test_enable_installs_eigh_when_opted_in(monkeypatch):
+    assert _eigh_registered(monkeypatch, "1")
 
 
 @pytest.fixture
