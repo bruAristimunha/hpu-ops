@@ -2,8 +2,10 @@
     PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_on_hpu.py [--baseline]
 Per op and n in 16, 22, 64, 128 (batch 32, float32): forward, and backward where differentiable. A case fails when
 the bridge ``cpu_fallback`` delta is not empty, when a warning says "runs on the CPU" (hpu_complex's boxed fallback
-does not move the bridge metric, so both are read), or when the error exceeds 1e-3 * max(1, max|ref|). One float64
-case per op: the error is at most 1e-12 and hpu-ops#16's warning comes once. Two probes of Gaudi behavior: argmax
+does not move the bridge metric, so both are read), or when the error, in forward or backward, exceeds
+max(1e-3, 2 * the error of the same op in float32 on the CPU): no worse than CPU float32 by more than 2x. One float64
+case per op: every output (eigh: w and V) matches the native CPU float64 result to 1e-12, and hpu-ops#16's warning
+comes once. Two probes of Gaudi behavior: argmax
 returns the first index among ties, and int64 argsort stays on the card.
 One ``RESULT {json}`` line per case; the last line counts them; exits 1 if any case failed.
 ``--baseline`` skips ``hpu_ops.enable()`` to time the stock stack: fallbacks are then recorded (status "fallback")
@@ -225,6 +227,10 @@ def reference_grads(case, ref_in):
     return [x.grad for x in xs]
 
 
+def grad_error(xs, ref_grads):
+    return max(rel_err(x.grad, g) for x, g in zip(xs, ref_grads))
+
+
 def backward(case, cpu_in, ref_in):
     """Backward alone inside the watch: the forward and the loss run, and sync, before it opens."""
     xs = [x.to(HPU).detach().requires_grad_() for x in cpu_in]
@@ -233,8 +239,11 @@ def backward(case, cpu_in, ref_in):
     with watch() as rec:
         loss.backward()
         sync()
-    grad_err = max(rel_err(x.grad, g) for x, g in zip(xs, reference_grads(case, ref_in)))
-    return grad_err, rec
+    ref_grads = reference_grads(case, ref_in)
+    # the bar for the gradient is CPU float32's own error, measured on the same op
+    cpu_xs = [x.detach().clone().requires_grad_() for x in cpu_in]
+    case.loss(as_tensors(case.fn(*cpu_xs))).backward()
+    return grad_error(xs, ref_grads), grad_error(cpu_xs, ref_grads), rec
 
 
 def run_case(case, n):
@@ -249,13 +258,16 @@ def run_case(case, n):
         if BASELINE and case.name == "linalg.eigh" and rec["fallback"]:
             EIGH_FALLBACKS.append(rec["fallback"])
         row["max_rel_err"], notes = case.err(out, ref, ref_in)
-        hard += notes + ([f"error {row['max_rel_err']:.3g} > {TOL32}"] if not row["max_rel_err"] <= TOL32 else [])
+        row["err_cpu32"], _ = case.err(as_tensors(case.fn(*cpu_in)), ref, ref_in)
+        tol = max(TOL32, 2 * row["err_cpu32"])
+        hard += notes + ([f"error {row['max_rel_err']:.3g} > {tol:.3g}"] if not row["max_rel_err"] <= tol else [])
         if case.scope == "all":
             soft += ["forward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
         if case.loss:
-            row["grad_err"], rec = backward(case, cpu_in, ref_in)
+            row["grad_err"], row["grad_err_cpu32"], rec = backward(case, cpu_in, ref_in)
+            gtol = max(TOL32, 2 * row["grad_err_cpu32"])
             row["bwd_fallback"] = rec["fallback"]
-            hard += [f"gradient error {row['grad_err']:.3g} > {TOL32}"] * (not row["grad_err"] <= TOL32)
+            hard += [f"gradient error {row['grad_err']:.3g} > {gtol:.3g}"] * (not row["grad_err"] <= gtol)
             soft += ["backward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
@@ -276,16 +288,17 @@ def run_float64(case):
         ops_linalg._WARNED.clear()  # the warning comes once per op name and process
         cpu_in = case.make(BATCH, F64_N, torch.float64)
         h_in = [x.to(HPU) for x in cpu_in]
-        # Gaudi2 rounds float64 to float32 at the host-to-card copy (hpu-ops#16): the reference runs over what the card holds.
+        # Gaudi2 rounds float64 to float32 at every host-to-card copy (hpu-ops#16): the reference is the native CPU op
+        # over what the card holds, its outputs rounded by the same copy (the decline path returns through .to(hpu)).
         cpu_in = [x.cpu() for x in h_in]
-        ref = as_tensors(case.fn(*cpu_in))
+        ref = [r.to(HPU).cpu() for r in as_tensors(case.fn(*cpu_in))]
         with watch() as first:
             out = as_tensors(case.fn(*h_in))
             sync()
         with watch() as second:
             case.fn(*h_in)
             sync()
-        row["max_rel_err"], problems = case.err(out, ref, cpu_in)
+        row["max_rel_err"], problems = err_all(out, ref, cpu_in)  # every output directly, no reconstruction
         said = [m for c, m in first["caught"] if issubclass(c, UserWarning) and F64_TEXT in m]
         again = [m for _, m in second["caught"] if F64_TEXT in m]
         row.update(fwd_fallback=first["fallback"], warned=len(said), warned_again=len(again))

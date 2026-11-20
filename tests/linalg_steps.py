@@ -64,6 +64,9 @@ def run_model(name, P, info, X, y, baseline):
            "baseline": baseline}
     try:
         torch.manual_seed(0)
+        if not baseline:
+            from hpu_ops import linalg as ops_linalg
+            ops_linalg._WARNED.clear()  # the float64 warning is once per process: let each model see it
         model = P.build(name, X.shape[1], info, None).to(HPU)
         xb = X.to(HPU)
         if hasattr(model, "fixed_input"):
