@@ -891,8 +891,15 @@ def test_logsumexp_reduces_with_kept_dims_then_reshapes():
     assert reductions and all(n.args[2] is True for n in reductions), [n.args for n in reductions]
 
 
-def test_logsumexp_eager_mode_keeps_the_native_kernel(monkeypatch):
-    monkeypatch.setenv("PT_HPU_LAZY_MODE", "0")
+@pytest.mark.parametrize("setting", ["0", "", None])
+def test_logsumexp_eager_mode_keeps_the_native_kernel(monkeypatch, setting):
+    """Off a Gaudi stack the mode is read from PT_HPU_LAZY_MODE; unset is eager, as bridge 1.21.4 runs unset."""
+    if importlib.util.find_spec("habana_frameworks"):
+        pytest.skip("Gaudi stack present: the bridge reports its mode")
+    if setting is None:
+        monkeypatch.delenv("PT_HPU_LAZY_MODE", raising=False)
+    else:
+        monkeypatch.setenv("PT_HPU_LAZY_MODE", setting)
     with cpu_as_hpu(perf.install_logsumexp) as calls:
         torch.logsumexp(torch.randn(4, 6), 1)
     assert not calls["logsumexp"]

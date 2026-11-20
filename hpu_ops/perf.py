@@ -4,7 +4,9 @@
   infinities zeroed. In lazy mode Gaudi's ``logsumexp`` kernel is slower than amax, exp, sum and log recorded into the
   same graph; in eager mode its one kernel beats their six launches, so eager calls (and ``torch.compile``, which runs
   in eager mode) keep it. The max is detached: the result does not depend on it, so autograd differentiates
-  ``exp(x - m) / sum`` only, as ATen's own ``logsumexp`` backward (``grad * exp(x - result)``). The reductions keep
+  ``exp(x - m) / sum`` only, as ATen's own ``logsumexp`` backward (``grad * exp(x - result)``). The two differ where
+  ``result`` rounds to the max: for ``[1e30, 1e30, -1e30]`` ATen (and Gaudi's kernel) give ``[1, 1, 0]``, the
+  composite the softmax ``[0.5, 0.5, 0]``. The reductions keep
   their dims and the result is reshaped: in lazy mode the backward of a dim reduction to a 0-d tensor that is then
   summed fails (``repro/lazy_expand_garbage_size.py``).
 
@@ -24,9 +26,13 @@ REDUCED = (torch.float16, torch.bfloat16)
 
 
 def lazy_mode():
-    """Whether Habana's bridge records ops into lazy graphs: ``PT_HPU_LAZY_MODE``, read when its library loads
-    (default 1 on bridge 1.21)."""
-    return os.environ.get("PT_HPU_LAZY_MODE", "1") not in ("0", "")
+    """Whether Habana's bridge records ops into lazy graphs, as the bridge reports it; off a Gaudi stack,
+    ``PT_HPU_LAZY_MODE`` (unset: eager, as bridge 1.21.4 runs with it unset)."""
+    try:
+        from habana_frameworks.torch.utils.internal import is_lazy
+    except ImportError:
+        return os.environ.get("PT_HPU_LAZY_MODE", "0") not in ("0", "")
+    return bool(is_lazy())
 
 
 def _dims(input, dim):
