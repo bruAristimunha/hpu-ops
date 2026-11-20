@@ -8,9 +8,10 @@ add_library(linalg_tpc SHARED glue.cpp)
 target_include_directories(linalg_tpc PRIVATE ${TPC_INCLUDE_DIR})
 
 # gj_solve (A, B) and gj_inv (A alone, B = identity, -DIDENTITY_B) share one source;
-# the 4 tri_solve variants share tri_solve_f32_gaudi2.c; jacobi_eigh has its own.
+# jacobi_eigh and jacobi_eigh_refine (Pass 2 adaptive-shift refinement, -DREFINE_PASS) share one source;
+# the 4 tri_solve variants share tri_solve_f32_gaudi2.c (-DUPPER, -DUNIT_DIAG).
 foreach(KERNEL
-        gj_solve_f32_gaudi2 gj_inv_f32_gaudi2 jacobi_eigh_f32_gaudi2
+        gj_solve_f32_gaudi2 gj_inv_f32_gaudi2 jacobi_eigh_f32_gaudi2 jacobi_eigh_refine_f32_gaudi2
         tri_solve_lower_f32_gaudi2 tri_solve_upper_f32_gaudi2
         tri_solve_lower_unit_f32_gaudi2 tri_solve_upper_unit_f32_gaudi2)
     set(SOURCE ${KERNEL})
@@ -26,6 +27,9 @@ foreach(KERNEL
         if(KERNEL MATCHES "_unit_")
             list(APPEND DEFINES -DUNIT_DIAG)
         endif()
+    elseif(KERNEL STREQUAL "jacobi_eigh_refine_f32_gaudi2")
+        set(SOURCE jacobi_eigh_f32_gaudi2)
+        set(DEFINES -DREFINE_PASS)
     endif()
     add_custom_command(
         OUTPUT ${KERNEL}_x86.o

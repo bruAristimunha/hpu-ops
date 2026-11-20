@@ -3,7 +3,7 @@
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
  *   A [n, n, batch]  f32     B [m, n, batch]  f32     X [m, n, batch]  f32
  *   D [n, batch]  f32: the pivot at each step (U's diagonal of P A = L U)
- *   S [2, batch]  f32: lane 0 = (-1)^swaps, lane 1 = LAPACK's info (1 + the first zero pivot, else 0)
+ *   S [2, batch]  f32: lane 0 = (-1)^swaps, lane 1 = info (1 + first zero pivot, kernel's order)
  * D and S give det = S0 * prod(D) and slogdet. A zero pivot zeroes the pivot row, so later pivots stay finite.
  * With -DIDENTITY_B the kernel takes A alone and solves against the identity (inv): m = n, no B tensor.
  * Row i of A and of B is one 64-lane vector in local memory (lane j = column j), so n, m <= MAXN.

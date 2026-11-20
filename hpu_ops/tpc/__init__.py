@@ -1,32 +1,36 @@
-"""The Gaudi2 TPC kernels behind ``linalg.solve``, ``inv``, ``det``, ``slogdet``, ``solve_triangular`` and
-``cholesky_solve``:
+"""The Gaudi2 TPC kernels behind ``linalg.solve``, ``inv``, ``det``, ``slogdet``, ``solve_triangular``,
+``cholesky_solve`` and ``eigh``:
+
 - ``torch.ops.linalg_tpc.gj_solve(A[b, n, n], B[b, n, m]) -> (X[b, n, m], D[b, n], S[b, 2])`` and
-  ``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel) for float32, n <= 64 (B columns chunked by 64). One
-  matrix per index-space member, rows in local memory, partial pivoting. ``D`` holds the pivots (U's diagonal),
-  ``S[:, 0]`` the sign (-1)^swaps of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own
-  elimination order, can differ from LAPACK's, and is nonzero exactly when a pivot is exactly zero.
-- ``torch.ops.linalg_tpc.tri_solve_{lower,upper}[_unit](A[b, n, n], B[b, n, m]) -> X[b, n, m]``: dedicated
-  non-pivoting forward/back substitution for float32, n <= 64 (B columns chunked by 64; ``left=False`` via ``.mT`` and
-  flipped ``upper``); opposite triangle (and diagonal for ``_unit``) is never read.
+  ``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel): Gauss-Jordan with partial pivoting for float32,
+  n <= 64 (B columns chunked by 64). One matrix per index-space member, rows in local memory, no LUT-based special
+  function (so the 80 KB of local memory are available). ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign
+  (-1)^swaps of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can
+  differ from LAPACK's, and is nonzero exactly when a pivot is exactly zero. The kernel zeroes the pivot row of a zero
+  pivot so later pivots stay finite.
+- ``torch.ops.linalg_tpc.tri_solve_{lower,upper}[_unit](A[b, n, n], B[b, n, m]) -> X[b, n, m]``: forward or back
+  substitution without pivoting for float32, n <= 64 (B columns chunked by 64; ``left=False`` through ``.mT`` and the
+  flipped triangle). The other triangle (and the diagonal for ``_unit``) is never read. Substitution is backward
+  stable, so it keeps CPU float32's accuracy on ill-conditioned triangles, which pivoted Gauss-Jordan does not.
 
 ``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
-n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Eager, batch 32: n = 22
-0.30 ms against 3.7 ms for the CPU fallback, n = 32 0.54 ms against 5.0 ms, batch 1024 3.1 ms against 52 ms; accuracy
-within 3.2x of CPU float32.
+n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Batch 32, n = 22,
+eager: 1.27 ms per call against about 3.7 ms for Habana's CPU fallback (the raw kernel takes 0.19 ms); batch 1024:
+3.7 ms against 52 ms. Accuracy within about 3.8x of CPU float32's, also on repeated eigenvalues, condition 1e6 and
+inputs scaled by 1e30.
 
-The torch-op composites of ``hpu_ops.linalg`` are correct but 3-25x slower than Habana's CPU fallback on Gaudi2 (one
-launch per op). The kernel, eager, batch 32: n = 22 solve 0.20 ms against 4.7 ms for the fallback, n = 32 0.28 ms,
-batch 1024 1.9 ms against 20 ms; the pivots equal LAPACK's U diagonal to 6e-6, the determinant to 9e-6.
+The torch-op composites of ``hpu_ops.linalg`` are correct but were measured 3-25x slower than Habana's CPU fallback
+per call on Gaudi2 (one launch per op). The solve kernel, batch 32, n = 22, eager: 2.7 ms against about 4.5 ms for
+the fallback (lazy 0.57 against about 2.2).
 
-Habana reads ``GC_KERNEL_PATH`` when the first graph compiles, so ``install_kernel_path`` must run before the first HPU
-op of the process; ``hpu_ops.enable()`` calls it.
+Habana reads ``GC_KERNEL_PATH`` when the device initialises, so ``install_kernel_path`` must run before the first HPU
+op of the process; ``hpu_ops.enable()`` calls it. ``HPU_OPS_TPC=0`` in the environment keeps the kernels off.
 """
 import functools
 import os
 import pathlib
 import warnings
 
-import numpy as np
 import torch
 
 MAXN = 64
@@ -34,11 +38,17 @@ EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
 LATE_WARNING = ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off for this process "
-                "(call enable() before the first HPU op)")
-BUILD_WARNING = ("hpu_ops: building the TPC linalg extension failed ({error}); solve, inv, det, slogdet and the "
-                 "triangular solves keep Habana's CPU fallback.")
+                "(call enable() before the first HPU op). The linalg ops then run through hpu-ops' own CPU route, "
+                "not Habana's fallback.")
+BUILD_WARNING = ("hpu_ops: building the TPC linalg extension failed ({error}); solve, inv, det, slogdet, the "
+                 "triangular solves and eigh run through hpu-ops' own CPU route, not Habana's fallback.")
+MISSING_WARNING = ("hpu_ops: {path} not found; TPC linalg kernels are off for this process. The linalg ops run "
+                   "through hpu-ops' own CPU route, not Habana's fallback.")
+OPT_OUT = "HPU_OPS_TPC"
 _INSTALLED = False
 _LATE_WARNED = False
+_MISSING_WARNED = False
+_DEVICE = None
 
 # The registration strings are those measured on Gaudi2, plus gj_inv (A alone, identity right-hand side) and
 # jacobi_eigh (A alone; W [batch, n], Vt [batch, n, n]). CPP: the
@@ -72,6 +82,8 @@ static habana::PartialOutputMetaDataVector tri_solve_meta(const at::Stack& input
 }
 static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", eigh_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh_refine", "jacobi_eigh_refine_f32_gaudi2",
+                                          eigh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", solve_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", inv_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::tri_solve_lower", "tri_solve_lower_f32_gaudi2", tri_solve_meta, nullptr);
@@ -109,6 +121,12 @@ at::Tensor tri_solve_upper(at::Tensor a, at::Tensor b) { return run_tri_solve("l
 at::Tensor tri_solve_lower_unit(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_lower_unit", a, b); }
 at::Tensor tri_solve_upper_unit(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_upper_unit", a, b); }
 static at::Tensor tri_meta_tensor(at::Tensor, at::Tensor b) { return b.new_empty(b.sizes()); }
+std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v1) {
+  std::vector<c10::IValue> inputs{a, v1};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_eigh_refine");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
@@ -117,6 +135,7 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("tri_solve_upper(Tensor a, Tensor b) -> Tensor");
   m.def("tri_solve_lower_unit(Tensor a, Tensor b) -> Tensor");
   m.def("tri_solve_upper_unit(Tensor a, Tensor b) -> Tensor");
+  m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
@@ -126,6 +145,7 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("tri_solve_upper", tri_solve_upper);
   m.impl("tri_solve_lower_unit", tri_solve_lower_unit);
   m.impl("tri_solve_upper_unit", tri_solve_upper_unit);
+  m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
@@ -141,6 +161,9 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("tri_solve_upper", tri_meta_tensor);
   m.impl("tri_solve_lower_unit", tri_meta_tensor);
   m.impl("tri_solve_upper_unit", tri_meta_tensor);
+  m.impl("jacobi_eigh_refine", [](at::Tensor a, at::Tensor v1) {
+    return std::make_tuple(a.new_empty({a.size(0), a.size(1)}), a.new_empty(a.sizes()));
+  });
 }
 """
 CPP_LAZY = r"""
@@ -194,6 +217,14 @@ static bool registered_tri = [] {
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::tri_solve_upper_unit", "tri_solve_upper_unit_f32_gaudi2", in, out, nullptr);
   return true;
 }();
+static bool registered_eigh_refine = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
+                                               {habana::custom_op::input_type::TENSOR, 1}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, wshape},
+                                                 {1, c10::ScalarType::Float, xshape_a}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_eigh_refine", "jacobi_eigh_refine_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor b) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_solve");
@@ -222,6 +253,12 @@ at::Tensor tri_solve_lower(at::Tensor a, at::Tensor b) { return run_tri_solve("l
 at::Tensor tri_solve_upper(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_upper", a, b); }
 at::Tensor tri_solve_lower_unit(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_lower_unit", a, b); }
 at::Tensor tri_solve_upper_unit(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_upper_unit", a, b); }
+std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v1) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_eigh_refine");
+  std::vector<c10::IValue> inputs{a, v1};
+  auto out = op.execute(inputs);
+  return {out[0], out[1]};
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
@@ -230,6 +267,7 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("tri_solve_upper(Tensor a, Tensor b) -> Tensor");
   m.def("tri_solve_lower_unit(Tensor a, Tensor b) -> Tensor");
   m.def("tri_solve_upper_unit(Tensor a, Tensor b) -> Tensor");
+  m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
@@ -239,6 +277,7 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("tri_solve_upper", tri_solve_upper);
   m.impl("tri_solve_lower_unit", tri_solve_lower_unit);
   m.impl("tri_solve_upper_unit", tri_solve_upper_unit);
+  m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
 """
 
@@ -264,8 +303,18 @@ def _habana_hpu():
 def install_kernel_path():
     """Put ``LIB`` first on ``GC_KERNEL_PATH`` (default ``DEFAULT_KERNELS`` when unset or empty, never duplicated) if
     the HPU is not initialized yet and return True; otherwise warn once and return False, as Habana reads the path
-    when the first graph compiles: set later, the kernel's graph fails to compile."""
-    global _INSTALLED, _LATE_WARNED
+    when the device initialises: set later, the kernel's graph fails to compile. Also False, silently, with
+    ``HPU_OPS_TPC=0`` in the environment, and, with one warning, when ``LIB`` does not exist."""
+    global _INSTALLED, _LATE_WARNED, _MISSING_WARNED
+    if os.environ.get(OPT_OUT) == "0":
+        _INSTALLED = False
+        return False
+    if not _lib_exists(LIB):
+        _INSTALLED = False
+        if not _MISSING_WARNED:
+            _MISSING_WARNED = True
+            warnings.warn(MISSING_WARNING.format(path=LIB), stacklevel=2)
+        return False
     if _initialized():
         _INSTALLED = False
         if not _LATE_WARNED:
@@ -279,15 +328,43 @@ def install_kernel_path():
     return True
 
 
+@functools.cache
+def _lib_exists(path):
+    return path.exists()
+
+
 def available():
-    """True when ``install_kernel_path`` succeeded in this process and the library is there."""
-    return _INSTALLED and LIB.exists()
+    """True when ``install_kernel_path`` succeeded in this process and the library is there (the file check is cached
+    per path)."""
+    return _INSTALLED and _lib_exists(LIB)
+
+
+def _device_name():
+    """The name of the HPU device (cached once read): ``habana_frameworks.torch.hpu.get_device_name()``, else
+    ``torch.hpu.get_device_name()``; "" if neither answers."""
+    global _DEVICE
+    if _DEVICE is None:
+        for module in (_habana_hpu(), getattr(torch, "hpu", None)):
+            try:
+                _DEVICE = str(module.get_device_name())
+                break
+            except Exception:  # noqa: BLE001  (no such module or name: try the next, else decline)
+                continue
+        else:
+            return ""
+    return _DEVICE
+
+
+def _gaudi2():
+    """The kernels are compiled for Gaudi2 only: on another generation they would fail or run wrong."""
+    return "GAUDI2" in _device_name().upper()
 
 
 def ready():
-    """``available()`` and the C++ extension built. The build happens on the first call; if it fails, one warning,
-    then False for the rest of the process (the ops keep Habana's CPU fallback, with no retry mid-forward)."""
-    return available() and _built()
+    """``available()``, a Gaudi2 device and the C++ extension built. The build happens on the first call; if it
+    fails, one warning, then False for the rest of the process (the ops run through hpu-ops' own CPU route, with no
+    retry mid-forward)."""
+    return available() and _gaudi2() and _built()
 
 
 @functools.cache
@@ -334,6 +411,12 @@ def _eigh_op():
     return torch.ops.linalg_tpc.jacobi_eigh
 
 
+def _eigh_refine_op():
+    """``torch.ops.linalg_tpc.jacobi_eigh_refine``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_eigh_refine
+
+
 def _tri_op(upper, unitriangular):
     """``torch.ops.linalg_tpc.tri_solve_*``, built on first use."""
     _load()
@@ -341,14 +424,15 @@ def _tri_op(upper, unitriangular):
     return getattr(torch.ops.linalg_tpc, name)
 
 
-# Lazy mode on bridge 1.21.4 can drop the unused outputs of a multi-output custom op (the callers use some of X, D and
-# S), and the next graph then fails at mark_step with "ValidateSyncInputTensors tensor_data is empty". A mark_step
-# before and after each call keeps the op alone in its graph. The cost is two graph boundaries per call; eager mode
-# needs none.
 def _lazy():
+    """Lazy mode, and not tracing under ``torch.compile``."""
     return os.environ.get("PT_HPU_LAZY_MODE", "1") != "0" and not torch.compiler.is_compiling()
 
 
+# Measured on Gaudi2, bridge 1.21.4, lazy mode: a TPC custom op whose inputs come from the pending lazy graph can fail
+# with "ValidateSyncInputTensors tensor_data is empty" (nondeterministic). A mark_step BEFORE the op prevents it (2 of
+# 2 gate runs race-free); a mark_step only AFTER the op does not, and packing the outputs into one tensor does not
+# either. The cost is one graph boundary per call; eager mode needs none.
 def _flush():
     """``mark_step`` in lazy mode; nothing in eager mode, while tracing under ``torch.compile``, or without Habana."""
     if not _lazy():
@@ -361,15 +445,9 @@ def _flush():
 
 
 def _call(op, *args):
-    """``op(*args)`` as a graph of its own in lazy mode, wrapped in an ATen node so ``.cpu()`` materializes it."""
+    """``op(*args)`` after a lazy graph boundary (``mark_step`` before the op only)."""
     _flush()
-    out = op(*args)
-    _flush()
-    if _lazy():
-        if isinstance(out, tuple):
-            return tuple(t.clone() if isinstance(t, torch.Tensor) else t for t in out)
-        return out.clone() if isinstance(out, torch.Tensor) else out
-    return out
+    return op(*args)
 
 
 def _fresh(t):
@@ -479,9 +557,14 @@ def eigh(A, upper):
     if n > EIGH_MAXN or A.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.eigh takes square A with n <= {EIGH_MAXN}, got {tuple(A.shape)}")
     batch = A.shape[:-2]
+    if n == 1:  # trivial, and the kernel's graph does not compile at n = 1 in lazy mode (synStatus 26)
+        A = A.to(torch.float32)
+        return A.reshape(*batch, 1).clone(), torch.ones_like(A)
     # a fresh tensor, never a view of the caller's input: views break lazy mode
     S = torch.triu(A) + torch.triu(A, 1).mT if upper else torch.tril(A) + torch.tril(A, -1).mT
-    W, Vt = _call(_eigh_op(), S.reshape(-1, n, n).to(torch.float32).contiguous())
+    S_flat = S.reshape(-1, n, n).to(torch.float32).contiguous()
+    _, Vt1 = _call(_eigh_op(), S_flat)
+    W, Vt = _call(_eigh_refine_op(), S_flat, Vt1)
     w, order = W.sort(-1)
     V = Vt.gather(-2, order[..., :, None].expand_as(Vt)).mT
     return w.reshape(*batch, n), V.reshape(*batch, n, n)
@@ -490,14 +573,16 @@ def eigh(A, upper):
 def eigh_reference(A, upper):
     """``eigh`` through numpy's LAPACK, the contract of the kernel path (torch's own ``linalg.eigh`` is what the CPU
     tests override). Detached: no autograd through the kernel. For the CPU tests."""
+    import numpy as np  # only here: ``import hpu_ops`` does not need numpy
+
     w, V = np.linalg.eigh(A.detach().cpu().numpy(), UPLO="U" if upper else "L")
     return torch.from_numpy(w).to(A.device), torch.from_numpy(V).to(A.device)
 
 
 def gj_solve_reference(A, B):
     """``gj_solve`` in plain torch, the contract of the kernel: ``lu`` and ``lu_solve`` of ``hpu_ops.linalg``, ``D``
-    the diagonal of U (a zero pivot leaves later pivots finite, as in the kernel), ``S[..., 0]`` the parity of the
-    pivots and ``S[..., 1]`` the info. For the CPU tests."""
+    the diagonal of U (a zero pivot leaves later pivots finite; the kernel also zeroes the pivot's row, which this
+    reference does not), ``S[..., 0]`` the parity of the pivots and ``S[..., 1]`` the info. For the CPU tests."""
     from .. import linalg
 
     LU, pivots = linalg.lu(A)
