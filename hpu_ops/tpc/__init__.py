@@ -1,14 +1,12 @@
 """The Gaudi2 TPC Gauss-Jordan kernel behind ``linalg.solve``, ``inv``, ``det``, ``slogdet``, ``solve_triangular`` and
-``cholesky_solve``: ``torch.ops.linalg_tpc.gj_solve(A[b, n, n], B[b, n, m]) -> P[b, n, m + 2]`` and ``gj_inv(A) -> P`` (B = identity,
-built in the kernel) for float32, n and m <= 32. Every op returns ONE packed tensor (lazy mode on bridge 1.21.4 drops
-the unused outputs of a multi-output custom op): columns ``0..m-1`` are ``X``, column ``m`` is ``D``, column ``m + 1``
-rows 0 and 1 are the sign and the info (the rest 0); the Python wrappers slice views and return ``(X, D, S)``. One matrix per index-space
+``cholesky_solve``: ``torch.ops.linalg_tpc.gj_solve(A[b, n, n], B[b, n, m]) -> (X[b, n, m], D[b, n], S[b, 2])`` and
+``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel) for float32, n and m <= 32. One matrix per index-space
 member, rows in local memory, partial pivoting. ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign (-1)^swaps
 of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can differ from
 LAPACK's, and is nonzero exactly when a pivot is exactly zero. The kernel zeroes the pivot row of a zero pivot so
 later pivots stay finite.
 
-``jacobi_eigh(A[b, n, n]) -> P[b, n, n + 1]`` (rows of ``Vt`` in columns ``0..n-1``, ``W[j]`` in column ``n``) is a one-sided Jacobi eigensolver of the same shape (float32,
+``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
 n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Batch 32, n = 22,
 eager: 1.27 ms per call against about 3.7 ms for Habana's CPU fallback (the raw kernel takes 0.19 ms); batch 1024:
 3.7 ms against 52 ms. Accuracy within about 3.8x of CPU float32's, also on repeated eigenvalues, condition 1e6 and
@@ -46,23 +44,30 @@ _MISSING_WARNED = False
 _DEVICE = None
 
 # The registration strings are those measured on Gaudi2, plus gj_inv (A alone, identity right-hand side) and
-# jacobi_eigh (A alone). Each op has ONE packed output (see the module docstring). CPP: the
-# eager and compile API (bridge 2), CPP_LAZY: the legacy API of lazy mode.
+# jacobi_eigh (A alone; W [batch, n], Vt [batch, n, n]). CPP: the
+# eager and compile API (bridge 2), CPP_LAZY: the legacy API of lazy mode. S is [batch, 2]: sign and info.
 CPP = r"""
 #include <torch/extension.h>
 #include "hpu_custom_op_pt2.h"
 
 static habana::PartialOutputMetaDataVector solve_meta(const at::Stack& inputs) {
   auto a = inputs[0].toTensor(), b = inputs[1].toTensor();
-  return {habana::PartialOutputMetaData{b.scalar_type(), {a.size(0), a.size(1), b.size(2) + 2}}};
+  auto batch = a.size(0), n = a.size(1);
+  return {habana::PartialOutputMetaData{b.scalar_type(), b.sizes().vec()},
+          habana::PartialOutputMetaData{b.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{b.scalar_type(), {batch, 2}}};
 }
 static habana::PartialOutputMetaDataVector inv_meta(const at::Stack& inputs) {
   auto a = inputs[0].toTensor();
-  return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1), a.size(2) + 2}}};
+  auto batch = a.size(0), n = a.size(1);
+  return {habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, 2}}};
 }
 static habana::PartialOutputMetaDataVector eigh_meta(const at::Stack& inputs) {
   auto a = inputs[0].toTensor();
-  return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1), a.size(2) + 1}}};
+  return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1)}},
+          habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()}};
 }
 static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", eigh_meta, nullptr);
@@ -71,25 +76,28 @@ static bool registered = [] {
   return true;
 }();
 
-at::Tensor gj_solve(at::Tensor a, at::Tensor b) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor b) {
   std::vector<c10::IValue> inputs{a, b};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::gj_solve");
-  return desc.execute(inputs)[0];
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
 }
-at::Tensor gj_inv(at::Tensor a) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::gj_inv");
-  return desc.execute(inputs)[0];
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
 }
-at::Tensor jacobi_eigh(at::Tensor a) {
+std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_eigh");
-  return desc.execute(inputs)[0];
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
 }
 TORCH_LIBRARY(linalg_tpc, m) {
-  m.def("gj_solve(Tensor a, Tensor b) -> Tensor");
-  m.def("gj_inv(Tensor a) -> Tensor");
-  m.def("jacobi_eigh(Tensor a) -> Tensor");
+  m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
+  m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
@@ -97,67 +105,81 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("jacobi_eigh", jacobi_eigh);
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
-  m.impl("gj_solve", [](at::Tensor a, at::Tensor b) { return b.new_empty({a.size(0), a.size(1), b.size(2) + 2}); });
-  m.impl("gj_inv", [](at::Tensor a) { return a.new_empty({a.size(0), a.size(1), a.size(2) + 2}); });
-  m.impl("jacobi_eigh", [](at::Tensor a) { return a.new_empty({a.size(0), a.size(1), a.size(2) + 1}); });
+  m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
+    return std::make_tuple(b.new_empty(b.sizes()), b.new_empty({a.size(0), a.size(1)}), b.new_empty({a.size(0), 2}));
+  });
+  m.impl("gj_inv", [](at::Tensor a) {
+    return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), a.size(1)}), a.new_empty({a.size(0), 2}));
+  });
+  m.impl("jacobi_eigh", [](at::Tensor a) {
+    return std::make_tuple(a.new_empty({a.size(0), a.size(1)}), a.new_empty(a.sizes()));
+  });
 }
 """
 CPP_LAZY = r"""
 #include <torch/extension.h>
 #include "hpu_custom_op.h"
 
-static auto pshape_solve = [](const at::Stack& s) {
-  auto a = s[0].toTensor(), b = s[1].toTensor();
-  return std::vector<int64_t>{a.size(0), a.size(1), b.size(2) + 2};
-};
-static auto pshape_inv = [](const at::Stack& s) {
+static auto xshape_b = [](const at::Stack& s) { return s[1].toTensor().sizes().vec(); };
+static auto xshape_a = [](const at::Stack& s) { return s[0].toTensor().sizes().vec(); };
+static auto dshape = [](const at::Stack& s) {
   auto a = s[0].toTensor();
-  return std::vector<int64_t>{a.size(0), a.size(1), a.size(2) + 2};
+  return std::vector<int64_t>{a.size(0), a.size(1)};
 };
-static auto pshape_eigh = [](const at::Stack& s) {
-  auto a = s[0].toTensor();
-  return std::vector<int64_t>{a.size(0), a.size(1), a.size(2) + 1};
-};
+static auto sshape = [](const at::Stack& s) { return std::vector<int64_t>{s[0].toTensor().size(0), 2}; };
 
 static bool registered_solve = [] {
   std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
                                                {habana::custom_op::input_type::TENSOR, 1}};
-  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, pshape_solve}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_b},
+                                                 {1, c10::ScalarType::Float, dshape},
+                                                 {2, c10::ScalarType::Float, sshape}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", in, out, nullptr);
   return true;
 }();
 static bool registered_inv = [] {
   std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
-  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, pshape_inv}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_a},
+                                                 {1, c10::ScalarType::Float, dshape},
+                                                 {2, c10::ScalarType::Float, sshape}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", in, out, nullptr);
   return true;
 }();
+
+static auto wshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  return std::vector<int64_t>{a.size(0), a.size(1)};
+};
 static bool registered_eigh = [] {
   std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
-  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, pshape_eigh}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, wshape},
+                                                 {1, c10::ScalarType::Float, xshape_a}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", in, out, nullptr);
   return true;
 }();
 
-at::Tensor gj_solve(at::Tensor a, at::Tensor b) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor b) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_solve");
   std::vector<c10::IValue> inputs{a, b};
-  return op.execute(inputs)[0];
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2]};
 }
-at::Tensor gj_inv(at::Tensor a) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_inv");
   std::vector<c10::IValue> inputs{a};
-  return op.execute(inputs)[0];
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2]};
 }
-at::Tensor jacobi_eigh(at::Tensor a) {
+std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_eigh");
   std::vector<c10::IValue> inputs{a};
-  return op.execute(inputs)[0];
+  auto out = op.execute(inputs);
+  return {out[0], out[1]};
 }
 TORCH_LIBRARY(linalg_tpc, m) {
-  m.def("gj_solve(Tensor a, Tensor b) -> Tensor");
-  m.def("gj_inv(Tensor a) -> Tensor");
-  m.def("jacobi_eigh(Tensor a) -> Tensor");
+  m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
+  m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
@@ -296,35 +318,36 @@ def _eigh_op():
     return torch.ops.linalg_tpc.jacobi_eigh
 
 
-def _pack(X, D, S):
-    """The packed layout of the kernel's single output from ``(X[b, n, m], D[b, n], S[b, 2])`` (n >= 2)."""
-    n = X.shape[-2]
-    return torch.cat([X, D[..., None], torch.nn.functional.pad(S, (0, n - 2))[..., None]], -1)
+# Lazy mode on bridge 1.21.4 can drop the unused outputs of a multi-output custom op (the callers use some of X, D and
+# S), and the next graph then fails at mark_step with "ValidateSyncInputTensors tensor_data is empty". A mark_step
+# before and after each call keeps the op alone in its graph. The cost is two graph boundaries per call; eager mode
+# needs none.
+def _flush():
+    """``mark_step`` in lazy mode; nothing in eager mode, while tracing under ``torch.compile``, or without Habana."""
+    if os.environ.get("PT_HPU_LAZY_MODE", "1") == "0" or torch.compiler.is_compiling():
+        return
+    try:
+        import habana_frameworks.torch.core as htcore
+    except ImportError:
+        return
+    htcore.mark_step()
 
 
-def _unpack(P):
-    """``(X, D, S)`` as views of the packed ``P[b, n, m + 2]``."""
-    m = P.shape[-1] - 2
-    return P[..., :m], P[..., m], P[..., :2, m + 1]
-
-
-def _trivial(A, B):
-    """``(X, D, S)`` for n = 1 without the kernel (the packed layout has no row 1 for the info there): the pivot is
-    the entry, and a zero pivot zeroes the row and has info 1."""
-    zero = A == 0
-    X = torch.where(zero, torch.zeros_like(B), B / torch.where(zero, torch.ones_like(A), A))
-    return X, A[..., 0], torch.cat([torch.ones_like(A[..., 0]), zero[..., 0].to(A.dtype)], -1)
+def _call(op, *args):
+    """``op(*args)`` as a graph of its own in lazy mode."""
+    _flush()
+    out = op(*args)
+    _flush()
+    return out
 
 
 def _chunked(A, B):
     """The kernel on ``A[b, n, n]`` and ``B[b, n, m]`` for any ``m``: columns of ``B`` in contiguous chunks of at most
     ``MAXN``, ``X`` concatenated, ``D`` and ``S`` from the first chunk (they depend on ``A`` alone)."""
-    if A.shape[-1] == 1:
-        return _trivial(A, B)
     op = _op()
     if B.shape[-1] <= MAXN:
-        return _unpack(op(A, B))
-    parts = [_unpack(op(A, chunk.contiguous())) for chunk in B.split(MAXN, -1)]
+        return _call(op, A, B)
+    parts = [_call(op, A, chunk.contiguous()) for chunk in B.split(MAXN, -1)]
     return torch.cat([p[0] for p in parts], -1), parts[0][1], parts[0][2]
 
 
@@ -353,8 +376,7 @@ def gj_inv(A):
     n = A.shape[-1]
     _check(A, n)
     batch = A.shape[:-2]
-    A = A.reshape(-1, n, n).to(torch.float32).contiguous()
-    X, D, S = _trivial(A, torch.ones_like(A)) if n == 1 else _unpack(_inv_op()(A))
+    X, D, S = _call(_inv_op(), A.reshape(-1, n, n).to(torch.float32).contiguous())
     return X.reshape(*batch, n, n), D.reshape(*batch, n), S.reshape(*batch, 2)
 
 
@@ -371,21 +393,10 @@ def eigh(A, upper):
         return A.reshape(*batch, 1).clone(), torch.ones_like(A)
     # a fresh tensor, never a view of the caller's input: views break lazy mode
     S = torch.triu(A) + torch.triu(A, 1).mT if upper else torch.tril(A) + torch.tril(A, -1).mT
-    P = _eigh_op()(S.reshape(-1, n, n).to(torch.float32).contiguous())
-    W, Vt = P[..., n], P[..., :n]
+    W, Vt = _call(_eigh_op(), S.reshape(-1, n, n).to(torch.float32).contiguous())
     w, order = W.sort(-1)
     V = Vt.gather(-2, order[..., :, None].expand_as(Vt)).mT
     return w.reshape(*batch, n), V.reshape(*batch, n, n)
-
-
-def eigh_packed_reference(A):
-    """The packed output of ``jacobi_eigh`` (``P[b, n, n + 1]``: eigenvector rows, ``W`` in column ``n``) through
-    numpy, for the CPU tests."""
-    import numpy as np
-
-    w, V = np.linalg.eigh(A.detach().cpu().numpy())
-    w, Vt = torch.from_numpy(w), torch.from_numpy(V).mT
-    return torch.cat([Vt, w[..., None]], -1).to(A.dtype)
 
 
 def eigh_reference(A, upper):
@@ -408,13 +419,3 @@ def gj_solve_reference(A, B):
     D = torch.diagonal(LU, dim1=-2, dim2=-1)
     S = torch.stack([linalg._parity(pivots).to(A.dtype), linalg.lu_info_of_diagonal(D).to(A.dtype)], -1)
     return X, D, S
-
-
-def gj_solve_packed_reference(A, B):
-    """``gj_solve_reference`` in the packed layout of the kernel's single output (n >= 2). For the CPU tests."""
-    return _pack(*gj_solve_reference(A, B))
-
-
-def gj_inv_packed_reference(A):
-    """The packed output of ``gj_inv`` (the right-hand side is the identity). For the CPU tests."""
-    return gj_solve_packed_reference(A, torch.eye(A.shape[-1], dtype=A.dtype).expand_as(A))

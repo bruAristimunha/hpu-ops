@@ -705,7 +705,7 @@ def test_tpc_chunks_columns(monkeypatch):
     def fake(A, B):
         assert B.shape[-1] <= tpc.MAXN and B.is_contiguous()
         seen.append(B.shape[-1])
-        return tpc.gj_solve_packed_reference(A, B)
+        return tpc.gj_solve_reference(A, B)
 
     monkeypatch.setattr(tpc, "_op", lambda: fake)
     A, B = f32(3, n=5), torch.randn(3, 70, 5).mT
@@ -721,7 +721,7 @@ def test_tpc_gj_solve_flattens_batch_dims(monkeypatch):
 
     def fake(A, B):
         shapes.append((A.dim(), A.is_contiguous(), A.dtype))
-        return tpc.gj_solve_packed_reference(A, B)
+        return tpc.gj_solve_reference(A, B)
 
     monkeypatch.setattr(tpc, "_op", lambda: fake)
     A, B = f32(2, 3, n=4).mT, torch.randn(2, 3, 4, 2)
@@ -864,7 +864,8 @@ def test_lu_placeholder_has_own_storage():
 
 
 def test_chunks_and_flat_inv_contract(monkeypatch):
-    monkeypatch.setattr(tpc, "_inv_op", lambda: tpc.gj_inv_packed_reference)
+    monkeypatch.setattr(tpc, "_inv_op", lambda: lambda A: tpc.gj_solve_reference(
+        A, torch.eye(A.shape[-1]).expand_as(A)))
     A = f32(2, 3, n=5)
     X, D, S = tpc.gj_inv(A)
     torch.testing.assert_close(X, torch.linalg.inv(A), rtol=1e-3, atol=1e-3)
@@ -940,46 +941,50 @@ def test_install_kernel_path(monkeypatch):
                                       "run through hpu-ops' own CPU route, not Habana's fallback.")
 
 
-def test_each_tpc_op_returns_one_tensor_and_the_slices_are_views(monkeypatch):
-    """One packed output per op (lazy mode drops unused outputs of multi-output ops, so no flush is needed)."""
-    out, calls = {}, []
-
-    def spy(name, fake):
-        def op(*args):
-            P = fake(*args)
-            assert isinstance(P, torch.Tensor)
-            calls.append(name)
-            out[name] = P
-            return P
-        return op
-
-    monkeypatch.setattr(tpc, "_op", lambda: spy("solve", tpc.gj_solve_packed_reference))
-    monkeypatch.setattr(tpc, "_inv_op", lambda: spy("inv", tpc.gj_inv_packed_reference))
-    monkeypatch.setattr(tpc, "_eigh_op", lambda: spy("eigh", tpc.eigh_packed_reference))
-    assert not hasattr(tpc, "_flush") and not hasattr(tpc, "_call")
-    A = f32(2, n=4)
-    results = {"solve": tpc.gj_solve(A, torch.randn(2, 4, 3)), "inv": tpc.gj_inv(A)}
-    for name, (X, D, S) in results.items():
-        P = out[name]
-        m = P.shape[-1] - 2
-        assert P.shape == (2, 4, m + 2) and X.shape == (2, 4, m) and D.shape == (2, 4) and S.shape == (2, 2)
-        for view in (X, D, S):
-            assert view.untyped_storage().data_ptr() == P.untyped_storage().data_ptr()
-        assert torch.equal(P[:, 2:, m + 1], torch.zeros(2, 2))
-    w, V = tpc.eigh(A, False)
-    assert calls == ["solve", "inv", "eigh"] and out["eigh"].shape == (2, 4, 5)
-    torch.testing.assert_close(w, torch.linalg.eigvalsh(A))
+@pytest.mark.parametrize("lazy, flushes", [("1", 2), ("0", 0)])
+def test_tpc_flushes_the_lazy_graph_around_the_op(monkeypatch, lazy, flushes):
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    torch_mod = types.SimpleNamespace(core=core)
+    hf = types.SimpleNamespace(torch=torch_mod)
+    for name, mod in (("habana_frameworks", hf), ("habana_frameworks.torch", torch_mod),
+                      ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", lazy)
+    monkeypatch.setattr(tpc, "_op", lambda: tpc.gj_solve_reference)
+    monkeypatch.setattr(tpc, "_inv_op",
+                        lambda: lambda A: tpc.gj_solve_reference(A, torch.eye(A.shape[-1]).expand_as(A)))
+    tpc.gj_solve(f32(2, n=4), torch.randn(2, 4, 3))
+    assert len(marks) == flushes
+    marks.clear()
+    tpc.gj_inv(f32(2, n=4))
+    assert len(marks) == flushes
 
 
-def test_tpc_n1_solve_and_inv_skip_the_kernel(monkeypatch):
-    monkeypatch.setattr(tpc, "_op", lambda: pytest.fail("kernel used"))
-    monkeypatch.setattr(tpc, "_inv_op", lambda: pytest.fail("kernel used"))
-    A = torch.tensor([[[2.0]], [[0.0]]])
-    X, D, S = tpc.gj_solve(A, torch.tensor([[[4.0, 6.0]], [[1.0, 1.0]]]))
-    assert torch.equal(X, torch.tensor([[[2.0, 3.0]], [[0.0, 0.0]]]))
-    assert torch.equal(D, torch.tensor([[2.0], [0.0]])) and torch.equal(S, torch.tensor([[1.0, 0.0], [1.0, 1.0]]))
-    X, D, S = tpc.gj_inv(A)
-    assert torch.equal(X, torch.tensor([[[0.5]], [[0.0]]])) and S.shape == (2, 2)
+def test_flush_comes_before_and_after_the_op(monkeypatch):
+    order = []
+    core = types.SimpleNamespace(mark_step=lambda: order.append("flush"))
+    torch_mod = types.SimpleNamespace(core=core)
+    for name, mod in (("habana_frameworks", types.SimpleNamespace(torch=torch_mod)),
+                      ("habana_frameworks.torch", torch_mod), ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    out = tpc._call(lambda x: order.append("op") or x, 1)
+    assert out == 1 and order == ["flush", "op", "flush"]
+
+
+def test_flush_is_skipped_when_compiling_or_without_habana(monkeypatch):
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    monkeypatch.setitem(sys.modules, "habana_frameworks", None)  # import raises ImportError
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch", None)
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.core", None)
+    tpc._flush()  # no Habana: no error
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.core", core)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    tpc._flush()
+    assert marks == []
 
 
 def test_lazy_cpp_registers_eigh_with_the_legacy_api():

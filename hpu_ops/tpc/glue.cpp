@@ -72,9 +72,9 @@ tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
         in->inputTensorNr = inputs;
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
     }
-    if (in->outputTensorNr != 1)
+    if (in->outputTensorNr != 3)
     {
-        in->outputTensorNr = 1;
+        in->outputTensorNr = 3;
         return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     }
     for (unsigned i = 0; i < inputs; i++)
@@ -109,11 +109,19 @@ tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
         full_dim(pb, 1, n);
         batch_dim(pb, 2);
     }
-    auto& pp = out->outputTensorAccessPattern[0];  // P [m + 2, n, batch]: X, D and S packed
-    base_pattern(pp);
-    full_dim(pp, 0, m + 2);
-    full_dim(pp, 1, n);
-    batch_dim(pp, 2);
+    auto& px = out->outputTensorAccessPattern[0];
+    base_pattern(px);
+    full_dim(px, 0, m);
+    full_dim(px, 1, n);
+    batch_dim(px, 2);
+    auto& pd = out->outputTensorAccessPattern[1];
+    base_pattern(pd);
+    full_dim(pd, 0, n);
+    batch_dim(pd, 1);
+    auto& ps = out->outputTensorAccessPattern[2];
+    base_pattern(ps);
+    full_dim(ps, 0, 2);
+    batch_dim(ps, 1);
 
     return identity ? copy_elf(out, _binary___gj_inv_f32_gaudi2_o_start, _binary___gj_inv_f32_gaudi2_o_end)
                     : copy_elf(out, _binary___gj_solve_f32_gaudi2_o_start, _binary___gj_solve_f32_gaudi2_o_end);
@@ -126,9 +134,9 @@ tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_l
         in->inputTensorNr = 1;
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
     }
-    if (in->outputTensorNr != 1)
+    if (in->outputTensorNr != 2)
     {
-        in->outputTensorNr = 1;
+        in->outputTensorNr = 2;
         return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     }
     if (in->inputTensors[0].geometry.dataType != tpc_lib_api::DATA_F32)
@@ -149,11 +157,15 @@ tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_l
     full_dim(pa, 0, n);
     full_dim(pa, 1, n);
     batch_dim(pa, 2);
-    auto& pp = out->outputTensorAccessPattern[0];  // P [n + 1, n, batch]: V rows and W packed
-    base_pattern(pp);
-    full_dim(pp, 0, n + 1);
-    full_dim(pp, 1, n);
-    batch_dim(pp, 2);
+    auto& pw = out->outputTensorAccessPattern[0];
+    base_pattern(pw);
+    full_dim(pw, 0, n);
+    batch_dim(pw, 1);
+    auto& pv = out->outputTensorAccessPattern[1];
+    base_pattern(pv);
+    full_dim(pv, 0, n);
+    full_dim(pv, 1, n);
+    batch_dim(pv, 2);
     return copy_elf(out, _binary___jacobi_eigh_f32_gaudi2_o_start, _binary___jacobi_eigh_f32_gaudi2_o_end);
 }
 

@@ -2,8 +2,7 @@
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
  *   A [n, n, batch]  f32 (symmetric; the lower triangle is mirrored by the caller)
- *   P [n + 1, n, batch]  f32: the ONE output; row j = eigenvector of W[j] in lanes 0..n-1, W[j] (eigenvalues,
- *   unsorted) in lane n. V rows are stored first (lanes 0..n-1), then W is merged into lane n of each row.
+ *   W [n, batch]     f32: eigenvalues, unsorted          V [n, n, batch]  f32: row j = eigenvector of W[j]
  * A is normalized by 1/sigma (sigma = Gershgorin bound, with overflow/subnormal prescaling) and shifted to
  * S = A/sigma + 1.001 I so S is strictly positive definite with O(1) entries. Two matrices (bt in lanes 0..31,
  * bt+1 in lanes 32..63 when has2) are packed side-by-side into u[0..n-1] (8 KB VLM total) and solved with
@@ -54,11 +53,6 @@ static inline float64 pack_halves(float64 lo, float64 hi)
     return v_f32_mov_dual_group_b(hi, 0xFFFFFFFF, 1, 3, MkWr(1, 1), p);
 }
 
-static inline float64 lane_bcast_w(float64 v, uint64 lane, int j)
-{
-    return v_f32_reduce_add(v_f32_sel_eq_u32_b(lane, (unsigned)j, v, 0.0f));  // as lane_bcast in gj_solve
-}
-
 static inline float64 unpack_hi_half(float64 p)
 {
     float64 z = 0.0f;
@@ -85,7 +79,7 @@ static inline float64 unpack_hi_half(float64 p)
         }                               \
     } while (0)
 
-void main(tensor A, tensor P)
+void main(tensor A, tensor W, tensor V)
 {
     const int n = get_dim_size(A, 0);
     const uint64 lane = read_lane_id_4b_b();
@@ -341,14 +335,14 @@ void main(tensor A, tensor P)
             u[j + 1] = vj1;
             int5 c0a = {0, j, bt, 0, 0};
             int5 c1a = {0, j + 1, bt, 0, 0};
-            v_f32_st_tnsr_partial(c0a, P, vj0, n - 1, 0);
-            v_f32_st_tnsr_partial(c1a, P, vj1, n - 1, 0);
+            v_f32_st_tnsr_partial(c0a, V, vj0, n - 1, 0);
+            v_f32_st_tnsr_partial(c1a, V, vj1, n - 1, 0);
             if (has2)
             {
                 int5 c0b = {0, j, bt + 1, 0, 0};
                 int5 c1b = {0, j + 1, bt + 1, 0, 0};
-                v_f32_st_tnsr_partial(c0b, P, unpack_hi_half(vj0), n - 1, 0);
-                v_f32_st_tnsr_partial(c1b, P, unpack_hi_half(vj1), n - 1, 0);
+                v_f32_st_tnsr_partial(c0b, V, unpack_hi_half(vj0), n - 1, 0);
+                v_f32_st_tnsr_partial(c1b, V, unpack_hi_half(vj1), n - 1, 0);
             }
         }
         if (j < n)
@@ -360,11 +354,11 @@ void main(tensor A, tensor P)
             float64 vj0 = v_f32_mul_b(u0, rn0);
             u[j] = vj0;
             int5 ca = {0, j, bt, 0, 0};
-            v_f32_st_tnsr_partial(ca, P, vj0, n - 1, 0);
+            v_f32_st_tnsr_partial(ca, V, vj0, n - 1, 0);
             if (has2)
             {
                 int5 cb = {0, j, bt + 1, 0, 0};
-                v_f32_st_tnsr_partial(cb, P, unpack_hi_half(vj0), n - 1, 0);
+                v_f32_st_tnsr_partial(cb, V, unpack_hi_half(vj0), n - 1, 0);
             }
         }
 
@@ -446,18 +440,12 @@ void main(tensor A, tensor P)
             if (j0 + 7 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 7), w7, w_packed);
         }
         w_packed = v_f32_mul_b(w_packed, inv_prescale);
-        // W[j] into lane n of row j: W is a vector over j (lane j = W[j]); lane j is broadcast to every lane and stored with a
-        // one-lane partial store (lanes n..n, as the partial stores above take (last lane, first lane)), matrix bt from the low half, bt + 1 from the high half.
-        const float64 w_hi = unpack_hi_half(w_packed);
-        for (int j = 0; j < n; j++)
+        int5 cwa = {0, bt, 0, 0, 0};
+        v_f32_st_tnsr_partial(cwa, W, w_packed, n - 1, 0);
+        if (has2)
         {
-            int5 cwa = {0, j, bt, 0, 0};
-            v_f32_st_tnsr_partial(cwa, P, lane_bcast_w(w_packed, lane, j), n, n);
-            if (has2)
-            {
-                int5 cwb = {0, j, bt + 1, 0, 0};
-                v_f32_st_tnsr_partial(cwb, P, lane_bcast_w(w_hi, lane, j), n, n);
-            }
+            int5 cwb = {0, bt + 1, 0, 0, 0};
+            v_f32_st_tnsr_partial(cwb, W, unpack_hi_half(w_packed), n - 1, 0);
         }
     }
 }
