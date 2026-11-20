@@ -1,6 +1,6 @@
 """The Gaudi2 TPC Gauss-Jordan kernel behind ``linalg.solve``, ``inv``, ``det``, ``slogdet``, ``solve_triangular`` and
 ``cholesky_solve``: ``torch.ops.linalg_tpc.gj_solve(A[b, n, n], B[b, n, m]) -> (X[b, n, m], D[b, n], S[b, 2])`` and
-``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel) for float32, n and m <= 32. One matrix per index-space
+``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel) for float32, n <= 64 (B columns chunked by 64). One matrix per index-space
 member, rows in local memory, partial pivoting. ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign (-1)^swaps
 of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can differ from
 LAPACK's, and is nonzero exactly when a pivot is exactly zero.
@@ -25,7 +25,7 @@ import warnings
 import numpy as np
 import torch
 
-MAXN = 32
+MAXN = 64
 EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"

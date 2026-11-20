@@ -18,7 +18,7 @@ namespace {
 const char* kSolve = "gj_solve_f32_gaudi2";
 const char* kInv = "gj_inv_f32_gaudi2";  // the same source with -DIDENTITY_B: A alone, B is the identity
 const char* kEigh = "jacobi_eigh_f32_gaudi2";
-constexpr uint64_t kMaxN = 32;      // MAXN of gj_solve
+constexpr uint64_t kMaxN = 64;      // MAXN of gj_solve
 constexpr uint64_t kMaxEighN = 32;  // MAXN of jacobi_eigh
 
 void base_pattern(tpc_lib_api::TensorAccessPattern& p)

@@ -694,7 +694,7 @@ def test_tpc_chunks_columns(monkeypatch):
     A, B = f32(3, n=5), torch.randn(3, 70, 5).mT
     got = tpc._chunked(A, B)
     want = tpc.gj_solve_reference(A, B)
-    assert seen == [32, 32, 6]
+    assert seen == [64, 6]
     torch.testing.assert_close(got, want)
 
 
