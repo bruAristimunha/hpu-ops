@@ -500,8 +500,8 @@ def run_case(case, n, timed=True):
 
 def run_float64(case):
     """float64 on the card: declined, with one warning naming hpu-ops#16 on the first call. eigh, eigvalsh and inv run
-    on hpu-ops' CPU route. solve, det and slogdet warn too (the autograd kernel's check), then Habana's fallback runs
-    them; solve_triangular and cholesky_solve are not installed: no warning, Habana's fallback. The case's
+    on hpu-ops' CPU route, and so do solve_triangular and cholesky_solve. solve, det and slogdet warn too (the
+    autograd kernel's check), then Habana's fallback runs them. The case's
     ``fallback64`` is the expected delta, and an op outside it fails."""
     row = {"op": case.name, "n": F64_N, "batch": BATCH, "dtype": "float64", "lazy": LAZY, "baseline": BASELINE}
     if BASELINE:
