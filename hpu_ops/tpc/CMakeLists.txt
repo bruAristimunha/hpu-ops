@@ -7,13 +7,25 @@ set(TPC_INCLUDE_DIR "/usr/lib/habanatools/include" CACHE STRING "TPC includes")
 add_library(linalg_tpc SHARED glue.cpp)
 target_include_directories(linalg_tpc PRIVATE ${TPC_INCLUDE_DIR})
 
-# gj_solve (A, B) and gj_inv (A alone, B = identity, -DIDENTITY_B) share one source; jacobi_eigh has its own.
-foreach(KERNEL gj_solve_f32_gaudi2 gj_inv_f32_gaudi2 jacobi_eigh_f32_gaudi2)
+# gj_solve (A, B) and gj_inv (A alone, B = identity, -DIDENTITY_B) share one source;
+# the 4 tri_solve variants share tri_solve_f32_gaudi2.c; jacobi_eigh has its own.
+foreach(KERNEL
+        gj_solve_f32_gaudi2 gj_inv_f32_gaudi2 jacobi_eigh_f32_gaudi2
+        tri_solve_lower_f32_gaudi2 tri_solve_upper_f32_gaudi2
+        tri_solve_lower_unit_f32_gaudi2 tri_solve_upper_unit_f32_gaudi2)
     set(SOURCE ${KERNEL})
     set(DEFINES "")
     if(KERNEL STREQUAL "gj_inv_f32_gaudi2")
         set(SOURCE gj_solve_f32_gaudi2)
         set(DEFINES -DIDENTITY_B)
+    elseif(KERNEL MATCHES "^tri_solve_")
+        set(SOURCE tri_solve_f32_gaudi2)
+        if(KERNEL MATCHES "_upper_")
+            list(APPEND DEFINES -DUPPER)
+        endif()
+        if(KERNEL MATCHES "_unit_")
+            list(APPEND DEFINES -DUNIT_DIAG)
+        endif()
     endif()
     add_custom_command(
         OUTPUT ${KERNEL}_x86.o

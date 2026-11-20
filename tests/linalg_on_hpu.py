@@ -29,6 +29,7 @@ import habana_frameworks.torch.core as htcore
 import habana_frameworks.torch.hpu as hthpu
 import torch
 from habana_frameworks.torch.hpu.metrics import metric_global
+from torch.utils._python_dispatch import TorchDispatchMode
 
 LAZY = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
 HPU = torch.device("hpu")
@@ -156,6 +157,72 @@ def make_cholesky_solve_upper(b, n, dtype):
     return [torch.randn(b, n, 3, dtype=dtype), L.cholesky(spd(b, n, dtype, "cpu"), upper=True)]
 
 
+def make_triangular_right(b, n, dtype):
+    return [spd(b, n, dtype, "cpu").tril(), torch.randn(b, 3, n, dtype=dtype)]
+
+
+def make_triangular_upper_right(b, n, dtype):
+    return [spd(b, n, dtype, "cpu").tril().mT.contiguous(), torch.randn(b, 3, n, dtype=dtype)]
+
+
+def make_triangular_ill_cond(b, n, dtype):
+    return [torch.tril(torch.randn(b, n, n, dtype=dtype) / n, -1) + torch.diag_embed(torch.logspace(-3, 0, n, dtype=dtype)),
+            torch.randn(b, n, 3, dtype=dtype)]
+
+
+def make_cholesky_ill_cond(b, n, dtype):
+    return [torch.randn(b, n, 3, dtype=dtype),
+            torch.tril(torch.randn(b, n, n, dtype=dtype) * (0.1 / n), -1)
+            + torch.diag_embed(torch.logspace(-3, 0, n, dtype=dtype))]
+
+
+def make_triangular_chunked(b, n, dtype):
+    return [spd(b, n, dtype, "cpu").tril(), torch.randn(b, n, 70, dtype=dtype)]
+
+
+def make_triangular_2d(b, n, dtype):
+    return [spd(b, n, dtype, "cpu")[0].tril(), torch.randn(n, 3, dtype=dtype)]
+
+
+def make_cholesky_2d(b, n, dtype):
+    return [torch.randn(n, 3, dtype=dtype), L.cholesky(spd(b, n, dtype, "cpu")[0])]
+
+
+def make_triangular_nan_other(b, n, dtype):
+    a = spd(b, n, dtype, "cpu").tril()
+    a[..., torch.ones(n, n, dtype=torch.bool).triu(1)] = float("nan")
+    return [a, torch.randn(b, n, 3, dtype=dtype)]
+
+
+def make_triangular_upper_unit_nan(b, n, dtype):
+    a = torch.triu(torch.randn(b, n, n, dtype=dtype), 1) / n
+    a[..., torch.ones(n, n, dtype=torch.bool).tril(0)] = float("nan")
+    return [a, torch.randn(b, n, 3, dtype=dtype)]
+
+
+def make_cholesky_nan_other(b, n, dtype):
+    c = L.cholesky(spd(b, n, dtype, "cpu"))
+    c[..., torch.ones(n, n, dtype=torch.bool).triu(1)] = float("nan")
+    return [torch.randn(b, n, 3, dtype=dtype), c]
+
+
+class _CpuQrForward(TorchDispatchMode):
+    """Substitutes accurate CPU float32 QR factors in forward so backward exercises HPU solve_triangular alone."""
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten.linalg_qr.default and args[0].device.type == "hpu":
+            q, r = L.qr(args[0].detach().cpu())
+            return q.to(args[0].device), r.to(args[0].device)
+        return func(*args, **(kwargs or {}))
+
+
+def qr_isolated(x):
+    if x.device.type != "hpu":
+        return L.qr(x)
+    with _CpuQrForward():
+        return L.qr(x)
+
+
 def make_pivoting(b, n, dtype):
     return [pivoting(b, n, dtype)]
 
@@ -259,8 +326,30 @@ CASES = (
     Case("cholesky_solve.upper", make_cholesky_solve_upper, lambda b, c: torch.cholesky_solve(b, c, upper=True),
          float64=False, tpc=True, sizes=(22,)),
     Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False),
-    # factor 20: the forward is Habana's native qr, not an hpu_ops kernel (measured 10.2x at n=16)
-    Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20),
+    # n=16 fails identically to --baseline due to Habana's native torch.linalg.qr forward kernel (repro/habana_qr_n16_accuracy.py)
+    Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=10),
+    Case("linalg.qr_bwd.isolated", make_general, qr_isolated, err_qr, loss_qr, scope="bwd", float64=False,
+         factor=10, tpc=True),
+    Case("linalg.solve_triangular.left_false", make_triangular_right,
+         lambda a, b: L.solve_triangular(a, b, upper=False, left=False), float64=False, tpc=True, sizes=(16, 22, 64)),
+    Case("linalg.solve_triangular.upper_left_false", make_triangular_upper_right,
+         lambda a, b: L.solve_triangular(a, b, upper=True, left=False), float64=False, tpc=True, sizes=(16, 22, 64)),
+    Case("linalg.solve_triangular.ill_cond", make_triangular_ill_cond,
+         lambda a, b: L.solve_triangular(a, b, upper=False), float64=False, tpc=True, sizes=(16, 22, 64)),
+    Case("cholesky_solve.ill_cond", make_cholesky_ill_cond,
+         lambda b, c: torch.cholesky_solve(b, c), float64=False, tpc=True, sizes=(16, 22, 64)),
+    Case("solve_triangular.m70_chunked", make_triangular_chunked,
+         lambda a, b: L.solve_triangular(a, b, upper=False), float64=False, tpc=True, sizes=(16, 22, 64)),
+    Case("solve_triangular.2d", make_triangular_2d,
+         lambda a, b: L.solve_triangular(a, b, upper=False), float64=False, tpc=True, sizes=(16, 22, 64)),
+    Case("cholesky_solve.2d", make_cholesky_2d,
+         lambda b, c: torch.cholesky_solve(b, c), float64=False, tpc=True, sizes=(16, 22, 64)),
+    Case("linalg.solve_triangular.ignored_upper_nan", make_triangular_nan_other,
+         lambda a, b: L.solve_triangular(a, b, upper=False), float64=False, tpc=True, sizes=(22,)),
+    Case("linalg.solve_triangular.ignored_diag_lower_nan", make_triangular_upper_unit_nan,
+         lambda a, b: L.solve_triangular(a, b, upper=True, unitriangular=True), float64=False, tpc=True, sizes=(22,)),
+    Case("cholesky_solve.ignored_upper_nan", make_cholesky_nan_other,
+         lambda b, c: torch.cholesky_solve(b, c), loss=None, float64=False, tpc=True, sizes=(22,)),
 )
 
 
@@ -528,6 +617,170 @@ def probe_argsort_int64():
     return not problems
 
 
+def _lazy_check_row(name, n, batch, check_fn):
+    row = {"op": name, "n": n, "batch": batch, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE}
+    problems = []
+    try:
+        err, bar, rec = check_fn()
+        row.update(max_rel_err=err, err_cpu32=bar, fwd_fallback=rec["fallback"])
+        problems += over_bar("error", err, bar)
+        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"exception {e!r}"[:300])
+    emit(**row, status="fail" if problems else "ok", problems=problems)
+    return not problems
+
+
+def run_lazy_single_call_checks(tpc):
+    """Single-call immediate .cpu() and 4x-repeated synced .cpu() checks on 3D (len(batch)==1, m<=64, left=True)
+    paths with zero trailing ops, B-only grad backward, and direct tpc.tri_solve / tpc.gj_solve / tpc.gj_inv."""
+    gen = torch.Generator().manual_seed(123)
+    out = []
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=gen, dtype=torch.float32)
+
+    def make_tri(b, n, m, upper, unit):
+        A = randn(b, n, n) / max(n, 1)
+        A = (A.triu(1) if upper else A.tril(-1)) if unit else ((A.triu() if upper else A.tril()) + 2.0 * torch.eye(n))
+        return A, randn(b, n, m)
+
+    # 1. Public solve_triangular: immediate single-call .cpu() (no sync) + 4x repeated sync(); .cpu()
+    for b, n, m, upper, unit in ((1, 1, 1, False, False), (4, 22, 5, False, False),
+                                 (32, 16, 3, True, False), (4, 64, 64, False, True)):
+        A, B = make_tri(b, n, m, upper, unit)
+        fn = lambda a, b_: L.solve_triangular(a, b_, upper=upper, left=True, unitriangular=unit)  # noqa: E731
+        ref = fn(A.double(), B.double())
+        bar = rel_err(fn(A, B), ref)
+
+        def check_tri(A=A, B=B, fn=fn, ref=ref, bar=bar):
+            Ah, Bh = A.to(HPU), B.to(HPU)
+            sync()
+            errs = []
+            with watch() as rec:
+                errs.append(rel_err(fn(Ah, Bh).cpu(), ref))  # immediate .cpu(), no sync/trailing op
+                for _ in range(4):
+                    x = fn(Ah, Bh)
+                    sync()
+                    errs.append(rel_err(x.cpu(), ref))
+            return max(errs), bar, rec
+
+        out.append(_lazy_check_row(f"lazy_single.solve_triangular.b{b}_m{m}_u{int(upper)}_unit{int(unit)}",
+                                   n, b, check_tri))
+
+    # 2. Public cholesky_solve: immediate single-call .cpu() + 4x repeated sync(); .cpu()
+    for b, n, m, upper in ((1, 1, 1, False), (4, 22, 5, False), (32, 16, 3, True), (4, 64, 64, False)):
+        g = randn(b, n, n)
+        C = L.cholesky(g @ g.mT + n * torch.eye(n), upper=upper)
+        B = randn(b, n, m)
+        fn = lambda b_, c_: torch.cholesky_solve(b_, c_, upper=upper)  # noqa: E731
+        ref = fn(B.double(), C.double())
+        bar = rel_err(fn(B, C), ref)
+
+        def check_chol(B=B, C=C, fn=fn, ref=ref, bar=bar):
+            Bh, Ch = B.to(HPU), C.to(HPU)
+            sync()
+            errs = []
+            with watch() as rec:
+                errs.append(rel_err(fn(Bh, Ch).cpu(), ref))
+                for _ in range(4):
+                    x = fn(Bh, Ch)
+                    sync()
+                    errs.append(rel_err(x.cpu(), ref))
+            return max(errs), bar, rec
+
+        out.append(_lazy_check_row(f"lazy_single.cholesky_solve.b{b}_m{m}_u{int(upper)}", n, b, check_chol))
+
+    # 3. SolveTriangular B-only grad (A.requires_grad=False, B.requires_grad=True)
+    for b, n, m, upper in ((4, 22, 5, False), (32, 16, 3, True)):
+        A, B = make_tri(b, n, m, upper, False)
+        W = randn(b, n, m)
+        ref_b = B.double().requires_grad_()
+        (L.solve_triangular(A.double(), ref_b, upper=upper) * W.double()).sum().backward()
+        cpu_b = B.clone().requires_grad_()
+        (L.solve_triangular(A, cpu_b, upper=upper) * W).sum().backward()
+        bar = rel_err(cpu_b.grad, ref_b.grad)
+
+        def check_b_grad(A=A, B=B, W=W, upper=upper, ref_g=ref_b.grad, bar=bar):
+            Ah, Wh = A.to(HPU), W.to(HPU)
+            sync()
+            errs = []
+            with watch() as rec:
+                for i in range(4):
+                    Bh = B.to(HPU).detach().requires_grad_()
+                    loss = (L.solve_triangular(Ah, Bh, upper=upper) * Wh).sum()
+                    sync()
+                    loss.backward()
+                    if i > 0:
+                        sync()
+                    errs.append(rel_err(Bh.grad.cpu(), ref_g))
+            return max(errs), bar, rec
+
+        out.append(_lazy_check_row(f"lazy_single.solve_triangular.b_only_grad.u{int(upper)}", n, b, check_b_grad))
+
+    # 4. Direct tpc.tri_solve, tpc.gj_solve, tpc.gj_inv single-call + 4x repeated .cpu()
+    A_t, B_t = make_tri(4, 22, 5, False, False)
+    ref_t = L.solve_triangular(A_t.double(), B_t.double(), upper=False)
+    bar_t = rel_err(L.solve_triangular(A_t, B_t, upper=False), ref_t)
+
+    def check_raw_tri():
+        Ah, Bh = A_t.to(HPU), B_t.to(HPU)
+        sync()
+        errs = []
+        with watch() as rec:
+            errs.append(rel_err(tpc.tri_solve(Ah, Bh, upper=False, left=True, unitriangular=False).cpu(), ref_t))
+            for _ in range(4):
+                x = tpc.tri_solve(Ah, Bh, upper=False, left=True, unitriangular=False)
+                sync()
+                errs.append(rel_err(x.cpu(), ref_t))
+        return max(errs), bar_t, rec
+
+    out.append(_lazy_check_row("lazy_single.tpc_tri_solve", 22, 4, check_raw_tri))
+
+    g_gj = randn(4, 22, 22)
+    A_gj = g_gj @ g_gj.mT + 22 * torch.eye(22)
+    B_gj = randn(4, 22, 5)
+    ref_gj = L.solve(A_gj.double(), B_gj.double())
+    bar_gj = rel_err(L.solve(A_gj, B_gj), ref_gj)
+
+    def check_raw_gj():
+        Ah, Bh = A_gj.to(HPU), B_gj.to(HPU)
+        sync()
+        errs = []
+        with watch() as rec:
+            x0, d0, s0 = tpc.gj_solve(Ah, Bh)
+            errs.append(rel_err(x0.cpu(), ref_gj))
+            assert not bool((s0.cpu()[..., 1] != 0).any()) and torch.isfinite(d0.cpu()).all()
+            for _ in range(4):
+                x, d, s = tpc.gj_solve(Ah, Bh)
+                sync()
+                errs.append(rel_err(x.cpu(), ref_gj))
+                assert not bool((s.cpu()[..., 1] != 0).any()) and torch.isfinite(d.cpu()).all()
+        return max(errs), bar_gj, rec
+
+    out.append(_lazy_check_row("lazy_single.tpc_gj_solve", 22, 4, check_raw_gj))
+
+    ref_inv = L.inv(A_gj.double())
+    bar_inv = rel_err(L.inv(A_gj), ref_inv)
+
+    def check_raw_inv():
+        Ah = A_gj.to(HPU)
+        sync()
+        errs = []
+        with watch() as rec:
+            x0, d0, s0 = tpc.gj_inv(Ah)
+            errs.append(rel_err(x0.cpu(), ref_inv))
+            assert not bool((s0.cpu()[..., 1] != 0).any()) and torch.isfinite(d0.cpu()).all()
+            for _ in range(4):
+                x, d, s = tpc.gj_inv(Ah)
+                sync()
+                errs.append(rel_err(x.cpu(), ref_inv))
+        return max(errs), bar_inv, rec
+
+    out.append(_lazy_check_row("lazy_single.tpc_gj_inv", 22, 4, check_raw_inv))
+    return out
+
+
 def main():
     global BASELINE, ops_linalg, tpc_maxn, eigh_maxn
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -563,6 +816,7 @@ def main():
         results.append(run_double_backward())
         for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
             results.append(run_singular(op, fn))
+        results += run_lazy_single_call_checks(tpc)
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
         ok = bool(EIGH_FALLBACKS)
         emit(op="metric_check", lazy=LAZY, baseline=True, status="ok" if ok else "error",

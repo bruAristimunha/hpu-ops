@@ -667,6 +667,19 @@ def gj_hook(monkeypatch):
     return calls
 
 
+@pytest.fixture
+def tri_hook(monkeypatch):
+    """``linalg._TRI`` set to the reference; the list collects ``(shape, upper, left, unitriangular)`` per call."""
+    calls = []
+
+    def hook(A, B, upper=False, left=True, unitriangular=False):
+        calls.append((tuple(A.shape), upper, left, unitriangular))
+        return tpc.tri_solve_reference(A.detach(), B.detach(), upper, left, unitriangular)
+
+    monkeypatch.setattr(linalg, "_TRI", hook)
+    return calls
+
+
 @pytest.mark.parametrize("m", [1, 3, 40])
 @pytest.mark.parametrize("n", [1, 3, 22])
 def test_tpc_reference_contract(n, m):
@@ -732,6 +745,9 @@ GJ_CASES = {
     "inv": (lambda: (torch.linalg.inv, (f32(2, 3, n=6),)), linalg.install_inv_det, "inv"),
     "det": (lambda: (torch.linalg.det, (f32(2, 3, n=6),)), linalg.install_inv_det, "det"),
     "slogdet": (lambda: (torch.linalg.slogdet, (f32(2, 3, n=6),)), linalg.install_inv_det, "slogdet"),
+}
+
+TRI_CASES = {
     "cholesky_solve_lower": (lambda: (lambda b, l: torch.cholesky_solve(b, l),
                                       (torch.randn(2, 6, 3), torch.linalg.cholesky(spd(2, n=6, dtype=torch.float32)))),
                              linalg.install_cholesky_solve, "cholesky_solve"),
@@ -739,12 +755,25 @@ GJ_CASES = {
                                       (torch.randn(2, 6, 3),
                                        torch.linalg.cholesky(spd(2, n=6, dtype=torch.float32)).mH)),
                              linalg.install_cholesky_solve, "cholesky_solve"),
+    "tri_n1": (lambda: (lambda a, b: torch.linalg.solve_triangular(a, b, upper=False),
+                        (f32(2, n=1), torch.randn(2, 1, 3))),
+               linalg.install_solve_triangular, "solve_triangular"),
+    "tri_broadcast": (lambda: (lambda a, b: torch.linalg.solve_triangular(a, b, upper=True),
+                               (f32(3, n=5), torch.randn(2, 1, 5, 4))),
+                      linalg.install_solve_triangular, "solve_triangular"),
+    "cholesky_broadcast": (lambda: (lambda b, l: torch.cholesky_solve(b, l),
+                                    (torch.randn(2, 1, 5, 3),
+                                     torch.linalg.cholesky(spd(1, 4, n=5, dtype=torch.float32)))),
+                           linalg.install_cholesky_solve, "cholesky_solve"),
+    "tri_m70_chunked": (lambda: (lambda a, b: torch.linalg.solve_triangular(a, b, upper=False),
+                                 (f32(2, n=5), torch.randn(2, 5, 70))),
+                        linalg.install_solve_triangular, "solve_triangular"),
 }
 for _upper in (False, True):
     for _left in (True, False):
         for _unit in (False, True):
             _key = f"tri_{'upper' if _upper else 'lower'}_{'left' if _left else 'right'}_{'unit' if _unit else 'full'}"
-            GJ_CASES[_key] = (
+            TRI_CASES[_key] = (
                 (lambda u=_upper, l=_left, t=_unit: _tri_case(u, l, t)), linalg.install_solve_triangular,
                 "solve_triangular")
 
@@ -756,6 +785,15 @@ def test_linalg_routes_through_gj(case, gj_hook):
     f, inputs = make()
     compare(f, install, *inputs, name=name, rtol=2e-3, atol=2e-3)
     assert gj_hook, "the kernel hook was not called"
+
+
+@pytest.mark.parametrize("case", list(TRI_CASES))
+def test_linalg_routes_through_tri(case, tri_hook):
+    torch.manual_seed(0)
+    make, install, name = TRI_CASES[case]
+    f, inputs = make()
+    compare(f, install, *inputs, name=name, rtol=2e-3, atol=2e-3)
+    assert tri_hook, "the tri kernel hook was not called"
 
 
 def test_gj_is_declined_past_maxn_on_hpu_and_without_the_kernel(monkeypatch):
@@ -784,11 +822,6 @@ DOUBLE_BACKWARD = {
               lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
     "solve_right": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b, left=False),
                     lambda: (general(n=4), torch.randn(2, 4, dtype=torch.float64))),
-    "solve_triangular": (linalg.install_solve_triangular,
-                         lambda a, b: torch.linalg.solve_triangular(a, b, upper=True),
-                         lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
-    "cholesky_solve": (linalg.install_cholesky_solve, lambda b, l: torch.cholesky_solve(b, torch.tril(l)),
-                       lambda: (torch.randn(4, 2, dtype=torch.float64), torch.linalg.cholesky(spd(n=4)))),
 }
 
 
@@ -800,6 +833,31 @@ def test_double_backward_through_gj(case, gj_hook):
     with cpu_as_hpu(install) as calls:
         assert torch.autograd.gradgradcheck(f, inputs, atol=1e-5, rtol=1e-4)
         assert sum(calls.values()) >= 1 and gj_hook
+
+
+DOUBLE_BACKWARD_TRI = {
+    "solve_triangular": (linalg.install_solve_triangular,
+                         lambda a, b: torch.linalg.solve_triangular(a, b, upper=True),
+                         lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
+    "solve_triangular_left_false": (linalg.install_solve_triangular,
+                                    lambda a, b: torch.linalg.solve_triangular(a, b, upper=False, left=False),
+                                    lambda: (general(n=4), torch.randn(2, 4, dtype=torch.float64))),
+    "cholesky_solve_lower": (linalg.install_cholesky_solve, lambda b, l: torch.cholesky_solve(b, torch.tril(l)),
+                             lambda: (torch.randn(4, 2, dtype=torch.float64), torch.linalg.cholesky(spd(n=4)))),
+    "cholesky_solve_upper": (linalg.install_cholesky_solve,
+                             lambda b, l: torch.cholesky_solve(b, torch.triu(l), upper=True),
+                             lambda: (torch.randn(4, 2, dtype=torch.float64), torch.linalg.cholesky(spd(n=4)).mH)),
+}
+
+
+@pytest.mark.parametrize("case", list(DOUBLE_BACKWARD_TRI))
+def test_double_backward_through_tri(case, tri_hook):
+    torch.manual_seed(0)
+    install, f, make = DOUBLE_BACKWARD_TRI[case]
+    inputs = [x.requires_grad_() for x in make()]
+    with cpu_as_hpu(install) as calls:
+        assert torch.autograd.gradgradcheck(f, inputs, atol=1e-5, rtol=1e-4)
+        assert sum(calls.values()) >= 1 and tri_hook
 
 
 def singular_hook(A, B):
@@ -972,3 +1030,268 @@ def test_lazy_cpp_registers_eigh_with_the_legacy_api():
     assert "UserCustomOpDescriptor" not in tpc.CPP_LAZY
     assert "HabanaCustomOpDescriptor::getCustomOpDescriptor(\"linalg_tpc::jacobi_eigh\")" in tpc.CPP_LAZY
     assert "UserCustomOpDescriptor::getUserCustomOpDescriptor(\"linalg_tpc::jacobi_eigh\")" in tpc.CPP
+
+
+def test_tri_solve_cpp_strings():
+    assert "UserCustomOpDescriptor" not in tpc.CPP_LAZY
+    for op in ("tri_solve_lower", "tri_solve_upper", "tri_solve_lower_unit", "tri_solve_upper_unit"):
+        assert f'"linalg_tpc::{op}"' in tpc.CPP
+        assert f'm.impl("{op}", tri_meta_tensor)' in tpc.CPP
+        assert f'"linalg_tpc::{op}"' in tpc.CPP_LAZY
+        assert f'm.impl("{op}", {op})' in tpc.CPP_LAZY
+
+
+@pytest.mark.parametrize("upper", [False, True])
+@pytest.mark.parametrize("left", [True, False])
+@pytest.mark.parametrize("unitriangular", [False, True])
+@pytest.mark.parametrize("batch", [(), (4,)])
+@pytest.mark.parametrize("m", [1, 3, 40])
+@pytest.mark.parametrize("n", [1, 3, 22])
+def test_tri_solve_reference_contract(n, m, batch, upper, left, unitriangular):
+    torch.manual_seed(0)
+    A = f32(*batch, n=n)
+    # Poison unused opposite triangle (and diagonal when unitriangular) with NaN to prove it is never read
+    mask_other = torch.ones(n, n, dtype=torch.bool).tril(-1) if upper else torch.ones(n, n, dtype=torch.bool).triu(1)
+    A[..., mask_other] = float("nan")
+    if unitriangular:
+        A.diagonal(dim1=-2, dim2=-1).zero_()
+    B = torch.randn(*batch, n, m) if left else torch.randn(*batch, m, n)
+    got = tpc.tri_solve_reference(A, B, upper=upper, left=left, unitriangular=unitriangular)
+    want = torch.linalg.solve_triangular(A, B, upper=upper, left=left, unitriangular=unitriangular)
+    assert got.shape == want.shape
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("upper", [False, True])
+@pytest.mark.parametrize("left", [True, False])
+@pytest.mark.parametrize("unitriangular", [False, True])
+def test_tpc_tri_solve_selects_elf_and_transposes(monkeypatch, upper, left, unitriangular):
+    torch.manual_seed(0)
+    picked = []
+
+    def fake_tri_op(u_eff, unit):
+        picked.append((u_eff, unit))
+
+        def fn(A, B):
+            assert A._base is None and B._base is None
+            assert A.is_contiguous() and B.is_contiguous()
+            return tpc.tri_solve_reference(A, B, upper=u_eff, left=True, unitriangular=unit)
+
+        return fn
+
+    monkeypatch.setattr(tpc, "_tri_op", fake_tri_op)
+    A = f32(2, n=1).mT
+    B = (torch.randn(2, 3, 1) if left else torch.randn(2, 1, 3)).mT
+    got = tpc.tri_solve(A, B, upper=upper, left=left, unitriangular=unitriangular)
+    want = torch.linalg.solve_triangular(A, B, upper=upper, left=left, unitriangular=unitriangular)
+    assert picked == [(upper if left else not upper, unitriangular)]
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("left", [True, False])
+def test_tpc_tri_solve_chunks_columns(monkeypatch, left):
+    torch.manual_seed(0)
+    seen = []
+
+    def fake_op(u, unit):
+        def fake(A, B):
+            assert B.shape[-1] <= tpc.MAXN and B.is_contiguous() and B._base is None
+            seen.append(B.shape[-1])
+            return tpc.tri_solve_reference(A, B, upper=u, left=True, unitriangular=unit)
+
+        return fake
+
+    monkeypatch.setattr(tpc, "_tri_op", fake_op)
+    A = f32(3, n=5)
+    B = torch.randn(3, 5, 70) if left else torch.randn(3, 70, 5)
+    got = tpc.tri_solve(A, B, upper=False, left=left, unitriangular=False)
+    want = torch.linalg.solve_triangular(A, B, upper=False, left=left, unitriangular=False)
+    assert seen == [64, 6]
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+
+def test_tpc_tri_solve_shapes_and_broadcast(monkeypatch):
+    torch.manual_seed(0)
+    seen = []
+
+    def fake_op(u, unit):
+        def fn(A, B):
+            seen.append((A.shape, B.shape, A.is_contiguous(), B.is_contiguous(), A.dtype, A._base is None,
+                         B._base is None))
+            return tpc.tri_solve_reference(A, B, upper=u, left=True, unitriangular=unit)
+
+        return fn
+
+    monkeypatch.setattr(tpc, "_tri_op", fake_op)
+    # 2D unbatched -> batch == () -> squeezed back to 2D
+    A2, B2 = f32(n=4).mT, torch.randn(4, 3)
+    got2 = tpc.tri_solve(A2, B2, upper=True)
+    assert got2.shape == (4, 3)
+    torch.testing.assert_close(got2, torch.linalg.solve_triangular(A2, B2, upper=True), rtol=1e-4, atol=1e-4)
+
+    # 3D batch == (1,) -> remains 3D (1, n, m)
+    A1, B1 = f32(1, n=4), torch.randn(1, 4, 3)
+    got1 = tpc.tri_solve(A1, B1, upper=False)
+    assert got1.shape == (1, 4, 3)
+
+    # Asymmetric batch broadcast (3,) vs (2, 1) -> (2, 3) -> flattened to (6, ...)
+    Ab, Bb = f32(3, n=4), torch.randn(2, 1, 4, 5)
+    gotb = tpc.tri_solve(Ab, Bb, upper=False)
+    assert gotb.shape == (2, 3, 4, 5)
+    torch.testing.assert_close(gotb, torch.linalg.solve_triangular(Ab, Bb, upper=False), rtol=1e-4, atol=1e-4)
+    assert all(ic and bc and dt == torch.float32 and ab and bb for _, _, ic, bc, dt, ab, bb in seen)
+
+
+def test_unflatten_2d_and_batched_for_gj(monkeypatch):
+    torch.manual_seed(0)
+    monkeypatch.setattr(tpc, "_op", lambda: tpc.gj_solve_reference)
+    monkeypatch.setattr(tpc, "_inv_op",
+                        lambda: lambda A: tpc.gj_solve_reference(A, torch.eye(A.shape[-1]).expand_as(A)))
+    A2, B2 = f32(n=4), torch.randn(4, 3)
+    X2, D2, S2 = tpc.gj_solve(A2, B2)
+    assert X2.shape == (4, 3) and D2.shape == (4,) and S2.shape == (2,)
+    Xi2, Di2, Si2 = tpc.gj_inv(A2)
+    assert Xi2.shape == (4, 4) and Di2.shape == (4,) and Si2.shape == (2,)
+    # batch=(1,) preserves 3D
+    A1, B1 = f32(1, n=4), torch.randn(1, 4, 3)
+    X1, D1, S1 = tpc.gj_solve(A1, B1)
+    assert X1.shape == (1, 4, 3) and D1.shape == (1, 4) and S1.shape == (1, 2)
+    Xi1, Di1, Si1 = tpc.gj_inv(A1)
+    assert Xi1.shape == (1, 4, 4) and Di1.shape == (1, 4) and Si1.shape == (1, 2)
+
+
+@pytest.mark.parametrize("lazy, flushes", [("1", 2), ("0", 0)])
+def test_tpc_tri_solve_flushes_lazy(monkeypatch, lazy, flushes):
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    torch_mod = types.SimpleNamespace(core=core)
+    hf = types.SimpleNamespace(torch=torch_mod)
+    for name, mod in (("habana_frameworks", hf), ("habana_frameworks.torch", torch_mod),
+                      ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", lazy)
+    monkeypatch.setattr(tpc, "_tri_op", lambda u, unit: lambda A, B: tpc.tri_solve_reference(A, B, u, True, unit))
+    tpc.tri_solve(f32(2, n=4), torch.randn(2, 4, 3))
+    assert len(marks) == flushes
+
+
+def test_cholesky_solve_two_pass_and_ignores_unused_triangle(tri_hook):
+    torch.manual_seed(0)
+    L_clean = torch.linalg.cholesky(spd(2, n=5, dtype=torch.float32))
+    L_dirty = L_clean.clone()
+    L_dirty[..., torch.ones(5, 5, dtype=torch.bool).triu(1)] = float("nan")
+    B = torch.randn(2, 5, 3)
+    with cpu_as_hpu(linalg.install_cholesky_solve), torch.no_grad():
+        got = torch.cholesky_solve(B, L_dirty, upper=False)
+    want = torch.cholesky_solve(B, L_clean, upper=False)
+    assert len(tri_hook) == 2
+    assert [(u, left, unit) for _, u, left, unit in tri_hook] == [(False, True, False), (True, True, False)]
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+    tri_hook.clear()
+    U_clean = L_clean.mH.clone()
+    U_dirty = U_clean.clone()
+    U_dirty[..., torch.ones(5, 5, dtype=torch.bool).tril(-1)] = float("nan")
+    with cpu_as_hpu(linalg.install_cholesky_solve), torch.no_grad():
+        got_u = torch.cholesky_solve(B, U_dirty, upper=True)
+    want_u = torch.cholesky_solve(B, U_clean, upper=True)
+    assert len(tri_hook) == 2
+    assert [(u, left, unit) for _, u, left, unit in tri_hook] == [(False, True, False), (True, True, False)]
+    torch.testing.assert_close(got_u, want_u, rtol=1e-4, atol=1e-4)
+
+
+def test_tri_not_used_past_maxn(tri_hook):
+    torch.manual_seed(0)
+    n = tpc.MAXN + 1
+    with cpu_as_hpu(linalg.install_solve_triangular):
+        torch.linalg.solve_triangular(f32(2, n=n), torch.randn(2, n, 2), upper=False)
+    with cpu_as_hpu(linalg.install_cholesky_solve):
+        torch.cholesky_solve(torch.randn(2, n, 2), f32(2, n=n).tril())
+    assert tri_hook == []
+
+
+def test_tri_bad_shapes_raise_like_torch(tri_hook):
+    A = f32(n=4)
+    with cpu_as_hpu(linalg.install_solve_triangular):
+        with pytest.raises((RuntimeError, ValueError)):
+            torch.linalg.solve_triangular(A, torch.randn(4), upper=False)
+        with pytest.raises((RuntimeError, ValueError)):
+            torch.linalg.solve_triangular(A, torch.randn(5, 2), upper=False)
+        with pytest.raises((RuntimeError, ValueError)):
+            torch.linalg.solve_triangular(A, torch.randn(2, 5), upper=False, left=False)
+    with cpu_as_hpu(linalg.install_cholesky_solve):
+        with pytest.raises((RuntimeError, ValueError)):
+            torch.cholesky_solve(torch.randn(4), A)
+        with pytest.raises((RuntimeError, ValueError)):
+            torch.cholesky_solve(torch.randn(5, 2), A)
+    assert tri_hook == []
+
+
+def test_tpc_lazy_materializes_output_tensors(monkeypatch):
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    torch_mod = types.SimpleNamespace(core=core)
+    hf = types.SimpleNamespace(torch=torch_mod)
+    for name, mod in (("habana_frameworks", hf), ("habana_frameworks.torch", torch_mod),
+                      ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    sentinels = []
+
+    def wrap_tri(u, unit):
+        def fn(A, B):
+            out = tpc.tri_solve_reference(A, B, u, True, unit)
+            sentinels.append(out.untyped_storage().data_ptr())
+            return out
+        return fn
+
+    def wrap_gj(A, B):
+        X, D, S = tpc.gj_solve_reference(A, B)
+        sentinels.append(X.untyped_storage().data_ptr())
+        return X, D, S
+
+    monkeypatch.setattr(tpc, "_tri_op", wrap_tri)
+    monkeypatch.setattr(tpc, "_op", lambda: wrap_gj)
+    monkeypatch.setattr(tpc, "_inv_op", lambda: lambda A: wrap_gj(A, torch.eye(A.shape[-1]).expand_as(A)))
+
+    A, B = f32(2, n=4), torch.randn(2, 4, 3)
+    X_tri = tpc.tri_solve(A, B, upper=False, left=True, unitriangular=False)
+    X_gj, _, _ = tpc.gj_solve(A, B)
+    X_inv, _, _ = tpc.gj_inv(A)
+    assert X_tri.untyped_storage().data_ptr() != sentinels[0]
+    assert X_gj.untyped_storage().data_ptr() != sentinels[1]
+    assert X_inv.untyped_storage().data_ptr() != sentinels[2]
+
+    # Compiling / Meta skips lazy clone & mark_step
+    marks.clear()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    meta_a = torch.empty((2, 4, 4), device="meta")
+    meta_b = torch.empty((2, 4, 3), device="meta")
+    sentinel_meta = meta_b.new_empty(meta_b.size())
+    out_meta = tpc._call(lambda a, b: sentinel_meta, meta_a, meta_b)
+    assert out_meta is sentinel_meta and out_meta.device.type == "meta" and marks == []
+
+
+def test_solve_triangular_and_cholesky_b_only_grad_route_through_tri(tri_hook):
+    torch.manual_seed(0)
+    A = f32(2, n=6)
+    B = torch.randn(2, 6, 3)
+    W = torch.randn(2, 6, 3)
+
+    b_ref = B.clone().requires_grad_()
+    (torch.linalg.solve_triangular(A, b_ref, upper=False) * W).sum().backward()
+    b_got = B.clone().requires_grad_()
+    with cpu_as_hpu(linalg.install_solve_triangular):
+        (torch.linalg.solve_triangular(A, b_got, upper=False) * W).sum().backward()
+    assert len(tri_hook) == 2
+    torch.testing.assert_close(b_got.grad, b_ref.grad, rtol=2e-3, atol=2e-3)
+
+    tri_hook.clear()
+    C = torch.linalg.cholesky(spd(2, n=6, dtype=torch.float32))
+    b_ref2 = B.clone().requires_grad_()
+    (torch.cholesky_solve(b_ref2, C) * W).sum().backward()
+    b_got2 = B.clone().requires_grad_()
+    with cpu_as_hpu(linalg.install_cholesky_solve):
+        (torch.cholesky_solve(b_got2, C) * W).sum().backward()
+    assert len(tri_hook) == 4
+    torch.testing.assert_close(b_got2.grad, b_ref2.grad, rtol=2e-3, atol=2e-3)

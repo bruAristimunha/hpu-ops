@@ -29,10 +29,11 @@ aten = torch.ops.aten
 FLOAT64_WARNING = ("hpu_ops: {name} of float64 HPU tensors runs on the CPU: Gaudi2 computes float64 at float32 "
                    "precision (bruAristimunha/hpu-ops#16).")
 _WARNED = set()
-# The Gauss-Jordan solver ``(A, B) -> (X, D, S)`` the Functions call for float32 n <= tpc.MAXN. None means
-# ``tpc.gj_solve`` on HPU with the kernel ready; the CPU tests set it to ``tpc.gj_solve_reference`` to exercise the
-# wiring.
+# The Gauss-Jordan solver ``(A, B) -> (X, D, S)`` and triangular solver ``(A, B, upper, left, unitriangular) -> X``
+# the Functions call for float32 n <= tpc.MAXN. None means ``tpc.gj_solve`` / ``tpc.tri_solve`` on HPU with the kernel
+# ready; the CPU tests set them to ``tpc.gj_solve_reference`` / ``tpc.tri_solve_reference`` to exercise the wiring.
 _GJ = None
+_TRI = None
 
 
 def _bind(op, args, kwargs):
@@ -104,6 +105,20 @@ def _gj_solve(A, B, left=True):
         return _gj(A, B)
     X, D, S = _gj(A.mT, B.mT)
     return X.mT, D, S
+
+
+def _use_tri(A):
+    """Whether ``A`` goes through the triangular substitution kernel: n <= ``tpc.MAXN`` and, on HPU, float32 with the
+    kernel ready; or, with the ``_TRI`` hook set (CPU tests), any dtype."""
+    if A.shape[-1] > tpc.MAXN:
+        return False
+    return _TRI is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
+
+
+def _tri(A, B, upper=False, left=True, unitriangular=False):
+    """Triangular substitution via ``tpc.tri_solve`` (or ``_TRI`` in CPU tests)."""
+    solver = tpc.tri_solve if _TRI is None else _TRI
+    return solver(A, B, upper, left, unitriangular)
 
 
 def _gj_info(S, batch):
@@ -189,21 +204,13 @@ def solve_triangular(A, B, upper, left=True, unitriangular=False):
     return X @ B if left else B @ X
 
 
-def _triangle(A, upper, unitriangular):
-    """The triangle of ``A`` that ``linalg.solve_triangular`` reads, as a full matrix: the other triangle zero, the
-    diagonal 1 with ``unitriangular``."""
-    k = int(unitriangular)
-    T = torch.triu(A, k) if upper else torch.tril(A, -k)
-    return T + torch.eye(A.shape[-1], dtype=A.dtype, device=A.device) if unitriangular else T
-
-
 class SolveTriangular(torch.autograd.Function):
     """``linalg.solve_triangular`` with torch's backward (``linalg_solve_triangular_backward``) over the composite."""
 
     @staticmethod
     def compute(A, B, upper, left, unitriangular):
-        if _use_tpc(A):
-            return _gj_solve(_triangle(A, upper, unitriangular), B, left)[0]
+        if _use_tri(A):
+            return _tri(A, B, upper, left, unitriangular)
         return solve_triangular(A, B, upper, left, unitriangular)
 
     @staticmethod
@@ -230,7 +237,12 @@ class SolveTriangular(torch.autograd.Function):
 def install_solve_triangular(device_type):
     """``linalg.solve_triangular`` on ``device_type`` as a matmul with the block-recursive inverse. Returns an undo."""
     op = aten.linalg_solve_triangular.default
-    takes = _tpc_takes(device_type, _takes(device_type, "solve_triangular"))
+    base = _takes(device_type, "solve_triangular")
+
+    def shapes_ok(A, B, upper=False, left=True, unitriangular=False):
+        return base(A, B) and B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
+
+    takes = _tpc_takes(device_type, shapes_ok)
     return register_kernels(device_type, _kernels(device_type, op, "solve_triangular", SolveTriangular, takes))
 
 
@@ -245,9 +257,9 @@ class CholeskySolve(torch.autograd.Function):
 
     @staticmethod
     def compute(B, L, upper):
-        if _use_tpc(L):
-            L = torch.triu(L) if upper else torch.tril(L)
-            return _gj(L.mH @ L if upper else L @ L.mH, B)[0]
+        if _use_tri(L):
+            Y = _tri(L.mH if upper else L, B, False, True, False)
+            return _tri(L if upper else L.mH, Y, True, True, False)
         return cholesky_solve(B, L, upper)
 
     @staticmethod
@@ -273,7 +285,12 @@ class CholeskySolve(torch.autograd.Function):
 
 def install_cholesky_solve(device_type):
     """``cholesky_solve`` on ``device_type`` as two matmuls with the block-recursive inverse. Returns an undo."""
-    takes = _tpc_takes(device_type, _takes(device_type, "cholesky_solve", matrix_at=1), matrix_at=1)
+    base = _takes(device_type, "cholesky_solve", matrix_at=1)
+
+    def shapes_ok(B, L, upper=False):
+        return base(B, L) and B.dim() >= 2 and B.shape[-2] == L.shape[-1]
+
+    takes = _tpc_takes(device_type, shapes_ok, matrix_at=1)
     autograd = _kernels(device_type, aten.cholesky_solve.default, "cholesky_solve", CholeskySolve, takes)[0]
     # The other two entries are dropped: the helper is the backend key of the same op, so each key gets one kernel.
     backend = _kernels(device_type, aten._cholesky_solve_helper.default, "cholesky_solve", CholeskySolve, takes)[1]
