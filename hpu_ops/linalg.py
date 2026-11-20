@@ -147,3 +147,46 @@ def install_solve_triangular(device_type):
     op = aten.linalg_solve_triangular.default
     return register_kernels(device_type, _kernels(device_type, op, "solve_triangular", SolveTriangular,
                                                   _takes(device_type, "solve_triangular")))
+
+
+def cholesky_solve(B, L, upper=False):
+    """``A^-1 B`` for ``A = L L^H`` (``U^H U`` if ``upper``): two matmuls with the explicit triangular inverse."""
+    Li = tri_inverse(L, upper)
+    return Li @ (Li.mH @ B) if upper else Li.mH @ (Li @ B)
+
+
+class CholeskySolve(torch.autograd.Function):
+    """``cholesky_solve`` with torch's backward (``cholesky_solve_backward``) over the composite."""
+
+    @staticmethod
+    def compute(B, L, upper):
+        return cholesky_solve(B, L, upper)
+
+    @staticmethod
+    def forward(ctx, B, L, upper):
+        X = CholeskySolve.compute(B, L, upper)
+        ctx.save_for_backward(L, X)
+        ctx.upper = upper
+        ctx.B_shape = B.shape
+        return X
+
+    @staticmethod
+    def backward(ctx, grad):
+        L, X = ctx.saved_tensors
+        gB = CholeskySolve.compute(grad, L, ctx.upper)
+        gL = None
+        if ctx.needs_input_grad[1]:
+            common = gB @ X.mH
+            common = common + common.mH
+            gL = -(L @ common) if ctx.upper else -(common @ L)
+            gL = gL.sum_to_size(L.shape)
+        return gB.sum_to_size(ctx.B_shape), gL, None
+
+
+def install_cholesky_solve(device_type):
+    """``cholesky_solve`` on ``device_type`` as two matmuls with the block-recursive inverse. Returns an undo."""
+    takes = _takes(device_type, "cholesky_solve", matrix_at=1)
+    autograd = _kernels(device_type, aten.cholesky_solve.default, "cholesky_solve", CholeskySolve, takes)[0]
+    # The other two entries are dropped: the helper is the backend key of the same op, so each key gets one kernel.
+    backend = _kernels(device_type, aten._cholesky_solve_helper.default, "cholesky_solve", CholeskySolve, takes)[1]
+    return register_kernels(device_type, [autograd, backend])

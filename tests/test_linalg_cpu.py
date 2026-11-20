@@ -127,3 +127,34 @@ def test_takes_declines_float64_on_hpu_and_warns_once():
                 torch.randn(3, 3, dtype=torch.float16), torch.randn(3, 3, dtype=torch.bfloat16),
                 torch.randn(0, 3, 3), torch.randn(3, 4), torch.randn(3)):
         assert linalg._takes("cpu", "x")(bad) is False
+
+
+# ---- cholesky_solve
+
+
+@pytest.mark.parametrize("upper", [False, True])
+@pytest.mark.parametrize("shape_case", [k for k in SHAPE_CASES if k != "transposed"])
+def test_cholesky_solve_matches_torch(shape_case, upper):
+    torch.manual_seed(0)
+    A, B = SHAPE_CASES[shape_case]()
+    L = torch.linalg.cholesky(spd(*A.shape[:-2], n=N))
+    L = L.mH if upper else L
+
+    def f(b, l):
+        if shape_case == "expanded":
+            b = b.expand(5, *b.shape[1:])  # stride 0 in the kernel; the gradient flows back through the expand
+        return torch.cholesky_solve(b, l, upper=upper)
+
+    compare(f, linalg.install_cholesky_solve, B, L, name="cholesky_solve", rtol=1e-6, atol=1e-6)
+
+
+def test_cholesky_solve_inference_mode_uses_backend_kernel():
+    # The `{}` key is not registered on the CPU stand-in, so this asserts the result only; the backend path is
+    # checked on Gaudi (Task 8).
+    torch.manual_seed(0)
+    L = torch.linalg.cholesky(spd(3, n=N))
+    B = torch.randn(3, N, 4, dtype=torch.float64)
+    want = torch.cholesky_solve(B, L)
+    with cpu_as_hpu(linalg.install_cholesky_solve), torch.inference_mode():
+        got = torch.cholesky_solve(B, L)
+    torch.testing.assert_close(got, want)
