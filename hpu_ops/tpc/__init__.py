@@ -318,10 +318,10 @@ def _eigh_op():
     return torch.ops.linalg_tpc.jacobi_eigh
 
 
-# Lazy mode on bridge 1.21.4 can drop the unused outputs of a multi-output custom op (the callers use some of X, D and
-# S), and the next graph then fails at mark_step with "ValidateSyncInputTensors tensor_data is empty". A mark_step
-# before and after each call keeps the op alone in its graph. The cost is two graph boundaries per call; eager mode
-# needs none.
+# Measured on Gaudi2, bridge 1.21.4, lazy mode: a TPC custom op whose inputs come from the pending lazy graph can fail
+# with "ValidateSyncInputTensors tensor_data is empty" (nondeterministic). A mark_step BEFORE the op prevents it (2 of
+# 2 gate runs race-free); a mark_step only AFTER the op does not, and packing the outputs into one tensor does not
+# either. The cost is one graph boundary per call; eager mode needs none.
 def _flush():
     """``mark_step`` in lazy mode; nothing in eager mode, while tracing under ``torch.compile``, or without Habana."""
     if os.environ.get("PT_HPU_LAZY_MODE", "1") == "0" or torch.compiler.is_compiling():
@@ -334,11 +334,9 @@ def _flush():
 
 
 def _call(op, *args):
-    """``op(*args)`` as a graph of its own in lazy mode."""
+    """``op(*args)`` after a lazy graph boundary (``mark_step`` before the op only)."""
     _flush()
-    out = op(*args)
-    _flush()
-    return out
+    return op(*args)
 
 
 def _chunked(A, B):

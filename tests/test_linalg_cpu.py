@@ -941,8 +941,8 @@ def test_install_kernel_path(monkeypatch):
                                       "run through hpu-ops' own CPU route, not Habana's fallback.")
 
 
-@pytest.mark.parametrize("lazy, flushes", [("1", 2), ("0", 0)])
-def test_tpc_flushes_the_lazy_graph_around_the_op(monkeypatch, lazy, flushes):
+@pytest.mark.parametrize("lazy, flushes", [("1", 1), ("0", 0)])
+def test_tpc_flushes_the_lazy_graph_before_the_op(monkeypatch, lazy, flushes):
     marks = []
     core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
     torch_mod = types.SimpleNamespace(core=core)
@@ -961,7 +961,7 @@ def test_tpc_flushes_the_lazy_graph_around_the_op(monkeypatch, lazy, flushes):
     assert len(marks) == flushes
 
 
-def test_flush_comes_before_and_after_the_op(monkeypatch):
+def test_flush_comes_before_the_op_only(monkeypatch):
     order = []
     core = types.SimpleNamespace(mark_step=lambda: order.append("flush"))
     torch_mod = types.SimpleNamespace(core=core)
@@ -970,7 +970,7 @@ def test_flush_comes_before_and_after_the_op(monkeypatch):
         monkeypatch.setitem(sys.modules, name, mod)
     monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
     out = tpc._call(lambda x: order.append("op") or x, 1)
-    assert out == 1 and order == ["flush", "op", "flush"]
+    assert out == 1 and order == ["flush", "op"]
 
 
 def test_flush_is_skipped_when_compiling_or_without_habana(monkeypatch):
