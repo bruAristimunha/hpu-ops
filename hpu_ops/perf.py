@@ -1,16 +1,19 @@
 """HPU composites for ops whose Gaudi kernel runs on the card but is slower than a few of Gaudi's other ops (issue #21).
 
-- ``logsumexp`` in lazy mode as ATen's own composite, ``log(sum(exp(x - m))) + m`` with ``m`` the max with its
-  infinities zeroed. In lazy mode Gaudi's ``logsumexp`` kernel is slower than amax, exp, sum and log recorded into the
-  same graph; in eager mode its one kernel beats their six launches, so eager calls (and ``torch.compile``, which runs
-  in eager mode) keep it. The max is detached: the result does not depend on it, so autograd differentiates
+- ``logsumexp`` in lazy mode, for inputs that record a gradient, as ATen's own composite, ``log(sum(exp(x - m))) + m``
+  with ``m`` the max with its infinities zeroed. In lazy mode, forward + backward through Gaudi's ``logsumexp`` kernel
+  is slower than through amax, exp, sum and log recorded into the same graph (measured 0.80-1.38x, faster in 31 of 32
+  runs). The forward alone is not reliably faster (0.68-1.46x), so calls that record no gradient (``no_grad``, inputs
+  without ``requires_grad``, inference mode) keep Gaudi's kernel; in lazy mode those still pass through this Python
+  kernel (``inference_mode`` skips it), measured 0.79-1.27x, median 0.92x. In eager mode its one kernel beats their six launches, so eager calls (and
+  ``torch.compile``, which runs in eager mode) keep it. The max is detached: the result does not depend on it, so autograd differentiates
   ``exp(x - m) / sum`` only, as ATen's own ``logsumexp`` backward (``grad * exp(x - result)``). The two differ where
   ``result`` rounds to the max: for ``[1e30, 1e30, -1e30]`` ATen (and Gaudi's kernel) give ``[1, 1, 0]``, the
   composite the softmax ``[0.5, 0.5, 0]``. The reductions keep
   their dims and the result is reshaped: in lazy mode the backward of a dim reduction to a 0-d tensor that is then
   summed fails (``repro/lazy_expand_garbage_size.py``).
 
-Registered at ``AutogradHPU``. Cases it does not take (eager mode, integer or complex inputs, an empty ``dim`` list, an
+Registered at ``AutogradHPU``. Cases it does not take (eager mode, no gradient recorded, integer or complex inputs, an empty ``dim`` list, an
 empty reduced dimension, symbolic sizes) go to the op's own kernel. 16-bit inputs are reduced in float32 and returned in
 their dtype, as by an autocast to float32.
 """
@@ -75,7 +78,7 @@ def install_logsumexp(device_type, lazy=None):
     op = aten.logsumexp.default
 
     def kernel(input, dim, keepdim=False):
-        if _logsumexp_takes(input, dim, keepdim):
+        if torch.is_grad_enabled() and input.requires_grad and _logsumexp_takes(input, dim, keepdim):
             count("logsumexp")
             return logsumexp(input, dim, keepdim)
         return op._op_dk(DispatchKey.Autograd, input, dim, keepdim)

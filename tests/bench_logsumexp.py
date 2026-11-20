@@ -39,7 +39,7 @@ def run(fn, x, n, keep):
     hthpu.synchronize()
 
 
-def bench(label, fn, x):
+def bench(label, fn, x, taken=True):
     """Median ms of ROUNDS alternating blocks with (ours) and without (habana) the rewrite."""
     times = {"habana": [], "ours": []}
     fb = {"habana": 0, "ours": 0}
@@ -61,10 +61,10 @@ def bench(label, fn, x):
                     times[name].append((time.perf_counter() - t) / N * 1e3)
                 fb[name] += fallback_total() - before
                 warn[name] += sum("runs on the CPU" in str(w.message) for w in record)
-                if name == "ours" and perf.lazy_mode():
+                if name == "ours" and perf.lazy_mode() and taken:
                     assert calls["logsumexp"] - c0 >= N, "rewrite not taken"
                 elif name == "ours":
-                    assert calls["logsumexp"] == c0, "rewrite taken in eager mode"
+                    assert calls["logsumexp"] == c0, "rewrite taken in eager mode or without a gradient"
                 else:
                     assert calls["logsumexp"] == c0, "rewrite taken while undone"
                 outs[name] = keep[-1]
@@ -123,6 +123,7 @@ def main():
         x_cpu = torch.randn(shape)
         x = x_cpu.to(hpu)
         fwd = lambda t, d=dim: torch.logsumexp(t, d)  # noqa: E731
+        fwd_grad = lambda t, d=dim: torch.logsumexp(t.detach().requires_grad_(), d)  # noqa: E731
 
         def fwd_bwd(t, d=dim):
             t = t.detach().requires_grad_()
@@ -132,7 +133,8 @@ def main():
 
         c_ms = cpu_ms(fwd, x_cpu)
         print(f"-- {shape} dim={dim}: cpu forward {c_ms:.3f} ms", flush=True)
-        bench(f"   forward", fwd, x)
+        bench(f"   forward, no gradient (not taken)", fwd, x, taken=False)
+        bench(f"   forward, input requires grad", fwd_grad, x)
         bench(f"   forward+backward", fwd_bwd, x)
         errs = accuracy(x_cpu, dim, False)
         print(f"   max err vs CPU float64 (out, grad): habana {errs['habana'][0]:.1e} {errs['habana'][1]:.1e}  "
@@ -143,9 +145,9 @@ def main():
     want = torch.logsumexp(special, 1)
     undo = perf.install_logsumexp("hpu")
     try:
-        got = torch.logsumexp(special.to(hpu), 1)
+        got = torch.logsumexp(special.to(hpu).requires_grad_(), 1).detach()
         step()
-        bf = torch.logsumexp(torch.randn(64, 22, 22).to(hpu).bfloat16(), -1)
+        bf = torch.logsumexp(torch.randn(64, 22, 22).to(hpu).bfloat16().requires_grad_(), -1)
         step()
         xc = torch.randn(64, 22, 22)
         if LAZY:

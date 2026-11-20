@@ -19,8 +19,9 @@ at the tensor's pickling:
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
   roll wrongly (EMG2QwertyNet's input gradient).
-- ``logsumexp`` in lazy mode as ATen's composite (``perf``): there Gaudi's kernel is slower than amax, exp, sum and
-  log recorded into the same graph (forward + backward 1.1-1.4x). Eager mode keeps Gaudi's kernel (issue #21).
+- ``logsumexp`` in lazy mode, for inputs that record a gradient, as ATen's composite (``perf``): there forward +
+  backward through Gaudi's kernel is slower than through amax, exp, sum and log recorded into the same graph (about
+  1.1-1.3x, noisy). Eager mode and calls without a gradient keep Gaudi's kernel (issue #21).
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.

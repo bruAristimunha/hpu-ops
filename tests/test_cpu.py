@@ -824,9 +824,24 @@ def test_logsumexp_infinities_and_nan_as_aten():
                       [-1e30, 0.0, 88.0]])
     want = torch.logsumexp(x, 1)
     with cpu_as_hpu(lazy_logsumexp) as calls:
-        got = torch.logsumexp(x, 1)
+        got = torch.logsumexp(x.requires_grad_(), 1)
     assert calls["logsumexp"] == 1
-    torch.testing.assert_close(got, want, equal_nan=True)
+    torch.testing.assert_close(got.detach(), want, equal_nan=True)
+
+
+def test_logsumexp_forward_only_keeps_the_native_kernel():
+    """Measured: forward + backward is faster as the composite in lazy mode, forward alone is not (0.97x), so calls
+    that record no gradient (no_grad, inputs without requires_grad, inference mode) keep the device's kernel."""
+    x = torch.randn(6, 5)
+    with cpu_as_hpu(lazy_logsumexp) as calls:
+        plain = torch.logsumexp(x, 1)
+        with torch.no_grad():
+            no_grad = torch.logsumexp(x.clone().requires_grad_(), 1)
+        assert not calls["logsumexp"]
+        torch.logsumexp(x.clone().requires_grad_(), 1)
+        assert calls["logsumexp"] == 1
+    torch.testing.assert_close(plain, torch.logsumexp(x, 1))
+    torch.testing.assert_close(no_grad, torch.logsumexp(x, 1))
 
 
 def test_logsumexp_gradient_of_infinite_and_large_slices():
@@ -838,9 +853,9 @@ def test_logsumexp_gradient_of_infinite_and_large_slices():
 
 
 def test_logsumexp_dtypes_layouts_and_what_it_does_not_take():
-    x = torch.randn(8, 6, 4)
-    permuted = torch.randn(4, 6, 8).permute(2, 1, 0)
-    offset = torch.randn(100)[3:3 + 48].view(8, 6)
+    x = torch.randn(8, 6, 4, requires_grad=True)
+    permuted = torch.randn(4, 6, 8, requires_grad=True).permute(2, 1, 0)
+    offset = torch.randn(100, requires_grad=True)[3:3 + 48].view(8, 6)
     with cpu_as_hpu(lazy_logsumexp) as calls:
         half = torch.logsumexp(x.bfloat16(), 1)
         with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -849,8 +864,8 @@ def test_logsumexp_dtypes_layouts_and_what_it_does_not_take():
         view = torch.logsumexp(offset, -1)
         taken = calls["logsumexp"]
         ints = torch.logsumexp(torch.arange(6).view(2, 3), 1)
-        empty = torch.logsumexp(torch.randn(3, 0), 1)
-        empty_rows = torch.logsumexp(torch.randn(0, 3), 1)
+        empty = torch.logsumexp(torch.randn(3, 0, requires_grad=True), 1)
+        empty_rows = torch.logsumexp(torch.randn(0, 3, requires_grad=True), 1)
         with pytest.raises(RuntimeError, match="broadcast shape"):  # torch's own error for an empty dim list
             torch.logsumexp(x, ())
         with pytest.raises(IndexError):
@@ -858,15 +873,16 @@ def test_logsumexp_dtypes_layouts_and_what_it_does_not_take():
         with pytest.raises(RuntimeError):
             torch.logsumexp(x, (1, 1))
         out = torch.empty(8, 4)
-        torch.logsumexp(x, 1, out=out)
+        torch.logsumexp(x.detach(), 1, out=out)
         untaken = calls["logsumexp"] - taken
     assert taken == 4 and untaken == 1, (taken, untaken)  # after the snapshot, only the (0, 3) input over dim 1 is taken
+    x, permuted, offset = x.detach(), permuted.detach(), offset.detach()
     assert half.dtype == torch.bfloat16 and (half.float() - torch.logsumexp(x, 1)).abs().max() < 5e-2
     assert autocast.dtype == torch.float32
-    torch.testing.assert_close(strided, torch.logsumexp(permuted, 1))
-    torch.testing.assert_close(view, torch.logsumexp(offset, -1))
+    torch.testing.assert_close(strided.detach(), torch.logsumexp(permuted, 1))
+    torch.testing.assert_close(view.detach(), torch.logsumexp(offset, -1))
     torch.testing.assert_close(ints, torch.logsumexp(torch.arange(6).view(2, 3), 1))
-    assert torch.equal(empty, torch.logsumexp(torch.randn(3, 0), 1)) and empty_rows.shape == (0,)
+    assert torch.equal(empty.detach(), torch.logsumexp(torch.randn(3, 0), 1)) and empty_rows.shape == (0,)
     torch.testing.assert_close(out, torch.logsumexp(x, 1))
 
 
@@ -901,12 +917,12 @@ def test_logsumexp_eager_mode_keeps_the_native_kernel(monkeypatch, setting):
     else:
         monkeypatch.setenv("PT_HPU_LAZY_MODE", setting)
     with cpu_as_hpu(perf.install_logsumexp) as calls:
-        torch.logsumexp(torch.randn(4, 6), 1)
+        torch.logsumexp(torch.randn(4, 6, requires_grad=True), 1)
     assert not calls["logsumexp"]
     assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::logsumexp", "AutogradCPU")
     monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
     with cpu_as_hpu(perf.install_logsumexp) as calls:
-        torch.logsumexp(torch.randn(4, 6), 1)
+        torch.logsumexp(torch.randn(4, 6, requires_grad=True), 1)
     assert calls["logsumexp"] == 1
 
 
