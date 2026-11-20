@@ -1,5 +1,5 @@
-"""HPU composites for the linalg ops Gaudi lacks (``linalg_solve_triangular``, ``cholesky_solve``) or
-runs on the CPU, built from matmuls that stay on the card and compile into the step graph.
+"""HPU composites for the linalg ops Gaudi lacks (``linalg_solve_triangular``, ``cholesky_solve``, ``linalg.inv``,
+``det``, ``slogdet``) or runs on the CPU, built from matmuls that stay on the card and compile into the step graph.
 
 Each is a ``torch.autograd.Function`` registered at ``Autograd{}``: its backward is torch's formula over the same
 composites, so gradients match torch's. Its forward is also registered at the backend key, for calls below autograd
@@ -304,3 +304,100 @@ def install_solve(device_type):
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
     return register_kernels(device_type, _kernels(device_type, op, "solve", SolveEx, takes))
+
+
+def _inverse(LU, pivots):
+    """``A^-1`` from ``lu``'s factors: the solve against the identity."""
+    n = LU.shape[-1]
+    return lu_solve(LU, pivots, torch.eye(n, dtype=LU.dtype, device=LU.device))
+
+
+def _parity(pivots):
+    """The sign of the row permutation of ``lu``'s pivots: -1 to the number of swaps."""
+    n = pivots.shape[-1]
+    swaps = (pivots != torch.arange(1, n + 1, device=pivots.device, dtype=pivots.dtype)).sum(-1)
+    return 1 - 2 * (swaps % 2)
+
+
+class InvEx(torch.autograd.Function):
+    """``aten.linalg_inv_ex`` from the masked LU, with torch's backward (``-X^H g X^H``) over the composite. ``info``
+    is not differentiable."""
+
+    @staticmethod
+    def compute(A, check_errors):
+        LU, pivots = lu(A)
+        info = lu_info(LU)
+        if check_errors:
+            torch.ops.aten._linalg_check_errors(info, "linalg.inv_ex", is_matrix=A.dim() == 2)
+        return _inverse(LU, pivots), info
+
+    @staticmethod
+    def forward(ctx, A, check_errors):
+        X, info = InvEx.compute(A, check_errors)
+        ctx.save_for_backward(X)
+        ctx.mark_non_differentiable(info)
+        return X, info
+
+    @staticmethod
+    def backward(ctx, grad, *_):
+        (X,) = ctx.saved_tensors
+        return -(X.mH @ grad @ X.mH), None
+
+
+class Det(torch.autograd.Function):
+    """``aten._linalg_det`` as the signed product of U's diagonal, with torch's backward (``g det A^-H``), the inverse
+    recomputed from the saved factors. A singular matrix has det 0 and a non-finite gradient. ``LU`` and ``pivots``
+    are not differentiable."""
+
+    @staticmethod
+    def compute(A):
+        LU, pivots = lu(A)
+        diag = torch.diagonal(LU, dim1=-2, dim2=-1)
+        return _parity(pivots).to(A.dtype) * diag.prod(-1), LU, pivots
+
+    @staticmethod
+    def forward(ctx, A):
+        det, LU, pivots = Det.compute(A)
+        ctx.save_for_backward(det, LU, pivots)
+        ctx.mark_non_differentiable(LU, pivots)
+        return det, LU, pivots
+
+    @staticmethod
+    def backward(ctx, grad, *_):
+        det, LU, pivots = ctx.saved_tensors
+        return (grad * det)[..., None, None] * _inverse(LU, pivots).mH
+
+
+class Slogdet(torch.autograd.Function):
+    """``aten._linalg_slogdet`` as the sign and log of U's diagonal, with torch's backward (``g A^-H``) for
+    ``logabsdet``, the inverse recomputed from the saved factors. ``sign``, ``LU`` and ``pivots`` are not
+    differentiable."""
+
+    @staticmethod
+    def compute(A):
+        LU, pivots = lu(A)
+        diag = torch.diagonal(LU, dim1=-2, dim2=-1)
+        sign = _parity(pivots).to(A.dtype) * diag.sign().prod(-1)
+        return sign, diag.abs().log().sum(-1), LU, pivots
+
+    @staticmethod
+    def forward(ctx, A):
+        sign, logabsdet, LU, pivots = Slogdet.compute(A)
+        ctx.save_for_backward(LU, pivots)
+        ctx.mark_non_differentiable(sign, LU, pivots)
+        return sign, logabsdet, LU, pivots
+
+    @staticmethod
+    def backward(ctx, _sign, grad, *_):
+        LU, pivots = ctx.saved_tensors
+        return grad[..., None, None] * _inverse(LU, pivots).mH
+
+
+def install_inv_det(device_type):
+    """``linalg.inv``/``inv_ex``, ``det`` and ``slogdet`` on ``device_type`` from the masked LU and two triangular
+    matmuls. Returns an undo."""
+    entries = []
+    for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
+                               (aten._linalg_slogdet.default, "slogdet", Slogdet)):
+        entries += _kernels(device_type, op, name, function, _takes(device_type, name))
+    return register_kernels(device_type, entries)

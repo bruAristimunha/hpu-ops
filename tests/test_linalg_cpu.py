@@ -318,3 +318,59 @@ def test_solve_ex_check_errors_raises_like_torch():
         with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
             torch.linalg.solve_ex(A, B, check_errors=True)
         assert calls["solve"] >= 1, dict(calls)
+
+
+# ---- inv, det, slogdet
+
+INV_DET_FNS = {"inv": torch.linalg.inv, "inv_ex": torch.linalg.inv_ex, "det": torch.linalg.det,
+               "slogdet": torch.linalg.slogdet}
+INV_DET_COUNT = {"inv": "inv", "inv_ex": "inv", "det": "det", "slogdet": "slogdet"}
+
+
+@pytest.mark.parametrize("batch", [(), (2, 3)])
+@pytest.mark.parametrize("n", [1, 3, 22])
+@pytest.mark.parametrize("fn", list(INV_DET_FNS))
+def test_inv_det_slogdet_match_torch(fn, n, batch):
+    torch.manual_seed(0)
+    A = general(*batch, n=n)
+    compare(INV_DET_FNS[fn], linalg.install_inv_det, A, name=INV_DET_COUNT[fn])
+
+
+@pytest.mark.parametrize("fn", list(INV_DET_FNS))
+def test_inv_det_float32(fn):
+    torch.manual_seed(0)
+    A = general(4, n=5, dtype=torch.float32)
+    compare(INV_DET_FNS[fn], linalg.install_inv_det, A, name=INV_DET_COUNT[fn], rtol=1e-4, atol=1e-4)
+
+
+def test_inv_det_singular():
+    A = torch.zeros(3, 3, dtype=torch.float64)
+    with pytest.raises(RuntimeError) as native:
+        torch.linalg.inv(A)
+    with cpu_as_hpu(linalg.install_inv_det) as calls:
+        assert torch.equal(torch.linalg.det(A), torch.zeros((), dtype=torch.float64))
+        sign, logabsdet = torch.linalg.slogdet(A)
+        assert sign.item() == 0.0 and logabsdet.item() == float("-inf")
+        with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
+            torch.linalg.inv(A)
+        assert calls["det"] >= 1 and calls["slogdet"] >= 1 and calls["inv"] >= 1, dict(calls)
+
+
+def test_inv_ex_check_errors_raises_like_torch():
+    A = torch.zeros(3, 3, dtype=torch.float64)
+    with pytest.raises(RuntimeError) as native:
+        torch.linalg.inv_ex(A, check_errors=True)
+    with cpu_as_hpu(linalg.install_inv_det) as calls:
+        with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
+            torch.linalg.inv_ex(A, check_errors=True)
+        assert calls["inv"] >= 1, dict(calls)
+
+
+def test_inv_compiled_has_no_native_op():
+    torch.manual_seed(0)
+    A = general(3, n=N)
+    nodes = []
+    with cpu_as_hpu(linalg.install_inv_det):
+        got = compiled(torch.linalg.inv, nodes)(A)
+    torch.testing.assert_close(got, torch.linalg.inv(A))
+    assert "aten.linalg_inv_ex.default" not in ops(nodes), ops(nodes)

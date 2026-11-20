@@ -22,6 +22,7 @@ at the tensor's pickling:
 - ``linalg.solve_triangular`` and ``cholesky_solve`` as matmuls with a block-recursive inverse (``linalg``): they have
   no HPU kernel and ran on the CPU; float64 stays on the CPU, as Gaudi2 computes it at float32 precision
   (hpu-ops#16). Cholesky's and QR's backward use the first.
+- ``linalg.inv``, ``det`` and ``slogdet`` from the masked LU and triangular matmuls (``linalg``), as ``linalg.solve``.
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -51,7 +52,7 @@ BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_grou
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
          composite.install_roll, linalg.install_solve_triangular, linalg.install_cholesky_solve,
-         linalg.install_solve,
+         linalg.install_solve, linalg.install_inv_det,
          serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
