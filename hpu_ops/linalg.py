@@ -15,7 +15,6 @@ On Gaudi2 these composites lose to Habana's CPU fallback (one launch per op), so
 triangular solves). Without the kernel, or past ``MAXN``, the call on ``hpu`` is declined and Habana's fallback runs.
 The composites stay the path of the CPU stand-in.
 """
-import functools
 import warnings
 
 import torch
@@ -116,27 +115,14 @@ def _gj_info(S, batch):
     return info
 
 
-@functools.lru_cache(maxsize=None)
-def _cached_pivots(n, device):
-    return torch.arange(1, n + 1, dtype=torch.int32, device=device)
-
-
-@functools.lru_cache(maxsize=None)
-def _cached_zero(dtype, device):
-    return torch.zeros((), dtype=dtype, device=device)
-
-
 def _unused_factors(A):
-    """The ``LU`` and ``pivots`` outputs the schemas require and the kernel does not compute: a cached scalar zero
-    expanded to A's shape (not A's LU) and the identity permutation (a cached ``arange`` expanded to the batch).
-    Both are views of storage of their own, so no device op runs per call; an alias of the input as an output breaks
-    lazy mode's graph. Only torch's own derivative reads them, and the Functions here replace it."""
+    """The ``LU`` and ``pivots`` outputs the schemas require and the kernel does not compute: a zero scalar expanded
+    to A's shape (not A's LU) and the identity permutation, expanded to the batch. Both are built on every call and
+    own their storage: a tensor cached from one lazy graph breaks the next, and an alias of the input as an output
+    does too. Only torch's own derivative reads them, and the Functions here replace it."""
     n = A.shape[-1]
-    zero = (torch.zeros((), dtype=A.dtype, device=A.device) if torch.compiler.is_compiling()
-            else _cached_zero(A.dtype, A.device))
-    pivots = (torch.arange(1, n + 1, dtype=torch.int32, device=A.device) if torch.compiler.is_compiling()
-              else _cached_pivots(n, A.device))
-    return zero.expand(A.shape), pivots.expand(*A.shape[:-1])
+    pivots = torch.arange(1, n + 1, dtype=torch.int32, device=A.device)
+    return A.new_zeros(()).expand(A.shape), pivots.expand(*A.shape[:-1])
 
 
 def _on_cpu(op, args, kwargs):
