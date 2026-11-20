@@ -25,6 +25,12 @@ extern const char _binary___matrix_exp_f32_gaudi2_o_start[];
 extern const char _binary___matrix_exp_f32_gaudi2_o_end[];
 extern const char _binary___matrix_exp_frechet_f32_gaudi2_o_start[];
 extern const char _binary___matrix_exp_frechet_f32_gaudi2_o_end[];
+extern const char _binary___lu_factor_f32_gaudi2_o_start[];
+extern const char _binary___lu_factor_f32_gaudi2_o_end[];
+extern const char _binary___lu_perm_f32_gaudi2_o_start[];
+extern const char _binary___lu_perm_f32_gaudi2_o_end[];
+extern const char _binary___lu_solve_f32_gaudi2_o_start[];
+extern const char _binary___lu_solve_f32_gaudi2_o_end[];
 }
 
 namespace {
@@ -39,6 +45,9 @@ const char* kSvdvals = "jacobi_svdvals_f32_gaudi2";
 const char* kHouseholder = "householder_product_f32_gaudi2";
 const char* kExpm = "matrix_exp_f32_gaudi2";
 const char* kExpmFrechet = "matrix_exp_frechet_f32_gaudi2";
+const char* kLu = "lu_factor_f32_gaudi2";
+const char* kLuPerm = "lu_perm_f32_gaudi2";  // the same source with -DPERM_FROM_PIVOTS
+const char* kLuSolve = "lu_solve_f32_gaudi2";
 constexpr uint64_t kMaxN = 32;      // MAXN of gj_solve, jacobi_svd and matrix_exp
 constexpr uint64_t kMaxHH = 64;     // MAXHH of householder_product
 constexpr uint64_t kMaxEighN = 32;  // MAXN of jacobi_eigh
@@ -383,6 +392,141 @@ tpc_lib_api::GlueCodeReturn expm_defs(tpc_lib_api::HabanaKernelParams* in,
                    : copy_elf(out, _binary___matrix_exp_f32_gaudi2_o_start, _binary___matrix_exp_f32_gaudi2_o_end);
 }
 
+tpc_lib_api::GlueCodeReturn lu_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out)
+{
+    if (in->inputTensorNr != 1)
+    {
+        in->inputTensorNr = 1;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
+    }
+    if (in->outputTensorNr != 2)
+    {
+        in->outputTensorNr = 2;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    }
+    if (in->inputTensors[0].geometry.dataType != tpc_lib_api::DATA_F32)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+    }
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    if (n < 1 || n > kMaxN || in->inputTensors[0].geometry.maxSizes[1] != n || batch < 1)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+
+    auto& pa = out->inputTensorAccessPattern[0];
+    base_pattern(pa);
+    full_dim(pa, 0, n);
+    full_dim(pa, 1, n);
+    batch_dim(pa, 2);
+    auto& plu = out->outputTensorAccessPattern[0];
+    base_pattern(plu);
+    full_dim(plu, 0, n);
+    full_dim(plu, 1, n);
+    batch_dim(plu, 2);
+    auto& ppv = out->outputTensorAccessPattern[1];
+    base_pattern(ppv);
+    full_dim(ppv, 0, n);
+    full_dim(ppv, 1, 3);
+    batch_dim(ppv, 2);
+    return copy_elf(out, _binary___lu_factor_f32_gaudi2_o_start, _binary___lu_factor_f32_gaudi2_o_end);
+}
+
+tpc_lib_api::GlueCodeReturn lu_perm_defs(tpc_lib_api::HabanaKernelParams* in,
+                                         tpc_lib_api::HabanaKernelInstantiation* out)
+{
+    if (in->inputTensorNr != 1)
+    {
+        in->inputTensorNr = 1;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
+    }
+    if (in->outputTensorNr != 1)
+    {
+        in->outputTensorNr = 1;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    }
+    if (in->inputTensors[0].geometry.dataType != tpc_lib_api::DATA_F32)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+    }
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[1];
+    if (n < 1 || n > kMaxN || batch < 1)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+    auto& pp = out->inputTensorAccessPattern[0];
+    base_pattern(pp);
+    full_dim(pp, 0, n);
+    batch_dim(pp, 1);
+    auto& po = out->outputTensorAccessPattern[0];
+    base_pattern(po);
+    full_dim(po, 0, n);
+    batch_dim(po, 1);
+    return copy_elf(out, _binary___lu_perm_f32_gaudi2_o_start, _binary___lu_perm_f32_gaudi2_o_end);
+}
+
+tpc_lib_api::GlueCodeReturn lu_solve_defs(tpc_lib_api::HabanaKernelParams* in,
+                                          tpc_lib_api::HabanaKernelInstantiation* out)
+{
+    if (in->inputTensorNr != 3)
+    {
+        in->inputTensorNr = 3;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
+    }
+    if (in->outputTensorNr != 1)
+    {
+        in->outputTensorNr = 1;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    }
+    for (unsigned i = 0; i < 3; i++)
+    {
+        if (in->inputTensors[i].geometry.dataType != tpc_lib_api::DATA_F32)
+        {
+            return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+        }
+    }
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    const uint64_t m = in->inputTensors[2].geometry.maxSizes[0];
+    if (n < 1 || n > kMaxN || m < 1 || m > kMaxN || batch < 1 || in->inputTensors[0].geometry.maxSizes[1] != n ||
+        in->inputTensors[1].geometry.maxSizes[0] != n || in->inputTensors[1].geometry.maxSizes[1] != batch ||
+        in->inputTensors[2].geometry.maxSizes[1] != n || in->inputTensors[2].geometry.maxSizes[2] != batch)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+    auto& pl = out->inputTensorAccessPattern[0];
+    base_pattern(pl);
+    full_dim(pl, 0, n);
+    full_dim(pl, 1, n);
+    batch_dim(pl, 2);
+    auto& pp = out->inputTensorAccessPattern[1];
+    base_pattern(pp);
+    full_dim(pp, 0, n);
+    batch_dim(pp, 1);
+    auto& pb = out->inputTensorAccessPattern[2];
+    base_pattern(pb);
+    full_dim(pb, 0, m);
+    full_dim(pb, 1, n);
+    batch_dim(pb, 2);
+    auto& px = out->outputTensorAccessPattern[0];
+    base_pattern(px);
+    full_dim(px, 0, m);
+    full_dim(px, 1, n);
+    batch_dim(px, 2);
+    return copy_elf(out, _binary___lu_solve_f32_gaudi2_o_start, _binary___lu_solve_f32_gaudi2_o_end);
+}
+
 }  // namespace
 
 extern "C" {
@@ -390,7 +534,7 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 10 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 13 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
@@ -403,6 +547,9 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint3
         strcpy(guids[7].name, kHouseholder);
         strcpy(guids[8].name, kExpm);
         strcpy(guids[9].name, kExpmFrechet);
+        strcpy(guids[10].name, kLu);
+        strcpy(guids[11].name, kLuPerm);
+        strcpy(guids[12].name, kLuSolve);
     }
     if (kernelCount != nullptr)
     {
@@ -453,6 +600,18 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (strcmp(params->guid.name, kExpmFrechet) == 0)
     {
         return expm_defs(params, instance, true);
+    }
+    if (strcmp(params->guid.name, kLu) == 0)
+    {
+        return lu_defs(params, instance);
+    }
+    if (strcmp(params->guid.name, kLuPerm) == 0)
+    {
+        return lu_perm_defs(params, instance);
+    }
+    if (strcmp(params->guid.name, kLuSolve) == 0)
+    {
+        return lu_solve_defs(params, instance);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }

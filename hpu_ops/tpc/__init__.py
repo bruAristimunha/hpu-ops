@@ -87,6 +87,15 @@ static habana::PartialOutputMetaDataVector hh_meta(const at::Stack& inputs) {
   auto a = inputs[0].toTensor();
   return {habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()}};
 }
+static habana::PartialOutputMetaDataVector lu_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  return {habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()},
+          habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), 3, a.size(1)}}};
+}
+static habana::PartialOutputMetaDataVector lu_solve_meta(const at::Stack& inputs) {
+  auto b = inputs[2].toTensor();
+  return {habana::PartialOutputMetaData{b.scalar_type(), b.sizes().vec()}};
+}
 static habana::PartialOutputMetaDataVector eigh_meta(const at::Stack& inputs) {
   auto a = inputs[0].toTensor();
   return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1)}},
@@ -107,6 +116,9 @@ static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::matrix_exp", "matrix_exp_f32_gaudi2", hh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::matrix_exp_frechet", "matrix_exp_frechet_f32_gaudi2", hh_meta,
                                           nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::lu_factor", "lu_factor_f32_gaudi2", lu_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::lu_perm", "lu_perm_f32_gaudi2", svdvals_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::lu_solve", "lu_solve_f32_gaudi2", lu_solve_meta, nullptr);
   return true;
 }();
 
@@ -158,6 +170,24 @@ at::Tensor matrix_exp_frechet(at::Tensor a, at::Tensor g) {
   auto out = desc.execute(inputs);
   return out[0];
 }
+std::tuple<at::Tensor, at::Tensor> lu_factor(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::lu_factor");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
+}
+at::Tensor lu_solve(at::Tensor lu, at::Tensor p, at::Tensor b) {
+  std::vector<c10::IValue> inputs{lu, p, b};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::lu_solve");
+  auto out = desc.execute(inputs);
+  return out[0];
+}
+at::Tensor lu_perm(at::Tensor p) {
+  std::vector<c10::IValue> inputs{p};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::lu_perm");
+  auto out = desc.execute(inputs);
+  return out[0];
+}
 std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_eigh");
@@ -179,6 +209,9 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("householder_product(Tensor a, Tensor tau) -> Tensor");
   m.def("matrix_exp(Tensor a) -> Tensor");
   m.def("matrix_exp_frechet(Tensor a, Tensor g) -> Tensor");
+  m.def("lu_factor(Tensor a) -> (Tensor, Tensor)");
+  m.def("lu_perm(Tensor p) -> Tensor");
+  m.def("lu_solve(Tensor lu, Tensor p, Tensor b) -> Tensor");
   m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
@@ -191,6 +224,9 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("householder_product", householder_product);
   m.impl("matrix_exp", matrix_exp);
   m.impl("matrix_exp_frechet", matrix_exp_frechet);
+  m.impl("lu_factor", lu_factor);
+  m.impl("lu_perm", lu_perm);
+  m.impl("lu_solve", lu_solve);
   m.impl("jacobi_eigh", jacobi_eigh);
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
@@ -220,6 +256,15 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   });
   m.impl("matrix_exp_frechet", [](at::Tensor a, at::Tensor g) {
     return a.new_empty(a.sizes());
+  });
+  m.impl("lu_factor", [](at::Tensor a) {
+    return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), 3, a.size(1)}));
+  });
+  m.impl("lu_perm", [](at::Tensor p) {
+    return p.new_empty(p.sizes());
+  });
+  m.impl("lu_solve", [](at::Tensor lu, at::Tensor p, at::Tensor b) {
+    return b.new_empty(b.sizes());
   });
   m.impl("jacobi_eigh", [](at::Tensor a) {
     return std::make_tuple(a.new_empty({a.size(0), a.size(1)}), a.new_empty(a.sizes()));
@@ -309,6 +354,33 @@ static bool registered_expm_frechet = [] {
   return true;
 }();
 
+static auto pvshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  return std::vector<int64_t>{a.size(0), 3, a.size(1)};
+};
+static bool registered_lu = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_a},
+                                                 {1, c10::ScalarType::Float, pvshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::lu_factor", "lu_factor_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static bool registered_lu_perm = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_a}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::lu_perm", "lu_perm_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static auto xshape_c = [](const at::Stack& s) { return s[2].toTensor().sizes().vec(); };
+static bool registered_lu_solve = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
+                                               {habana::custom_op::input_type::TENSOR, 1},
+                                               {habana::custom_op::input_type::TENSOR, 2}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_c}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::lu_solve", "lu_solve_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+
 static auto wshape = [](const at::Stack& s) {
   auto a = s[0].toTensor();
   return std::vector<int64_t>{a.size(0), a.size(1)};
@@ -377,6 +449,24 @@ at::Tensor matrix_exp_frechet(at::Tensor a, at::Tensor g) {
   auto out = op.execute(inputs);
   return out[0];
 }
+std::tuple<at::Tensor, at::Tensor> lu_factor(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::lu_factor");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1]};
+}
+at::Tensor lu_solve(at::Tensor lu, at::Tensor p, at::Tensor b) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::lu_solve");
+  std::vector<c10::IValue> inputs{lu, p, b};
+  auto out = op.execute(inputs);
+  return out[0];
+}
+at::Tensor lu_perm(at::Tensor p) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::lu_perm");
+  std::vector<c10::IValue> inputs{p};
+  auto out = op.execute(inputs);
+  return out[0];
+}
 std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_eigh");
   std::vector<c10::IValue> inputs{a};
@@ -398,6 +488,9 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("householder_product(Tensor a, Tensor tau) -> Tensor");
   m.def("matrix_exp(Tensor a) -> Tensor");
   m.def("matrix_exp_frechet(Tensor a, Tensor g) -> Tensor");
+  m.def("lu_factor(Tensor a) -> (Tensor, Tensor)");
+  m.def("lu_perm(Tensor p) -> Tensor");
+  m.def("lu_solve(Tensor lu, Tensor p, Tensor b) -> Tensor");
   m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
@@ -410,6 +503,9 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("householder_product", householder_product);
   m.impl("matrix_exp", matrix_exp);
   m.impl("matrix_exp_frechet", matrix_exp_frechet);
+  m.impl("lu_factor", lu_factor);
+  m.impl("lu_perm", lu_perm);
+  m.impl("lu_solve", lu_solve);
   m.impl("jacobi_eigh", jacobi_eigh);
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
@@ -573,6 +669,24 @@ def _expm_frechet_op():
     """``torch.ops.linalg_tpc.matrix_exp_frechet``, built on first use."""
     _load()
     return torch.ops.linalg_tpc.matrix_exp_frechet
+
+
+def _lu_op():
+    """``torch.ops.linalg_tpc.lu_factor``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.lu_factor
+
+
+def _lu_perm_op():
+    """``torch.ops.linalg_tpc.lu_perm``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.lu_perm
+
+
+def _lu_solve_op():
+    """``torch.ops.linalg_tpc.lu_solve``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.lu_solve
 
 
 def _eigh_op():
@@ -951,3 +1065,61 @@ def matrix_exp_frechet_reference(A, G):
     from .. import linalg
 
     return linalg._matrix_exp_frechet_torch(A, G)
+
+
+def lu_factor(A, pivots=True):
+    """``(LU, pivots, perm, info)`` for square ``A[..., n, n]`` (float32, n <= ``MAXN``) from the TPC LU kernel:
+    ``LU`` packed as ``torch.linalg.lu_factor`` returns it, ``pivots`` LAPACK's (int32, 1-based), ``perm`` the row
+    permutation (float32, exact below 2**24: ``LU``'s row i is ``A``'s row ``perm[i]``) and ``info`` LAPACK's
+    (int32). The kernel writes pivots, perm and info as float32; the int casts run on the card. With
+    ``pivots=False`` only ``(LU, perm)``: ``linalg.lu`` needs no pivots or info."""
+    n = A.shape[-1]
+    _check(A, n)
+    batch = A.shape[:-2]
+    LU, PV = _call(_lu_op(), A.reshape(-1, n, n).to(torch.float32).contiguous())
+    if not pivots:
+        return LU.reshape(*batch, n, n), PV[:, 1].reshape(*batch, n)
+    pivots = PV[:, 0].to(torch.int32).reshape(*batch, n)
+    perm = PV[:, 1].reshape(*batch, n)
+    info = PV[:, 2, 0].to(torch.int32).reshape(batch)
+    return LU.reshape(*batch, n, n), pivots, perm, info
+
+
+def lu_factor_reference(A):
+    """``lu_factor`` in plain torch, the contract of the kernel: ``hpu_ops.linalg.lu`` (partial pivoting, first
+    largest pivot, as LAPACK). Detached. For the CPU tests."""
+    from .. import linalg
+
+    LU, pivots = linalg.lu(A.detach())
+    return LU, pivots, linalg.pivots_to_perm(pivots).to(A.dtype), linalg.lu_info(LU)
+
+
+def lu_perm(pivots):
+    """The row permutation (float32, exact below 2**24; ``LU``'s row i is ``A``'s row ``perm[i]``) of LAPACK's
+    1-based ``pivots[..., n]`` (n <= ``MAXN``) from the TPC kernel: the swaps replayed in order, one launch."""
+    n = pivots.shape[-1]
+    if n > MAXN:
+        raise ValueError(f"hpu_ops.tpc.lu_perm takes n <= {MAXN} pivots, got {tuple(pivots.shape)}")
+    batch = pivots.shape[:-1]
+    perm = _call(_lu_perm_op(), pivots.reshape(-1, n).to(torch.float32).contiguous())
+    return perm.reshape(*batch, n)
+
+
+def lu_solve(LU, pivots, B):
+    """``A^-1 B`` from LAPACK's factors ``LU[..., n, n]`` and 1-based ``pivots[..., n]`` (float32, n <= ``MAXN``) and
+    ``B[..., n, m]`` (any m, in chunks of ``MAXN`` columns), batches broadcast, by the TPC getrs kernel: the row
+    swaps, then forward and back substitution. One launch per chunk."""
+    n, m = LU.shape[-1], B.shape[-1]
+    _check(LU, n)
+    if B.shape[-2] != n:
+        raise ValueError(f"hpu_ops.tpc.lu_solve takes B with n rows, got {tuple(LU.shape)} and {tuple(B.shape)}")
+    batch = torch.broadcast_shapes(LU.shape[:-2], pivots.shape[:-1], B.shape[:-2])
+    flat = lambda x, *shape: x.expand(*batch, *shape).reshape(-1, *shape).to(torch.float32).contiguous()  # noqa: E731
+    lu_f, piv_f = flat(LU, n, n), flat(pivots, n)
+    B_f = flat(B, n, m)
+    op = _lu_solve_op()
+    if m <= MAXN:
+        X = _call(op, lu_f, piv_f, B_f)
+    else:
+        X = torch.cat([_call(op, lu_f, piv_f, chunk.contiguous()) for chunk in B_f.split(MAXN, -1)], -1)
+    return X.reshape(*batch, n, m)

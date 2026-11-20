@@ -372,6 +372,15 @@ CASES = (
     Case("linalg.matrix_rank", make_general, lambda x: L.matrix_rank(x), err_all, None, tpc=True),
     Case("linalg.matrix_exp", make_skew, lambda x: L.matrix_exp(x), tpc=True),
     Case("linalg.householder_product", make_householder, lambda a, t: L.householder_product(a, t)),
+    # standalone LU (#10): the TPC LU kernel (LAPACK's factors and pivots) and the pivots-to-permutation kernel
+    Case("linalg.lu_factor", make_pivoting, lambda x: L.lu_factor(x), float64=False, tpc=True, gate=True),
+    Case("linalg.lu_factor_ex", make_pivoting, lambda x: L.lu_factor_ex(x), float64=False, tpc=True, gate=True),
+    Case("linalg.lu", make_pivoting, lambda x: L.lu(x), float64=False, tpc=True, gate=True),
+    Case("linalg.lu_solve", make_solve, lambda a, b: L.lu_solve(*L.lu_factor(a), b), float64=False, tpc=True,
+         gate=True),
+    Case("linalg.lu_solve.adjoint_right", make_solve_right,
+         lambda a, b: L.lu_solve(*L.lu_factor(a), b, left=False, adjoint=True), float64=False, tpc=True, sizes=(22,)),
+    Case("lu_unpack", make_pivoting, lambda x: torch.lu_unpack(*L.lu_factor(x)), float64=False, tpc=True, gate=True),
 )
 
 

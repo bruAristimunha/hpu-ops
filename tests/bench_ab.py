@@ -144,7 +144,28 @@ def cases(n, b):
         ("lu_solve", lambda x, bb: L.lu_solve(*L.lu_factor(x), bb), (P, Bs)),
         ("lu_unpack", lambda x: torch.lu_unpack(*L.lu_factor(x)), (P,)),
         ("lu", lambda x: L.lu(x), (P,)),
+        # what #13 is for: one forward and backward of an orthogonal-parametrized layer (spd_learn's BiMap pattern)
+        ("orthogonal_matrix_exp_step", orth_step("matrix_exp", n), (torch.randn(b, n, generator=g),)),
+        ("orthogonal_householder_step", orth_step("householder", n), (torch.randn(b, n, generator=g),)),
     ]
+
+
+def orth_step(kind, n):
+    """``x -> d(sum(layer(x)))/dW`` of ``orthogonal(Linear(n, n), orthogonal_map=kind)``, one layer per device and
+    dtype (same seed), so ours, stock and the CPU float64 reference use the same weight."""
+    layers = {}
+
+    def step(x):
+        key = (x.device.type, x.dtype)
+        if key not in layers:
+            torch.manual_seed(0)
+            lin = torch.nn.Linear(n, n, bias=False)
+            layers[key] = torch.nn.utils.parametrizations.orthogonal(lin, orthogonal_map=kind).to(x.device, x.dtype)
+        layer = layers[key]
+        weight = layer.parametrizations.weight.original
+        return torch.autograd.grad(layer(x).sum(), weight)
+
+    return step
 
 
 def main():

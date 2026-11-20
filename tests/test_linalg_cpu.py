@@ -2137,3 +2137,192 @@ def test_eigh_bad_uplo_raises_like_torch(eigh_hook):
     with cpu_as_hpu(jacobi.install_eigh):
         with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
             torch.linalg.eigvalsh(G, UPLO="X")
+
+
+# ---- standalone LU (#10): lu_factor / lu_factor_ex, lu_solve, lu_unpack, linalg.lu
+
+
+@pytest.fixture
+def lu_hook(monkeypatch):
+    """``linalg._LU`` and ``_LU_PERM`` set to the kernel's contract in plain torch; collects the shapes per call."""
+    calls = []
+
+    def factor(A):
+        calls.append(("factor", tuple(A.shape)))
+        return tpc.lu_factor_reference(A)
+
+    def perm(pivots):
+        calls.append(("perm", tuple(pivots.shape)))
+        return linalg.pivots_to_perm(pivots.detach()).to(torch.float32)
+
+    def solve(LU, pivots, B):
+        calls.append(("solve", tuple(B.shape)))
+        batch = torch.broadcast_shapes(LU.shape[:-2], B.shape[:-2])
+        return linalg.lu_solve(LU.detach().expand(*batch, *LU.shape[-2:]), pivots.expand(*batch, LU.shape[-1]),
+                               B.detach(), True)
+
+    monkeypatch.setattr(linalg, "_LU", factor)
+    monkeypatch.setattr(linalg, "_LU_PERM", perm)
+    monkeypatch.setattr(linalg, "_LU_SOLVE", solve)
+    return calls
+
+
+def _pivoting(*shape, dtype=torch.float64):
+    g = torch.Generator().manual_seed(3)
+    return torch.randn(*shape, generator=g, dtype=dtype) + 0.5 * torch.eye(shape[-1], dtype=dtype)
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (3, 3), (4, 22, 22), (2, 3, 7, 7), (32, 32)])
+def test_lu_factor_matches_torch(shape, lu_hook):
+    A = _pivoting(*shape)
+    compare(lambda a: torch.linalg.lu_factor(a)[0], linalg.install_lu, A, name="lu_factor", rtol=1e-8, atol=1e-8)
+    want = torch.linalg.lu_factor_ex(A)
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        got = torch.linalg.lu_factor_ex(A)
+        assert calls["lu_factor"] >= 1
+    assert got.pivots.dtype == torch.int32 and torch.equal(got.pivots, want.pivots)
+    assert got.info.dtype == torch.int32 and torch.equal(got.info, want.info)
+    assert ("factor", tuple(shape)) in lu_hook
+
+
+def test_lu_factor_singular_info_and_check_errors(lu_hook):
+    A = _pivoting(3, 5, 5)
+    A[1] = 0.0
+    A[2, :, 2] = 0.0
+    want = torch.linalg.lu_factor_ex(A)
+    with cpu_as_hpu(linalg.install_lu):
+        got = torch.linalg.lu_factor_ex(A)
+        assert torch.equal(got.info, want.info)
+        with pytest.raises(RuntimeError):
+            torch.linalg.lu_factor_ex(A, check_errors=True)
+        with pytest.raises(RuntimeError):
+            torch.linalg.lu_factor(A)
+
+
+def test_lu_factor_double_backward(lu_hook):
+    A = _pivoting(2, 4, 4).requires_grad_()
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        assert torch.autograd.gradcheck(lambda a: torch.linalg.lu_factor(a)[0], (A,))
+        assert torch.autograd.gradgradcheck(lambda a: torch.linalg.lu_factor(a)[0], (A,))
+        assert calls["lu_factor"] >= 1
+
+
+@pytest.mark.parametrize("left", [True, False])
+@pytest.mark.parametrize("adjoint", [False, True])
+@pytest.mark.parametrize("a_shape, b_cols", [((5, 5), 3), ((2, 6, 6), 1), ((2, 1, 4, 4), 40)])
+def test_lu_solve_matches_torch(a_shape, b_cols, left, adjoint, lu_hook, gj_hook):
+    A = _pivoting(*a_shape)
+    n = a_shape[-1]
+    LU, pivots = torch.linalg.lu_factor(A)
+    batch = (1, 3) if len(a_shape) == 4 else a_shape[:-2]  # (2, 1) against (1, 3): broadcast batch
+    B = torch.randn(*batch, *((n, b_cols) if left else (b_cols, n)), dtype=torch.float64)
+    compare(lambda lu_, b: torch.linalg.lu_solve(lu_, pivots, b, left=left, adjoint=adjoint), linalg.install_lu,
+            LU, B, name="lu_solve", rtol=1e-7, atol=1e-7)
+    # the getrs kernel for left, not adjoint (also the backward of left adjoint), else A = P L U and Gauss-Jordan
+    assert any(c[0] == "solve" for c in lu_hook) == left
+    assert any(c[0] == "perm" for c in lu_hook) and gj_hook  # one direction of every pair runs Gauss-Jordan
+
+
+def test_lu_solve_double_backward_and_legacy(lu_hook):
+    A = _pivoting(2, 4, 4)
+    LU, pivots = torch.linalg.lu_factor(A)
+    LU = LU.requires_grad_()
+    B = torch.randn(2, 4, 3, dtype=torch.float64, requires_grad=True)
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        assert torch.autograd.gradgradcheck(lambda lu_, b: torch.linalg.lu_solve(lu_, pivots, b), (LU, B))
+        got = torch.lu_solve(B, LU, pivots)
+        assert calls["lu_solve"] >= 1
+    torch.testing.assert_close(got, torch.linalg.solve(A, B))
+
+
+@pytest.mark.parametrize("unpack_data, unpack_pivots", [(True, True), (False, True), (True, False), (False, False)])
+def test_lu_unpack_matches_torch(unpack_data, unpack_pivots, lu_hook):
+    A = _pivoting(2, 3, 6, 6)
+    LU, pivots = torch.linalg.lu_factor(A)
+    want = torch.lu_unpack(LU, pivots, unpack_data, unpack_pivots)
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        got = torch.lu_unpack(LU, pivots, unpack_data, unpack_pivots)
+        assert calls["lu_unpack"] == 1
+    for g, w in zip(got, want, strict=True):
+        assert g.shape == w.shape and g.dtype == w.dtype
+        torch.testing.assert_close(g, w)
+    if unpack_data:
+        compare(lambda lu_: torch.lu_unpack(lu_, pivots, unpack_data, unpack_pivots)[1:], linalg.install_lu, LU,
+                name="lu_unpack")
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (5, 5), (2, 3, 7, 7)])
+def test_linalg_lu_matches_torch(shape, lu_hook):
+    A = _pivoting(*shape)
+    compare(lambda a: torch.linalg.lu(a), linalg.install_lu, A, name="lu", rtol=1e-8, atol=1e-8)
+    with cpu_as_hpu(linalg.install_lu):
+        A2 = A.clone().requires_grad_()
+        assert torch.autograd.gradgradcheck(lambda a: torch.linalg.lu(a)[1:], (A2,))
+
+
+def test_lu_declines_what_the_kernel_does_not_take(monkeypatch, lu_hook):
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        torch.linalg.lu_factor(torch.randn(4, 6, dtype=torch.float64))  # not square
+        torch.linalg.lu(torch.randn(3, 3, dtype=torch.complex128))
+        assert calls["lu_factor"] == 0 and calls["lu"] == 0
+    monkeypatch.setattr(tpc, "ready", lambda: False)
+    assert linalg._lu_kernel(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is False
+    monkeypatch.setattr(linalg, "_LU", None)
+    assert linalg._lu_kernel(torch.randn(4, 4)) is False  # CPU without the hook: the composite
+    assert linalg.install_lu  # pivot=False: torch's own kernel (the CPU raises; on HPU Habana's)
+    takes = linalg._tpc_takes("cpu", linalg._takes("cpu", "lu_factor"))
+    assert takes(torch.randn(4, 4, dtype=torch.float64))
+
+
+def test_lu_float64_warns_once_on_hpu():
+    linalg._WARNED.discard("lu_factor")
+    takes = linalg._tpc_takes("hpu", linalg._takes("hpu", "lu_factor"))
+    with pytest.warns(UserWarning, match="hpu-ops#16"):
+        assert takes(torch.randn(3, 3, dtype=torch.float64)) is False
+
+
+def test_tpc_lu_flushes_before_the_op_and_casts(monkeypatch):
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    torch_mod = types.SimpleNamespace(core=core)
+    for name, mod in (("habana_frameworks", types.SimpleNamespace(torch=torch_mod)),
+                      ("habana_frameworks.torch", torch_mod), ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+
+    def fake_lu(A):
+        LU, piv, perm, info = tpc.lu_factor_reference(A)
+        pv = torch.zeros(A.shape[0], 3, A.shape[-1])
+        pv[:, 0], pv[:, 1], pv[:, 2, 0] = piv.float(), perm.float(), info.float()
+        return LU, pv
+
+    monkeypatch.setattr(tpc, "_lu_op", lambda: fake_lu)
+    monkeypatch.setattr(tpc, "_lu_perm_op", lambda: lambda p: linalg.pivots_to_perm(p.int()).float())
+    A = _pivoting(2, 3, 5, 5, dtype=torch.float32)
+    LU, pivots, perm, info = tpc.lu_factor(A)
+    assert len(marks) == 1
+    want_LU, want_piv, want_info = torch.linalg.lu_factor_ex(A)
+    torch.testing.assert_close(LU, want_LU)
+    assert pivots.dtype == torch.int32 and torch.equal(pivots, want_piv)
+    assert info.dtype == torch.int32 and info.shape == (2, 3) and torch.equal(info, want_info)
+    assert perm.dtype == torch.float32 and perm.shape == (2, 3, 5)
+    torch.testing.assert_close(A.gather(-2, perm.long()[..., None].expand_as(A)),
+                               torch.tril(LU, -1) @ torch.triu(LU) + torch.triu(LU), rtol=1e-5, atol=1e-5)
+    marks.clear()
+    p = tpc.lu_perm(pivots)
+    assert len(marks) == 1 and torch.equal(p, perm)
+
+
+@pytest.mark.parametrize("perm_mode", ["kernel", "torch"])
+@pytest.mark.parametrize("solve_mode", ["kernel", "gj", "tri"])
+@pytest.mark.parametrize("left", [True, False])
+def test_lu_solve_and_unpack_modes(perm_mode, solve_mode, left, monkeypatch, lu_hook, gj_hook):
+    monkeypatch.setattr(linalg, "_LU_PERM_MODE", perm_mode)
+    monkeypatch.setattr(linalg, "_LU_SOLVE_MODE", solve_mode)
+    A = _pivoting(3, 6, 6)
+    LU, pivots = torch.linalg.lu_factor(A)
+    B = torch.randn(3, *((6, 2) if left else (2, 6)), dtype=torch.float64)
+    compare(lambda lu_, b: torch.linalg.lu_solve(lu_, pivots, b, left=left), linalg.install_lu, LU, B,
+            name="lu_solve", rtol=1e-7, atol=1e-7)
+    compare(lambda lu_: torch.lu_unpack(lu_, pivots), linalg.install_lu, LU, name="lu_unpack")
+    assert any(c[0] == "perm" for c in lu_hook) == (perm_mode == "kernel")

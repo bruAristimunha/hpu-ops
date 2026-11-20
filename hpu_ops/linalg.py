@@ -48,6 +48,11 @@ _HOUSEHOLDER = None
 # or Padé-13 composite on CPU when unset.
 _MATRIX_EXP = None
 _MATRIX_EXP_FRECHET = None
+# The LU hooks for CPU tests: ``_LU`` ``A -> (LU, pivots, perm, info)`` and ``_LU_PERM`` ``pivots -> perm``. None
+# means ``tpc.lu_factor`` / ``tpc.lu_perm`` on HPU with the kernel ready, else the composites (``lu``,
+# ``pivots_to_perm``).
+_LU = None
+_LU_PERM = None
 
 
 def _is_fake(t):
@@ -1412,3 +1417,245 @@ def install_householder_product(device_type):
     if device_type != "cpu":
         entries.append((aten.linalg_householder_product.out, "{}", hh_out_be))
     return register_kernels(device_type, entries)
+
+
+# ---- standalone LU (#10): lu_factor / lu_factor_ex, lu_solve, lu_unpack, linalg.lu
+
+
+def _lu_kernel(A):
+    """Whether ``A`` goes through the TPC LU kernel (or the ``_LU`` hook in the CPU tests)."""
+    if A.shape[-1] > tpc.MAXN:
+        return False
+    return _LU is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
+
+
+def _lu_factor(A):
+    """``(LU, pivots, perm, info)``: LAPACK's packed factors and 1-based int32 pivots, the row permutation (``LU``'s
+    row i is ``A``'s row ``perm[i]``, in ``A``'s dtype, exact below 2**24) and LAPACK's int32 info."""
+    if _lu_kernel(A):
+        LU, pivots, perm, info = (tpc.lu_factor if _LU is None else _LU)(A)
+        return LU.to(A.dtype), pivots, perm.to(A.dtype), info
+    LU, pivots = lu(A)
+    return LU, pivots, pivots_to_perm(pivots).to(A.dtype), lu_info(LU)
+
+
+# Variant knobs, measured on Gaudi2 (bridge 1.21.4, TEAM_REPORT): how lu_solve and lu_unpack turn pivots into the
+# permutation, "kernel" (one TPC launch) or "torch" (``pivots_to_perm``, n small gathers: slower in both modes);
+# how lu_solve solves, "kernel" (the TPC getrs kernel, left and not adjoint only), "gj" (A = P L U rebuilt, one
+# Gauss-Jordan kernel) or "tri" (``lu_solve``'s triangular inverses, not adjoint). "auto": kernel, else gj.
+_LU_PERM_MODE = "auto"
+_LU_SOLVE_MODE = "auto"
+# The getrs hook ``(LU, pivots, B) -> X`` for the CPU tests; None means ``tpc.lu_solve`` on HPU.
+_LU_SOLVE = None
+
+
+def _lu_perm(pivots, dtype):
+    """The row permutation of LAPACK's ``pivots`` in ``dtype``: one TPC launch on HPU, else ``pivots_to_perm``."""
+    if pivots.shape[-1] <= tpc.MAXN and _LU_PERM_MODE in ("auto", "kernel"):
+        if _LU_PERM is not None:
+            return _LU_PERM(pivots).to(dtype)
+        if pivots.device.type == "hpu" and tpc.ready():
+            return tpc.lu_perm(pivots).to(dtype)
+    return pivots_to_perm(pivots).to(dtype)
+
+
+def _perm_matrix(perm, n):
+    """``P`` with ``A = P L U``: ``P[..., perm[i], i] = 1``, built by a float compare (no integer gather)."""
+    iota = torch.arange(n, dtype=perm.dtype, device=perm.device)
+    return (perm[..., None, :] == iota[:, None]).to(perm.dtype)
+
+
+def _unpack(LU):
+    """``(L, U)`` of packed square factors: L unit lower triangular, U upper triangular."""
+    n = LU.shape[-1]
+    return torch.tril(LU, -1) + torch.eye(n, dtype=LU.dtype, device=LU.device), torch.triu(LU)
+
+
+def _lu_backward(A, P, L, U, gL, gU):
+    """torch's ``linalg_lu_backward`` for square A = P L U: ``P L^-H [tril(L^H gL, -1) + triu(gU U^H)] U^-H``,
+    written as ``A^-H (U^H M L^H P^T) A^-H`` (``P L^-H = A^-H U^H`` and ``U^-H = L^H P^T A^-H``), so the two
+    triangular inverses become one inverse of A through ``InvEx`` (the TPC Gauss-Jordan kernel on Gaudi2) and
+    matmuls. Differentiable (double backward)."""
+    M = A.new_zeros(()).expand(A.shape)
+    if gL is not None:
+        M = M + torch.tril(L.mH @ gL, -1)
+    if gU is not None:
+        M = M + torch.triu(gU @ U.mH)
+    Ai = InvEx.apply(A, False)[0]
+    return Ai.mH @ (U.mH @ M @ L.mH @ P.mT) @ Ai.mH
+
+
+class LuFactorEx(torch.autograd.Function):
+    """``aten.linalg_lu_factor_ex`` (square, ``pivot=True``) through the TPC LU kernel: LAPACK's packed factors,
+    pivots and info. ``pivots`` and ``info`` are not differentiable; the backward is torch's (``_lu_backward``)."""
+
+    @staticmethod
+    def compute(A, pivot=True, check_errors=False):
+        LU, pivots, _, info = _lu_factor(A)
+        if check_errors:
+            torch.ops.aten._linalg_check_errors(info, "torch.linalg.lu_factor_ex", is_matrix=A.dim() == 2)
+        return LU, pivots, info
+
+    @staticmethod
+    def forward(ctx, A, pivot=True, check_errors=False):
+        LU, pivots, perm, info = _lu_factor(A)
+        if check_errors:
+            torch.ops.aten._linalg_check_errors(info, "torch.linalg.lu_factor_ex", is_matrix=A.dim() == 2)
+        ctx.save_for_backward(A, LU, perm)
+        ctx.mark_non_differentiable(pivots, info)
+        return LU, pivots, info
+
+    @staticmethod
+    def backward(ctx, gLU, *_):
+        A, LU, perm = ctx.saved_tensors
+        L, U = _unpack(LU)
+        gA = _lu_backward(A, _perm_matrix(perm, A.shape[-1]), L, U, torch.tril(gLU, -1), torch.triu(gLU))
+        return gA, None, None
+
+
+class LinalgLu(torch.autograd.Function):
+    """``aten.linalg_lu`` (square, ``pivot=True``): the TPC LU kernel, unpacked. ``P`` is not differentiable; the
+    backward is torch's (``_lu_backward``)."""
+
+    @staticmethod
+    def compute(A, pivot=True):
+        if _LU is None and _lu_kernel(A):  # only LU and perm: no int casts of the pivots and info
+            LU, perm = tpc.lu_factor(A, pivots=False)
+        else:
+            LU, _, perm, _ = _lu_factor(A)
+        L, U = _unpack(LU)
+        return _perm_matrix(perm, A.shape[-1]), L, U
+
+    @staticmethod
+    def forward(ctx, A, pivot=True):
+        P, L, U = LinalgLu.compute(A)
+        ctx.save_for_backward(A, P, L, U)
+        ctx.mark_non_differentiable(P)
+        return P, L, U
+
+    @staticmethod
+    def backward(ctx, _gP, gL, gU):
+        A, P, L, U = ctx.saved_tensors
+        return _lu_backward(A, P, L, U, gL, gU), None
+
+
+def _lu_matrix(LU, pivots):
+    """``A = P L U`` rebuilt from the packed factors: a float compare for ``P`` and two matmuls on the MME."""
+    n = LU.shape[-1]
+    L, U = _unpack(LU)
+    return _perm_matrix(_lu_perm(pivots, LU.dtype), n) @ (L @ U)
+
+
+class LuSolve(torch.autograd.Function):
+    """``aten.linalg_lu_solve`` (square): ``A = P L U`` rebuilt with matmuls, then one Gauss-Jordan solve (the TPC
+    kernel on Gaudi2) of ``A``, or ``A^H`` with ``adjoint``, from the left or the right. Rebuilding costs one rounding
+    of ``L U`` (relative error about n eps |L||U| / |A|, as LAPACK's backward error). ``pivots`` is not
+    differentiable; the backward is torch's: ``gB`` the adjoint solve and ``gLU`` through ``A = P L U``."""
+
+    @staticmethod
+    def compute(LU, pivots, B, left=True, adjoint=False):
+        mode = _LU_SOLVE_MODE
+        if mode in ("auto", "kernel") and left and not adjoint and LU.shape[-1] <= tpc.MAXN:
+            if _LU_SOLVE is not None:
+                return _LU_SOLVE(LU, pivots, B)
+            if LU.device.type == "hpu" and LU.dtype == torch.float32 and tpc.ready():
+                return tpc.lu_solve(LU, pivots, B)
+        if mode == "tri" and not adjoint:
+            batch = torch.broadcast_shapes(LU.shape[:-2], B.shape[:-2])
+            return lu_solve(LU.expand(*batch, *LU.shape[-2:]), pivots.expand(*batch, LU.shape[-1]), B, left)
+        A = _lu_matrix(LU, pivots)
+        return SolveEx.compute(A.mH if adjoint else A, B, left, False)[0]
+
+    @staticmethod
+    def forward(ctx, LU, pivots, B, left=True, adjoint=False):
+        X = LuSolve.compute(LU, pivots, B, left, adjoint)
+        ctx.save_for_backward(LU, pivots, X)
+        ctx.left, ctx.adjoint = left, adjoint
+        ctx.B_shape = B.shape
+        return X
+
+    @staticmethod
+    def backward(ctx, gX):
+        LU, pivots, X = ctx.saved_tensors
+        left, adjoint = ctx.left, ctx.adjoint
+        gB = LuSolve.apply(LU, pivots, gX, left, not adjoint)
+        gLU = None
+        if ctx.needs_input_grad[0]:
+            if left:
+                gA = -(X @ gB.mH) if adjoint else -(gB @ X.mH)
+            else:
+                gA = -(gB.mH @ X) if adjoint else -(X.mH @ gB)
+            gA = gA.sum_to_size(LU.shape)
+            n = LU.shape[-1]
+            L, U = _unpack(LU)
+            PtgA = _perm_matrix(_lu_perm(pivots, LU.dtype), n).mT @ gA
+            gLU = torch.tril(PtgA @ U.mH, -1) + torch.triu(L.mH @ PtgA)
+        return gLU, None, gB.sum_to_size(ctx.B_shape), None, None
+
+
+class LuUnpack(torch.autograd.Function):
+    """``aten.lu_unpack`` (square): ``L`` and ``U`` by masks, ``P`` from the pivots by the TPC permutation kernel and a
+    float compare (Habana's ``lu_unpack`` falls back to the CPU). ``P`` is not differentiable; ``gLU = tril(gL, -1) +
+    triu(gU)`` as torch's."""
+
+    @staticmethod
+    def compute(LU, pivots, unpack_data=True, unpack_pivots=True):
+        empty = LU.new_empty(0)
+        L, U = _unpack(LU) if unpack_data else (empty, empty)
+        P = _perm_matrix(_lu_perm(pivots, LU.dtype), LU.shape[-1]) if unpack_pivots else empty
+        return P, L, U
+
+    @staticmethod
+    def forward(ctx, LU, pivots, unpack_data=True, unpack_pivots=True):
+        P, L, U = LuUnpack.compute(LU, pivots, unpack_data, unpack_pivots)
+        ctx.unpack_data = unpack_data
+        ctx.mark_non_differentiable(P)
+        return P, L, U
+
+    @staticmethod
+    def backward(ctx, _gP, gL, gU):
+        if not ctx.unpack_data:
+            return None, None, None, None
+        return torch.tril(gL, -1) + torch.triu(gU), None, None, None
+
+
+def _pivots_ok(LU, pivots):
+    return (isinstance(pivots, torch.Tensor) and pivots.dtype == torch.int32 and pivots.device == LU.device
+            and tuple(pivots.shape) == tuple(LU.shape[:-1]))
+
+
+def install_lu(device_type):
+    """``linalg.lu_factor`` / ``lu_factor_ex``, ``lu_solve``, ``lu_unpack`` and ``linalg.lu`` on ``device_type`` for
+    square float32 matrices of n <= ``tpc.MAXN``, through the TPC LU kernel. Returns an undo."""
+    factor_base = _tpc_takes(device_type, _takes(device_type, "lu_factor"))
+    lu_base = _tpc_takes(device_type, _takes(device_type, "lu"))
+    solve_base = _tpc_takes(device_type, _takes(device_type, "lu_solve"))
+    unpack_base = _tpc_takes(device_type, _takes(device_type, "lu_unpack"))
+
+    def factor_takes(A, pivot=True, check_errors=False):
+        return pivot is True and factor_base(A)
+
+    def lu_takes(A, pivot=True):
+        return pivot is True and lu_base(A)
+
+    def solve_takes(LU, pivots, B, left=True, adjoint=False):
+        if not (_pivots_ok(LU, pivots) and isinstance(B, torch.Tensor) and B.dim() >= 2 and solve_base(LU, B)):
+            return False
+        if B.shape[-2 if left else -1] != LU.shape[-1]:
+            return False
+        try:
+            torch.broadcast_shapes(LU.shape[:-2], B.shape[:-2])
+        except RuntimeError:
+            return False
+        return True
+
+    def unpack_takes(LU_data, LU_pivots, unpack_data=True, unpack_pivots=True):
+        return _pivots_ok(LU_data, LU_pivots) and unpack_base(LU_data)
+
+    groups = [
+        _kernels(device_type, aten.linalg_lu_factor_ex.default, "lu_factor", LuFactorEx, factor_takes),
+        _kernels(device_type, aten.linalg_lu.default, "lu", LinalgLu, lu_takes),
+        _kernels(device_type, aten.linalg_lu_solve.default, "lu_solve", LuSolve, solve_takes),
+        _kernels(device_type, aten.lu_unpack.default, "lu_unpack", LuUnpack, unpack_takes),
+    ]
+    return register_paired(device_type, groups)
