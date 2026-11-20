@@ -1136,6 +1136,27 @@ def test_bool_index_put_dtypes_layouts_inference_and_fallbacks():
     assert calls["bool_index_put"] == 1
 
 
+def test_bool_index_put_accumulate_keeps_negative_zero_and_expanded_self_falls_through():
+    # accumulate leaves unmasked elements untouched, as ATen: -0.0 stays -0.0 (sign bit compared)
+    mask = torch.tensor([True, False])
+    for inplace in (True, False):
+        t = torch.tensor([-0.0, -0.0])
+        want = t.clone().index_put_([mask], torch.tensor(1.0), accumulate=True) if inplace else \
+            t.index_put([mask], torch.tensor(1.0), accumulate=True)
+        with cpu_as_hpu(composite.install_index_put) as calls:
+            got = t.clone().index_put_([mask], torch.tensor(1.0), accumulate=True) if inplace else \
+                t.index_put([mask], torch.tensor(1.0), accumulate=True)
+        assert torch.equal(torch.signbit(got), torch.signbit(want)) and torch.equal(got, want), (got, want)
+        assert calls["bool_index_put_" if inplace else "bool_index_put"] == 1
+    # a self with internal overlap (expanded) is written by ATen, which copy_ would refuse: the rewrite declines
+    t = torch.zeros(1).expand(3)
+    want = torch.zeros(1).expand(3).index_put_([torch.tensor([True, False, True])], torch.tensor(1.0))
+    with cpu_as_hpu(composite.install_index_put) as calls:
+        got = t.index_put_([torch.tensor([True, False, True])], torch.tensor(1.0))
+    assert torch.equal(got, want)
+    assert not calls["bool_index_put_"]
+
+
 @pytest.mark.parametrize("mode", ["eager", "compiled"])
 def test_index_2d_matches_native_vech_and_trains(mode):
     torch.manual_seed(0)
@@ -1212,6 +1233,26 @@ def test_index_2d_edge_cases_dynamic_and_passthrough():
             empty_out = xe[..., torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)]
             assert empty_out.shape == (2, 0)
     assert not calls["index_2d"]
+
+
+def test_index_2d_out_of_range_raises_instead_of_reading_a_neighbour():
+    # flat index i0 * w + i1 is in range for x[0, 4] of a 3 x 4 tensor (it is x[1, 0]); torch raises
+    x = torch.arange(12.0).reshape(3, 4)
+    cases = [(torch.tensor([0]), torch.tensor([4])), (torch.tensor([0]), torch.tensor([-5])),
+             (torch.tensor([3]), torch.tensor([0])), (torch.tensor([-4, 0]), torch.tensor([0, 1]))]
+    for i0, i1 in cases:
+        with pytest.raises(IndexError):
+            _ = x[i0, i1]
+        with cpu_as_hpu(composite.install_index_2d) as calls:
+            with pytest.raises(IndexError, match="out of bounds"):
+                _ = x[i0, i1]
+        assert calls["index_2d"] == 1
+    # traced (fake) indices cannot be checked on the host: an out-of-range index goes past the end of the flat
+    # index_select (which raises on the CPU) instead of reading a neighbouring element
+    i0, i1 = torch.tensor([0]), torch.tensor([4])
+    with cpu_as_hpu(composite.install_index_2d):
+        with pytest.raises(Exception, match="out of range|out of bounds"):
+            torch.compile(lambda t: t[i0, i1], backend="aot_eager", fullgraph=True)(x)
 
 
 # ---- torch.save: tensor-level host copies

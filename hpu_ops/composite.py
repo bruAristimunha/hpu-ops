@@ -12,6 +12,7 @@ autocast off and return the input dtype, as the native ops do.
 """
 import torch
 from torch._C import DispatchKey
+from torch._subclasses.fake_tensor import is_fake
 
 from ._dispatch import count, register_kernels, static
 
@@ -97,18 +98,15 @@ def bool_index_put_(self, indices, values, accumulate=False):
     CPU and flushes the partial lazy graph mid-backward (triggering ``synStatus 30`` in ``GBWAtt``)."""
     with torch.autocast(self.device.type, enabled=False):
         mask, val = _bool_mask_expanded(self, indices, values)
-        if accumulate:
-            return self.add_(torch.where(mask, val, val.new_zeros(())))
-        return self.copy_(torch.where(mask, val, self))
+        # accumulate adds only where the mask is set: adding +0.0 elsewhere would turn -0.0 into +0.0
+        return self.copy_(torch.where(mask, self + val if accumulate else val, self))
 
 
 def bool_index_put(self, indices, values, accumulate=False):
     """Out-of-place boolean-mask scalar assignment via ``torch.where``."""
     with torch.autocast(self.device.type, enabled=False):
         mask, val = _bool_mask_expanded(self, indices, values)
-        if accumulate:
-            return self + torch.where(mask, val, val.new_zeros(()))
-        return torch.where(mask, val, self)
+        return torch.where(mask, self + val if accumulate else val, self)
 
 
 def _bool_index_put_takes(self, indices, values, accumulate=False):
@@ -132,16 +130,40 @@ def _bool_index_put_takes(self, indices, values, accumulate=False):
     return True
 
 
+def _bool_index_put_inplace_takes(self, indices, values, accumulate=False):
+    # an expanded self (several elements on one memory location) is written by ATen's kernel but refused by copy_
+    return _bool_index_put_takes(self, indices, values, accumulate) and torch._debug_has_internal_overlap(self) == 0
+
+
+def _concrete(t):
+    """True for a real tensor outside any tracer: its values can be read on the host."""
+    return not is_fake(t) and torch._guards.detect_fake_mode() is None and not torch._is_functional_tensor(t)
+
+
 def index_2d(self, indices):
     """Trailing 2-D integer indexing ``X[..., ix0, ix1]`` (``Vech``'s ``sym_to_upper``) as a flat ``index_select``
     over the last two dimensions. Avoids Habana's DSD ``index.Tensor`` backward recipe and eager ``index.Tensor_out``
-    fallback."""
-    ix0, ix1 = indices[-2].to(self.device), indices[-1].to(self.device)
-    ix0, ix1 = torch.broadcast_tensors(ix0, ix1)
+    fallback.
+
+    Out-of-range indices: host indices raise torch's ``IndexError`` (checked on the host, no card sync). Indices on
+    the card cannot be checked without a sync; they are sent past the end of the flat ``index_select``, which on
+    Gaudi2 (bridge 1.21.4, eager and lazy) returns 0.0 without raising, the same value Habana's native
+    ``index.Tensor`` returns for them. They never read a neighbouring element."""
+    ix0, ix1 = indices[-2], indices[-1]
+    # host indices (Vech's triu_indices) stay on the host for the arithmetic and the bounds check
+    on = self.device if self.device in (ix0.device, ix1.device) else ix0.device
+    ix0, ix1 = torch.broadcast_tensors(ix0.to(on), ix1.to(on))
     h, w = self.shape[-2], self.shape[-1]
+    inside = (ix0 >= -h) & (ix0 < h) & (ix1 >= -w) & (ix1 < w)
+    if on.type == "cpu" and _concrete(inside) and not bool(inside.all()):
+        bad0 = ~((ix0 >= -h) & (ix0 < h))
+        dim, size, idx = (-2, h, ix0[bad0]) if bad0.any() else (-1, w, ix1[~((ix1 >= -w) & (ix1 < w))])
+        raise IndexError(f"index {int(idx.reshape(-1)[0])} is out of bounds for dimension "
+                         f"{self.dim() + dim} with size {size}")
     i0 = torch.where(ix0 < 0, ix0 + h, ix0)
     i1 = torch.where(ix1 < 0, ix1 + w, ix1)
-    flat = (i0 * w + i1).reshape(-1)
+    # an index out of its own dimension must not land on a neighbouring row: send it past the end instead
+    flat = torch.where(inside, i0 * w + i1, h * w).reshape(-1).to(self.device)
     return self.flatten(-2).index_select(-1, flat).reshape((*self.shape[:-2], *ix0.shape))
 
 
@@ -219,9 +241,9 @@ def install_index_put(device_type):
     op_out = aten.index_put.default
     return register_kernels(device_type, [
         (op_inplace, "Autograd{}", _kernel(op_inplace, "bool_index_put_", bool_index_put_,
-                                           _bool_index_put_takes, DispatchKey.Autograd)),
+                                           _bool_index_put_inplace_takes, DispatchKey.Autograd)),
         (op_inplace, "{}", _kernel(op_inplace, "bool_index_put_", bool_index_put_,
-                                   _bool_index_put_takes, DispatchKey.CompositeExplicitAutograd)),
+                                   _bool_index_put_inplace_takes, DispatchKey.CompositeExplicitAutograd)),
         (op_out, "Autograd{}", _kernel(op_out, "bool_index_put", bool_index_put,
                                        _bool_index_put_takes, DispatchKey.Autograd)),
         (op_out, "{}", _kernel(op_out, "bool_index_put", bool_index_put,
