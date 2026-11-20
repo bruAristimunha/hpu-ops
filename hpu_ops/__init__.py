@@ -19,21 +19,20 @@ at the tensor's pickling:
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
   roll wrongly (EMG2QwertyNet's input gradient).
-- ``linalg.solve_triangular`` and ``cholesky_solve`` as matmuls with a block-recursive inverse (``linalg``): they have
-  no HPU kernel and ran on the CPU; float64 stays on the CPU, as Gaudi2 computes it at float32 precision
-  (hpu-ops#16). Cholesky's and QR's backward use the first.
+- ``linalg.solve_triangular`` and ``cholesky_solve`` (``linalg``): they have no HPU kernel and ran on the CPU; float64
+  stays on the CPU, as Gaudi2 stores it at float32 precision (hpu-ops#16). Cholesky's and QR's backward use them.
 - ``linalg.inv``, ``det`` and ``slogdet`` from the masked LU and triangular matmuls (``linalg``), as ``linalg.solve``.
 - On Gaudi2 those composites are 3-25x slower than Habana's CPU fallback (one launch per op), so ``linalg.solve``,
   ``inv``, ``det``, ``slogdet``, ``solve_triangular`` and ``cholesky_solve`` of float32 matrices with n <= 32 run
   through a TPC Gauss-Jordan kernel with partial pivoting (``tpc``), one matrix per index-space member. Eager, batch
-  32: n = 22 solve 0.20 ms against 4.7 ms for the fallback (23x), n = 32 0.28 ms, batch 1024 1.9 ms against 20 ms; the
-  pivots equal LAPACK's U diagonal to 6e-6, the determinant to 9e-6. Habana reads the kernel path when the first graph
+  32, n = 22: solve 2.7 ms against about 4.5 ms for the fallback, inv 1.8 against 4.6, det 0.82 against 2.7 (lazy:
+  0.57, 0.48, 0.51 against about 2.2, 2.2, 1.4). Habana reads the kernel path when the first graph
   compiles, so ``enable()`` must run before the first HPU op, else the kernel is off (one warning) and these calls
   keep Habana's CPU fallback, as they do for n > 32.
 - ``linalg.eigh`` and ``eigvalsh`` of float32 matrices with n <= 32 run through a TPC one-sided Jacobi kernel
-  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32: n = 22 about 0.3 ms
-  against 3.7 ms for the fallback, batch 1024 3.7 ms against 52 ms; within 4x of CPU float32 accuracy, also on
-  repeated eigenvalues, condition 1e6 and extreme scales (1e-40 to 1e38).
+  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32, n = 22: 1.27 ms
+  against about 3.7 ms for the fallback (lazy 0.80 against about 1.4); batch 1024 3.7 ms against 52 ms; within about
+  3.8x of CPU float32 accuracy, also on repeated eigenvalues, condition 1e6 and inputs scaled by 1e30.
   Without the kernel, or past n = 32, the call is declined and keeps
   Habana's CPU fallback: the parallel-Jacobi composite of ``eigh`` is exact but 100x slower than the fallback on Gaudi2,
   so it only serves the CPU stand-in.

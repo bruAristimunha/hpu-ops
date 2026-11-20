@@ -25,6 +25,10 @@ On 1.21 and 1.22, `enable()` warns when the setting did not take effect: Habana'
 
 Compile with `dynamic=False`, or keep one batch size (`drop_last=True`). A new batch size otherwise makes the shapes symbolic, and linear upsampling falls back to the slow decomposition, with a warning.
 
+### float64
+
+Gaudi2 stores float64 as float32 when a tensor is copied to it: `1 + 2**-40` comes back as `1`. No result computed on the card can be float64-exact. For float64 linalg, hpu-ops computes on the CPU, over the values the card holds, and warns once per op (hpu-ops#16). The kernels above take float32 only.
+
 ### bfloat16 autocast with CUDA's op lists (optional)
 
 Under `torch.autocast("hpu", torch.bfloat16)`, Habana's default lists put norms, softmax, `mean` and `mul` in bfloat16, even for float32 inputs. CUDA keeps them in float32. The lists are the same in bridges 1.21 to 1.24. Habana reads its two lists from files when its library loads. For torch's CUDA lists (`ATen/autocast_mode.h`), export them before Python starts. CUDA's promote ops that Habana's fixed promote list lacks (`atan2`, `bilinear`, `cross`, `dot`, `vdot`, `grid_sampler`, `index_put`, `tensordot`, `scatter_add`) join the float32 list: float32 is CUDA's result for mixed inputs, and mixed inputs would otherwise fail. So does `binary_cross_entropy`, which CUDA refuses under autocast.
@@ -68,10 +72,37 @@ One fix is outside the dispatcher: `torch.save` pickles HPU tensors through a te
 | einsum graphs fail to compile (BIOT: `Can not compile graph`). | `pass_remove_unnecessary_bmm_view` removes views that are not pure batch merges. Unfixed in bridge 1.24.2. | `enable()` sets Habana's `PT_HPU_DISABLE_pass_remove_unnecessary_bmm_view`, Intel's own workaround (vllm-gaudi #1102). | BIOT compiles. |
 | LaBraM fails to compile (`used before defined`). | `batch_as_strided` puts a `getitem` before the node it reads. Fixed in bridge 1.22. | `enable()` sets `PT_HPU_DISABLE_pass_batch_as_strided_groups`. | LaBraM compiles. |
 | FBCNet and FBMSNet fail to compile (`create tensor invalid permutation 4 2`), EEGNet and Deep4Net at times. | `pass_weight_permutation` puts an `hpu.weight_permutation` before every 2-D and 3-D convolution weight. The backward of some graphs then fails to create a tensor. | `enable()` sets `PT_HPU_DISABLE_pass_weight_permutation`. | All four compile (EEGNet and Deep4Net: 8 of 8 times). CBraMod steps 2.2% faster, CodeBrain the same. |
+| `linalg.solve_triangular` and `cholesky_solve` run on the CPU, and so do the backward passes of `cholesky` and `qr` (#12). | No HPU kernel; Habana's CPU fallback. The backward of Cholesky and QR is made of these two solves. | A TPC kernel (below) for float32 matrices with n <= 32. The backward passes of `cholesky` and `qr` reach it through the two solves. | `solve_triangular`, n = 22, batch 32: 0.49 ms lazy, 0.46 ms eager, against about 1.4 and 1.5 ms for the fallback. |
+| `linalg.solve`, `solve_ex`, `det` and `slogdet` run on the CPU (#10). | No HPU kernel. Rebuilt from torch ops, they were 3 to 25 times slower than the fallback: one launch per op. | A TPC Gauss-Jordan kernel with partial pivoting, n <= 32, right-hand sides in chunks of 32. Gradients are torch's formulas; double backward works. | n = 22, batch 32, lazy / eager: `solve` 0.57 / 2.7 ms against about 2.2 / 4.5; `det` 0.51 / 0.82 against about 1.4 / 2.7. `solve_ex`, eager: 0.46 ms against about 4.5. |
+| `linalg.inv` runs on the CPU (#11). | No HPU kernel. | The same Gauss-Jordan kernel. | n = 22, batch 32, lazy / eager: 0.48 / 1.8 ms against about 2.2 / 4.6. |
+| `linalg.eigh` and `eigvalsh` run on the CPU (#8; 21 of 21 SPD models). | No HPU kernel. The parallel-Jacobi composite is exact but about 100 times slower than the fallback, so it only serves the CPU stand-in. | A TPC one-sided Jacobi kernel, n <= 32. | n = 22, batch 32, lazy / eager: 0.80 / 1.27 ms against about 1.4 / 3.7 (the raw kernel takes 0.19 ms). Batch 1024: 3.7 ms against 52 ms. Training steps: see below. |
 
 The pass switches are read at every compile. A non-empty setting in your environment wins (`PT_HPU_DISABLE_<pass>=0` keeps a pass on).
 
+### Linalg kernels on the TPC
+
+The linalg rows above run as single TPC kernels, one matrix per index-space member. They live in `hpu_ops/tpc/`. The library, `liblinalg_tpc.so`, is prebuilt. To rebuild it inside the Habana image, run `hpu_ops/tpc/build.sh`.
+
+- **Kernels:** Gauss-Jordan with partial pivoting for `solve`, `inv`, `det`, `slogdet`, `solve_triangular` and `cholesky_solve`; one-sided Jacobi for `eigh` and `eigvalsh`.
+- **Limit:** float32 matrices with n <= 32. Larger n keeps Habana's CPU fallback; float64 runs on the CPU (see "float64").
+- **Order:** call `hpu_ops.enable()` before the first HPU op. Habana reads the kernel path when the device initialises; later, the kernels are off, with one warning, and the calls use the fallback.
+- **Lazy mode:** works. Each kernel call ends its lazy graph.
+- **Accuracy:** within 10x of CPU float32 against float64 (`eigh` within about 3.8x), also with dense repeated eigenvalues, condition 1e6 and inputs scaled by 1e30.
+
 ## Measured on Gaudi2 (habana 1.21.4 / torch 2.6.0)
+
+### SPD models: training steps with the linalg kernels
+
+Same pod, batch 32, ms per training step, `origin/main` to this branch.
+
+| model | lazy | eager |
+|---|---|---|
+| SPDNet | 24.7 to 20.0 | 66.8 to 60.5 |
+| TensorCSPNet | 344.7 to 175.7 | 367.2 to 200.0 |
+| EEGSPDNet | 65.6 to 61.0 | 220.7 to 226.2 |
+| TSMNet | 38.1 to 48.0 | 159.9 to 175.1 |
+
+TSMNet got slower: its `solve` has n = 40, above the kernel limit, so it takes the fallback.
 
 ### braindecode models
 
@@ -171,6 +202,13 @@ It also checks:
 - that `torch.save` works after an eager and after a compiled optimizer step, and loads, on the card, the values of the same step run on the CPU;
 - with `hpu_ops.autocast`'s lists exported, CUDA's output dtypes under bfloat16 autocast (without them, Habana's are printed);
 - that braindecode's FBCNet compiles (the weight-permutation switch), and that its output and parameter gradients match eager mode.
+
+## Known gaps
+
+- TSMNet's `solve` has n = 40, above the kernel limit of 32. It runs on Habana's fallback and its training step is slower than on `origin/main` (table above). The limit is being raised to 64.
+- `info`, the index of a singular pivot, follows the kernel's own elimination order and can differ from LAPACK's.
+- The backward of `qr` at n = 16 is less accurate than CPU float32. A substitution kernel is being written for it.
+- float64 linalg runs on the CPU (see "float64").
 
 ## Limits
 
