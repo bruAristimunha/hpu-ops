@@ -483,6 +483,61 @@ def run_double_backward(tol=1e-2):
     return not problems
 
 
+def rotated(b, n, diagonal, seed):
+    """``Q diag(d) Q^T`` for a random orthogonal Q per batch element (QR of a normal matrix), float32."""
+    g = torch.Generator().manual_seed(seed)
+    Q = torch.linalg.qr(torch.randn(b, n, n, generator=g, dtype=torch.float64)).Q
+    S = Q @ torch.diag_embed(diagonal.double()).expand(b, n, n) @ Q.mT
+    return ((S + S.mT) / 2).float().contiguous()
+
+
+def adversarial_input(kind, n, seed):
+    """The eigh inputs the first kernel versions failed: dense repeated eigenvalues, condition 1e6 (max 1), and an
+    extreme scale (1e30 times a unit-scale matrix)."""
+    if kind == "deg_rotated":
+        return rotated(BATCH, n, torch.tensor([1.0] * (n // 2) + [2.0] * (n - n // 2)), seed)
+    if kind == "illcond_1e6":
+        d = torch.logspace(0, 6, n, dtype=torch.float64)
+        return rotated(BATCH, n, d / d.max(), seed)
+    S = rotated(BATCH, n, torch.linspace(0.1, 1.0, n, dtype=torch.float64), seed)
+    return (S.double() * 1e30).float().contiguous()
+
+
+def eigh_metrics(w, V, S, w_ref):
+    """Eigenvalue error and reconstruction error relative to ``max|w_ref|`` and ``max|S|``, and the orthogonality
+    error ``max|V^T V - I|`` (absolute), all in float64."""
+    w, V, S = w.detach().cpu().double(), V.detach().cpu().double(), S.double()
+    eye = torch.eye(S.shape[-1], dtype=torch.float64)
+    return {"w": rel_err(w, w_ref), "recon": rel_err(V * w.unsqueeze(-2) @ V.mT, S),
+            "orth": float((V.mT @ V - eye).abs().max()) if torch.isfinite(V).all() else math.inf}
+
+
+def run_eigh_adversarial(kind, n, seed):
+    """eigh on the card for one adversarial input against the bar of 10x CPU float32's error on w, ``V diag(w) V^T``
+    and orthogonality (floor 1e-6); finite outputs; no fallback, no CPU warning."""
+    row = {"op": f"linalg.eigh.{kind}", "n": n, "seed": seed, "batch": BATCH, "dtype": "float32", "lazy": LAZY,
+           "baseline": BASELINE}
+    hard = []
+    try:
+        S = adversarial_input(kind, n, seed)
+        w_ref = torch.linalg.eigvalsh(S.double())
+        with watch() as rec:
+            w, V = L.eigh(S.to(HPU))
+            sync()
+        got = eigh_metrics(w, V, S, w_ref)
+        cw, cV = L.eigh(S)
+        cpu = eigh_metrics(cw, cV, S, w_ref)
+        row.update(errors=got, errors_cpu32=cpu, fwd_fallback=rec["fallback"])
+        for name in got:
+            hard += over_bar(f"{name} error", got[name], cpu[name])
+        hard += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+    except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
+        hard.append(f"exception {e!r}"[:300])
+    problems = [] if BASELINE else hard
+    emit(**row, status="fail" if problems else "fallback" if hard else "ok", problems=hard)
+    return not problems
+
+
 def check_tpc(tpc):
     """After the first op: with ``hpu_ops.enable()`` the TPC extension must be ready, else every kernel-routed op
     silently fell back."""
@@ -561,6 +616,8 @@ def main():
             results.append(run_float64(case))
     if not BASELINE:
         results.append(run_double_backward())
+        results += [run_eigh_adversarial(kind, n, seed) for kind in ("deg_rotated", "illcond_1e6", "scaled_1e30")
+                    for n in (16, 22) for seed in range(3)]
         for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
             results.append(run_singular(op, fn))
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong

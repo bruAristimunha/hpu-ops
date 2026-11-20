@@ -3,11 +3,11 @@
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
  *   A [n, n, batch]  f32 (symmetric; the lower triangle is mirrored by the caller)
  *   W [n, batch]     f32: eigenvalues, unsorted          V [n, n, batch]  f32: row j = eigenvector of W[j]
- * A is normalized by 1/sigma (sigma = Gershgorin bound) and shifted to S = A/sigma + 1.001 I so S is strictly
- * positive definite with O(1) entries. Two matrices (bt in lanes 0..31, bt+1 in lanes 32..63 when has2) are
- * packed side-by-side into u[0..n-1] (8 KB VLM total) and solved simultaneously with LUT-free reduce_add_half32
- * and K=3 interleaved round-robin pairs (+ K=2, K=1 tails). Rayleigh quotient W[j] = v_j^T A v_j is tiled in
- * 8-column VRF blocks using v_broadcast_element_i32.
+ * A is normalized by 1/sigma (sigma = Gershgorin bound, with overflow/subnormal prescaling) and shifted to
+ * S = A/sigma + 1.001 I so S is strictly positive definite with O(1) entries. Two matrices (bt in lanes 0..31,
+ * bt+1 in lanes 32..63 when has2) are packed side-by-side into u[0..n-1] (8 KB VLM total) and solved with
+ * LUT-free reduce_add_half32, 1-rsqrt rotation (minimax deg-4 + 1 NR for inv_c), and K=3 interleaved
+ * round-robin pairs (+ K=2, K=1 tails). Rayleigh quotient W[j] = v_j^T A v_j is tiled in 8-column VRF blocks.
  */
 #define MAXN 32  // u[32] = 8 KB of 16 KB LUT-mode VLM, leaving 8 KB for register spills
 
@@ -21,6 +21,30 @@ static inline float64 reduce_add_half32(float64 p)
     p = v_f32_add_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 2)));
     p = v_f32_add_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 1)));
     return p;
+}
+
+static inline float64 reduce_max_half32(float64 p)
+{
+    p = v_f32_max_b(p, v_f32_mov_dual_group_all_b(p, 0xFFFFFFFF, 1, 0, 3, 2, SW_MDG_ALL, p));
+    p = v_f32_max_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 8)));
+    p = v_f32_max_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 4)));
+    p = v_f32_max_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 2)));
+    p = v_f32_max_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 1)));
+    return p;
+}
+
+static inline float64 inv_sqrt_unit(float64 c2)
+{
+    // Degree-4 relative-error minimax polynomial on [0.5, 1.0] + 1 NR step (< 1e-7 max rel err)
+    float64 p = 1.1498469f;
+    p = v_f32_mac_b(c2, p, -4.40869479f);
+    p = v_f32_mac_b(c2, p, 6.8050256f);
+    p = v_f32_mac_b(c2, p, -5.47635557f);
+    p = v_f32_mac_b(c2, p, 2.9302518f);
+    float64 half_c2 = v_f32_mul_b(-0.5f, c2);
+    float64 p2 = v_f32_mul_b(p, p);
+    float64 nr = v_f32_mac_b(half_c2, p2, 1.5f);
+    return v_f32_mul_b(p, nr);
 }
 
 static inline float64 pack_halves(float64 lo, float64 hi)
@@ -66,7 +90,7 @@ void main(tensor A, tensor W, tensor V)
     const int m = n_even - 1;
     const int half_n = n_even >> 1;
     const int k_start = n & 1;  // when n is odd, k==0 has q == m == n (padding) and is skipped
-    const int sweeps = (n <= 4) ? 4 : (n <= 16) ? 6 : (n <= 22) ? 7 : 8;
+    const int sweeps = (n <= 4) ? 4 : (n <= 16) ? 8 : (n <= 22) ? 9 : 10;
     const float shift_norm = 1.001f;
 
     // Unified 2-matrix SIMD half-vector packed path: bt in lanes 0..31, bt+1 (if has2) in lanes 32..63
@@ -74,6 +98,7 @@ void main(tensor A, tensor W, tensor V)
     {
         const int has2 = (bt + 1 < off[0] + size[0]);
         float64 sigma = 0.0f;
+        float64 max_abs = 0.0f;
         for (int i = 0; i < n; i++)
         {
             int5 c0 = {0, i, bt, 0, 0};
@@ -86,15 +111,33 @@ void main(tensor A, tensor W, tensor V)
             }
             float64 packed = pack_halves(r0, r1);
             u[i] = packed;
-            sigma = v_f32_max_b(sigma, reduce_add_half32(v_f32_abs_b(packed)));
+            float64 ap = v_f32_abs_b(packed);
+            max_abs = v_f32_max_b(max_abs, ap);
+            sigma = v_f32_max_b(sigma, reduce_add_half32(ap));
         }
-        // Per-half safe normalization by 1/sigma and diagonal shift 1.001f
-        float64 safe_sigma = v_f32_sel_eq_f32_b(sigma, 0.0f, 1.0f, sigma);
+        max_abs = reduce_max_half32(max_abs);
+        // Per-half branchless overflow/subnormal prescaling + safe normalization by 1/sigma and diagonal shift 1.001f
+        float64 prescale = v_f32_sel_grt_f32_b(sigma, 1e35f, 0x1p-20f, 1.0f);
+        float64 inv_prescale = v_f32_sel_grt_f32_b(sigma, 1e35f, 0x1p+20f, 1.0f);
+        float64 use_sigma = v_f32_sel_grt_f32_b(sigma, 1e35f,
+                                                v_f32_mul_b((float)n, v_f32_mul_b(max_abs, 0x1p-20f)),
+                                                sigma);
+        float64 sub_prescale = v_f32_sel_eq_f32_b(sigma, 0.0f, prescale, 0x1p+20f);
+        float64 sub_inv_prescale = v_f32_sel_eq_f32_b(sigma, 0.0f, inv_prescale, 0x1p-20f);
+        float64 sub_sigma = v_f32_sel_eq_f32_b(sigma, 0.0f, use_sigma,
+                                               v_f32_mul_b((float)n, v_f32_mul_b(max_abs, 0x1p+20f)));
+        prescale = v_f32_sel_less_f32_b(sigma, 1e-35f, sub_prescale, prescale);
+        inv_prescale = v_f32_sel_less_f32_b(sigma, 1e-35f, sub_inv_prescale, inv_prescale);
+        use_sigma = v_f32_sel_less_f32_b(sigma, 1e-35f, sub_sigma, use_sigma);
+
+        float64 safe_sigma = v_f32_sel_eq_f32_b(use_sigma, 0.0f, 1.0f, use_sigma);
+        safe_sigma = v_f32_sel_grt_f32_b(safe_sigma, 1e35f, 1.0f, safe_sigma);
+        safe_sigma = v_f32_sel_less_f32_b(safe_sigma, 1e-35f, 1.0f, safe_sigma);
         float64 inv_sigma = v_reciprocal_f32(safe_sigma);
         inv_sigma = v_f32_mul_b(inv_sigma, v_f32_sub_b(2.0f, v_f32_mul_b(safe_sigma, inv_sigma)));
         for (int i = 0; i < n; i++)
         {
-            float64 row = v_f32_mul_b(u[i], inv_sigma);
+            float64 row = v_f32_mul_b(v_f32_mul_b(u[i], prescale), inv_sigma);
             u[i] = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)i, v_f32_add_b(row, shift_norm), row);
         }
 
@@ -145,16 +188,16 @@ void main(tensor A, tensor W, tensor V)
                     float64 c21 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d1), inv_r1, 1.0f));
                     float64 c22 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d2), inv_r2, 1.0f));
 
-                    float64 inv_c0 = v_rsqrt_f32(c20);
-                    float64 inv_c1 = v_rsqrt_f32(c21);
-                    float64 inv_c2 = v_rsqrt_f32(c22);
+                    float64 inv_c0 = inv_sqrt_unit(c20);
+                    float64 inv_c1 = inv_sqrt_unit(c21);
+                    float64 inv_c2 = inv_sqrt_unit(c22);
 
                     float64 c0 = v_f32_mul_b(c20, inv_c0);
                     float64 c1 = v_f32_mul_b(c21, inv_c1);
                     float64 c2 = v_f32_mul_b(c22, inv_c2);
-                    float64 s0 = v_f32_mul_b(v_f32_mul_b(0.5f, g20), v_f32_mul_b(inv_r0, inv_c0));
-                    float64 s1 = v_f32_mul_b(v_f32_mul_b(0.5f, g21), v_f32_mul_b(inv_r1, inv_c1));
-                    float64 s2 = v_f32_mul_b(v_f32_mul_b(0.5f, g22), v_f32_mul_b(inv_r2, inv_c2));
+                    float64 s0 = v_f32_mul_b(gamma0, v_f32_mul_b(inv_r0, inv_c0));
+                    float64 s1 = v_f32_mul_b(gamma1, v_f32_mul_b(inv_r1, inv_c1));
+                    float64 s2 = v_f32_mul_b(gamma2, v_f32_mul_b(inv_r2, inv_c2));
                     s0 = v_f32_sel_less_f32_b(d0, 0.0f, v_f32_sub_b(0.0f, s0), s0);
                     s1 = v_f32_sel_less_f32_b(d1, 0.0f, v_f32_sub_b(0.0f, s1), s1);
                     s2 = v_f32_sel_less_f32_b(d2, 0.0f, v_f32_sub_b(0.0f, s2), s2);
@@ -216,13 +259,13 @@ void main(tensor A, tensor W, tensor V)
                     float64 c20 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d0), inv_r0, 1.0f));
                     float64 c21 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d1), inv_r1, 1.0f));
 
-                    float64 inv_c0 = v_rsqrt_f32(c20);
-                    float64 inv_c1 = v_rsqrt_f32(c21);
+                    float64 inv_c0 = inv_sqrt_unit(c20);
+                    float64 inv_c1 = inv_sqrt_unit(c21);
 
                     float64 c0 = v_f32_mul_b(c20, inv_c0);
                     float64 c1 = v_f32_mul_b(c21, inv_c1);
-                    float64 s0 = v_f32_mul_b(v_f32_mul_b(0.5f, g20), v_f32_mul_b(inv_r0, inv_c0));
-                    float64 s1 = v_f32_mul_b(v_f32_mul_b(0.5f, g21), v_f32_mul_b(inv_r1, inv_c1));
+                    float64 s0 = v_f32_mul_b(gamma0, v_f32_mul_b(inv_r0, inv_c0));
+                    float64 s1 = v_f32_mul_b(gamma1, v_f32_mul_b(inv_r1, inv_c1));
                     s0 = v_f32_sel_less_f32_b(d0, 0.0f, v_f32_sub_b(0.0f, s0), s0);
                     s1 = v_f32_sel_less_f32_b(d1, 0.0f, v_f32_sub_b(0.0f, s1), s1);
 
@@ -258,9 +301,9 @@ void main(tensor A, tensor W, tensor V)
                     float64 sr2 = v_f32_sel_eq_f32_b(r2, 0.0f, 1.0f, r2);
                     float64 inv_r = v_rsqrt_f32(sr2);
                     float64 c2 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d), inv_r, 1.0f));
-                    float64 inv_c = v_rsqrt_f32(c2);
+                    float64 inv_c = inv_sqrt_unit(c2);
                     float64 c = v_f32_mul_b(c2, inv_c);
-                    float64 s = v_f32_mul_b(v_f32_mul_b(0.5f, g2), v_f32_mul_b(inv_r, inv_c));
+                    float64 s = v_f32_mul_b(gamma, v_f32_mul_b(inv_r, inv_c));
                     s = v_f32_sel_less_f32_b(d, 0.0f, v_f32_sub_b(0.0f, s), s);
 
                     c = v_f32_sel_eq_f32_b(gamma, 0.0f, 1.0f, c);
@@ -345,7 +388,7 @@ void main(tensor A, tensor W, tensor V)
                     int5 cb = {0, i, bt + 1, 0, 0};
                     r1 = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, v_f32_ld_tnsr_b(cb, A));
                 }
-                float64 arow = pack_halves(r0, r1);
+                float64 arow = v_f32_mul_b(pack_halves(r0, r1), prescale);
                 float64 b0 = v_f32_sel_less_u32_b(lane, 32u,
                                                   as_float64(v_broadcast_element_i32(as_int64(v0), i)),
                                                   as_float64(v_broadcast_element_i32(as_int64(v0), i + 32)));
@@ -396,6 +439,7 @@ void main(tensor A, tensor W, tensor V)
             if (j0 + 6 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 6), w6, w_packed);
             if (j0 + 7 < n) w_packed = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)(j0 + 7), w7, w_packed);
         }
+        w_packed = v_f32_mul_b(w_packed, inv_prescale);
         int5 cwa = {0, bt, 0, 0, 0};
         v_f32_st_tnsr_partial(cwa, W, w_packed, n - 1, 0);
         if (has2)
