@@ -263,7 +263,75 @@ def install_solve_triangular(device_type):
         return base(A, B) and B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
     takes = _tpc_takes(device_type, shapes_ok)
-    return register_paired(device_type, [_kernels(device_type, op, "solve_triangular", SolveTriangular, takes)])
+    groups = [_kernels(device_type, op, "solve_triangular", SolveTriangular, takes),
+              _solve_triangular_out_kernels(device_type, takes), _triangular_solve_kernels(device_type, takes)]
+    return register_paired(device_type, groups)
+
+
+def _into(out, X):
+    """``X`` written into ``out`` (resized if its shape differs, as torch's out= ops do); returns ``out``."""
+    if out.shape != X.shape:
+        out.resize_(X.shape)
+    return out.copy_(X)
+
+
+def _solve_triangular_out_kernels(device_type, takes):
+    """``linalg.solve_triangular(..., out=)`` (``aten.linalg_solve_triangular.out``): the same route as the functional
+    op, written into ``out``. out= ops do not differentiate, so a call with an input that requires grad keeps the
+    op's own autograd kernel (which raises, as in torch)."""
+    op = aten.linalg_solve_triangular.out
+    functional = aten.linalg_solve_triangular.default
+
+    def ours(A, B, *, upper, left=True, unitriangular=False, out):
+        return out.dtype == A.dtype and takes(A, B, upper, left, unitriangular)
+
+    def autograd_kernel(*args, **kwargs):
+        grads = torch.is_grad_enabled() and any(t.requires_grad for t in args[:2])
+        if not grads and ours(*args, **kwargs):
+            count("solve_triangular")
+            A, B, upper, left, unitriangular, out = _bind(op, args, kwargs)
+            return _into(out, SolveTriangular.compute(A, B, upper, left, unitriangular))
+        return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
+
+    def backend_kernel(*args, **kwargs):
+        A, B, upper, left, unitriangular, out = _bind(op, args, kwargs)
+        if ours(*args, **kwargs):
+            count("solve_triangular")
+            return _into(out, SolveTriangular.compute(A, B, upper, left, unitriangular))
+        return _into(out, _on_cpu(functional, (A, B), dict(upper=upper, left=left, unitriangular=unitriangular)))
+
+    return [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
+
+
+def _triangular_solve_kernels(device_type, takes):
+    """The legacy ``torch.triangular_solve(B, A, upper, transpose, unitriangular)`` (``aten.triangular_solve``):
+    ``solution`` through the same route as ``linalg.solve_triangular`` (``transpose`` solves with ``A^T``), and
+    ``cloned_coefficient`` a copy of ``A`` broadcast to the batch, as torch returns it."""
+    op = aten.triangular_solve.default
+
+    def outputs(solve, B, A, upper, transpose, unitriangular):
+        X = solve(A.mT if transpose else A, B, upper != transpose, True, unitriangular)
+        batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+        return X, A.expand(*batch, *A.shape[-2:]).clone()
+
+    def ours(B, A, upper, transpose, unitriangular):
+        return takes(A.mT if transpose else A, B, upper != transpose, True, unitriangular)
+
+    def autograd_kernel(*args, **kwargs):
+        bound = _bind(op, args, kwargs)
+        if ours(*bound):
+            count("solve_triangular")
+            return outputs(SolveTriangular.apply, *bound)
+        return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
+
+    def backend_kernel(*args, **kwargs):
+        bound = _bind(op, args, kwargs)
+        if ours(*bound):
+            count("solve_triangular")
+            return outputs(SolveTriangular.compute, *bound)
+        return _on_cpu(op, args, kwargs)
+
+    return [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
 
 
 def cholesky_solve(B, L, upper=False):
