@@ -13,9 +13,9 @@ Composites contain no host sync: loops run over Python ints from static shapes.
 
 On Gaudi2 these composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
 with the TPC Gauss-Jordan kernel of ``hpu_ops.tpc`` loaded, float32 matrices of n <= ``tpc.MAXN`` go through it
-instead (solve, inv, det, slogdet). The triangular solves (``solve_triangular``, ``cholesky_solve``) are not installed
-by default: pivoted Gauss-Jordan on a triangle loses accuracy and ``cholesky_solve`` squares the condition number;
-a substitution kernel is coming. Their code and tests stay. Without the kernel, or past ``MAXN``, the call on
+instead (solve, inv, det, slogdet), and the triangular solves (``solve_triangular``, ``cholesky_solve``) through
+its substitution kernel (``tpc.tri_solve``): no pivoting, so no accuracy is lost on ill-conditioned triangles, and
+``cholesky_solve`` is two substitutions, never L L^H. Without the kernel, or past ``MAXN``, the call on
 ``hpu`` is declined and runs through hpu-ops' own CPU route (``_on_cpu``), which is not Habana's fallback. The
 composites stay the path of the CPU stand-in.
 """
