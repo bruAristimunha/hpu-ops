@@ -225,6 +225,17 @@ def make_lstsq(b, n, dtype):
     return [torch.randn(b, n + 6, n, dtype=dtype), torch.randn(b, n + 6, 3, dtype=dtype)]
 
 
+def make_skew(b, n, dtype):
+    a = torch.randn(b, n, n, dtype=dtype)
+    return [0.1 * (a - a.mT)]
+
+
+def make_householder(b, n, dtype):
+    a = torch.randn(b, n, n, dtype=dtype).tril(-1)
+    tau = 2.0 / (1.0 + (a * a).sum(-2))
+    return [a, tau]
+
+
 class Case(NamedTuple):
     name: str
     make: Callable
@@ -264,6 +275,8 @@ CASES = (
     # matrix_norm_nuc sums S on HPU at float32 precision after _linalg_svd declines float64 (~6.7e-8 vs CPU f64)
     Case("linalg.matrix_norm_nuc", make_general, lambda x: L.matrix_norm(x, ord="nuc"), float64=False, tpc=True),
     Case("linalg.matrix_rank", make_general, lambda x: L.matrix_rank(x), err_all, None, tpc=True),
+    Case("linalg.matrix_exp", make_skew, lambda x: L.matrix_exp(x), tpc=True),
+    Case("linalg.householder_product", make_householder, lambda a, t: L.householder_product(a, t)),
 )
 
 
@@ -577,6 +590,119 @@ def run_svd_edges():
     return out_results
 
 
+def run_expm_hh_edges():
+    """Edge cases for Issue #13: matrix_exp s>0/zeros/n=1, householder rect/k<n/k=0/singular, and orthogonal layers."""
+    out_results = []
+
+    def check(label, fn, cpu_in, grad_fn=loss_sum, expect_fb=False):
+        row = {"op": f"expm_hh_edge.{label}", "n": SINGULAR_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY}
+        problems = []
+        try:
+            ref_in = [x.double() for x in cpu_in]
+            ref = as_tensors(fn(*ref_in))
+            with watch() as rec:
+                got = as_tensors(fn(*(x.to(HPU) for x in cpu_in)))
+                sync()
+            row["fwd_fallback"] = rec["fallback"]
+            e, notes = err_all(got, ref, ref_in)
+            e32, _ = err_all(as_tensors(fn(*cpu_in)), ref, ref_in)
+            row["max_rel_err"], row["err_cpu32"] = e, e32
+            problems += notes + over_bar("error", e, e32)
+            if not expect_fb:
+                problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+            if grad_fn is not None:
+                xs = [x.to(HPU).detach().requires_grad_() for x in cpu_in]
+                loss = grad_fn(as_tensors(fn(*xs)))
+                sync()
+                with watch() as brec:
+                    loss.backward()
+                    sync()
+                row["bwd_fallback"] = brec["fallback"]
+                ref_grads = reference_grads(
+                    Case(label, lambda *_: cpu_in, fn, loss=grad_fn), ref_in)
+                cpu_xs = [x.detach().clone().requires_grad_() for x in cpu_in]
+                grad_fn(as_tensors(fn(*cpu_xs))).backward()
+                ge = grad_error(xs, ref_grads)
+                ge32 = grad_error(cpu_xs, ref_grads)
+                row["grad_err"], row["grad_err_cpu32"] = ge, ge32
+                problems += over_bar("gradient error", ge, ge32)
+                if not expect_fb:
+                    problems += ["bwd fell back"] * bool(brec["fallback"]) + cpu_warnings(brec)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"exception {e!r}"[:300])
+        emit(**row, status="fail" if problems else "ok", problems=problems)
+        out_results.append(not problems)
+
+    # matrix_exp edge cases
+    check("expm_large_s_gt_0", lambda x: L.matrix_exp(x), [5.0 * torch.randn(BATCH, SINGULAR_N, SINGULAR_N)])
+    check("expm_zeros", lambda x: L.matrix_exp(x), [torch.zeros(BATCH, SINGULAR_N, SINGULAR_N)])
+    check("expm_n1", lambda x: L.matrix_exp(x), [torch.randn(BATCH, 1, 1)])
+    check("expm_torch_alias", lambda x: torch.matrix_exp(x), make_skew(BATCH, SINGULAR_N, torch.float32))
+
+    # householder_product edge cases (Issue #13 exact shapes)
+    a22 = torch.randn(BATCH, 22, 22).tril(-1)
+    t21 = 2.0 / (1.0 + (a22[..., :21] ** 2).sum(-2))
+    check("hh_22_22_k21", lambda a, t: L.householder_product(a, t), [a22, t21])
+
+    a10 = torch.randn(BATCH, 22, 10).tril(-1)
+    t10 = 2.0 / (1.0 + (a10 ** 2).sum(-2))
+    t6 = 2.0 / (1.0 + (a10[..., :6] ** 2).sum(-2))
+    check("hh_22_10_k10", lambda a, t: L.householder_product(a, t), [a10, t10])
+    check("hh_22_10_k6", lambda a, t: L.householder_product(a, t), [a10, t6])
+    check("hh_22_10_k0", lambda a, t: L.householder_product(a, t), [a10, torch.empty(BATCH, 0)], grad_fn=None)
+
+    a64_32 = torch.randn(BATCH, 64, 32).tril(-1)
+    t64_32 = 2.0 / (1.0 + (a64_32 ** 2).sum(-2))
+    check("hh_64_32_k32", lambda a, t: L.householder_product(a, t), [a64_32, t64_32])
+
+    # orthogonal parametrizations (matrix_exp & householder) on (22, 22) & (22, 10)
+    from torch.nn.utils.parametrizations import orthogonal
+
+    for omap in ("matrix_exp", "householder"):
+        for rows, cols in ((22, 22), (22, 10)):
+            row = {"op": f"orthogonal.{omap}_{rows}x{cols}", "n": rows, "batch": BATCH,
+                   "dtype": "float32", "lazy": LAZY}
+            problems = []
+            try:
+                torch.manual_seed(0)
+                layer_ref = orthogonal(torch.nn.Linear(cols, rows, bias=False).double(),
+                                       orthogonal_map=omap, use_trivialization=False)
+                layer_cpu32 = orthogonal(torch.nn.Linear(cols, rows, bias=False),
+                                         orthogonal_map=omap, use_trivialization=False)
+                layer_hpu = orthogonal(torch.nn.Linear(cols, rows, bias=False),
+                                         orthogonal_map=omap, use_trivialization=False)
+                with torch.no_grad():
+                    w0 = torch.randn(rows, cols)
+                    layer_ref.parametrizations.weight.original.copy_(w0.double())
+                    layer_cpu32.parametrizations.weight.original.copy_(w0)
+                    layer_hpu.parametrizations.weight.original.copy_(w0)
+                layer_hpu = layer_hpu.to(HPU)
+                x = torch.randn(BATCH, cols)
+                xh = x.to(HPU)
+                sync()
+                layer_ref(x.double()).sum().backward()
+                layer_cpu32(x).sum().backward()
+                with watch() as rec:
+                    out_h = layer_hpu(xh)
+                    out_h.sum().backward()
+                    sync()
+                row["fwd_fallback"] = rec["fallback"]
+                row["max_rel_err"] = rel_err(out_h, layer_ref(x.double()))
+                row["err_cpu32"] = rel_err(layer_cpu32(x), layer_ref(x.double()))
+                row["grad_err"] = rel_err(layer_hpu.parametrizations.weight.original.grad,
+                                          layer_ref.parametrizations.weight.original.grad)
+                row["grad_err_cpu32"] = rel_err(layer_cpu32.parametrizations.weight.original.grad,
+                                                layer_ref.parametrizations.weight.original.grad)
+                problems += over_bar("error", row["max_rel_err"], row["err_cpu32"])
+                problems += over_bar("gradient error", row["grad_err"], row["grad_err_cpu32"])
+                problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"exception {e!r}"[:300])
+            emit(**row, status="fail" if problems else "ok", problems=problems)
+            out_results.append(not problems)
+    return out_results
+
+
 def main():
     global BASELINE, EIGH_STRICT, ops_linalg, tpc_maxn
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -617,6 +743,7 @@ def main():
         for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
             results.append(run_singular(op, fn))
         results += run_svd_edges()
+        results += run_expm_hh_edges()
     if BASELINE and not args.only:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
         ok = bool(EIGH_FALLBACKS)
         emit(op="metric_check", lazy=LAZY, baseline=True, status="ok" if ok else "error",

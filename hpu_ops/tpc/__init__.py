@@ -19,6 +19,7 @@ import warnings
 import torch
 
 MAXN = 32
+MAXHH = 64
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
 LATE_WARNING = ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off for this process "
@@ -66,6 +67,10 @@ static habana::PartialOutputMetaDataVector svdvals_meta(const at::Stack& inputs)
   auto a = inputs[0].toTensor();
   return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1)}}};
 }
+static habana::PartialOutputMetaDataVector hh_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  return {habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()}};
+}
 static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", solve_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", inv_meta, nullptr);
@@ -73,6 +78,11 @@ static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_svd_full", "jacobi_svd_full_f32_gaudi2", svd_full_meta,
                                           nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_svdvals", "jacobi_svdvals_f32_gaudi2", svdvals_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::householder_product", "householder_product_f32_gaudi2", hh_meta,
+                                          nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::matrix_exp", "matrix_exp_f32_gaudi2", hh_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::matrix_exp_frechet", "matrix_exp_frechet_f32_gaudi2", hh_meta,
+                                          nullptr);
   return true;
 }();
 
@@ -106,12 +116,33 @@ at::Tensor jacobi_svdvals(at::Tensor a) {
   auto out = desc.execute(inputs);
   return out[0];
 }
+at::Tensor householder_product(at::Tensor a, at::Tensor tau) {
+  std::vector<c10::IValue> inputs{a, tau};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::householder_product");
+  auto out = desc.execute(inputs);
+  return out[0];
+}
+at::Tensor matrix_exp(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::matrix_exp");
+  auto out = desc.execute(inputs);
+  return out[0];
+}
+at::Tensor matrix_exp_frechet(at::Tensor a, at::Tensor g) {
+  std::vector<c10::IValue> inputs{a, g};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::matrix_exp_frechet");
+  auto out = desc.execute(inputs);
+  return out[0];
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svdvals(Tensor a) -> Tensor");
+  m.def("householder_product(Tensor a, Tensor tau) -> Tensor");
+  m.def("matrix_exp(Tensor a) -> Tensor");
+  m.def("matrix_exp_frechet(Tensor a, Tensor g) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
@@ -119,6 +150,9 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("jacobi_svd", jacobi_svd);
   m.impl("jacobi_svd_full", jacobi_svd_full);
   m.impl("jacobi_svdvals", jacobi_svdvals);
+  m.impl("householder_product", householder_product);
+  m.impl("matrix_exp", matrix_exp);
+  m.impl("matrix_exp_frechet", matrix_exp_frechet);
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
@@ -137,6 +171,15 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   });
   m.impl("jacobi_svdvals", [](at::Tensor a) {
     return a.new_empty({a.size(0), a.size(1)});
+  });
+  m.impl("householder_product", [](at::Tensor a, at::Tensor tau) {
+    return a.new_empty(a.sizes());
+  });
+  m.impl("matrix_exp", [](at::Tensor a) {
+    return a.new_empty(a.sizes());
+  });
+  m.impl("matrix_exp_frechet", [](at::Tensor a, at::Tensor g) {
+    return a.new_empty(a.sizes());
   });
 }
 """
@@ -199,6 +242,26 @@ static bool registered_svdvals = [] {
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_svdvals", "jacobi_svdvals_f32_gaudi2", in, out, nullptr);
   return true;
 }();
+static bool registered_hh = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
+                                               {habana::custom_op::input_type::TENSOR, 1}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_a}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::householder_product", "householder_product_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static bool registered_expm = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_a}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::matrix_exp", "matrix_exp_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static bool registered_expm_frechet = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
+                                               {habana::custom_op::input_type::TENSOR, 1}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_a}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::matrix_exp_frechet", "matrix_exp_frechet_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor b) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_solve");
@@ -230,12 +293,33 @@ at::Tensor jacobi_svdvals(at::Tensor a) {
   auto out = op.execute(inputs);
   return out[0];
 }
+at::Tensor householder_product(at::Tensor a, at::Tensor tau) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::householder_product");
+  std::vector<c10::IValue> inputs{a, tau};
+  auto out = op.execute(inputs);
+  return out[0];
+}
+at::Tensor matrix_exp(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::matrix_exp");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return out[0];
+}
+at::Tensor matrix_exp_frechet(at::Tensor a, at::Tensor g) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::matrix_exp_frechet");
+  std::vector<c10::IValue> inputs{a, g};
+  auto out = op.execute(inputs);
+  return out[0];
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svdvals(Tensor a) -> Tensor");
+  m.def("householder_product(Tensor a, Tensor tau) -> Tensor");
+  m.def("matrix_exp(Tensor a) -> Tensor");
+  m.def("matrix_exp_frechet(Tensor a, Tensor g) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
@@ -243,6 +327,9 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("jacobi_svd", jacobi_svd);
   m.impl("jacobi_svd_full", jacobi_svd_full);
   m.impl("jacobi_svdvals", jacobi_svdvals);
+  m.impl("householder_product", householder_product);
+  m.impl("matrix_exp", matrix_exp);
+  m.impl("matrix_exp_frechet", matrix_exp_frechet);
 }
 """
 
@@ -348,6 +435,24 @@ def _svdvals_op():
     """``torch.ops.linalg_tpc.jacobi_svdvals``, built on first use."""
     _load()
     return torch.ops.linalg_tpc.jacobi_svdvals
+
+
+def _hh_op():
+    """``torch.ops.linalg_tpc.householder_product``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.householder_product
+
+
+def _expm_op():
+    """``torch.ops.linalg_tpc.matrix_exp``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.matrix_exp
+
+
+def _expm_frechet_op():
+    """``torch.ops.linalg_tpc.matrix_exp_frechet``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.matrix_exp_frechet
 
 
 # Lazy mode on bridge 1.21.4 can drop the unused outputs of a multi-output custom op (the callers use some of X, D and
@@ -600,3 +705,84 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
     else:
         u_ord = v_ord = order
     return U.gather(-1, u_ord[..., None, :].expand_as(U)), S, Vh.gather(-2, v_ord[..., :, None].expand_as(Vh))
+
+
+def householder_product(A, tau, flush=False):
+    """Householder product ``Q`` for ``A[..., m, n]`` and ``tau[..., k]`` (float32, m <= ``MAXHH``, m >= n >= k)."""
+    if A.dim() < 2:
+        raise ValueError(f"hpu_ops.tpc takes 2D+ A, got {tuple(A.shape)}")
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k = tau.shape[-1]
+    if m > MAXHH or m < n or k > n or tau.dim() != A.dim() - 1 or tau.shape[:-1] != batch:
+        raise ValueError(
+            f"hpu_ops.tpc takes m >= n >= k with m <= {MAXHH}, got {tuple(A.shape)} and {tuple(tau.shape)}")
+    if A.numel() == 0 or k == 0:
+        return torch.eye(m, n, dtype=torch.float32, device=A.device).expand(*batch, m, n).clone()
+    A_t = A.mT.reshape(-1, n, m).to(torch.float32).contiguous()
+    tau_f = tau.reshape(-1, k).to(torch.float32).contiguous()
+    op = _hh_op()
+    Q_t = _call(op, A_t, tau_f) if flush else op(A_t, tau_f)
+    return Q_t.mT.reshape(*batch, m, n)
+
+
+def householder_product_reference(A, tau):
+    """``householder_product`` in plain torch, matching the TPC kernel contract. For the CPU tests."""
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k = tau.shape[-1]
+    if m > MAXHH or m < n or k > n or tau.dim() != A.dim() - 1 or tau.shape[:-1] != batch:
+        raise ValueError(
+            f"hpu_ops.tpc takes m >= n >= k with m <= {MAXHH}, got {tuple(A.shape)} and {tuple(tau.shape)}")
+    if A.numel() == 0 or k == 0:
+        return torch.eye(m, n, dtype=A.dtype, device=A.device).expand(*batch, m, n).clone()
+    A_f = A.reshape(-1, m, n)
+    tau_f = tau.reshape(-1, k)
+    b = A_f.shape[0]
+    Q = torch.eye(m, n, dtype=A.dtype, device=A.device).expand(b, m, n).clone()
+    rows = torch.arange(m, device=A.device)
+    for i in range(k - 1, -1, -1):
+        v = torch.where(rows > i, A_f[..., :, i], torch.where(rows == i, 1.0, 0.0))
+        t_v = tau_f[..., i:i + 1] * v
+        dots = v.unsqueeze(-2) @ Q[..., :, i + 1:]
+        Q[..., :, i + 1:] = Q[..., :, i + 1:] - t_v.unsqueeze(-1) * dots
+        Q[..., :, i] = (rows == i).to(A.dtype) - t_v
+    return Q.reshape(*batch, m, n)
+
+
+def matrix_exp(A, flush=False):
+    """Matrix exponential ``exp(A)`` for ``A[..., n, n]`` (float32, n <= ``MAXN``) from the Gaudi2 TPC kernel."""
+    n = A.shape[-1]
+    _check(A, n)
+    if A.numel() == 0:
+        return A.new_empty(A.shape, dtype=torch.float32)
+    batch = A.shape[:-2]
+    A_f = A.reshape(-1, n, n).to(torch.float32).contiguous()
+    op = _expm_op()
+    Y = _call(op, A_f) if flush else op(A_f)
+    return Y.reshape(*batch, n, n)
+
+
+def matrix_exp_frechet(A, G, flush=False):
+    """Adjoint Fréchet derivative ``L_exp(A^T, G)`` for ``A, G[..., n, n]`` (float32, n <= ``MAXN``) on Gaudi2 TPC."""
+    n = A.shape[-1]
+    _check(A, n)
+    batch = torch.broadcast_shapes(A.shape[:-2], G.shape[:-2])
+    if A.numel() == 0:
+        return A.new_empty(*batch, n, n, dtype=torch.float32)
+    flat = lambda x: x.expand(*batch, n, n).reshape(-1, n, n).to(torch.float32).contiguous()  # noqa: E731
+    op = _expm_frechet_op()
+    Y = _call(op, flat(A), flat(G)) if flush else op(flat(A), flat(G))
+    return Y.reshape(*batch, n, n)
+
+
+def matrix_exp_reference(A):
+    """``matrix_exp`` in plain torch, matching the TPC kernel contract. For the CPU tests."""
+    from .. import linalg
+
+    return linalg._matrix_exp_composite(A, False)
+
+
+def matrix_exp_frechet_reference(A, G):
+    """``matrix_exp_frechet`` in plain torch, matching the TPC kernel contract. For the CPU tests."""
+    from .. import linalg
+
+    return linalg._matrix_exp_frechet_torch(A, G)

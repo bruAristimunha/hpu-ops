@@ -15,6 +15,12 @@ extern const char _binary___jacobi_svd_full_f32_gaudi2_o_start[];
 extern const char _binary___jacobi_svd_full_f32_gaudi2_o_end[];
 extern const char _binary___jacobi_svdvals_f32_gaudi2_o_start[];
 extern const char _binary___jacobi_svdvals_f32_gaudi2_o_end[];
+extern const char _binary___householder_product_f32_gaudi2_o_start[];
+extern const char _binary___householder_product_f32_gaudi2_o_end[];
+extern const char _binary___matrix_exp_f32_gaudi2_o_start[];
+extern const char _binary___matrix_exp_f32_gaudi2_o_end[];
+extern const char _binary___matrix_exp_frechet_f32_gaudi2_o_start[];
+extern const char _binary___matrix_exp_frechet_f32_gaudi2_o_end[];
 }
 
 namespace {
@@ -24,7 +30,11 @@ const char* kInv = "gj_inv_f32_gaudi2";  // the same source with -DIDENTITY_B: A
 const char* kSvd = "jacobi_svd_f32_gaudi2";
 const char* kSvdFull = "jacobi_svd_full_f32_gaudi2";
 const char* kSvdvals = "jacobi_svdvals_f32_gaudi2";
+const char* kHouseholder = "householder_product_f32_gaudi2";
+const char* kExpm = "matrix_exp_f32_gaudi2";
+const char* kExpmFrechet = "matrix_exp_frechet_f32_gaudi2";
 constexpr uint64_t kMaxN = 32;      // MAXN of gj_solve and jacobi_svd
+constexpr uint64_t kMaxHH = 64;     // MAXHH of householder_product
 
 void base_pattern(tpc_lib_api::TensorAccessPattern& p)
 {
@@ -195,6 +205,118 @@ tpc_lib_api::GlueCodeReturn svd_defs(tpc_lib_api::HabanaKernelParams* in, tpc_li
                : copy_elf(out, _binary___jacobi_svd_f32_gaudi2_o_start, _binary___jacobi_svd_f32_gaudi2_o_end);
 }
 
+tpc_lib_api::GlueCodeReturn householder_defs(tpc_lib_api::HabanaKernelParams* in,
+                                             tpc_lib_api::HabanaKernelInstantiation* out)
+{
+    if (in->inputTensorNr != 2)
+    {
+        in->inputTensorNr = 2;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
+    }
+    if (in->outputTensorNr != 1)
+    {
+        in->outputTensorNr = 1;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    }
+    for (unsigned i = 0; i < 2; i++)
+    {
+        if (in->inputTensors[i].geometry.dataType != tpc_lib_api::DATA_F32)
+        {
+            return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+        }
+    }
+    const uint64_t m = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[1];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    const uint64_t k = in->inputTensors[1].geometry.maxSizes[0];
+    if (m < 1 || n < 1 || m > kMaxHH || n > m || k < 1 || k > n || batch < 1 ||
+        in->inputTensors[1].geometry.maxSizes[1] != batch)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+
+    auto& pa = out->inputTensorAccessPattern[0];
+    base_pattern(pa);
+    full_dim(pa, 0, m);
+    full_dim(pa, 1, n);
+    batch_dim(pa, 2);
+
+    auto& pt = out->inputTensorAccessPattern[1];
+    base_pattern(pt);
+    full_dim(pt, 0, k);
+    batch_dim(pt, 1);
+
+    auto& pq = out->outputTensorAccessPattern[0];
+    base_pattern(pq);
+    full_dim(pq, 0, m);
+    full_dim(pq, 1, n);
+    batch_dim(pq, 2);
+
+    return copy_elf(out, _binary___householder_product_f32_gaudi2_o_start,
+                    _binary___householder_product_f32_gaudi2_o_end);
+}
+
+tpc_lib_api::GlueCodeReturn expm_defs(tpc_lib_api::HabanaKernelParams* in,
+                                      tpc_lib_api::HabanaKernelInstantiation* out, bool frechet)
+{
+    const unsigned inputs = frechet ? 2 : 1;
+    if (in->inputTensorNr != inputs)
+    {
+        in->inputTensorNr = inputs;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
+    }
+    if (in->outputTensorNr != 1)
+    {
+        in->outputTensorNr = 1;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    }
+    for (unsigned i = 0; i < inputs; i++)
+    {
+        if (in->inputTensors[i].geometry.dataType != tpc_lib_api::DATA_F32)
+        {
+            return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+        }
+    }
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    if (n < 1 || n > kMaxN || in->inputTensors[0].geometry.maxSizes[1] != n || batch < 1 ||
+        (frechet && (in->inputTensors[1].geometry.maxSizes[0] != n ||
+                     in->inputTensors[1].geometry.maxSizes[1] != n ||
+                     in->inputTensors[1].geometry.maxSizes[2] != batch)))
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+
+    auto& pa = out->inputTensorAccessPattern[0];
+    base_pattern(pa);
+    full_dim(pa, 0, n);
+    full_dim(pa, 1, n);
+    batch_dim(pa, 2);
+    if (frechet)
+    {
+        auto& pg = out->inputTensorAccessPattern[1];
+        base_pattern(pg);
+        full_dim(pg, 0, n);
+        full_dim(pg, 1, n);
+        batch_dim(pg, 2);
+    }
+    auto& py = out->outputTensorAccessPattern[0];
+    base_pattern(py);
+    full_dim(py, 0, n);
+    full_dim(py, 1, n);
+    batch_dim(py, 2);
+
+    return frechet ? copy_elf(out, _binary___matrix_exp_frechet_f32_gaudi2_o_start,
+                              _binary___matrix_exp_frechet_f32_gaudi2_o_end)
+                   : copy_elf(out, _binary___matrix_exp_f32_gaudi2_o_start, _binary___matrix_exp_f32_gaudi2_o_end);
+}
+
 }  // namespace
 
 extern "C" {
@@ -202,7 +324,7 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 5 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 8 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
@@ -210,6 +332,9 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint3
         strcpy(guids[2].name, kSvd);
         strcpy(guids[3].name, kSvdvals);
         strcpy(guids[4].name, kSvdFull);
+        strcpy(guids[5].name, kHouseholder);
+        strcpy(guids[6].name, kExpm);
+        strcpy(guids[7].name, kExpmFrechet);
     }
     if (kernelCount != nullptr)
     {
@@ -240,6 +365,18 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (strcmp(params->guid.name, kSvdvals) == 0)
     {
         return svd_defs(params, instance, true, false);
+    }
+    if (strcmp(params->guid.name, kHouseholder) == 0)
+    {
+        return householder_defs(params, instance);
+    }
+    if (strcmp(params->guid.name, kExpm) == 0)
+    {
+        return expm_defs(params, instance, false);
+    }
+    if (strcmp(params->guid.name, kExpmFrechet) == 0)
+    {
+        return expm_defs(params, instance, true);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }

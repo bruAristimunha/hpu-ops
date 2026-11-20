@@ -1353,3 +1353,315 @@ def test_lstsq_rcond_zero_vs_negative(driver, rcond, svd_hook):
         elif s_min >= 10.0 * eps:
             assert torch.isfinite(got.solution).all()
             torch.testing.assert_close(got.solution, want.solution, rtol=1e-3, atol=1e-3)
+
+
+# ---- matrix_exp & householder_product (#13)
+
+
+@pytest.fixture
+def expm_hook(monkeypatch):
+    """``linalg._MATRIX_EXP`` / ``linalg._MATRIX_EXP_FRECHET`` set to reference functions."""
+    calls = []
+
+    def fwd(A):
+        calls.append(("fwd", tuple(A.shape)))
+        return tpc.matrix_exp_reference(A)
+
+    def bwd(A, G):
+        calls.append(("bwd", tuple(A.shape)))
+        return tpc.matrix_exp_frechet_reference(A, G)
+
+    monkeypatch.setattr(linalg, "_MATRIX_EXP", fwd)
+    monkeypatch.setattr(linalg, "_MATRIX_EXP_FRECHET", bwd)
+    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
+    return calls
+
+
+@pytest.fixture
+def hh_hook(monkeypatch):
+    """``linalg._HOUSEHOLDER`` set to ``tpc.householder_product_reference``."""
+    calls = []
+
+    def hook(A, tau):
+        calls.append((tuple(A.shape), tuple(tau.shape)))
+        return tpc.householder_product_reference(A, tau)
+
+    monkeypatch.setattr(linalg, "_HOUSEHOLDER", hook)
+    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
+    return calls
+
+
+@pytest.mark.parametrize("kind", ["unit", "skew", "large", "zeros", "n1", "transposed", "expanded"])
+def test_matrix_exp_matches_torch(kind, expm_hook):
+    torch.manual_seed(0)
+    if kind == "unit":
+        A = torch.randn(2, 3, 22, 22, dtype=torch.float64) * 0.4
+    elif kind == "skew":
+        x = torch.randn(3, 22, 22, dtype=torch.float64)
+        A = 0.1 * (x - x.mT)
+    elif kind == "large":
+        A = 5.0 * torch.randn(2, 16, 16, dtype=torch.float64)
+    elif kind == "zeros":
+        A = torch.zeros(3, 22, 22, dtype=torch.float64)
+    elif kind == "n1":
+        A = torch.randn(4, 1, 1, dtype=torch.float64)
+    elif kind == "transposed":
+        A = (0.3 * torch.randn(22, 22, dtype=torch.float64)).mT
+    else:
+        base = 0.3 * torch.randn(1, 6, 6, dtype=torch.float64)
+        calls = compare(lambda x: torch.linalg.matrix_exp(x.expand(3, 6, 6)),
+                        linalg.install_matrix_exp, base, name="matrix_exp", rtol=1e-10, atol=1e-10)
+        assert calls["matrix_exp"] >= 1 and expm_hook
+        return
+    rtol = 1e-9 if kind == "large" else 1e-11
+    calls = compare(torch.linalg.matrix_exp, linalg.install_matrix_exp, A, name="matrix_exp", rtol=rtol, atol=rtol)
+    assert calls["matrix_exp"] >= 1 and expm_hook
+    compare(torch.matrix_exp, linalg.install_matrix_exp, A, name="matrix_exp", rtol=rtol, atol=rtol)
+
+
+def test_matrix_exp_float32_and_double_backward(expm_hook):
+    torch.manual_seed(0)
+    for A in (0.1 * (lambda x: x - x.mT)(torch.randn(2, 22, 22)), 5.0 * torch.randn(2, 22, 22)):
+        Ad = A.double().requires_grad_()
+        ref = torch.linalg.matrix_exp(Ad)
+        ref.sum().backward()
+        Ac = A.clone().requires_grad_()
+        want = torch.linalg.matrix_exp(Ac)
+        want.sum().backward()
+        Ag = A.clone().requires_grad_()
+        with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+            got = torch.linalg.matrix_exp(Ag)
+            got.sum().backward()
+            assert calls["matrix_exp"] >= 1
+        e_got = (got.double() - ref).abs().max() / ref.abs().max()
+        e_want = (want.double() - ref).abs().max() / ref.abs().max()
+        ge_got = (Ag.grad.double() - Ad.grad).abs().max() / Ad.grad.abs().max()
+        ge_want = (Ac.grad.double() - Ad.grad).abs().max() / Ad.grad.abs().max()
+        assert e_got <= max(1e-6, 10 * e_want)
+        assert ge_got <= max(1e-6, 10 * ge_want)
+
+    A_dbl = torch.randn(2, 5, 5, dtype=torch.float64, requires_grad=True)
+    A_big = (4.0 * torch.randn(4, 4, dtype=torch.float64)).detach().requires_grad_()
+    with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+        assert torch.autograd.gradcheck(torch.linalg.matrix_exp, (A_dbl,))
+        assert torch.autograd.gradgradcheck(torch.linalg.matrix_exp, (A_dbl,))
+        assert torch.autograd.gradgradcheck(torch.matrix_exp, (A_big,))
+        assert calls["matrix_exp"] >= 1 and expm_hook
+
+
+def test_matrix_exp_compiled_and_out_and_declines(monkeypatch, expm_hook):
+    torch.manual_seed(0)
+    A = torch.randn(2, 8, 8, dtype=torch.float64, requires_grad=True)
+    nodes = []
+    with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+        got = compiled(torch.linalg.matrix_exp, nodes, fullgraph=True)(A)
+        got.sum().backward()
+        assert calls["matrix_exp"] >= 1
+    assert "aten.linalg_matrix_exp.default" not in ops(nodes), ops(nodes)
+    want = torch.linalg.matrix_exp(A.detach())
+    torch.testing.assert_close(got.detach(), want)
+
+    # Declines: float64 warns once on hpu, oversize, empty, invalid shape raises
+    linalg._WARNED.clear()
+    takes_hpu = linalg._tpc_takes("hpu", linalg._takes("hpu", "matrix_exp"))
+    with pytest.warns(UserWarning, match="hpu-ops#16"):
+        assert takes_hpu(torch.randn(4, 4, dtype=torch.float64)) is False
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert takes_hpu(torch.randn(4, 4, dtype=torch.float64)) is False
+    assert takes_hpu(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is False
+    assert takes_hpu(torch.randn(0, 4, 4)) is False
+
+    for empty_shape in ((0, 0), (2, 0, 0), (0, 3, 3)):
+        Ae = torch.empty(empty_shape, dtype=torch.float64, requires_grad=True)
+        with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+            ge = torch.linalg.matrix_exp(Ae)
+            ge.sum().backward()
+            assert calls["matrix_exp"] == 0
+        assert ge.shape == empty_shape
+
+    with cpu_as_hpu(linalg.install_matrix_exp):
+        with pytest.raises(RuntimeError):
+            torch.linalg.matrix_exp(torch.randn(3, 4))
+        with pytest.raises(RuntimeError):
+            torch.linalg.matrix_exp(torch.randn(4))
+
+    # out= overload (both accepted and declined on cpu_as_hpu and mocked HPU backend)
+    out = torch.empty(0, dtype=torch.float64)
+    with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+        r = torch.ops.aten.linalg_matrix_exp.out(A.detach(), out=out)
+        assert r is out and calls["matrix_exp"] >= 1
+    torch.testing.assert_close(out, want)
+
+    captured = []
+    monkeypatch.setattr(linalg, "register_kernels", lambda _d, e: captured.extend(e))
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    linalg.install_matrix_exp("hpu")
+    out_be = next(fn for op, key, fn in captured if op == torch.ops.aten.linalg_matrix_exp.out and key == "{}")
+    monkeypatch.setattr(linalg, "_on_cpu", lambda op, args, kw: op(*(x.clone() for x in args), **kw))
+    out_acc = torch.empty(0, dtype=torch.float32)
+    A32 = torch.randn(2, 6, 6, dtype=torch.float32)
+    assert out_be(A32, out=out_acc) is out_acc
+    torch.testing.assert_close(out_acc, torch.linalg.matrix_exp(A32), rtol=1e-5, atol=1e-5)
+    out_dec = torch.empty(0, dtype=torch.float32)
+    A_big = torch.randn(2, tpc.MAXN + 1, tpc.MAXN + 1, dtype=torch.float32)
+    assert out_be(A_big, out=out_dec) is out_dec
+    torch.testing.assert_close(out_dec, torch.linalg.matrix_exp(A_big))
+
+
+@pytest.mark.parametrize("fmode", ["tpc", "wy"])
+@pytest.mark.parametrize("m, n, k", [
+    (1, 1, 1),
+    (4, 4, 4),
+    (6, 4, 4),
+    (22, 22, 22),
+    (22, 22, 21),
+    (22, 10, 10),
+    (22, 10, 6),
+    (64, 32, 32),
+])
+def test_householder_product_matches_torch(m, n, k, fmode, hh_hook, monkeypatch):
+    torch.manual_seed(0)
+    monkeypatch.setattr(linalg, "_HH_FORWARD", fmode)
+    A = torch.randn(2, m, n, dtype=torch.float64)
+    tau = 2.0 / (1.0 + (A.tril(-1)[..., :k] ** 2).sum(-2))
+    calls = compare(torch.linalg.householder_product, linalg.install_householder_product, A, tau,
+                    name="householder_product", rtol=1e-10, atol=1e-10)
+    assert calls["householder_product"] >= 1
+    if fmode == "tpc":
+        assert hh_hook
+    compare(torch.orgqr, linalg.install_householder_product, A, tau,
+            name="householder_product", rtol=1e-10, atol=1e-10)
+
+
+def test_householder_product_noncontig_oversize_and_arbitrary_tau(hh_hook):
+    torch.manual_seed(0)
+    # Non-contiguous A.mT and strided tau, arbitrary non-unitary tau, batched 4D
+    A = torch.randn(2, 3, 4, 6, dtype=torch.float64).mT
+    tau = (2.0 * torch.rand(2, 3, 6, dtype=torch.float64))[..., ::2]
+    compare(torch.linalg.householder_product, linalg.install_householder_product, A, tau,
+            name="householder_product", rtol=1e-9, atol=1e-9)
+
+    # m > MAXHH (68 > 64) falls through to Compact-WY cleanly
+    A_big = torch.randn(2, 68, 32, dtype=torch.float64)
+    tau_big = 2.0 / (1.0 + (A_big.tril(-1) ** 2).sum(-2))
+    compare(torch.linalg.householder_product, linalg.install_householder_product, A_big, tau_big,
+            name="householder_product", rtol=1e-10, atol=1e-10)
+
+    # Singular H_0 (tau[0] = 1/||v_0||^2) and tau[1] = 0: native returns NaN, ours stays finite and matches gradcheck!
+    A_s = torch.randn(2, 8, 5, dtype=torch.float64)
+    v0 = torch.cat([torch.ones(2, 1, dtype=torch.float64), A_s[:, 1:, 0]], -1)
+    tau_s = 2.0 / (1.0 + (A_s.tril(-1) ** 2).sum(-2))
+    tau_s[:, 0] = 1.0 / (v0 * v0).sum(-1)
+    tau_s[:, 1] = 0.0
+    A_req = A_s.clone().requires_grad_()
+    tau_req = tau_s.clone().requires_grad_()
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        assert torch.autograd.gradcheck(torch.linalg.householder_product, (A_req, tau_req))
+        assert torch.autograd.gradgradcheck(torch.linalg.householder_product, (A_req, tau_req))
+        assert calls["householder_product"] >= 1
+
+
+def test_householder_product_k0_empty_gradgrad_compiled_and_declines(monkeypatch, hh_hook):
+    torch.manual_seed(0)
+    # k = 0 accepted with zero fallbacks; forward == eye(m, n), backward == (None, None)
+    A0 = torch.randn(2, 22, 10, dtype=torch.float64, requires_grad=True)
+    tau0 = torch.empty(2, 0, dtype=torch.float64, requires_grad=True)
+    want0 = torch.linalg.householder_product(A0, tau0)
+    want0.sum().backward()
+    assert A0.grad is None and tau0.grad is None
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        got0 = torch.linalg.householder_product(A0, tau0)
+        got0.sum().backward()
+        assert calls["householder_product"] >= 1
+    torch.testing.assert_close(got0, want0)
+    assert A0.grad is None and tau0.grad is None
+    assert linalg._householder_takes("hpu")(A0.float(), tau0.float()) is True
+
+    # Double backward (k < n)
+    A = torch.randn(2, 5, 3, dtype=torch.float64, requires_grad=True)
+    t = (2.0 * torch.rand(2, 2, dtype=torch.float64)).detach().requires_grad_()
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        assert torch.autograd.gradgradcheck(torch.linalg.householder_product, (A, t))
+        assert calls["householder_product"] >= 1
+
+    # compiled(fullgraph=True)
+    nodes = []
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        got_c = compiled(torch.linalg.householder_product, nodes, fullgraph=True)(A.detach(), t.detach())
+        assert calls["householder_product"] >= 1
+    assert "aten.linalg_householder_product.default" not in ops(nodes), ops(nodes)
+    torch.testing.assert_close(got_c, torch.linalg.householder_product(A.detach(), t.detach()))
+
+    # Declines and native errors
+    A32, t32 = torch.randn(2, 8, 5), torch.rand(2, 4)
+    A64, t64 = A32.double(), t32.double()
+    linalg._WARNED.clear()
+    takes_hpu = linalg._householder_takes("hpu")
+    with pytest.warns(UserWarning, match="hpu-ops#16"):
+        assert takes_hpu(A64, t64) is False
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert takes_hpu(A64, t64) is False
+
+    for empty_a, empty_t in ((torch.empty(0, 0), torch.empty(0)),
+                             (torch.empty(5, 0), torch.empty(0)),
+                             (torch.empty(0, 5, 4), torch.empty(0, 4))):
+        with cpu_as_hpu(linalg.install_householder_product) as calls:
+            ge = torch.linalg.householder_product(empty_a, empty_t)
+            assert calls["householder_product"] == 0
+        assert torch.equal(ge, torch.linalg.householder_product(empty_a, empty_t))
+
+    with cpu_as_hpu(linalg.install_householder_product):
+        with pytest.raises(RuntimeError):
+            torch.linalg.householder_product(torch.randn(4, 6), torch.rand(4))
+        with pytest.raises(RuntimeError):
+            torch.linalg.householder_product(torch.randn(6, 4), torch.rand(5))
+        with pytest.raises(RuntimeError):
+            torch.linalg.householder_product(torch.randn(2, 6, 4), torch.rand(3, 4))
+
+    # out= backend overload (accept and decline)
+    captured = []
+    monkeypatch.setattr(linalg, "register_kernels", lambda _d, e: captured.extend(e))
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    linalg.install_householder_product("hpu")
+    hh_out = next(fn for op, key, fn in captured if op == torch.ops.aten.linalg_householder_product.out and key == "{}")
+    monkeypatch.setattr(linalg, "_on_cpu", lambda op, args, kw: op(*(x.clone() for x in args), **kw))
+    out_acc = torch.empty(0)
+    assert hh_out(A32, t32, out=out_acc) is out_acc
+    torch.testing.assert_close(out_acc, torch.linalg.householder_product(A32, t32), rtol=1e-5, atol=1e-5)
+    out_dec = torch.empty(0, dtype=torch.float64)
+    assert hh_out(A64, t64, out=out_dec) is out_dec
+    torch.testing.assert_close(out_dec, torch.linalg.householder_product(A64, t64))
+
+
+@pytest.mark.parametrize("omap", ["matrix_exp", "householder"])
+@pytest.mark.parametrize("shape", [(22, 22), (22, 10), (10, 22)])
+def test_orthogonal_matrix_exp_and_householder(omap, shape, expm_hook, hh_hook):
+    from torch.nn.utils.parametrizations import orthogonal
+
+    rows, cols = shape
+    x = torch.randn(4, cols, dtype=torch.float64)
+
+    def run():
+        torch.manual_seed(0)
+        layer = orthogonal(torch.nn.Linear(cols, rows, bias=False).double(),
+                           orthogonal_map=omap, use_trivialization=False)
+        out = layer(x)
+        out.sum().backward()
+        w = layer.weight.detach()
+        return out, w, [p.grad for p in layer.parameters()]
+
+    want_out, want_w, want_grads = run()
+    install = linalg.install_matrix_exp if omap == "matrix_exp" else linalg.install_householder_product
+    key = "matrix_exp" if omap == "matrix_exp" else "householder_product"
+    with cpu_as_hpu(install) as calls:
+        got_out, got_w, got_grads = run()
+        assert calls[key] >= 1
+    torch.testing.assert_close(got_out, want_out, rtol=1e-9, atol=1e-9)
+    torch.testing.assert_close(got_w, want_w, rtol=1e-9, atol=1e-9)
+    for g, wg in zip(got_grads, want_grads, strict=True):
+        torch.testing.assert_close(g, wg, rtol=1e-9, atol=1e-9)
+    k = min(rows, cols)
+    gram = got_w.mT @ got_w if rows >= cols else got_w @ got_w.mT
+    torch.testing.assert_close(gram, torch.eye(k, dtype=torch.float64), rtol=1e-10, atol=1e-10)

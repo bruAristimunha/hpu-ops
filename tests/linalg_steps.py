@@ -35,7 +35,7 @@ STEPS = 20
 # substrings of the bridge's fallback op names; "eigh" joins them when eigh is checked
 LINALG_OPS = ("solve_triangular", "cholesky_solve", "linalg_solve", "linalg_inv", "inverse", "linalg_det",
               "linalg_slogdet", "linalg_lu", "lu_unpack", "linalg_svd", "linalg_pinv", "linalg_lstsq",
-              "linalg_matrix_norm", "linalg_matrix_rank")
+              "linalg_matrix_norm", "linalg_matrix_rank", "linalg_matrix_exp", "linalg_householder_product")
 
 
 def sync():

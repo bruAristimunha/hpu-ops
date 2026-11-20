@@ -15,6 +15,7 @@ On Gaudi2 these composites lose to Habana's CPU fallback (one launch per op), so
 triangular solves). Without the kernel, or past ``MAXN``, the call on ``hpu`` is declined and Habana's fallback runs.
 The composites stay the path of the CPU stand-in.
 """
+import math
 import warnings
 
 import torch
@@ -36,12 +37,22 @@ _GJ = None
 # The Jacobi SVD hook ``(A, compute_uv) -> (U, S, Vh)`` for CPU tests; None means ``tpc.jacobi_svd`` /
 # ``tpc.jacobi_svdvals`` on HPU, or ``tpc.svd_reference`` on CPU when unset.
 _SVD = None
+# The Householder product hook ``(A, tau) -> Q`` for CPU tests; None means ``tpc.householder_product`` on HPU,
+# or ``tpc.householder_product_reference`` on CPU when unset.
+_HOUSEHOLDER = None
+# The matrix_exp hooks for CPU tests; None means ``tpc.matrix_exp`` / ``tpc.matrix_exp_frechet`` on HPU,
+# or Padé-13 composite on CPU when unset.
+_MATRIX_EXP = None
+_MATRIX_EXP_FRECHET = None
 
 
 def _is_fake(t):
-    from torch._subclasses.fake_tensor import FakeTensor
+    from torch._subclasses.fake_tensor import FakeTensor, is_fake
+    from torch._subclasses.functional_tensor import FunctionalTensor
 
-    return isinstance(t, FakeTensor) or torch.compiler.is_compiling()
+    if isinstance(t, FakeTensor) or is_fake(t) or torch.compiler.is_compiling():
+        return True
+    return isinstance(t, FunctionalTensor) and is_fake(t.elem)
 
 
 def _bind(op, args, kwargs):
@@ -1022,4 +1033,347 @@ def install_matrix_rank(device_type):
         entries.append((op, "Autograd{}", ag))
         if device_type != "cpu":
             entries.append((op, "{}", be))
+    return register_kernels(device_type, entries)
+
+
+# ---- matrix_exp & householder_product (#13)
+
+
+_PADE13_THETA = 5.371920351148152
+_PADE13_C = (
+    1.0,
+    0.5,
+    3.0 / 25.0,
+    11.0 / 600.0,
+    11.0 / 5520.0,
+    3.0 / 18400.0,
+    1.0 / 96600.0,
+    1.0 / 1932000.0,
+    1.0 / 48944000.0,
+    1.0 / 1585785600.0,
+    1.0 / 67395888000.0,
+    1.0 / 3953892096000.0,
+    1.0 / 355850288640000.0,
+    1.0 / 64764752532480000.0,
+)
+_EXPM_STRATEGY = "auto"  # "auto" | "tpc" | "item" | "masked8" | "masked12" | "masked16"
+
+
+def _pade13_uv(A_s):
+    n = A_s.shape[-1]
+    c = _PADE13_C
+    eye = torch.eye(n, dtype=A_s.dtype, device=A_s.device)
+    X2 = A_s @ A_s
+    X4 = X2 @ X2
+    X6 = X2 @ X4
+    W1 = c[13] * X6 + c[11] * X4 + c[9] * X2
+    W2 = c[7] * X6 + c[5] * X4 + c[3] * X2 + c[1] * eye
+    W = X6 @ W1 + W2
+    U = A_s @ W
+    Z1 = c[12] * X6 + c[10] * X4 + c[8] * X2
+    Z2 = c[6] * X6 + c[4] * X4 + c[2] * X2 + eye
+    V = X6 @ Z1 + Z2
+    return U, V
+
+
+def _matrix_exp_composite(A, use_grad):
+    if _is_fake(A) or _EXPM_STRATEGY.startswith("masked"):
+        s_max = int(_EXPM_STRATEGY[6:]) if _EXPM_STRATEGY.startswith("masked") else 16
+        norm = A.detach().abs().sum(-2).amax((-1,), keepdim=True).unsqueeze(-1)
+        s_t = torch.ceil(torch.log2(torch.clamp(norm / _PADE13_THETA, min=1.0))).clamp(0, s_max)
+        A_s = A * (2.0 ** (-s_t))
+        U, V = _pade13_uv(A_s)
+        R = SolveEx.apply(V - U, V + U, True, False)[0] if use_grad else SolveEx.compute(V - U, V + U, True, False)[0]
+        for k in range(s_max):
+            R = torch.where(s_t > k, R @ R, R)
+        return R
+    norm = float(A.detach().abs().sum(-2).amax().item())
+    s = 0 if (norm <= _PADE13_THETA or not math.isfinite(norm)) else min(math.ceil(math.log2(norm / _PADE13_THETA)), 128)
+    A_s = A if s == 0 else A * math.ldexp(1.0, -s)
+    U, V = _pade13_uv(A_s)
+    R = SolveEx.apply(V - U, V + U, True, False)[0] if use_grad else SolveEx.compute(V - U, V + U, True, False)[0]
+    for _ in range(s):
+        R = R @ R
+    return R
+
+
+def _matrix_exp_frechet_torch(A, gY):
+    """Adjoint Fréchet derivative ``L_exp(A^T, gY)`` via Padé-13 + ``SolveEx`` (supports double backward)."""
+    At = A.mT
+    if _is_fake(A) or _is_fake(gY) or _EXPM_STRATEGY.startswith("masked"):
+        s_max = int(_EXPM_STRATEGY[6:]) if _EXPM_STRATEGY.startswith("masked") else 16
+        norm = At.detach().abs().sum(-2).amax((-1,), keepdim=True).unsqueeze(-1)
+        s_t = torch.ceil(torch.log2(torch.clamp(norm / _PADE13_THETA, min=1.0))).clamp(0, s_max)
+        scale = 2.0 ** (-s_t)
+        As, Es = At * scale, gY * scale
+        s = None
+    else:
+        norm = float(At.detach().abs().sum(-2).amax().item())
+        s = 0 if (norm <= _PADE13_THETA or not math.isfinite(norm)) else min(
+            math.ceil(math.log2(norm / _PADE13_THETA)), 128)
+        scale = math.ldexp(1.0, -s)
+        As, Es = (At, gY) if s == 0 else (At * scale, gY * scale)
+    n = As.shape[-1]
+    c = _PADE13_C
+    eye = torch.eye(n, dtype=As.dtype, device=As.device)
+    X2 = As @ As
+    X4 = X2 @ X2
+    X6 = X2 @ X4
+    M2 = As @ Es + Es @ As
+    M4 = X2 @ M2 + M2 @ X2
+    M6 = X2 @ M4 + M2 @ X4
+    W1 = c[13] * X6 + c[11] * X4 + c[9] * X2
+    W2 = c[7] * X6 + c[5] * X4 + c[3] * X2 + c[1] * eye
+    W = X6 @ W1 + W2
+    LW1 = c[13] * M6 + c[11] * M4 + c[9] * M2
+    LW2 = c[7] * M6 + c[5] * M4 + c[3] * M2
+    LW = M6 @ W1 + X6 @ LW1 + LW2
+    U = As @ W
+    LU = Es @ W + As @ LW
+    Z1 = c[12] * X6 + c[10] * X4 + c[8] * X2
+    Z2 = c[6] * X6 + c[4] * X4 + c[2] * X2 + eye
+    V = X6 @ Z1 + Z2
+    LZ1 = c[12] * M6 + c[10] * M4 + c[8] * M2
+    LZ2 = c[6] * M6 + c[4] * M4 + c[2] * M2
+    LV = M6 @ Z1 + X6 @ LZ1 + LZ2
+    D = V - U
+    R = SolveEx.apply(D, V + U, True, False)[0]
+    L = SolveEx.apply(D, (LV + LU) - (LV - LU) @ R, True, False)[0]
+    if s is None:
+        for k in range(s_max):
+            active = s_t > k
+            L = torch.where(active, R @ L + L @ R, L)
+            if k + 1 < s_max:
+                R = torch.where(active, R @ R, R)
+    else:
+        for step in range(s):
+            L = R @ L + L @ R
+            if step + 1 < s:
+                R = R @ R
+    return L
+
+
+class MatrixExp(torch.autograd.Function):
+    """``aten.linalg_matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.MAXN``), with differentiable Padé-13
+    Fréchet backward for double backward and ``torch.compile``."""
+
+    @staticmethod
+    def compute(A):
+        if _is_fake(A):
+            return tpc.matrix_exp(A) if (A.device.type == "hpu" and tpc.ready()) else _matrix_exp_composite(A, False)
+        if _EXPM_STRATEGY in ("auto", "tpc"):
+            if _MATRIX_EXP is not None:
+                return _MATRIX_EXP(A.detach())
+            if A.device.type == "hpu" and tpc.ready():
+                return tpc.matrix_exp(A)
+        return _matrix_exp_composite(A, False)
+
+    @staticmethod
+    def forward(ctx, A):
+        Y = MatrixExp.compute(A)
+        ctx.save_for_backward(A)
+        return Y
+
+    @staticmethod
+    def backward(ctx, gY):
+        (A,) = ctx.saved_tensors
+        if not torch.is_grad_enabled() and not _is_fake(A) and not _is_fake(gY) and _EXPM_STRATEGY in ("auto", "tpc"):
+            if _MATRIX_EXP_FRECHET is not None:
+                return _MATRIX_EXP_FRECHET(A.detach(), gY.detach())
+            if A.device.type == "hpu" and tpc.ready():
+                return tpc.matrix_exp_frechet(A, gY)
+        return _matrix_exp_frechet_torch(A, gY)
+
+
+def install_matrix_exp(device_type):
+    """``linalg.matrix_exp`` / ``torch.matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.MAXN``).
+    Returns an undo."""
+    op = aten.linalg_matrix_exp.default
+    takes = _tpc_takes(device_type, _takes(device_type, "matrix_exp"))
+
+    def expm_ag(A):
+        if takes(A):
+            count("matrix_exp")
+            if _is_fake(A) and A.device.type != "hpu":
+                return _matrix_exp_composite(A, torch.is_grad_enabled() and A.requires_grad)
+            if _EXPM_STRATEGY in ("item", "masked8", "masked12", "masked16"):
+                return _matrix_exp_composite(A, torch.is_grad_enabled() and A.requires_grad)
+            return MatrixExp.apply(A)
+        return op._op_dk(DispatchKey.Autograd, A)
+
+    def expm_be(A):
+        if takes(A):
+            count("matrix_exp")
+            return MatrixExp.compute(A)
+        return _on_cpu(op, (A,), {})
+
+    entries = [(op, "Autograd{}", expm_ag)]
+    if device_type != "cpu":
+        entries.append((op, "{}", expm_be))
+
+    op_out = aten.linalg_matrix_exp.out
+
+    def expm_out_be(A, *, out):
+        if takes(A):
+            count("matrix_exp")
+            res = MatrixExp.compute(A)
+        elif device_type == "cpu":
+            return op_out._op_dk(DispatchKey.CompositeExplicitAutograd, A, out=out)
+        else:
+            res = _on_cpu(op_out, (A,), {"out": out})
+        out.resize_(res.shape).copy_(res)
+        return out
+
+    entries.append((op_out, "{}", expm_out_be))
+    return register_kernels(device_type, entries)
+
+
+_HH_FORWARD = "auto"  # "auto" | "tpc" | "tpc_noflush" | "wy"
+_HH_BACKWARD_INV = "auto"  # "auto" | "tpc" | "wy"
+_HH_MAX_M = None
+
+
+def _unit_triu_inv(U):
+    """Inverse of unit upper-triangular ``U[..., k, k]`` starting from 2x2 blocks."""
+    k = U.shape[-1]
+    if k <= 1:
+        return torch.ones_like(U)
+    if k == 2:
+        return torch.eye(2, dtype=U.dtype, device=U.device) - torch.triu(U, 1)
+    p = 1 << (k - 1).bit_length()
+    Ip = torch.eye(p, dtype=U.dtype, device=U.device)
+    U_pad = F.pad(torch.triu(U, 1), (0, p - k, 0, p - k)) + Ip if p > k else torch.triu(U, 1) + Ip
+    b = p >> 1
+    U2 = torch.diagonal(U_pad.unflatten(-2, (b, 2)).unflatten(-1, (b, 2)), dim1=-4, dim2=-2).movedim(-1, -3)
+    X = 2.0 * torch.eye(2, dtype=U.dtype, device=U.device) - U2
+    s = 2
+    while s < p:
+        nb = p // (2 * s)
+        blocks = torch.diagonal(
+            U_pad.unflatten(-2, (nb, 2 * s)).unflatten(-1, (nb, 2 * s)), dim1=-4, dim2=-2
+        ).movedim(-1, -3)
+        C = blocks[..., :s, s:]
+        Xa, Xd = X[..., 0::2, :, :], X[..., 1::2, :, :]
+        ur = -(Xa @ C @ Xd)
+        X = torch.cat([torch.cat([Xa, ur], -1), F.pad(Xd, (s, 0))], -2)
+        s *= 2
+    return X[..., 0, :k, :k]
+
+
+def _compact_wy_factors(A, tau):
+    m, k = A.shape[-2], tau.shape[-1]
+    Y = torch.tril(A[..., :k], -1) + torch.eye(m, k, dtype=A.dtype, device=A.device)
+    S = torch.triu(Y.mH @ Y, 1)
+    U = torch.eye(k, dtype=A.dtype, device=A.device) + tau.unsqueeze(-1) * S
+    return Y, S, U
+
+
+def _compact_wy_forward(A, tau, Ui=None):
+    m, n, k = A.shape[-2], A.shape[-1], tau.shape[-1]
+    if k == 0:
+        return torch.eye(m, n, dtype=A.dtype, device=A.device).expand_as(A).clone()
+    Y, _, U = _compact_wy_factors(A, tau)
+    if Ui is None:
+        Ui = _unit_triu_inv(U)
+    T = Ui * tau.unsqueeze(-2)
+    return torch.eye(m, n, dtype=A.dtype, device=A.device) - Y @ (T @ Y[..., :n, :].mH)
+
+
+def _run_householder_tpc(A, tau, flush=True):
+    if _HOUSEHOLDER is not None:
+        return _HOUSEHOLDER(A.detach(), tau.detach())
+    if A.device.type == "hpu":
+        return tpc.householder_product(A, tau, flush=flush)
+    return tpc.householder_product_reference(A, tau)
+
+
+class HouseholderProduct(torch.autograd.Function):
+    """``aten.linalg_householder_product`` with TPC / Compact-WY forward and exact Compact-WY backward."""
+
+    @staticmethod
+    def compute(A, tau):
+        m, n, k = A.shape[-2], A.shape[-1], tau.shape[-1]
+        if k == 0:
+            return torch.eye(m, n, dtype=A.dtype, device=A.device).expand_as(A).clone()
+        if _is_fake(A) and A.device.type != "hpu":
+            return _compact_wy_forward(A, tau)
+        tpc_ok = m <= tpc.MAXHH and (_HOUSEHOLDER is not None or (A.device.type == "hpu" and tpc.ready()))
+        if _HH_FORWARD == "wy":
+            return _compact_wy_forward(A, tau)
+        flush = _HH_FORWARD == "tpc"
+        return _run_householder_tpc(A, tau, flush=flush) if tpc_ok else _compact_wy_forward(A, tau)
+
+    @staticmethod
+    def forward(ctx, A, tau):
+        Q = HouseholderProduct.compute(A, tau)
+        ctx.save_for_backward(A, tau)
+        return Q
+
+    @staticmethod
+    def backward(ctx, gQ):
+        A, tau = ctx.saved_tensors
+        m, n, k = A.shape[-2], A.shape[-1], tau.shape[-1]
+        if k == 0 or (not ctx.needs_input_grad[0] and not ctx.needs_input_grad[1]):
+            return None, None
+        Y, S, U = _compact_wy_factors(A, tau)
+        use_tpc_inv = (_HH_BACKWARD_INV != "wy") and k <= tpc.MAXN and _use_tpc(U)
+        Ui = InvEx.apply(U, False)[0] if use_tpc_inv else _unit_triu_inv(U)
+        T = Ui * tau.unsqueeze(-2)
+        Yn = Y[..., :n, :]
+        gQYn = gQ @ Yn
+        gT = -(Y.mH @ gQYn)
+        YT = Y @ T
+        gY_n = -(gQ.mH @ YT)
+        gY_dir = -(gQYn @ T.mH) + (F.pad(gY_n, (0, 0, 0, m - n)) if m > n else gY_n)
+        W = Ui.mH @ torch.triu(gT)
+        WTt = W @ T.mH
+        g_tau = torch.diagonal(W, dim1=-2, dim2=-1) - (WTt * S).sum(-1) if ctx.needs_input_grad[1] else None
+        gA = None
+        if ctx.needs_input_grad[0]:
+            Gs = torch.triu(-(tau.unsqueeze(-1) * WTt), 1)
+            gY = gY_dir + Y @ (Gs + Gs.mH)
+            gA_k = torch.tril(gY, -1)
+            gA = F.pad(gA_k, (0, n - k)) if n > k else gA_k
+        return gA, g_tau
+
+
+def _householder_takes(device_type, max_m=None):
+    def takes(A, tau, **_out):
+        if not _takes_tensors(device_type, "householder_product", [A]):
+            return False
+        if A.dim() < 2 or A.shape[-2] < A.shape[-1]:
+            return False
+        if tau.dtype != A.dtype or tau.device != A.device or not static(*tau.shape):
+            return False
+        if tau.dim() != A.dim() - 1 or tau.shape[:-1] != A.shape[:-2] or tau.shape[-1] > A.shape[-1]:
+            return False
+        m = A.shape[-2]
+        cap = _HH_MAX_M if max_m is None else max_m
+        if cap is not None and m > cap:
+            return False
+        if device_type == "hpu" and m <= tpc.MAXHH and tau.shape[-1] > 0 and not tpc.ready():
+            return False
+        return True
+
+    return takes
+
+
+def install_householder_product(device_type):
+    """``linalg.householder_product`` / ``torch.orgqr`` via Gaudi2 TPC kernel & Compact-WY backward.
+    Returns an undo."""
+    op = aten.linalg_householder_product.default
+    takes = _householder_takes(device_type)
+    entries = _kernels(device_type, op, "householder_product", HouseholderProduct, takes)
+
+    def hh_out_be(A, tau, *, out):
+        if takes(A, tau):
+            count("householder_product")
+            res = HouseholderProduct.compute(A, tau)
+        else:
+            res = _on_cpu(aten.linalg_householder_product.out, (A, tau), {"out": out})
+        out.resize_(res.shape).copy_(res)
+        return out
+
+    if device_type != "cpu":
+        entries.append((aten.linalg_householder_product.out, "{}", hh_out_be))
     return register_kernels(device_type, entries)

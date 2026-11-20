@@ -44,3 +44,35 @@ foreach(KERNEL jacobi_svd_f32_gaudi2 jacobi_svd_full_f32_gaudi2 jacobi_svdvals_f
     set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
     target_link_libraries(linalg_tpc ${KERNEL})
 endforeach()
+
+set(HH_KERNEL householder_product_f32_gaudi2)
+add_custom_command(
+    OUTPUT ${HH_KERNEL}_x86.o
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${HH_KERNEL}.c
+    COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${HH_KERNEL}.c ${CMAKE_CURRENT_BINARY_DIR}/${HH_KERNEL}.c
+    COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 -I${TPC_INCLUDE_DIR}/ ./${HH_KERNEL}.c -c
+    COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${HH_KERNEL}.o ${HH_KERNEL}_x86.o)
+add_library(${HH_KERNEL} STATIC ${HH_KERNEL}_x86.o)
+set_target_properties(${HH_KERNEL} PROPERTIES LINKER_LANGUAGE C)
+target_link_libraries(linalg_tpc ${HH_KERNEL})
+
+# One source, two kernels: matrix_exp (A) and matrix_exp_frechet (A, G -> L_exp(A^T, G), -DFRECHET).
+# matrix_exp_frechet uses -O1: tpc-clang 14.0.5 -O2 miscompiles the __local__ array copy after matmul_nn.
+set(EXPM_SOURCE matrix_exp_f32_gaudi2)
+foreach(KERNEL matrix_exp_f32_gaudi2 matrix_exp_frechet_f32_gaudi2)
+    set(DEFINES "")
+    set(OPT "-O2")
+    if(KERNEL STREQUAL "matrix_exp_frechet_f32_gaudi2")
+        set(DEFINES -DFRECHET)
+        set(OPT "-O1")
+    endif()
+    add_custom_command(
+        OUTPUT ${KERNEL}_x86.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${EXPM_SOURCE}.c
+        COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${EXPM_SOURCE}.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
+        COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 ${OPT} ${DEFINES} -I${TPC_INCLUDE_DIR}/ ./${KERNEL}.c -c
+        COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
+    add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
+    set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
+    target_link_libraries(linalg_tpc ${KERNEL})
+endforeach()
