@@ -158,3 +158,51 @@ def test_cholesky_solve_inference_mode_matches_torch():
     # The CPU stand-in never registers the `{}` key; the backend kernel is checked on Gaudi in Task 7.
     assert not calls, dict(calls)
     torch.testing.assert_close(got, want)
+
+
+# ---- pivoted LU
+
+
+@pytest.mark.parametrize("batch", [(), (4,)])
+@pytest.mark.parametrize("n", [1, 3, 22])
+def test_lu_matches_lu_factor(n, batch):
+    torch.manual_seed(0)
+    A = torch.randn(*batch, n, n, dtype=torch.float64)  # no dominant diagonal: the pivots move
+    LU, pivots = linalg.lu(A)
+    want_LU, want_pivots = torch.linalg.lu_factor(A)
+    torch.testing.assert_close(LU, want_LU)
+    assert pivots.dtype == torch.int32
+    assert torch.equal(pivots, want_pivots)
+
+
+@pytest.mark.parametrize("batch", [(), (4,)])
+@pytest.mark.parametrize("n", [1, 3, 22])
+def test_perm_reorders_rows_to_LU(n, batch):
+    torch.manual_seed(0)
+    A = torch.randn(*batch, n, n, dtype=torch.float64)
+    LU, pivots = torch.linalg.lu_factor(A)
+    _, L, U = torch.lu_unpack(LU, pivots)
+    perm = linalg.pivots_to_perm(pivots)
+    assert perm.dtype == torch.int64
+    torch.testing.assert_close(A.gather(-2, perm[..., None].expand_as(A)), L @ U)
+
+
+@pytest.mark.parametrize("n", [1, 3, 22])
+def test_lu_solve_left_and_right(n):
+    torch.manual_seed(0)
+    A = torch.randn(4, n, n, dtype=torch.float64)
+    B = torch.randn(4, n, 5, dtype=torch.float64)
+    torch.testing.assert_close(linalg.lu_solve(*linalg.lu(A), B), torch.linalg.solve(A, B))
+    C = torch.randn(4, 5, n, dtype=torch.float64)
+    torch.testing.assert_close(linalg.lu_solve(*linalg.lu(A), C, left=False), torch.linalg.solve(A, C, left=False))
+
+
+def test_lu_singular_has_no_nan():
+    torch.manual_seed(0)
+    A = torch.randn(3, 4, 4, dtype=torch.float64)
+    A[1, :, 1] = 0
+    LU, _ = linalg.lu(A)
+    assert torch.isfinite(LU).all()
+    info = linalg.lu_info(LU)
+    assert info.dtype == torch.int32
+    assert torch.equal(info, torch.linalg.lu_factor_ex(A).info)

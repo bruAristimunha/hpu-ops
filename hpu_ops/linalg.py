@@ -190,3 +190,60 @@ def install_cholesky_solve(device_type):
     # The other two entries are dropped: the helper is the backend key of the same op, so each key gets one kernel.
     backend = _kernels(device_type, aten._cholesky_solve_helper.default, "cholesky_solve", CholeskySolve, takes)[1]
     return register_kernels(device_type, [autograd, backend])
+
+
+def lu(A):
+    """``(LU, pivots)`` of ``A`` as ``torch.linalg.lu_factor`` returns them: L (unit diagonal) and U packed in one
+    matrix, ``pivots`` int32 and 1-based. Partial pivoting, right-looking, ``n`` steps; every step works on full-size
+    tensors under masks, so each step has one shape and no step indexes by a boolean mask. A zero pivot divides by 1,
+    so singular input gives finite factors."""
+    n = A.shape[-1]
+    rows = torch.arange(n, device=A.device)
+    LU, piv = A, []
+    for k in range(n):
+        col = LU[..., :, k].abs().masked_fill(rows < k, -1.0)  # rows above k never pivot
+        p = col.argmax(-1)  # [...]
+        swap = torch.where(rows == k, p[..., None], torch.where(rows == p[..., None], k, rows))
+        LU = LU.gather(-2, swap[..., None].expand_as(LU))
+        pivot = LU[..., k:k + 1, k:k + 1]
+        l = torch.where((rows > k)[:, None], LU[..., :, k:k + 1] / torch.where(pivot == 0, 1.0, pivot), 0.0)
+        LU = LU - l * torch.where((rows > k)[None, :], LU[..., k:k + 1, :], 0.0)
+        LU = torch.where(((rows > k)[:, None]) & (rows == k)[None, :], l, LU)
+        piv.append(p)
+    return LU, (torch.stack(piv, -1) + 1).to(torch.int32)
+
+
+def pivots_to_perm(pivots):
+    """The row permutation ``perm`` (int64, ``[..., n]``) of ``lu``'s pivots, with ``A.gather(-2, perm[..., None]
+    .expand_as(A)) == L @ U``: the swaps replayed in order on ``arange(n)``."""
+    n = pivots.shape[-1]
+    rows = torch.arange(n, device=pivots.device)
+    perm = rows.expand(pivots.shape)
+    for k in range(n):
+        p = (pivots[..., k] - 1).long()
+        swap = torch.where(rows == k, p[..., None], torch.where(rows == p[..., None], k, rows))
+        perm = perm.gather(-1, swap)
+    return perm
+
+
+def lu_info(LU):
+    """LAPACK's ``info`` (int32, ``[...]``): 1 + the index of the first zero on the diagonal of U, else 0."""
+    zero = torch.diagonal(LU, dim1=-2, dim2=-1) == 0
+    return torch.where(zero.any(-1), zero.int().argmax(-1) + 1, 0).to(torch.int32)
+
+
+def lu_solve(LU, pivots, B, left=True):
+    """``A^-1 B`` (``B A^-1`` if not ``left``) from ``lu``'s factors: two matmuls with the explicit triangular
+    inverses, and a gather for the permutation."""
+    perm = pivots_to_perm(pivots)
+    Li = tri_inverse(LU, False, unitriangular=True)
+    Ui = tri_inverse(LU, True)
+    if left:
+        shape = torch.broadcast_shapes(B.shape[:-2], perm.shape[:-1])
+        index = perm.expand(*shape, perm.shape[-1])[..., None].expand(*shape, *B.shape[-2:])
+        return Ui @ (Li @ B.expand(*shape, *B.shape[-2:]).gather(-2, index))
+    Y = B @ Ui @ Li
+    inverse = perm.argsort(-1)
+    shape = torch.broadcast_shapes(Y.shape[:-2], inverse.shape[:-1])
+    index = inverse.expand(*shape, inverse.shape[-1])[..., None, :].expand(*shape, *Y.shape[-2:])
+    return Y.expand(*shape, *Y.shape[-2:]).gather(-1, index)
