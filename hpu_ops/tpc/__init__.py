@@ -13,6 +13,10 @@
   flipped triangle). The other triangle (and the diagonal for ``_unit``) is never read. Substitution is backward
   stable, so it keeps CPU float32's accuracy on ill-conditioned triangles, which pivoted Gauss-Jordan does not.
 
+Both work in the normal float32 range: the card flushes subnormal inputs and results to zero (a subnormal entry
+counts as zero, so an all-subnormal matrix is singular on the card), while a pivot or diagonal up to the float32
+maximum is right (values >= 2^64 are scaled by 2^-64 before the reciprocal, which then never becomes subnormal).
+
 ``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
 n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Batch 32, n = 22,
 lazy: 0.54 / 1.0 ms per call in two processes against 2.4 / 2.7 for Habana's CPU fallback

@@ -95,8 +95,12 @@ void main(tensor A, tensor B, tensor X)
             float64 acc = v_f32_sub_b(row_b, sum);
 #ifndef UNIT_DIAG
             float64 diag = lane_bcast(row_a, i);
-            float64 inv = lut_free_recip(diag);
-            acc = v_f32_mul_b(acc, inv);
+            // |diag| >= 2^64: scale diag and acc by 2^-64 (exact) so recip(diag) is never subnormal, which the
+            // card flushes to zero; acc * 2^-64 underflows only when the result itself is subnormal
+            float64 scale = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(diag), 0x7FFFFFFFu), 0x5F800000u,
+                                                0x1p-64f, 1.0f);
+            float64 inv = lut_free_recip(v_f32_mul_b(diag, scale));
+            acc = v_f32_mul_b(v_f32_mul_b(acc, scale), inv);
 #endif
             x[i] = acc;
             if (m < 64)

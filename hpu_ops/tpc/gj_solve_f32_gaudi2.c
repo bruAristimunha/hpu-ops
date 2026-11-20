@@ -157,9 +157,13 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
             sv = v_f32_sel_eq_u32_b(p, (unsigned)k, sv, v_f32_sub_b(0.0f, sv));
             infov = v_f32_sel_eq_f32_b(pk, 0.0f, v_f32_sel_eq_f32_b(infov, 0.0f, (float)(k + 1), infov), infov);
             // a zero pivot gives a zero pivot row: its elimination is a no-op, as in LAPACK
-            float64 inv = lut_free_recip(pk);
-            ak = v_f32_mul_b(ap, inv);
-            bk = v_f32_mul_b(bp, inv);
+            // |pivot| >= 2^64: scale the pivot row by 2^-64 (exact) so recip(pivot) is never subnormal, which the
+            // card flushes to zero; a row entry underflows only when its quotient is subnormal itself
+            float64 scale = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(pk), 0x7FFFFFFFu), 0x5F800000u,
+                                                0x1p-64f, 1.0f);
+            float64 inv = lut_free_recip(v_f32_mul_b(pk, scale));
+            ak = v_f32_mul_b(v_f32_mul_b(ap, scale), inv);
+            bk = v_f32_mul_b(v_f32_mul_b(bp, scale), inv);
             a[k] = ak;
             b[k] = bk;
             for (int i = 0; i < n; i++)
