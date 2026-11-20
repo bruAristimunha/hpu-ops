@@ -247,3 +247,53 @@ def lu_solve(LU, pivots, B, left=True):
     shape = torch.broadcast_shapes(Y.shape[:-2], inverse.shape[:-1])
     index = inverse.expand(*shape, inverse.shape[-1])[..., None, :].expand(*shape, *Y.shape[-2:])
     return Y.expand(*shape, *Y.shape[-2:]).gather(-1, index)
+
+
+def _is_vector_rhs(A, B):
+    """torch's rule: ``B`` is one vector, or a batch of vectors shaped like ``A``'s rows."""
+    return B.dim() == 1 or (B.dim() == A.dim() - 1 and B.shape == A.shape[:-1])
+
+
+class SolveEx(torch.autograd.Function):
+    """``linalg._linalg_solve_ex`` from the masked LU, with torch's backward (``linalg_solve_backward``) over the
+    composite. ``LU``, ``pivots`` and ``info`` are not differentiable."""
+
+    @staticmethod
+    def compute(A, B, left, check_errors):
+        vector = _is_vector_rhs(A, B)
+        if vector and not left:
+            raise RuntimeError("linalg.solve: Vector broadcasting of the left hand side is not supported for left=False. "
+                               "In this case linalg.solve is equivalent to B / A.squeeze(-1)")
+        LU, pivots = lu(A)
+        info = lu_info(LU)
+        if check_errors:
+            torch.ops.aten._linalg_check_errors(info, "linalg.solve", is_matrix=A.dim() == 2)
+        result = lu_solve(LU, pivots, B.unsqueeze(-1) if vector else B, left)
+        return (result.squeeze(-1) if vector else result), LU, pivots, info
+
+    @staticmethod
+    def forward(ctx, A, B, left, check_errors):
+        X, LU, pivots, info = SolveEx.compute(A, B, left, check_errors)
+        ctx.save_for_backward(A, X)
+        ctx.left = left
+        ctx.vector = _is_vector_rhs(A, B)
+        ctx.B_shape = B.shape
+        ctx.mark_non_differentiable(LU, pivots, info)
+        return X, LU, pivots, info
+
+    @staticmethod
+    def backward(ctx, grad, *_):
+        A, X = ctx.saved_tensors
+        gB = SolveEx.compute(A.mH, grad, ctx.left, False)[0]
+        gA = None
+        if ctx.needs_input_grad[0]:
+            g, x = (gB.unsqueeze(-1), X.unsqueeze(-1)) if ctx.vector else (gB, X)
+            gA = (-(g @ x.mH) if ctx.left else -(x.mH @ g)).sum_to_size(A.shape)
+        return gA, gB.sum_to_size(ctx.B_shape), None, None
+
+
+def install_solve(device_type):
+    """``linalg.solve`` (``_linalg_solve_ex``) on ``device_type`` as the masked LU and two triangular matmuls. Returns
+    an undo."""
+    op = aten._linalg_solve_ex.default
+    return register_kernels(device_type, _kernels(device_type, op, "solve", SolveEx, _takes(device_type, "solve")))

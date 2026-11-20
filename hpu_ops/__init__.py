@@ -51,6 +51,7 @@ BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_grou
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
          composite.install_roll, linalg.install_solve_triangular, linalg.install_cholesky_solve,
+         linalg.install_solve,
          serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "

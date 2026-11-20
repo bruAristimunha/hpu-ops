@@ -1,5 +1,6 @@
 """The linalg composites checked on the CPU standing in for HPU: outputs and gradients against torch's own, and what
 compiled graphs contain."""
+import re
 import warnings
 
 import pytest
@@ -211,3 +212,88 @@ def test_lu_singular_has_no_nan():
     info = linalg.lu_info(LU)
     assert info.dtype == torch.int32
     assert torch.equal(info, torch.linalg.lu_factor_ex(A).info)
+
+
+# ---- solve
+
+SOLVE_CASES = {
+    "vector": lambda: (general(n=N), torch.randn(N, dtype=torch.float64)),
+    "batched_vector": lambda: (general(4, n=N), torch.randn(4, N, dtype=torch.float64)),
+    "batched_matrix": lambda: (general(4, n=N), torch.randn(4, N, 3, dtype=torch.float64)),
+    "right": lambda: (general(4, n=N), torch.randn(4, 3, N, dtype=torch.float64)),
+    "broadcast": lambda: (general(3, n=N), torch.randn(2, 1, N, 2, dtype=torch.float64)),
+    "transposed": lambda: (general(n=N).mT, torch.randn(N, 4, dtype=torch.float64)),
+    "expanded": lambda: (general(5, n=N), torch.randn(1, N, 4, dtype=torch.float64)),  # expanded to 5 inside f
+}
+
+
+@pytest.mark.parametrize("case", list(SOLVE_CASES))
+def test_solve_matches_torch(case):
+    torch.manual_seed(0)
+    A, B = SOLVE_CASES[case]()
+
+    def f(a, b):
+        if case == "expanded":
+            b = b.expand(5, *b.shape[1:])  # stride 0 in the kernel; the gradient flows back through the expand
+        return torch.linalg.solve(a, b, left=case != "right")
+
+    compare(f, linalg.install_solve, A, B, name="solve")
+
+
+def test_solve_float32():
+    torch.manual_seed(0)
+    A, B = general(4, n=N, dtype=torch.float32), torch.randn(4, N, 3)
+    compare(torch.linalg.solve, linalg.install_solve, A, B, name="solve", rtol=1e-4, atol=1e-4)
+
+
+def test_solve_ex_factors_rebuild_A_and_info_matches():
+    torch.manual_seed(0)
+    A, B = general(3, n=5), torch.randn(3, 5, 2, dtype=torch.float64)
+    op = torch.ops.aten._linalg_solve_ex
+    want = op(A, B)
+    with cpu_as_hpu(linalg.install_solve):
+        got = op(A, B)
+    torch.testing.assert_close(got[0], want[0])
+    assert torch.equal(got[3], want[3])
+    # Native CPU packs the factors of A^T for a row-major A; ours are lu_factor's, and must rebuild A.
+    P, L, U = torch.lu_unpack(got[1], got[2])
+    torch.testing.assert_close(P @ L @ U, A)
+
+
+def test_cayley_orthogonal_trains_through_the_composite():
+    from torch.nn.utils.parametrizations import orthogonal
+
+    x = torch.randn(32, N, dtype=torch.float64)
+
+    def run():
+        torch.manual_seed(0)
+        layer = orthogonal(torch.nn.Linear(N, N, bias=False).double(), orthogonal_map="cayley")
+        layer(x).sum().backward()
+        return {k: p.grad for k, p in layer.named_parameters()}
+
+    want = run()
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        got = run()
+        assert calls["solve"] >= 1, dict(calls)
+    torch.testing.assert_close(got, want)
+
+
+def test_solve_singular_raises_like_torch():
+    A = torch.zeros(4, 4, dtype=torch.float64)
+    B = torch.ones(4, 2, dtype=torch.float64)
+    with pytest.raises(RuntimeError) as native:
+        torch.linalg.solve(A, B)
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
+            torch.linalg.solve(A, B)
+        assert calls["solve"] >= 1, dict(calls)
+
+
+def test_solve_compiled_has_no_native_op():
+    torch.manual_seed(0)
+    A, B = general(3, n=N), torch.randn(3, N, 4, dtype=torch.float64)
+    nodes = []
+    with cpu_as_hpu(linalg.install_solve):
+        got = compiled(torch.linalg.solve, nodes)(A, B)
+    torch.testing.assert_close(got, torch.linalg.solve(A, B))
+    assert "aten._linalg_solve_ex.default" not in ops(nodes), ops(nodes)
