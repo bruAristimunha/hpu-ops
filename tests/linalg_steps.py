@@ -1,9 +1,10 @@
 """On a Gaudi card: one train step (forward, backward, Adam) of the SPD models that use the linalg composites.
-    PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_steps.py [--baseline]
+    PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_steps.py [--baseline] [--with-eigh]
 SPDNet, TSMNet, TensorCSPNet, EEGSPDNet and GBWAtt on a real batch of 32 at BNCI2014_001's width (22 channels):
 five warm-up steps, then the mean ms of 20 steps and the CPU-fallback ops per step (bridge ``cpu_fallback`` metric).
 A model fails when its step errors or when one of the ops of the linalg composites falls back: solve_triangular,
-cholesky_solve, solve, inv, det, slogdet, eigh and eigvalsh. One ``RESULT {json}`` line per model; the last line
+cholesky_solve, solve, inv, det and slogdet, and with ``--with-eigh`` (which installs the opt-in
+hpu_ops.eigh.install_eigh) eigh too. One ``RESULT {json}`` line per model; the last line
 counts them; exits 1 if any model failed. ``--baseline`` skips ``hpu_ops.enable()`` to time the stock stack: those
 fallbacks are then recorded and do not fail a model. Needs the spd_diag package (``spd_diag.protocol``,
 ``spd_diag.cache``, ``spd_diag.models``)."""
@@ -29,8 +30,8 @@ MODEL_NAMES = ("SPDNet", "TSMNet", "TensorCSPNet", "EEGSPDNet", "GBWAtt")
 BATCH = 32
 WARMUP = 5
 STEPS = 20
-LINALG_OPS = ("solve_triangular", "cholesky_solve", "linalg_solve", "linalg_inv", "inverse", "linalg_det",
-              "linalg_slogdet", "eigh", "linalg_lu", "lu_unpack")  # substrings of the bridge's fallback op names
+LINALG_OPS = ["solve_triangular", "cholesky_solve", "linalg_solve", "linalg_inv", "inverse", "linalg_det",
+              "linalg_slogdet", "linalg_lu", "lu_unpack"]  # plus "eigh" with eigh checked  # substrings of the bridge's fallback op names
 
 
 def sync():
@@ -113,11 +114,18 @@ def run_model(name, P, info, X, y, baseline):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--baseline", action="store_true", help="skip hpu_ops.enable()")
-    baseline = parser.parse_args().baseline
+    parser.add_argument("--with-eigh", action="store_true",
+                        help="install hpu_ops.eigh.install_eigh and fail a model whose step makes eigh fall back")
+    args = parser.parse_args()
+    baseline = args.baseline
     import hpu_ops
     complex_state = "skipped (baseline)"
     if not baseline:
         hpu_ops.enable()
+        if args.with_eigh and hpu_ops.eigh.install_eigh not in hpu_ops.FIXES:
+            hpu_ops.eigh.install_eigh("hpu")
+        if args.with_eigh or hpu_ops.eigh.install_eigh in hpu_ops.FIXES:
+            LINALG_OPS.append("eigh")
         try:
             import hpu_complex
             hpu_complex.enable()
