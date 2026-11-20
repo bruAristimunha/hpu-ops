@@ -455,12 +455,14 @@ class InvEx(torch.autograd.Function):
 class Det(torch.autograd.Function):
     """``aten._linalg_det`` as the signed product of U's diagonal, with torch's backward (``g det A^-H``), the inverse
     recomputed from A, so double backward works. A singular matrix has det 0 and a non-finite gradient. ``LU`` and
-    ``pivots`` are not differentiable; they are those of A (native's CPU kernel returns those of A^T)."""
+    ``pivots`` are not differentiable; they are those of A (native's CPU kernel returns those of A^T). Through the TPC
+    kernel D and S come from the identity kernel (``_gj_inv``) with X discarded: a view of the input (``A[..., :1]``)
+    as the right-hand side breaks lazy mode on Gaudi2."""
 
     @staticmethod
     def compute(A):
         if _use_tpc(A):
-            _, D, S = _gj(A, A[..., :, :1])
+            _, D, S = _gj_inv(A)
             return S[..., 0] * D.prod(-1), *_unused_factors(A)
         LU, pivots = lu(A)
         diag = torch.diagonal(LU, dim1=-2, dim2=-1)
@@ -487,7 +489,7 @@ class Slogdet(torch.autograd.Function):
     @staticmethod
     def compute(A):
         if _use_tpc(A):
-            _, D, S = _gj(A, A[..., :, :1])
+            _, D, S = _gj_inv(A)
             return (S[..., 0] * D.sign().prod(-1), D.abs().log().sum(-1), *_unused_factors(A))
         LU, pivots = lu(A)
         diag = torch.diagonal(LU, dim1=-2, dim2=-1)
