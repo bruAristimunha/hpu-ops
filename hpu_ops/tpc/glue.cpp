@@ -1,0 +1,152 @@
+// Glue for the batched linalg TPC kernel (Gaudi2). One index-space member per matrix (batch on dim 0).
+#include <cstring>
+
+#include "gc_interface.h"
+#include "tpc_kernel_lib_interface.h"
+
+extern "C" {
+extern const char _binary___gj_solve_f32_gaudi2_o_start[];
+extern const char _binary___gj_solve_f32_gaudi2_o_end[];
+}
+
+namespace {
+
+const char* kSolve = "gj_solve_f32_gaudi2";
+constexpr uint64_t kMaxN = 32;      // MAXN of gj_solve
+
+void base_pattern(tpc_lib_api::TensorAccessPattern& p)
+{
+    for (int d = 0; d < 5; d++)
+    {
+        p.mapping[d].indexSpaceDim = 0;
+        p.mapping[d].a = 0;
+        p.mapping[d].start_b = 0;
+        p.mapping[d].end_b = 0;
+    }
+}
+
+void full_dim(tpc_lib_api::TensorAccessPattern& p, int d, uint64_t size)
+{
+    p.mapping[d].indexSpaceDim = 0;
+    p.mapping[d].allRequired = true;
+    p.mapping[d].a = 0;
+    p.mapping[d].start_b = 0;
+    p.mapping[d].end_b = size - 1;
+}
+
+void batch_dim(tpc_lib_api::TensorAccessPattern& p, int d)
+{
+    p.mapping[d].indexSpaceDim = 0;
+    p.mapping[d].allRequired = true;
+    p.mapping[d].a = 1;
+    p.mapping[d].start_b = 0;
+    p.mapping[d].end_b = 0;
+}
+
+tpc_lib_api::GlueCodeReturn copy_elf(tpc_lib_api::HabanaKernelInstantiation* out, const char* start, const char* end)
+{
+    const unsigned isa = static_cast<unsigned>(end - start);
+    if (out->kernel.elfSize < isa)
+    {
+        out->kernel.elfSize = isa;
+        return tpc_lib_api::GLUE_INSUFFICIENT_ELF_BUFFER;
+    }
+    out->kernel.elfSize = isa;
+    memcpy(out->kernel.kernelElf, start, isa);
+    return tpc_lib_api::GLUE_SUCCESS;
+}
+
+tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out)
+{
+    if (in->inputTensorNr != 2)
+    {
+        in->inputTensorNr = 2;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
+    }
+    if (in->outputTensorNr != 3)
+    {
+        in->outputTensorNr = 3;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    }
+    for (unsigned i = 0; i < 2; i++)
+    {
+        if (in->inputTensors[i].geometry.dataType != tpc_lib_api::DATA_F32)
+        {
+            return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+        }
+    }
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t m = in->inputTensors[1].geometry.maxSizes[0];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    if (n > kMaxN || m > kMaxN || in->inputTensors[0].geometry.maxSizes[1] != n ||
+        in->inputTensors[1].geometry.maxSizes[1] != n)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;  // (preferredSplitDim - 1) = index-space dim 0
+
+    auto& pa = out->inputTensorAccessPattern[0];
+    base_pattern(pa);
+    full_dim(pa, 0, n);
+    full_dim(pa, 1, n);
+    batch_dim(pa, 2);
+    auto& pb = out->inputTensorAccessPattern[1];
+    base_pattern(pb);
+    full_dim(pb, 0, m);
+    full_dim(pb, 1, n);
+    batch_dim(pb, 2);
+    auto& px = out->outputTensorAccessPattern[0];
+    base_pattern(px);
+    full_dim(px, 0, m);
+    full_dim(px, 1, n);
+    batch_dim(px, 2);
+    auto& pd = out->outputTensorAccessPattern[1];
+    base_pattern(pd);
+    full_dim(pd, 0, n);
+    batch_dim(pd, 1);
+    auto& ps = out->outputTensorAccessPattern[2];
+    base_pattern(ps);
+    full_dim(ps, 0, 1);
+    batch_dim(ps, 1);
+
+    return copy_elf(out, _binary___gj_solve_f32_gaudi2_o_start, _binary___gj_solve_f32_gaudi2_o_end);
+}
+
+}  // namespace
+
+extern "C" {
+
+tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
+                                           tpc_lib_api::GuidInfo* guids)
+{
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 1 : 0;
+    if (guids != nullptr && count)
+    {
+        strcpy(guids[0].name, kSolve);
+    }
+    if (kernelCount != nullptr)
+    {
+        *kernelCount = count;
+    }
+    return tpc_lib_api::GLUE_SUCCESS;
+}
+
+tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams* params,
+                                                 tpc_lib_api::HabanaKernelInstantiation* instance)
+{
+    if (strcmp(params->guid.name, kSolve) == 0)
+    {
+        return solve_defs(params, instance);
+    }
+    return tpc_lib_api::GLUE_NODE_NOT_FOUND;
+}
+
+tpc_lib_api::GlueCodeReturn GetShapeInference(tpc_lib_api::DeviceId, const tpc_lib_api::ShapeInferenceParams*,
+                                              tpc_lib_api::ShapeInferenceOutput*)
+{
+    return tpc_lib_api::GLUE_SUCCESS;
+}
+
+}  // extern "C"

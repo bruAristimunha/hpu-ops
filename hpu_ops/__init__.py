@@ -23,6 +23,13 @@ at the tensor's pickling:
   no HPU kernel and ran on the CPU; float64 stays on the CPU, as Gaudi2 computes it at float32 precision
   (hpu-ops#16). Cholesky's and QR's backward use the first.
 - ``linalg.inv``, ``det`` and ``slogdet`` from the masked LU and triangular matmuls (``linalg``), as ``linalg.solve``.
+- On Gaudi2 those composites are 3-25x slower than Habana's CPU fallback (one launch per op), so ``linalg.solve``,
+  ``inv``, ``det``, ``slogdet``, ``solve_triangular`` and ``cholesky_solve`` of float32 matrices with n <= 32 run
+  through a TPC Gauss-Jordan kernel with partial pivoting (``tpc``), one matrix per index-space member. Eager, batch
+  32: n = 22 solve 0.20 ms against 4.7 ms for the fallback (23x), n = 32 0.28 ms, batch 1024 1.9 ms against 20 ms; the
+  pivots equal LAPACK's U diagonal to 6e-6, the determinant to 9e-6. Habana reads the kernel path when the first graph
+  compiles, so ``enable()`` must run before the first HPU op, else the kernel is off (one warning) and these calls
+  keep Habana's CPU fallback, as they do for n > 32.
 - ``linalg.eigh`` and ``eigvalsh`` stay on Habana's CPU fallback. ``hpu_ops.eigh.install_eigh("hpu")`` installs an
   opt-in parallel-Jacobi composite (``eigh``). It is exact but slower than the fallback on Gaudi2 (1.21.4: 760-7600 ms
   against 2.8-35 ms, batch 32, n = 16-128), and it crashes the device in lazy mode at n >= 64; a TPC kernel is planned.
@@ -46,7 +53,7 @@ import warnings
 
 import torch
 
-from . import composite, conv, eigh, linalg, serialization, upsample  # noqa: F401  (eigh: opt-in, hpu_ops.eigh)
+from . import composite, conv, eigh, linalg, serialization, tpc, upsample  # noqa: F401  (eigh: opt-in, hpu_ops.eigh)
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -85,6 +92,7 @@ def enable():
         import habana_frameworks.torch.core  # noqa: F401  (Habana's kernels first: they are never overridden)
     except ImportError:
         return
+    tpc.install_kernel_path()  # before any HPU op: Habana reads the kernel path when the first graph compiles
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"

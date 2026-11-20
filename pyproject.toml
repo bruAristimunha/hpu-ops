@@ -14,7 +14,8 @@ requires-python = ">=3.9"
 # Intel's Habana installer (a PyPI torch would shadow the fork).
 
 [tool.setuptools]
-packages = ["hpu_ops"]
+packages = ["hpu_ops", "hpu_ops.tpc"]
 
 [tool.setuptools.package-data]
 hpu_ops = ["*.txt"]
+"hpu_ops.tpc" = ["*.so", "*.c", "*.cpp", "*.sh", "CMakeLists.txt"]

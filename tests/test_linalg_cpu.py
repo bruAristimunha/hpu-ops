@@ -1,5 +1,6 @@
 """The linalg composites checked on the CPU standing in for HPU: outputs and gradients against torch's own, and what
 compiled graphs contain."""
+import os
 import re
 import warnings
 
@@ -10,7 +11,7 @@ from test_cpu import compiled, cpu_as_hpu, ops
 
 import hpu_ops
 from hpu_ops import eigh as jacobi
-from hpu_ops import linalg
+from hpu_ops import linalg, tpc
 
 
 def compare(f, install, *inputs, name, rtol=None, atol=None):
@@ -535,3 +536,183 @@ def test_eigh_degenerate_grad_matches_torch(diagonal, use):
         assert calls["eigh"] >= 1, dict(calls)
     assert torch.isfinite(got).all()
     torch.testing.assert_close(got, want)
+
+
+# ---- the TPC Gauss-Jordan kernel: the reference contract, the chunking and the wiring (the CPU stands in for the card)
+
+
+def f32(*batch, n):
+    """A well-conditioned float32 matrix: its triangles invert stably too, with or without a unit diagonal."""
+    return 0.3 * torch.randn(*batch, n, n) + 2 * torch.eye(n)
+
+
+@pytest.fixture
+def gj_hook(monkeypatch):
+    """``linalg._GJ`` set to the reference; the list collects one entry per call."""
+    calls = []
+
+    def hook(A, B):
+        calls.append(tuple(A.shape))
+        return tpc.gj_solve_reference(A, B)
+
+    monkeypatch.setattr(linalg, "_GJ", hook)
+    return calls
+
+
+@pytest.mark.parametrize("m", [1, 3, 40])
+@pytest.mark.parametrize("n", [1, 3, 22])
+def test_tpc_reference_contract(n, m):
+    torch.manual_seed(0)
+    A, B = torch.randn(4, n, n), torch.randn(4, n, m)
+    X, D, S = tpc.gj_solve_reference(A, B)
+    assert X.shape == (4, n, m) and D.shape == (4, n) and S.shape == (4, 1)
+    torch.testing.assert_close(X, torch.linalg.solve(A, B), rtol=1e-3, atol=1e-3)
+    LU = torch.linalg.lu_factor(A).LU
+    torch.testing.assert_close(D, torch.diagonal(LU, dim1=-2, dim2=-1), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(S[:, 0] * D.prod(-1), torch.linalg.det(A), rtol=1e-3, atol=1e-3)
+
+
+def test_tpc_chunks_columns(monkeypatch):
+    torch.manual_seed(0)
+    seen = []
+
+    def fake(A, B):
+        assert B.shape[-1] <= tpc.MAXN
+        seen.append(B.shape[-1])
+        return tpc.gj_solve_reference(A, B)
+
+    monkeypatch.setattr(tpc, "_op", lambda: fake)
+    A, B = f32(3, n=5), torch.randn(3, 5, 70)
+    got = tpc._chunked(A, B)
+    want = tpc.gj_solve_reference(A, B)
+    assert seen == [32, 32, 6]
+    torch.testing.assert_close(got, want)
+
+
+def test_tpc_gj_solve_flattens_batch_dims(monkeypatch):
+    torch.manual_seed(0)
+    shapes = []
+
+    def fake(A, B):
+        shapes.append((A.dim(), A.is_contiguous(), A.dtype))
+        return tpc.gj_solve_reference(A, B)
+
+    monkeypatch.setattr(tpc, "_op", lambda: fake)
+    A, B = f32(2, 3, n=4).mT, torch.randn(2, 3, 4, 2)
+    X, D, S = tpc.gj_solve(A, B)
+    assert shapes == [(3, True, torch.float32)]
+    assert X.shape == (2, 3, 4, 2) and D.shape == (2, 3, 4) and S.shape == (2, 3, 1)
+    torch.testing.assert_close(X, torch.linalg.solve(A, B), rtol=1e-3, atol=1e-3)
+
+
+def _tri_case(upper, left, unit):
+    A = f32(n=6)
+    B = torch.randn(6, 3) if left else torch.randn(3, 6)
+    return (lambda a, b: torch.linalg.solve_triangular(a, b, upper=upper, left=left, unitriangular=unit)), (A, B)
+
+
+GJ_CASES = {
+    "solve": (lambda: (lambda a, b: torch.linalg.solve(a, b), (f32(2, n=6), torch.randn(2, 6, 3))),
+              linalg.install_solve, "solve"),
+    "solve_vector": (lambda: (lambda a, b: torch.linalg.solve(a, b), (f32(2, n=6), torch.randn(2, 6))),
+                     linalg.install_solve, "solve"),
+    "solve_right": (lambda: (lambda a, b: torch.linalg.solve(a, b, left=False), (f32(2, n=6), torch.randn(2, 3, 6))),
+                    linalg.install_solve, "solve"),
+    "solve_broadcast": (lambda: (lambda a, b: torch.linalg.solve(a, b), (f32(3, n=6), torch.randn(2, 1, 6, 2))),
+                        linalg.install_solve, "solve"),
+    "inv": (lambda: (torch.linalg.inv, (f32(2, 3, n=6),)), linalg.install_inv_det, "inv"),
+    "det": (lambda: (torch.linalg.det, (f32(2, 3, n=6),)), linalg.install_inv_det, "det"),
+    "slogdet": (lambda: (torch.linalg.slogdet, (f32(2, 3, n=6),)), linalg.install_inv_det, "slogdet"),
+    "cholesky_solve_lower": (lambda: (lambda b, l: torch.cholesky_solve(b, l),
+                                      (torch.randn(2, 6, 3), torch.linalg.cholesky(spd(2, n=6, dtype=torch.float32)))),
+                             linalg.install_cholesky_solve, "cholesky_solve"),
+    "cholesky_solve_upper": (lambda: (lambda b, l: torch.cholesky_solve(b, l, upper=True),
+                                      (torch.randn(2, 6, 3),
+                                       torch.linalg.cholesky(spd(2, n=6, dtype=torch.float32)).mH)),
+                             linalg.install_cholesky_solve, "cholesky_solve"),
+}
+for _upper in (False, True):
+    for _left in (True, False):
+        for _unit in (False, True):
+            GJ_CASES[f"tri_{'upper' if _upper else 'lower'}_{'left' if _left else 'right'}_{'unit' if _unit else 'full'}"] = (
+                (lambda u=_upper, l=_left, t=_unit: _tri_case(u, l, t)), linalg.install_solve_triangular,
+                "solve_triangular")
+
+
+@pytest.mark.parametrize("case", list(GJ_CASES))
+def test_linalg_routes_through_gj(case, gj_hook):
+    torch.manual_seed(0)
+    make, install, name = GJ_CASES[case]
+    f, inputs = make()
+    compare(f, install, *inputs, name=name, rtol=2e-3, atol=2e-3)
+    assert gj_hook, "the kernel hook was not called"
+
+
+def test_gj_is_declined_past_maxn_on_hpu_and_without_the_kernel(monkeypatch):
+    A = torch.randn(2, 4, 4)
+    takes = linalg._tpc_takes("hpu", linalg._takes("hpu", "solve"))
+    monkeypatch.setattr(tpc, "available", lambda: False)
+    assert takes(A) is False
+    monkeypatch.setattr(tpc, "available", lambda: True)
+    assert takes(A) is True
+    assert takes(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is False
+    assert takes(torch.randn(tpc.MAXN, tpc.MAXN)) is True
+    cpu = linalg._tpc_takes("cpu", linalg._takes("cpu", "solve"))
+    monkeypatch.setattr(tpc, "available", lambda: False)
+    assert cpu(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is True  # the CPU stand-in keeps the composite
+
+
+def test_gj_not_used_for_float64_or_past_maxn(gj_hook):
+    torch.manual_seed(0)
+    with cpu_as_hpu(linalg.install_solve):
+        torch.linalg.solve(general(3, n=5), torch.randn(3, 5, 2, dtype=torch.float64))
+        torch.linalg.solve(f32(2, n=tpc.MAXN + 1), torch.randn(2, tpc.MAXN + 1, 2))
+    assert gj_hook == []
+
+
+def test_singular_info_from_pivots(gj_hook):
+    A = torch.zeros(3, 3)
+    with pytest.raises(RuntimeError) as native_solve:
+        torch.linalg.solve(A, torch.ones(3, 2))
+    with pytest.raises(RuntimeError) as native_inv:
+        torch.linalg.inv(A)
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        with pytest.raises(RuntimeError, match=re.escape(str(native_solve.value))):
+            torch.linalg.solve(A, torch.ones(3, 2))
+        assert calls["solve"] >= 1, dict(calls)
+    with cpu_as_hpu(linalg.install_inv_det) as calls:
+        with pytest.raises(RuntimeError, match=re.escape(str(native_inv.value))):
+            torch.linalg.inv(A)
+        assert torch.equal(torch.linalg.det(A), torch.zeros(()))
+        assert calls["inv"] >= 1 and calls["det"] >= 1, dict(calls)
+    assert len(gj_hook) >= 3
+
+
+def test_install_kernel_path(monkeypatch):
+    default = "/usr/lib/habanalabs/libtpc_kernels.so"
+    monkeypatch.setattr(tpc, "_INSTALLED", False)
+    monkeypatch.setattr(tpc, "_LATE_WARNED", False)
+    monkeypatch.setattr(tpc, "_initialized", lambda: False)
+    monkeypatch.delenv("GC_KERNEL_PATH", raising=False)
+    assert tpc.install_kernel_path() is True and tpc.available() is True
+    assert os.environ["GC_KERNEL_PATH"] == f"{tpc.LIB}:{default}"
+    assert tpc.install_kernel_path() is True
+    assert os.environ["GC_KERNEL_PATH"] == f"{tpc.LIB}:{default}"
+    monkeypatch.setenv("GC_KERNEL_PATH", "/x/other.so")
+    assert tpc.install_kernel_path() is True
+    assert os.environ["GC_KERNEL_PATH"] == f"{tpc.LIB}:/x/other.so"
+    assert tpc.install_kernel_path() is True
+    assert os.environ["GC_KERNEL_PATH"] == f"{tpc.LIB}:/x/other.so"
+
+    monkeypatch.setattr(tpc, "_INSTALLED", False)
+    monkeypatch.setattr(tpc, "_initialized", lambda: True)
+    monkeypatch.setenv("GC_KERNEL_PATH", "/x/other.so")
+    with pytest.warns(UserWarning, match="used before hpu_ops.enable") as record:
+        assert tpc.install_kernel_path() is False
+    assert tpc.available() is False and os.environ["GC_KERNEL_PATH"] == "/x/other.so"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert tpc.install_kernel_path() is False  # warned once
+    assert len(record) == 1
+    assert str(record[0].message) == ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off "
+                                      "for this process (call enable() before the first HPU op)")
