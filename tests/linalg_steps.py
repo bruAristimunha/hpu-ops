@@ -5,9 +5,11 @@ five warm-up steps, then the mean ms of 20 steps and the CPU-fallback ops per st
 A model fails when its step errors or when one of the ops of the linalg composites falls back: solve_triangular,
 cholesky_solve, solve, inv, det and slogdet, and with ``--with-eigh`` (which installs the opt-in
 hpu_ops.eigh.install_eigh) eigh too. One ``RESULT {json}`` line per model; the last line
-counts them; exits 1 if any model failed. ``--baseline`` skips ``hpu_ops.enable()`` to time the stock stack: those
-fallbacks are then recorded and do not fail a model. Needs the spd_diag package (``spd_diag.protocol``,
-``spd_diag.cache``, ``spd_diag.models``)."""
+counts them; exits 1 if any model failed. The A/B is chosen by which ``hpu_ops`` is on PYTHONPATH (this branch or
+origin/main's): spd_diag's ``_enable_device("hpu")`` runs ``hpu_ops.enable()`` and ``hpu_complex.enable()`` in
+either case, and the PLUGINS line prints ``hpu_ops.__file__`` to show which package ran. ``--baseline`` only records
+the linalg fallbacks and "runs on the CPU" warnings instead of failing a model on them. Needs the spd_diag package
+(``spd_diag.protocol``, ``spd_diag.cache``, ``spd_diag.models``)."""
 import argparse
 import json
 import os
@@ -30,8 +32,9 @@ MODEL_NAMES = ("SPDNet", "TSMNet", "TensorCSPNet", "EEGSPDNet", "GBWAtt")
 BATCH = 32
 WARMUP = 5
 STEPS = 20
-LINALG_OPS = ["solve_triangular", "cholesky_solve", "linalg_solve", "linalg_inv", "inverse", "linalg_det",
-              "linalg_slogdet", "linalg_lu", "lu_unpack"]  # plus "eigh" with eigh checked  # substrings of the bridge's fallback op names
+# substrings of the bridge's fallback op names; "eigh" joins them when eigh is checked
+LINALG_OPS = ("solve_triangular", "cholesky_solve", "linalg_solve", "linalg_inv", "inverse", "linalg_det",
+              "linalg_slogdet", "linalg_lu", "lu_unpack")
 
 
 def sync():
@@ -60,13 +63,13 @@ def resolve(name, models):
     return found[0]
 
 
-def run_model(name, P, info, X, y, baseline):
+def run_model(name, P, info, X, y, baseline, linalg_ops):
     row = {"model": name, "dataset": DATASET, "n_ch": X.shape[1], "batch": BATCH, "lazy": LAZY,
            "baseline": baseline}
     try:
         torch.manual_seed(0)
-        if not baseline:
-            from hpu_ops import linalg as ops_linalg
+        ops_linalg = sys.modules.get("hpu_ops.linalg")  # origin/main's hpu_ops has no linalg module
+        if hasattr(ops_linalg, "_WARNED"):
             ops_linalg._WARNED.clear()  # the float64 warning is once per process: let each model see it
         model = P.build(name, X.shape[1], info, None).to(HPU)
         xb = X.to(HPU)
@@ -101,7 +104,7 @@ def run_model(name, P, info, X, y, baseline):
         row["ms_per_step"] = round((time.perf_counter() - t) / STEPS * 1e3, 1)
         row["fallback_per_step"] = {k: v / STEPS for k, v in delta(f0, fb_ops()).items()}
         row["linalg_fallback_per_step"] = {k: v for k, v in row["fallback_per_step"].items()
-                                           if any(s in k for s in LINALG_OPS)}
+                                           if any(s in k for s in linalg_ops)}
         row["status"] = "fallback" if row["linalg_fallback_per_step"] or row["cpu_warnings"] else "ok"
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         row.update(status="error", error=repr(e)[:400],
@@ -113,31 +116,31 @@ def run_model(name, P, info, X, y, baseline):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--baseline", action="store_true", help="skip hpu_ops.enable()")
+    parser.add_argument("--baseline", action="store_true",
+                        help="record linalg fallbacks instead of failing on them "
+                             "(the A/B is the hpu_ops on PYTHONPATH)")
     parser.add_argument("--with-eigh", action="store_true",
                         help="install hpu_ops.eigh.install_eigh and fail a model whose step makes eigh fall back")
     args = parser.parse_args()
     baseline = args.baseline
-    import hpu_ops
-    complex_state = "skipped (baseline)"
-    if not baseline:
-        hpu_ops.enable()
-        if args.with_eigh and hpu_ops.eigh.install_eigh not in hpu_ops.FIXES:
-            hpu_ops.eigh.install_eigh("hpu")
-        if args.with_eigh or hpu_ops.eigh.install_eigh in hpu_ops.FIXES:
-            LINALG_OPS.append("eigh")
-        try:
-            import hpu_complex
-            hpu_complex.enable()
-            complex_state = "enabled " + str(getattr(hpu_complex, "__version__", "?"))
-        except ImportError:
-            complex_state = "not found"
-    print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), "hpu_complex", complex_state, "baseline",
-          baseline, "lazy", LAZY, flush=True)
+    import hpu_complex
     from spd_diag import protocol as P
     from spd_diag.cache import open_cache
     from spd_diag.models import MODELS
-    P._enable_device("hpu")
+
+    import hpu_ops
+    P._enable_device("hpu")  # hpu_ops.enable() and hpu_complex.enable(), whichever hpu_ops is on PYTHONPATH
+    eigh = getattr(hpu_ops, "eigh", None)
+    if args.with_eigh:
+        if eigh is None:
+            raise SystemExit(f"--with-eigh: {hpu_ops.__file__} has no hpu_ops.eigh")
+        if eigh.install_eigh not in hpu_ops.FIXES:
+            eigh.install_eigh("hpu")
+    eigh_checked = args.with_eigh or (eigh is not None and eigh.install_eigh in hpu_ops.FIXES)
+    linalg_ops = LINALG_OPS + ("eigh",) * eigh_checked
+    print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), hpu_ops.__file__, "hpu_complex",
+          getattr(hpu_complex, "__version__", "?"), "enabled by spd_diag; baseline (fallbacks recorded)", baseline,
+          "eigh checked", eigh_checked, "lazy", LAZY, flush=True)
     cache = open_cache(DATASET)
     info, sd = cache.info, cache.subject(cache.subjects[0], "X")
     X = torch.as_tensor(sd.X[:BATCH], dtype=torch.float32)
@@ -151,7 +154,7 @@ def main():
             emit(model=name, dataset=DATASET, lazy=LAZY, baseline=baseline, status="error", error=str(e)[:400])
             results.append(False)
             continue
-        results.append(run_model(name, P, info, X, y, baseline))
+        results.append(run_model(name, P, info, X, y, baseline, linalg_ops))
     print(f"SUMMARY {len(results)} models, {results.count(False)} failed", flush=True)
     return 0 if all(results) else 1
 

@@ -2,14 +2,15 @@
     PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_on_hpu.py [--baseline] [--with-eigh]
 Per op and n in 16, 22, 64, 128 (batch 32, float32): forward, and backward where differentiable. A case fails when
 the bridge ``cpu_fallback`` delta is not empty, when a warning says "runs on the CPU" (hpu_complex's boxed fallback
-does not move the bridge metric, so both are read), or when the error, in forward or backward, exceeds
-max(1e-3, 2 * the error of the same op in float32 on the CPU): no worse than CPU float32 by more than 2x. One float64
-case per op: every output (eigh: w and V) matches the native CPU float64 result to 1e-12, and hpu-ops#16's warning
-comes once. Two probes of Gaudi behavior: argmax
-returns the first index among ties, and int64 argsort stays on the card.
+does not move the bridge metric, so both are read), when an error or its CPU float32 bar is not finite, or when the
+relative error ``max|x - ref| / max|ref|``, in forward or backward, exceeds max(1e-6, 10 * the error of the same op in
+float32 on the CPU): no worse than 10x CPU float32. One float64 case per op: every output (eigh: w and V) matches the
+native CPU float64 result to 1e-12, and hpu-ops#16's warning comes once. Two probes of Gaudi behavior: argmax returns
+the first index among ties, and int64 argsort stays on the card.
 One ``RESULT {json}`` line per case; the last line counts them; exits 1 if any case failed.
-eigh is opt-in (not in hpu_ops.FIXES): its two cases are "expected fallback" rows, timed and never failed on the fallback,
-unless ``--with-eigh`` installs it and checks it strictly (n <= 22 in lazy mode: n = 64 caused a device critical error).
+eigh is opt-in (not in hpu_ops.FIXES): its two cases are "expected fallback" rows, timed and never failed on the
+fallback, unless ``--with-eigh`` installs it and checks it strictly (n <= 22 in lazy mode: n = 64 caused a device
+critical error).
 ``--baseline`` skips ``hpu_ops.enable()`` to time the stock stack: fallbacks are then recorded (status "fallback")
 and do not fail a case, and the float64 cases are skipped (no warning to expect)."""
 from __future__ import annotations
@@ -36,7 +37,8 @@ torch.manual_seed(0)
 SIZES = (16, 22, 64, 128)
 BATCH = 32
 F64_N = 22
-TOL32 = 1e-3
+TOL32 = 1e-6  # floor of the float32 bar
+CPU32_FACTOR = 10  # the card may be this many times worse than CPU float32
 TOL64 = 1e-12
 CPU_TEXT = "runs on the CPU"
 F64_TEXT = "hpu-ops#16"
@@ -128,16 +130,19 @@ def make_general(b, n, dtype):
 
 
 def rel_err(got, ref):
-    """``max|got - ref| / max(1, max|ref|)`` in float64; NaN counts as infinite."""
+    """``max|got - ref| / max|ref|`` in float64 (absolute when ref is all zeros); NaN counts as infinite."""
     got, ref = got.detach().cpu().double(), ref.detach().double()
     if got.shape != ref.shape:
         return math.inf
-    e = float((got - ref).abs().max() / max(1.0, float(ref.abs().max())))
+    scale = float(ref.abs().max())
+    e = float((got - ref).abs().max()) / (scale if scale > 0 else 1.0)
     return math.inf if math.isnan(e) else e
 
 
 def err_all(out, ref, ins):
-    return max(rel_err(o, r) for o, r in zip(out, ref)), []
+    if len(out) != len(ref):
+        return math.inf, [f"{len(out)} outputs, expected {len(ref)}"]
+    return max(rel_err(o, r) for o, r in zip(out, ref, strict=True)), []
 
 
 def err_slogdet(out, ref, ins):
@@ -171,7 +176,8 @@ def loss_eigh(out):
 
 def loss_qr(out):
     """Q and R are fixed only up to the signs of Q's columns, which differ between LAPACK on float64 and the card's
-    float32 QR: ``sum(Q)`` or ``sum(R)`` alone gives gradients of opposite sign. ``Q R`` and ``|R|`` do not depend on them."""
+    float32 QR: ``sum(Q)`` or ``sum(R)`` alone gives gradients of opposite sign. ``Q R`` and ``|R|`` do not depend on
+    them."""
     Q, R = out
     return (Q @ R).sum() + R.abs().sum()
 
@@ -239,7 +245,7 @@ def reference_grads(case, ref_in):
 
 
 def grad_error(xs, ref_grads):
-    return max(rel_err(x.grad, g) for x, g in zip(xs, ref_grads))
+    return max(rel_err(x.grad, g) for x, g in zip(xs, ref_grads, strict=True))
 
 
 def backward(case, cpu_in, ref_in):
@@ -257,6 +263,14 @@ def backward(case, cpu_in, ref_in):
     return grad_error(xs, ref_grads), grad_error(cpu_xs, ref_grads), rec
 
 
+def over_bar(what, err, err_cpu32):
+    """The problems of one error against its bar, max(TOL32, 10 * CPU float32's error); both must be finite."""
+    if not (math.isfinite(err) and math.isfinite(err_cpu32)):
+        return [f"{what} {err:.3g} or its CPU float32 bar {err_cpu32:.3g} is not finite"]
+    tol = max(TOL32, CPU32_FACTOR * err_cpu32)
+    return [f"{what} {err:.3g} > {tol:.3g}"] * (not err <= tol)
+
+
 def run_case(case, n):
     row = {"op": case.name, "n": n, "batch": BATCH, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE}
     hard, soft = [], []  # wrong results or errors; CPU fallbacks
@@ -270,15 +284,13 @@ def run_case(case, n):
             EIGH_FALLBACKS.append(rec["fallback"])
         row["max_rel_err"], notes = case.err(out, ref, ref_in)
         row["err_cpu32"], _ = case.err(as_tensors(case.fn(*cpu_in)), ref, ref_in)
-        tol = max(TOL32, 2 * row["err_cpu32"])
-        hard += notes + ([f"error {row['max_rel_err']:.3g} > {tol:.3g}"] if not row["max_rel_err"] <= tol else [])
+        hard += notes + over_bar("error", row["max_rel_err"], row["err_cpu32"])
         if case.scope == "all":
             soft += ["forward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
         if case.loss:
             row["grad_err"], row["grad_err_cpu32"], rec = backward(case, cpu_in, ref_in)
-            gtol = max(TOL32, 2 * row["grad_err_cpu32"])
             row["bwd_fallback"] = rec["fallback"]
-            hard += [f"gradient error {row['grad_err']:.3g} > {gtol:.3g}"] * (not row["grad_err"] <= gtol)
+            hard += over_bar("gradient error", row["grad_err"], row["grad_err_cpu32"])
             soft += ["backward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
@@ -365,7 +377,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--baseline", action="store_true", help="skip hpu_ops.enable()")
     parser.add_argument("--with-eigh", action="store_true",
-                        help="install hpu_ops.eigh.install_eigh and check eigh and eigvalsh strictly (n <= 22 in lazy mode)")
+                        help="install hpu_ops.eigh.install_eigh and check eigh and eigvalsh strictly "
+                             "(n <= 22 in lazy mode)")
     args = parser.parse_args()
     BASELINE = args.baseline
     import hpu_ops
