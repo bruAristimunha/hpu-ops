@@ -1336,6 +1336,101 @@ def test_matrix_rank_routes_through_svd(svd_hook):
     assert "aten._linalg_svd.default" not in ops(nodes), ops(nodes)
 
 
+def _tiny_singular_value_matrix():
+    """A batch with singular values (1, 1, 1, 1e-3, 1e-9): the last is below eps * max(m, n) * smax in float32."""
+    torch.manual_seed(0)
+    Q1 = torch.linalg.qr(torch.randn(3, 5, 5, dtype=torch.float64))[0]
+    Q2 = torch.linalg.qr(torch.randn(3, 5, 5, dtype=torch.float64))[0]
+    d = torch.tensor([1.0, 1.0, 1.0, 1e-3, 1e-9], dtype=torch.float64)
+    return ((Q1 * d) @ Q2.mT).float()
+
+
+ZERO_ATOL_FNS = {
+    "rank atol=0.": lambda x: torch.linalg.matrix_rank(x, atol=0.0),
+    "rank atol=-1.": lambda x: torch.linalg.matrix_rank(x, atol=-1.0),
+    "rank atol=tensor(0.)": lambda x: torch.linalg.matrix_rank(x, atol=torch.tensor(0.0)),
+    "rank atol=tensor([0., 1e-6, 0.])": lambda x: torch.linalg.matrix_rank(x, atol=torch.tensor([0.0, 1e-6, 0.0])),
+    "rank atol=1e-6": lambda x: torch.linalg.matrix_rank(x, atol=1e-6),
+}
+
+
+@pytest.mark.parametrize("fn", list(ZERO_ATOL_FNS))
+def test_matrix_rank_atol_without_rtol_keeps_default_rtol_unless_positive(fn, svd_hook):
+    """torch's get_atol_rtol: a given atol zeroes the default rtol only where atol > 0."""
+    A = _tiny_singular_value_matrix()
+    want = ZERO_ATOL_FNS[fn](A)
+    with cpu_as_hpu(linalg.install_matrix_rank) as calls:
+        got = ZERO_ATOL_FNS[fn](A)
+        assert calls["svd"] >= 1
+    assert torch.equal(got, want), (got, want)
+
+
+@pytest.mark.parametrize("atol", [0.0, torch.tensor(0.0), torch.tensor([0.0, 1e-6, 0.0])])
+def test_pinv_atol_zero_keeps_default_rtol(atol, svd_hook):
+    A = _tiny_singular_value_matrix()
+    want = torch.linalg.pinv(A, atol=atol)
+    with cpu_as_hpu(linalg.install_pinv) as calls:
+        got = torch.linalg.pinv(A, atol=atol)
+        assert calls["pinv"] >= 1
+    torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-3)
+    assert got.abs().max() < 1e4  # the 1e-9 value is dropped, not inverted
+
+
+@pytest.fixture
+def cia_backends(monkeypatch):
+    """The CompositeImplicitAutograd ops' backend kernels registered on the CPU stand-in; collects ``_on_cpu`` calls."""
+    monkeypatch.setattr(linalg, "_CIA_BACKENDS_ON_CPU", True)
+    seen = []
+    original = linalg._on_cpu
+
+    def spy(op, args, kwargs):
+        seen.append(str(op))
+        return original(op, args, kwargs)
+
+    monkeypatch.setattr(linalg, "_on_cpu", spy)
+    return seen
+
+
+INFERENCE_DECLINED = {
+    "matrix_norm fro": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, "fro")),
+    "matrix_norm 1": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, 1)),
+    "matrix_norm inf": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, float("inf"))),
+    "matrix_norm -1": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, -1)),
+    "matrix_norm 2 dtype": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, 2, dtype=torch.float64)),
+    "matrix_rank hermitian": (linalg.install_matrix_rank, lambda x: torch.linalg.matrix_rank(x, hermitian=True)),
+    "matrix_rank hermitian tol": (linalg.install_matrix_rank,
+                                  lambda x: torch.linalg.matrix_rank(x, 1e-3, hermitian=True)),
+    "matrix_rank hermitian atol": (linalg.install_matrix_rank,
+                                   lambda x: torch.linalg.matrix_rank(x, atol=torch.tensor(1e-3), hermitian=True)),
+}
+
+
+@pytest.mark.parametrize("case", list(INFERENCE_DECLINED))
+def test_declined_cia_calls_decompose_under_inference_mode(case, cia_backends, svd_hook):
+    """A declined call of a CompositeImplicitAutograd op below autograd decomposes on the device (as before hpu-ops),
+    never through hpu-ops' CPU route."""
+    install, fn = INFERENCE_DECLINED[case]
+    S = spd(2, n=5, dtype=torch.float32)
+    want = fn(S)
+    with cpu_as_hpu(install), torch.inference_mode():
+        got = fn(S)
+    assert cia_backends == [], cia_backends
+    torch.testing.assert_close(got, want)
+
+
+def test_taken_cia_calls_use_the_kernel_under_inference_mode(cia_backends, svd_hook):
+    A = torch.randn(2, 5, 4)
+    for install, fn, name in ((linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, "nuc"), "svd"),
+                              (linalg.install_svd, torch.linalg.svdvals, "svd"),
+                              (linalg.install_matrix_rank, torch.linalg.matrix_rank, "svd")):
+        want = fn(A)
+        with cpu_as_hpu(install) as calls, torch.inference_mode():
+            got = fn(A)
+            assert calls[name] >= 1
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+    assert cia_backends == []
+
+
 @pytest.mark.parametrize("shape", [(6, 4), (4, 6), (4, 4)])
 def test_tpc_svd_full_matrices_and_unsorted(monkeypatch, shape):
     torch.manual_seed(0)
@@ -2326,3 +2421,33 @@ def test_lu_solve_and_unpack_modes(perm_mode, solve_mode, left, monkeypatch, lu_
             name="lu_solve", rtol=1e-7, atol=1e-7)
     compare(lambda lu_: torch.lu_unpack(lu_, pivots), linalg.install_lu, LU, name="lu_unpack")
     assert any(c[0] == "perm" for c in lu_hook) == (perm_mode == "kernel")
+
+
+LU_OPS = ("linalg_lu_factor_ex", "linalg_lu", "linalg_lu_solve", "lu_unpack")
+
+
+@pytest.mark.parametrize("lazy, knob, installed", [
+    ("1", None, ()), (None, None, ()), ("1", "0", ()), ("1", "1", LU_OPS), ("0", "1", LU_OPS),
+    ("0", None, ("linalg_lu_factor_ex", "linalg_lu_solve", "lu_unpack"))])
+def test_lu_ops_installed_only_where_measured_faster(monkeypatch, lazy, knob, installed):
+    """Lazy-mode LU, and linalg.lu in both modes, were measured at parity or slower than Habana's fallback: on HPU they
+    are installed only with HPU_OPS_LU_SLOW=1."""
+    for name, value in (("PT_HPU_LAZY_MODE", lazy), (linalg.LU_SLOW, knob)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    def present():
+        return {op for op in LU_OPS if torch._C._dispatch_has_kernel_for_dispatch_key(f"aten::{op}", "AutogradHPU")}
+
+    assert present() == set()
+    undo = linalg.install_lu("hpu")
+    try:
+        assert present() == set(installed)
+    finally:
+        undo()
+    assert present() == set()
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    monkeypatch.delenv(linalg.LU_SLOW, raising=False)
+    assert all(linalg._lu_wanted("cpu", name) for name in ("lu", "lu_factor"))  # the CPU stand-in always installs

@@ -20,6 +20,7 @@ a substitution kernel is coming. Their code and tests stay. Without the kernel, 
 composites stay the path of the CPU stand-in.
 """
 import math
+import os
 import warnings
 
 import torch
@@ -726,6 +727,12 @@ class Svd(torch.autograd.Function):
         return gA, None, None, None
 
 
+# The backend kernels of the CompositeImplicitAutograd ops (svdvals, matrix_norm, matrix_rank) run under inference
+# mode; a call they decline goes to the op's own decomposition, never to the CPU. The CPU stand-in registers them
+# only when a test sets this (the CPU has no kernel at its backend key for these ops either).
+_CIA_BACKENDS_ON_CPU = False
+
+
 def install_svd(device_type):
     """``linalg.svd``, ``svdvals`` and ``matrix_norm(2/-2/'nuc')`` via ``aten._linalg_svd``. Returns an undo."""
     takes = _svd_takes(device_type)
@@ -762,10 +769,10 @@ def install_svd(device_type):
     def svdvals_be(A, driver=None):
         if takes(A, driver=driver):
             return svdvals_run(A)
-        return _on_cpu(svdvals_op, (A,), {"driver": driver})
+        return svdvals_op._op_dk(DispatchKey.CompositeImplicitAutograd, A, driver=driver)
 
     entries.append((svdvals_op, "Autograd{}", svdvals_ag))
-    if device_type != "cpu":
+    if device_type != "cpu" or _CIA_BACKENDS_ON_CPU:
         entries.append((svdvals_op, "{}", svdvals_be))
 
     def _norm_dims(A, dim):
@@ -803,41 +810,38 @@ def install_svd(device_type):
                     return _norm_run(A, ord_, dims[0], dims[1], keepdim)
                 return op_._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
 
-            def be(*args, **kwargs):
-                A, ord_, dim, keepdim, dtype = _bind(op_, args, kwargs)
-                dims = _norm_dims(A, dim) if dtype is None and pred_(ord_) else None
-                if dims is not None and _takes_tensors(device_type, "svd", [A]) and \
-                        A.shape[dims[0]] <= tpc.MAXN and A.shape[dims[1]] <= tpc.MAXN and \
-                        (device_type != "hpu" or tpc.ready()):
-                    return _norm_run(A, ord_, dims[0], dims[1], keepdim)
-                return _on_cpu(op_, args, kwargs)
+            return ag
 
-            return ag, be
-
-        ag_n, be_n = _make_norm(norm_op, check_ord)
-        entries.append((norm_op, "Autograd{}", ag_n))
-        if device_type != "cpu":
-            entries.append((norm_op, "{}", be_n))
+        # Autograd key only: below autograd (inference mode) torch's decomposition runs on the device and reaches
+        # svdvals' backend kernel for 2, -2 and nuc. A backend kernel here cost the other ords (fro, 1, inf) about
+        # 0.03 ms per call of Python dispatch (Gaudi2, bridge 1.21.4: 0.78-0.88x of the decomposition).
+        entries.append((norm_op, "Autograd{}", _make_norm(norm_op, check_ord)))
 
     return register_kernels(device_type, entries)
 
 
 def _pinv_tol(S, m, n, atol=None, rtol=None):
+    """``max(atol, rtol * S_max)`` with torch's ``get_atol_rtol`` defaults: a missing ``atol`` is 0; a missing ``rtol``
+    is ``eps * max(m, n)``, or 0 where ``atol > 0`` (``atol <= 0`` keeps the default)."""
     S_max = S[..., :1] if S.shape[-1] == 0 else S.amax(-1, keepdim=True)
+    default_rtol = max(m, n) * torch.finfo(S.dtype).eps
     if atol is None and rtol is None:
-        return S_max * (max(m, n) * torch.finfo(S.dtype).eps)
+        return S_max * default_rtol
     t_atol = atol.to(device=S.device, dtype=S.dtype).unsqueeze(-1) if atol is not None else S.new_zeros(())
-    t_rtol = rtol.to(device=S.device, dtype=S.dtype).unsqueeze(-1) if rtol is not None else S.new_zeros(())
+    if rtol is not None:
+        t_rtol = rtol.to(device=S.device, dtype=S.dtype).unsqueeze(-1)
+    else:
+        t_rtol = torch.where(t_atol > 0, 0.0, default_rtol).to(S.dtype)
     return torch.maximum(t_atol, t_rtol * S_max)
 
 
 def _pinv_tol_scalar(S, m, n, atol=None, rtol=None):
+    """``_pinv_tol`` for float ``atol`` / ``rtol``."""
     S_max = S[..., :1] if S.shape[-1] == 0 else S.amax(-1, keepdim=True)
-    if atol is None and rtol is None:
-        return S_max * (max(m, n) * torch.finfo(S.dtype).eps)
-    t_atol = S.new_full((), atol) if atol is not None else S.new_zeros(())
-    t_rtol = S.new_full((), rtol) if rtol is not None else S.new_zeros(())
-    return torch.maximum(t_atol, t_rtol * S_max)
+    default_rtol = max(m, n) * torch.finfo(S.dtype).eps
+    if rtol is None:
+        rtol = 0.0 if atol is not None and atol > 0 else default_rtol
+    return torch.maximum(S.new_full((), 0.0 if atol is None else atol), rtol * S_max)
 
 
 def _pinv_backward(A, P, gP):
@@ -989,7 +993,7 @@ def install_matrix_rank(device_type):
             A, tol, hermitian = _bind(op, args, kwargs)
             if not hermitian and svd_takes(A):
                 return run(A, tol)
-            return _on_cpu(op, args, kwargs)
+            return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
 
         return kernel, backend
 
@@ -1013,7 +1017,7 @@ def install_matrix_rank(device_type):
             A, tol, hermitian = _bind(op, args, kwargs)
             if takes(A, tol, hermitian):
                 return run(A, tol)
-            return _on_cpu(op, args, kwargs)
+            return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
 
         return kernel, backend
 
@@ -1039,7 +1043,7 @@ def install_matrix_rank(device_type):
             A, atol, rtol, hermitian = _bind(op, args, kwargs)
             if takes(A, atol, rtol, hermitian):
                 return run(A, atol, rtol)
-            return _on_cpu(op, args, kwargs)
+            return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
 
         return kernel, backend
 
@@ -1060,7 +1064,7 @@ def install_matrix_rank(device_type):
             A, atol, rtol, hermitian = _bind(op, args, kwargs)
             if not hermitian and svd_takes(A):
                 return run(A, atol, rtol)
-            return _on_cpu(op, args, kwargs)
+            return op._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
 
         return kernel, backend
 
@@ -1071,7 +1075,7 @@ def install_matrix_rank(device_type):
                       (aten.linalg_matrix_rank.atol_rtol_float, make_atol_rtol_float)):
         ag, be = maker(op)
         entries.append((op, "Autograd{}", ag))
-        if device_type != "cpu":
+        if device_type != "cpu" or _CIA_BACKENDS_ON_CPU:
             entries.append((op, "{}", be))
     return register_kernels(device_type, entries)
 
@@ -1624,9 +1628,26 @@ def _pivots_ok(LU, pivots):
             and tuple(pivots.shape) == tuple(LU.shape[:-1]))
 
 
+# Measured on Gaudi2 (bridge 1.21.4, TEAM_REPORT, same-process A/B): in lazy mode the LU ops are at parity with
+# Habana's CPU fallback or slower (one graph boundary per TPC launch: lu_factor_ex 0.71-0.98x, linalg.lu 0.65x), and
+# linalg.lu is at parity or slower in eager mode too (0.87x median of 5 rounds). So on HPU ``install_lu`` installs
+# only what was faster (lu_factor / lu_factor_ex, lu_solve, lu_unpack in eager mode) unless ``HPU_OPS_LU_SLOW=1``
+# asks for every LU op in both modes (no fallbacks, at that speed).
+LU_SLOW = "HPU_OPS_LU_SLOW"
+
+
+def _lu_wanted(device_type, op_name):
+    """Whether ``install_lu`` installs ``op_name`` ("lu" for ``linalg.lu``, else the factor, solve and unpack ops)."""
+    if device_type != "hpu" or os.environ.get(LU_SLOW) == "1":
+        return True
+    lazy = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
+    return not lazy and op_name != "lu"
+
+
 def install_lu(device_type):
     """``linalg.lu_factor`` / ``lu_factor_ex``, ``lu_solve``, ``lu_unpack`` and ``linalg.lu`` on ``device_type`` for
-    square float32 matrices of n <= ``tpc.MAXN``, through the TPC LU kernel. Returns an undo."""
+    square float32 matrices of n <= ``tpc.MAXN``, through the TPC LU kernel. On HPU only the ops measured faster than
+    the fallback, unless ``HPU_OPS_LU_SLOW=1`` (see ``LU_SLOW``). Returns an undo."""
     factor_base = _tpc_takes(device_type, _takes(device_type, "lu_factor"))
     lu_base = _tpc_takes(device_type, _takes(device_type, "lu"))
     solve_base = _tpc_takes(device_type, _takes(device_type, "lu_solve"))
@@ -1653,9 +1674,11 @@ def install_lu(device_type):
         return _pivots_ok(LU_data, LU_pivots) and unpack_base(LU_data)
 
     groups = [
-        _kernels(device_type, aten.linalg_lu_factor_ex.default, "lu_factor", LuFactorEx, factor_takes),
-        _kernels(device_type, aten.linalg_lu.default, "lu", LinalgLu, lu_takes),
-        _kernels(device_type, aten.linalg_lu_solve.default, "lu_solve", LuSolve, solve_takes),
-        _kernels(device_type, aten.lu_unpack.default, "lu_unpack", LuUnpack, unpack_takes),
+        _kernels(device_type, op, name, function, takes) for op, name, function, takes in (
+            (aten.linalg_lu_factor_ex.default, "lu_factor", LuFactorEx, factor_takes),
+            (aten.linalg_lu.default, "lu", LinalgLu, lu_takes),
+            (aten.linalg_lu_solve.default, "lu_solve", LuSolve, solve_takes),
+            (aten.lu_unpack.default, "lu_unpack", LuUnpack, unpack_takes),
+        ) if _lu_wanted(device_type, name)
     ]
     return register_paired(device_type, groups)
