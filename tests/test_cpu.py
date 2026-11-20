@@ -886,9 +886,13 @@ def test_index_under_no_grad_and_inference_mode():
 def test_index_compiled():
     x = torch.randn(5, 6, 6)
     want = train_step(_vech_scaled, x)
+    nodes = []
     with cpu_as_hpu(hpu_ops._install):
-        got = train_step(compiled(_vech_scaled, []), x)
+        got = train_step(compiled(_vech_scaled, nodes), x)
     assert_same(got, want, tol=0)
+    # the index rewrite does not reach a traced graph (fake index values); the mask put does
+    assert {"aten.index.Tensor", "aten.index_put.default", "aten.where.self"} <= ops(nodes)
+    assert not ops(nodes) & {"aten.index_select.default", "aten.index_add.default"}
 
 
 @pytest.mark.parametrize("make", [
@@ -919,9 +923,27 @@ def test_index_compiled_with_the_index_as_an_input():
     x, rows = torch.randn(5, 6, 6), torch.tensor([0, 5, 2])
     f = lambda x, rows: x[:, rows, rows.flip(0)]  # noqa: E731
     want = train_step(lambda x: f(x, rows), x)
+    nodes = []
     with cpu_as_hpu(indexing.install_index):
-        got = train_step(lambda x: compiled(f, [])(x, rows), x)
+        got = train_step(lambda x: compiled(f, nodes)(x, rows), x)
     assert_same(got, want, tol=0)
+    assert {"aten.index.Tensor", "aten.index_put.default"} <= ops(nodes)
+    assert not ops(nodes) & {"aten.index_select.default", "aten.index_add.default"}
+
+
+@pytest.mark.parametrize("idx", [
+    lambda: [None, torch.tensor(1)],  # one 0-d index after a slice
+    lambda: [None, torch.tensor(1), torch.tensor(-2)],  # two adjacent 0-d indices
+    lambda: [torch.tensor(2), None, torch.tensor(0)],  # 0-d indices separated by a slice
+])
+def test_index_of_0d_indices_called_directly(idx):
+    x = torch.randn(3, 4, 5, dtype=torch.float64, requires_grad=True)
+    want = torch.ops.aten.index.Tensor(x, idx())
+    with cpu_as_hpu(indexing.install_index) as calls:
+        got = torch.ops.aten.index.Tensor(x, idx())
+        torch.autograd.gradcheck(lambda x: torch.ops.aten.index.Tensor(x, idx()), (x,))
+    assert calls["index_select_flat"] >= 1
+    assert got.shape == want.shape and torch.equal(got, want)
 
 
 def test_index_double_backward():

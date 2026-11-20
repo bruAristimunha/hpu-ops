@@ -33,6 +33,9 @@ CASES = {
     "separated": (lambda x: x[torch.tensor([0, 1, 1]), :, torch.tensor([3, 0, 3])], lambda: torch.randn(4, 9, 5)),
     "device index": (lambda x: x[..., torch.tensor([0, 5, 5], device=x.device)], lambda: torch.randn(32, 6, 6)),
     "negative index": (lambda x: x[..., torch.tensor([-1, 0]), torch.tensor([2, -3])], lambda: torch.randn(32, 6, 6)),
+    "0-d, direct aten": (lambda x: torch.ops.aten.index.Tensor(x, [None, torch.tensor(1)]), lambda: torch.randn(32, 6, 6)),
+    "0-d and 1-d": (lambda x: torch.ops.aten.index.Tensor(x, [None, torch.tensor(-1), torch.tensor([0, 2])]),
+                    lambda: torch.randn(32, 6, 6)),
 }
 
 

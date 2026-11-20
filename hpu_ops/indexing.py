@@ -10,7 +10,9 @@
   slice separates them), with the linear index of the broadcast indices; its backward is ``index_add``, which is right.
   Index tensors on the CPU (spd_learn's ``triu_indices``) are checked against the sizes on the host, and an index out of
   range goes to ATen's kernel, which raises; an index tensor already on the device is wrapped for negative values but
-  not checked against the sizes (that would need a host sync).
+  not checked against the sizes (that would need a host sync). Eager and lazy mode only: while ``torch.compile`` traces,
+  the index tensors are fake, their values cannot be checked, and the traced graph keeps ATen's ``index`` and its
+  accumulating ``index_put`` backward (hpu_backend does not run the lazy-mode kernel this works around).
   Two other forms were measured right on ``vech`` and SPDResNet but not everywhere: a leading-index ``index`` of a
   permuted view (CorNet's gradient stayed 0.44 off), and rewriting the backward's ``_index_put_impl_`` through a
   permuted view (SPNN's launch failed, see the next item).
@@ -79,6 +81,8 @@ def index_select_flat(self, indices):
         lin = t if lin is None else lin * size + t
     flat = self.flatten(start, pos[-1]) if len(pos) > 1 else self
     out = flat.index_select(start, lin.reshape(-1).to(self.device))
+    if lin.dim() == 0:
+        return out.squeeze(start)  # 0-d indices (direct aten calls): the indexed dims go away
     return out.unflatten(start, lin.shape) if lin.dim() != 1 else out
 
 
