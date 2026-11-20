@@ -189,6 +189,26 @@ def test_perm_reorders_rows_to_LU(n, batch):
     torch.testing.assert_close(A.gather(-2, perm[..., None].expand_as(A)), L @ U)
 
 
+def test_pivots_to_perm_gathers_no_integer_data():
+    """Gaudi2 (bridge 1.21) cannot compile a gather or scatter whose data tensor is an integer dtype."""
+    seen = []
+
+    class Record(torch.utils._python_dispatch.TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func.overloadpacket in (torch.ops.aten.gather, torch.ops.aten.scatter):
+                seen.extend((func.overloadpacket.__name__, a.dtype) for a in args[:1] + args[3:]
+                            if isinstance(a, torch.Tensor))
+            return func(*args, **(kwargs or {}))
+
+    torch.manual_seed(0)
+    A, B = torch.randn(4, 5, 5), torch.randn(4, 5, 3)
+    with Record():
+        linalg.pivots_to_perm(linalg.lu(A)[1])
+        linalg.lu_solve(*linalg.lu(A), B)
+    assert seen  # the hook saw the gathers
+    assert not [s for s in seen if not (s[1].is_floating_point or s[1].is_complex)], seen
+
+
 @pytest.mark.parametrize("left", [True, False])
 @pytest.mark.parametrize("batches", [((4,), (4,)), ((), (4,)), ((4,), ()), ((2, 1), (3,))])
 @pytest.mark.parametrize("n", [1, 3, 22])

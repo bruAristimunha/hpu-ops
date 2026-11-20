@@ -218,12 +218,13 @@ def pivots_to_perm(pivots):
     .expand_as(A)) == L @ U``: the swaps replayed in order on ``arange(n)``."""
     n = pivots.shape[-1]
     rows = torch.arange(n, device=pivots.device)
-    perm = rows.expand(pivots.shape)
+    # int64 gather does not compile on Gaudi2 (bridge 1.21): carry perm as float32 (exact below 2**24), cast at the end
+    perm = rows.float().expand(pivots.shape)
     for k in range(n):
         p = (pivots[..., k] - 1).long()
         swap = torch.where(rows == k, p[..., None], torch.where(rows == p[..., None], k, rows))
         perm = perm.gather(-1, swap)
-    return perm
+    return perm.long()
 
 
 def lu_info(LU):
