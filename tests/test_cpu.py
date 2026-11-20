@@ -16,7 +16,7 @@ from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 
 import hpu_ops
-from hpu_ops import autocast, composite, conv, serialization, upsample
+from hpu_ops import autocast, composite, conv, index, serialization, upsample
 
 
 @contextlib.contextmanager
@@ -792,6 +792,147 @@ def test_autocast_files_hold_torchs_cuda_lists():
     assert autocast.exports() == [f"export {name}={shlex.quote(path)}" for name, path in files.items()]
 
 
+# ---- advanced indexing (aten::index.Tensor) as index_select / device-moved indexing
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_index_contiguous_triu_matches_torch_and_compiles(mode):
+    """SPDNet / sym_to_upper pattern: (32, 22, 22) indexed at trailing [..., i0, i1]."""
+    torch.manual_seed(0)
+    ix = torch.triu_indices(22, 22)
+    f = lambda x: x[..., ix[0], ix[1]]  # noqa: E731
+    x = torch.randn(32, 22, 22, dtype=torch.float64)
+    want, nodes = train_step(f, x), []
+    with cpu_as_hpu(index.install) as calls:
+        g = f if mode == "eager" else compiled(f, nodes, fullgraph=True, dynamic=True)
+        got = train_step(g, x)
+        if mode == "compiled":
+            x2 = torch.randn(5, 22, 22, dtype=torch.float64)
+            assert_same(train_step(g, x2), train_step(f, x2))
+    assert_same(got, want)
+    assert calls["index"] > 0
+    if mode == "compiled":
+        assert "aten.index_select.default" in ops(nodes)
+        assert not any("aten.index." in op for op in ops(nodes)), ops(nodes)
+
+
+@pytest.mark.parametrize("shape, make_call", [
+    ((3, 4, 5, 6), lambda: (lambda t: t[:, torch.tensor([0, 2, -1]), torch.tensor([1, -2, 3]), :])),
+    ((3, 4, 5), lambda: (lambda t: torch.ops.aten.index.Tensor(t, [None, torch.tensor(2), None]))),
+    ((4, 5), lambda: (lambda t: torch.ops.aten.index.Tensor(t, [torch.tensor(1), torch.tensor(-1)]))),
+    ((3, 4, 5), lambda: (lambda t: t[:, torch.tensor([0, -1]), torch.tensor(2)])),
+    ((3, 4, 5), lambda: (lambda t: t[:, torch.tensor([[0], [-1]]), torch.tensor([1, 2, -3])])),
+    ((3, 4, 5), lambda: (lambda t: t[:, torch.tensor([1, 1, 3, 1], dtype=torch.int32)])),
+    ((3, 4, 5), lambda: (lambda t: t[:, torch.empty(0, dtype=torch.long)])),
+    ((0, 4, 5), lambda: (lambda t: t[:, torch.tensor([0, 2])])),
+    ((3, 4, 0), lambda: (lambda t: t[:, torch.tensor([0, 2])])),
+    ((3, 0, 5), lambda: (lambda t: t[:, torch.empty(0, dtype=torch.long)])),
+    ((4, 5, 6), lambda: (lambda t: t[torch.tensor([-1, 0, 2, -1]), :, torch.tensor([1, -2, 4, 1])])),
+    ((2, 3, 4, 5), lambda: (lambda t: t[:, torch.tensor([[0, 1], [1, -1]]), :, torch.tensor([1, -3])])),
+])
+def test_index_integer_patterns_eager_and_grad(shape, make_call):
+    torch.manual_seed(0)
+    x = torch.randn(*shape, dtype=torch.float64)
+    f = make_call()
+    want = train_step(f, x)
+    with cpu_as_hpu(index.install) as calls:
+        got = train_step(f, x)
+    assert_same(got, want)
+    assert calls["index"] == 1
+
+
+def test_index_non_contiguous_self_and_compiled_non_contiguous_indices():
+    torch.manual_seed(0)
+    x = torch.randn(5, 3, 6, dtype=torch.float64).permute(1, 2, 0)
+    i0 = torch.tensor([-1, 0, 1, 0])
+    i1 = torch.tensor([2, -1, 0, 2])
+    f = lambda t: t[i0, :, i1]  # noqa: E731
+    want, nodes = train_step(f, x), []
+    with cpu_as_hpu(index.install) as calls:
+        eager = train_step(f, x)
+        got = train_step(compiled(f, nodes, fullgraph=True, dynamic=True), x)
+    assert_same(eager, want)
+    assert_same(got, want)
+    assert calls["index"] >= 2
+    assert not any("aten.index." in op for op in ops(nodes)), ops(nodes)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16, torch.float16, torch.int64, torch.bool])
+def test_index_dtypes_and_autocast(dtype):
+    torch.manual_seed(0)
+    if dtype.is_floating_point:
+        x = torch.randn(4, 5, 5, dtype=dtype)
+    elif dtype == torch.int64:
+        x = torch.arange(100, dtype=dtype).reshape(4, 5, 5)
+    else:
+        x = torch.arange(100).reshape(4, 5, 5) % 2 == 0
+    ix = torch.triu_indices(5, 5)
+    want = x[..., ix[0], ix[1]]
+    with cpu_as_hpu(index.install) as calls:
+        got = x[..., ix[0], ix[1]]
+        if dtype == torch.float32:
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                auto = x[..., ix[0], ix[1]]
+            assert auto.dtype == torch.float32 and torch.equal(auto, want)
+    assert got.dtype == want.dtype and torch.equal(got, want) and calls["index"] >= 1
+
+
+def test_index_bool_masks_and_backend_kernel():
+    torch.manual_seed(0)
+    x = torch.randn(6, 5, 5, dtype=torch.float64)
+    mask2d = torch.ones(5, 5, dtype=torch.bool).triu()
+    empty_mask = torch.zeros(5, 5, dtype=torch.bool)
+    mask1d = torch.tensor([True, False, True, False, True, False])
+    want_2d = train_step(lambda t: t[:, mask2d], x)
+    want_empty = train_step(lambda t: t[:, empty_mask], x)
+    want_1d = train_step(lambda t: t[mask1d], x)
+    with cpu_as_hpu(index.install) as calls:
+        got_2d = train_step(lambda t: t[:, mask2d], x)
+        got_empty = train_step(lambda t: t[:, empty_mask], x)
+        assert calls["index"] == 2
+        got_1d = train_step(lambda t: t[mask1d], x)
+        assert calls["index"] == 2  # same-device bool mask without leading None keeps native op
+    assert_same(got_2d, want_2d)
+    assert_same(got_empty, want_empty)
+    assert_same(got_1d, want_1d)
+
+    # Below-autograd (inference_mode) kernel and off-device classification
+    op = torch.ops.aten.index.Tensor
+    backend = index._device_kernel("cpu", op, torch._C.DispatchKey.CompositeExplicitAutogradNonFunctional)
+    ix = torch.triu_indices(5, 5)
+    with torch.inference_mode():
+        torch.testing.assert_close(backend(x, [None, ix[0], ix[1]]), op(x, [None, ix[0], ix[1]]), atol=0, rtol=0)
+    assert index._classify(x, [torch.ones(6, dtype=torch.bool, device="meta")]) == "move"
+    assert index._classify(x, [None, torch.tensor(True, device="meta")]) == "move"
+
+
+@pytest.mark.parametrize("bad_idx", [
+    lambda: (torch.tensor([0.0, 1.0]),),
+    lambda: (torch.tensor([0, 1], dtype=torch.int8),),
+    lambda: (torch.tensor([0, 1], dtype=torch.int16),),
+    lambda: (slice(None), torch.tensor([0, 1]), torch.tensor([0, 1, 2])),
+    lambda: (torch.tensor([0]), torch.tensor([0]), torch.tensor([0]), torch.tensor([0])),
+    lambda: (slice(None), torch.ones(2, 2, dtype=torch.bool)),
+])
+def test_index_invalid_inputs_reach_aten(bad_idx):
+    x = torch.randn(3, 4, 5)
+    idx = bad_idx()
+    with pytest.raises(Exception) as want:
+        x[idx]
+    with cpu_as_hpu(index.install) as calls, pytest.raises(type(want.value)):
+        x[idx]
+    assert not calls["index"]
+
+
+def test_index_elsewhere_stays_native():
+    x = torch.randn(4, 5, 5)
+    ix = torch.triu_indices(5, 5)
+    nodes = []
+    with cpu_as_hpu(lambda device: index.install("hpu")) as calls:
+        train_step(compiled(lambda t: t[..., ix[0], ix[1]], nodes), x)
+    assert "aten.index.Tensor" in ops(nodes) and not calls["index"]
+
+
 # ---- installing and undoing
 
 
@@ -809,7 +950,7 @@ def test_undo_restores_torch():
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
                  "aten::embedding_dense_backward", "aten::convolution_backward", "aten::roll",
-                 "aten::upsample_linear1d"):
+                 "aten::upsample_linear1d", "aten::index.Tensor"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 
 
