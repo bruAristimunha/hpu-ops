@@ -231,6 +231,48 @@ for mode in ("eager", "compiled"):
     expect(f"input gradient of a stack of rolls by -1, 0, +1, {mode}", err <= 1e-6 and calls["roll_zero"] > 0,
            f"max|err| {err:.1e}")
 
+# ---- boolean-mask index_put_ / index_put and trailing 2-D index.Tensor (GBWAtt lazy synStatus 30)
+calls.clear()
+def mask_assign(t):
+    y = t * 2.0
+    y[y <= 0] = 0
+    return y
+check("boolean-mask index_put_ (scalar)", mask_assign, (torch.randn(8, 18),), atol=1e-5)
+check("boolean-mask index_put_ (inference_mode)", mask_assign, (torch.randn(8, 18),), atol=1e-5,
+      context=torch.inference_mode)
+expect("boolean-mask index_put_ took torch.where", calls["bool_index_put_"] > 0, f"{calls['bool_index_put_']} times")
+
+class _MaskInBwd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x * 1.0
+
+    @staticmethod
+    def backward(ctx, g):
+        (x,) = ctx.saved_tensors
+        s = g.clone()
+        s[x <= 0.5] = 0
+        return s
+
+calls.clear()
+m_bwd = torch.eye(18, device=hpu, requires_grad=True)
+x_bwd = torch.randn(32, 3, 18, 18, device=hpu)
+ixs_cpu = torch.triu_indices(18, 18)
+def gbw_repro_step():
+    m_bwd.grad = None
+    root = _MaskInBwd.apply(m_bwd)
+    (root @ x_bwd @ root)[..., ixs_cpu[0], ixs_cpu[1]].sum().backward()
+fallbacks_gbw = cpu_fallbacks(gbw_repro_step)
+expect("GBWAtt mask-in-backward + Vech index_2d on card (no fallback)",
+       not fallbacks_gbw and calls["bool_index_put_"] > 0 and calls["index_2d"] > 0,
+       f"fallbacks={fallbacks_gbw}, calls={dict(calls)}")
+
+calls.clear()
+check("trailing 2-D index.Tensor (Vech triu_indices)", lambda t: t[..., ixs_cpu[0], ixs_cpu[1]],
+      (torch.randn(4, 3, 18, 18),), atol=1e-5)
+expect("trailing 2-D index.Tensor took index_select", calls["index_2d"] > 0, f"{calls['index_2d']} times")
+
 # ---- linear upsampling by other than a power of two: Gaudi's forward kernel drifts with the length (NeuroPose's
 # 9920 to 10000: 34% off), and its backward is less exact than the CPU's at some sizes. Output and input gradient as
 # close to float64 as the CPU's float32 kernel.

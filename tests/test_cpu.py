@@ -728,6 +728,219 @@ def test_roll_of_a_stack_by_zero(mode):
     assert calls["roll_zero"] > 0
 
 
+# ---- boolean-mask index_put_ / index_put and trailing 2-D index.Tensor (GBWAtt)
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+@pytest.mark.parametrize("accumulate", [False, True])
+@pytest.mark.parametrize("mask_shape", [(3, 4), (3,)])
+def test_bool_index_put_matches_native_and_trains(mode, accumulate, mask_shape):
+    torch.manual_seed(0)
+    x = torch.randn(3, 4, dtype=torch.float64)
+    mask = torch.randn(*mask_shape) > 0
+    val = torch.tensor(1.25, dtype=torch.float64)
+
+    def fn(t, v):
+        y = t * 2.0
+        y.index_put_([mask], v, accumulate=accumulate)
+        return y
+
+    want = train_step(fn, x, val)
+    nodes = []
+    with cpu_as_hpu(composite.install_index_put) as calls:
+        got = train_step(fn if mode == "eager" else compiled(fn, nodes), x, val)
+    assert_same(got, want)
+    assert calls["bool_index_put_"] > 0
+    if mode == "compiled":
+        assert not any("index_put" in op for op in ops(nodes)), ops(nodes)
+
+
+def test_bool_index_put_out_of_place_and_inside_custom_backward():
+    torch.manual_seed(0)
+    x = torch.randn(4, 5, dtype=torch.float64)
+    mask = x > 0
+    val = torch.tensor(-0.5, dtype=torch.float64)
+
+    def out_of_place(t, v):
+        return t.index_put([mask], v)
+
+    want = train_step(out_of_place, x, val)
+    with cpu_as_hpu(composite.install_index_put) as calls:
+        got = train_step(out_of_place, x, val)
+    assert_same(got, want)
+    assert calls["bool_index_put"] > 0
+
+    class CustomSqrt(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, a):
+            ctx.save_for_backward(a)
+            return a * 2.0
+
+        @staticmethod
+        def backward(ctx, g):
+            (a,) = ctx.saved_tensors
+            s = g.clone()
+            s[a <= 0] = 0
+            return s
+
+    xa = x.clone().requires_grad_()
+    CustomSqrt.apply(xa).sum().backward()
+    want_grad = xa.grad.clone()
+
+    xb = x.clone().requires_grad_()
+    with cpu_as_hpu(composite.install_index_put) as calls:
+        CustomSqrt.apply(xb).sum().backward()
+    torch.testing.assert_close(xb.grad, want_grad, atol=0, rtol=0)
+    assert calls["bool_index_put_"] == 1
+
+
+def test_bool_index_put_dtypes_layouts_inference_and_fallbacks():
+    torch.manual_seed(0)
+    x = torch.randn(3, 4)
+    mask = x > 0
+    with torch.inference_mode():
+        want_inf = x.clone()
+        want_inf[mask] = 0
+    with cpu_as_hpu(composite.install_index_put) as calls:
+        with torch.inference_mode():
+            got_inf = x.clone()
+            got_inf[mask] = 0
+            got_0d = x.clone()
+            got_0d[torch.tensor(True)] = 7.0
+        torch.testing.assert_close(got_inf, want_inf, atol=0, rtol=0)
+        torch.testing.assert_close(got_0d, torch.full_like(x, 7.0), atol=0, rtol=0)
+        # Non-contiguous + scalar dtype cast + bool/int64 accumulate
+        xt = x.t().clone()
+        xt_ref = xt.clone()
+        mt = xt > 0
+        xt[mt] = torch.tensor(3, dtype=torch.int64)
+        xt_ref[mt] = torch.tensor(3, dtype=torch.int64)
+        torch.testing.assert_close(xt, xt_ref, atol=0, rtol=0)
+
+        xb = torch.tensor([True, False, True])
+        xb_ref = xb.clone()
+        mb = torch.tensor([True, True, False])
+        xb.index_put_([mb], torch.tensor(True), accumulate=True)
+        xb_ref.index_put_([mb], torch.tensor(True), accumulate=True)
+        assert torch.equal(xb, xb_ref)
+
+        # Leaf requires_grad still raises PyTorch's in-place leaf error
+        xl = torch.randn(3, 4, requires_grad=True)
+        with pytest.raises(RuntimeError, match="leaf Variable"):
+            xl[mask] = 0
+    assert calls["bool_index_put_"] >= 4
+
+    # Unsupported / invalid index_put_ / index_put patterns fall through to ATen without counting
+    with cpu_as_hpu(composite.install_index_put) as calls:
+        xi = torch.zeros(3, 4)
+        xi[torch.tensor([True, False, True])] = torch.ones(2, 4)
+        xi[torch.tensor([0, 2]), torch.tensor([1, 3])] = 5.0
+        with pytest.raises(IndexError):
+            xi[torch.tensor([True, False])] = 0
+        # 0-d self with 0-d bool mask
+        with pytest.raises(IndexError):
+            torch.tensor(2.0).index_put_([torch.tensor(True)], torch.tensor(99.0))
+        with pytest.raises(IndexError):
+            torch.tensor(2.0).index_put([torch.tensor(True)], torch.tensor(99.0))
+        # accumulate=True with mismatched dtype
+        with pytest.raises(RuntimeError):
+            xi.index_put_([mask], torch.tensor(1.5, dtype=torch.float64), accumulate=True)
+        with pytest.raises(RuntimeError):
+            xi.index_put([mask], torch.tensor(1.5, dtype=torch.float64), accumulate=True)
+        # Complex scalar into real/int self raises overflow RuntimeError
+        with pytest.raises(RuntimeError):
+            xi.index_put_([mask], torch.tensor(1.0 + 2.0j))
+        with pytest.raises(RuntimeError):
+            torch.zeros(3, 4, dtype=torch.int64).index_put([mask], torch.tensor(1.0 + 2.0j))
+    assert not calls["bool_index_put_"] and not calls["bool_index_put"]
+
+    # Complex scalar into bool self matches native ATen (True)
+    x_bool = torch.zeros(3, 4, dtype=torch.bool)
+    want_bool = x_bool.index_put([mask], torch.tensor(1.0 + 2.0j))
+    with cpu_as_hpu(composite.install_index_put) as calls:
+        got_bool = x_bool.index_put([mask], torch.tensor(1.0 + 2.0j))
+    assert torch.equal(got_bool, want_bool)
+    assert calls["bool_index_put"] == 1
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_index_2d_matches_native_vech_and_trains(mode):
+    torch.manual_seed(0)
+    x = torch.randn(4, 3, 6, 6, dtype=torch.float64)
+    ixs = torch.triu_indices(6, 6)
+    f = lambda t: t[..., ixs[0], ixs[1]]  # noqa: E731
+    want, nodes = train_step(f, x), []
+    with cpu_as_hpu(composite.install_index_2d) as calls:
+        got = train_step(f if mode == "eager" else compiled(f, nodes), x)
+    assert_same(got, want)
+    assert calls["index_2d"] > 0
+    if mode == "compiled":
+        assert "aten.index.Tensor" not in ops(nodes) and "aten.index_select.default" in ops(nodes), ops(nodes)
+
+
+def test_index_2d_edge_cases_dynamic_and_passthrough():
+    torch.manual_seed(0)
+    cases = [
+        (torch.randn(2, 3, 5, 4, dtype=torch.float64), (torch.tensor([0, -1, 2], dtype=torch.int32),
+                                                        torch.tensor([1, 3, -2], dtype=torch.int64))),
+        (torch.randn(5, 4, dtype=torch.float64).t(), (torch.tensor([[0, 1], [2, -1]]), torch.tensor([1, -2]))),
+        (torch.randn(3, 5, 4, dtype=torch.float64), (torch.tensor(2), torch.tensor(-1))),
+        (torch.randn(0, 5, 4, dtype=torch.float64), (torch.tensor([0, 1]), torch.tensor([2, 3]))),
+        (torch.randn(2, 5, 4, dtype=torch.float64),
+         (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))),
+    ]
+    for x, (i0, i1) in cases:
+        f = lambda t, a=i0, b=i1: (torch.ops.aten.index.Tensor(t, [None, a, b]) if a.dim() == 0  # noqa: E731
+                                   else t[..., a, b])
+        want = train_step(f, x)
+        with cpu_as_hpu(composite.install_index_2d) as calls:
+            got = train_step(f, x)
+        assert_same(got, want)
+        assert calls["index_2d"] == 1
+
+    # 2-D self with two 0-d indices via aten.index.Tensor (eager + compiled)
+    x2 = torch.arange(16.0, dtype=torch.float64).reshape(4, 4)
+    i0_0d, i1_0d = torch.tensor(2), torch.tensor(-1)
+    f_2d_0d = lambda t: torch.ops.aten.index.Tensor(t, [i0_0d, i1_0d])  # noqa: E731
+    want_2d_0d = train_step(f_2d_0d, x2)
+    for mode in ("eager", "compiled"):
+        nodes_0d = []
+        with cpu_as_hpu(composite.install_index_2d) as calls:
+            fn = f_2d_0d if mode == "eager" else compiled(f_2d_0d, nodes_0d, dynamic=True, fullgraph=True)
+            got_2d_0d = train_step(fn, x2)
+        assert_same(got_2d_0d, want_2d_0d)
+        assert got_2d_0d[0].shape == ()
+        assert calls["index_2d"] > 0
+        if mode == "compiled":
+            assert "aten.index.Tensor" not in ops(nodes_0d), ops(nodes_0d)
+
+    # Dynamic shapes under torch.compile
+    ixs = torch.triu_indices(5, 5)
+    f_dyn = lambda t: t[..., ixs[0], ixs[1]]  # noqa: E731
+    x_dyn, nodes = torch.randn(3, 2, 5, 5, dtype=torch.float64), []
+    want_dyn = train_step(f_dyn, x_dyn)
+    with cpu_as_hpu(composite.install_index_2d) as calls:
+        got_dyn = train_step(compiled(f_dyn, nodes, dynamic=True, fullgraph=True), x_dyn)
+    assert_same(got_dyn, want_dyn)
+    assert "aten.index.Tensor" not in ops(nodes) and calls["index_2d"] > 0
+
+    # Non-trailing / non-2D / boolean / mismatched / 0-size trailing dims keep ATen
+    with cpu_as_hpu(composite.install_index_2d) as calls:
+        xp = torch.randn(3, 4, 5)
+        _ = xp[torch.tensor([0, 2]), :, torch.tensor([1, 3])]
+        _ = xp[..., torch.tensor([0, 1])]
+        _ = xp[xp > 0]
+        with pytest.raises(IndexError):
+            _ = xp[..., torch.tensor([0, 1]), torch.tensor([0, 1, 2])]
+        for shape in ((2, 0, 4), (2, 4, 0)):
+            xe = torch.empty(*shape)
+            with pytest.raises(IndexError):
+                _ = xe[..., torch.tensor([0]), torch.tensor([0])]
+            empty_out = xe[..., torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)]
+            assert empty_out.shape == (2, 0)
+    assert not calls["index_2d"]
+
+
 # ---- torch.save: tensor-level host copies
 
 
@@ -809,8 +1022,10 @@ def test_undo_restores_torch():
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
                  "aten::embedding_dense_backward", "aten::convolution_backward", "aten::roll",
-                 "aten::upsample_linear1d"):
+                 "aten::upsample_linear1d", "aten::index_put_", "aten::index_put", "aten::index.Tensor"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
+    for name in ("aten::index_put_", "aten::index_put"):
+        assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "CPU")
 
 
 @pytest.mark.parametrize("op", ["scaled_dot_product_attention", "_scaled_dot_product_fused_attention_overrideable"])
