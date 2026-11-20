@@ -121,14 +121,22 @@ def _cached_pivots(n, device):
     return torch.arange(1, n + 1, dtype=torch.int32, device=device)
 
 
+@functools.lru_cache(maxsize=None)
+def _cached_zero(dtype, device):
+    return torch.zeros((), dtype=dtype, device=device)
+
+
 def _unused_factors(A):
-    """The ``LU`` and ``pivots`` outputs the schemas require and the kernel does not compute: ``A`` itself, not its
-    LU, and the identity permutation (a cached ``arange`` expanded to the batch, a view). Only torch's own derivative
-    reads them, and the Functions here replace it."""
+    """The ``LU`` and ``pivots`` outputs the schemas require and the kernel does not compute: a cached scalar zero
+    expanded to A's shape (not A's LU) and the identity permutation (a cached ``arange`` expanded to the batch).
+    Both are views of storage of their own, so no device op runs per call; an alias of the input as an output breaks
+    lazy mode's graph. Only torch's own derivative reads them, and the Functions here replace it."""
     n = A.shape[-1]
+    zero = (torch.zeros((), dtype=A.dtype, device=A.device) if torch.compiler.is_compiling()
+            else _cached_zero(A.dtype, A.device))
     pivots = (torch.arange(1, n + 1, dtype=torch.int32, device=A.device) if torch.compiler.is_compiling()
               else _cached_pivots(n, A.device))
-    return A.detach(), pivots.expand(*A.shape[:-1])
+    return zero.expand(A.shape), pivots.expand(*A.shape[:-1])
 
 
 def _on_cpu(op, args, kwargs):
@@ -356,8 +364,8 @@ class SolveEx(torch.autograd.Function):
     """``aten._linalg_solve_ex`` from the masked LU, with torch's backward (``linalg_solve_backward``) over the
     composite. ``LU``, ``pivots`` and ``info`` are not differentiable. ``LU`` and ``pivots`` are those of A (native's
     CPU kernel returns those of A^T); only torch's own derivative reads them, and this kernel replaces it. Through
-    the TPC kernel ``LU`` and ``pivots`` are not computed: ``LU`` is ``A`` itself and ``pivots`` the identity
-    permutation."""
+    the TPC kernel ``LU`` and ``pivots`` are not computed: ``LU`` is a zero placeholder and ``pivots`` the
+    identity permutation."""
 
     @staticmethod
     def compute(A, B, left, check_errors):

@@ -729,6 +729,13 @@ def test_info_from_the_kernels_second_lane(gj_hook):
     assert got.dtype == torch.int32 and torch.equal(got, want) and want.any()
 
 
+def test_lu_placeholder_has_own_storage():
+    A = f32(2, 3, n=4)
+    LU, pivots = linalg._unused_factors(A)
+    assert LU.shape == A.shape and LU.dtype == A.dtype and pivots.shape == A.shape[:-1]
+    assert LU.untyped_storage().data_ptr() != A.untyped_storage().data_ptr()
+
+
 def test_chunks_and_flat_inv_contract(monkeypatch):
     monkeypatch.setattr(tpc, "_inv_op", lambda: lambda A: tpc.gj_solve_reference(
         A, torch.eye(A.shape[-1]).expand_as(A)))
