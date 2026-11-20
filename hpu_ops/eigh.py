@@ -16,15 +16,15 @@ aten = torch.ops.aten
 JACOBI_SWEEPS = 10
 
 
-def _schedule(n):
+def _schedule(n, device=None):
     """The round-robin (circle method) pairing of ``n`` (even) indices: ``[n - 1, n // 2, 2]``, each row ``(p, q)``
-    with ``p < q``; every index once per round, every pair once over the rounds."""
+    with ``p < q``; every index once per round, every pair once over the rounds. Built on ``device``."""
     others, rounds = list(range(1, n)), []
     for _ in range(n - 1):
         line = [0] + others
         rounds.append([sorted((line[i], line[n - 1 - i])) for i in range(n // 2)])
         others = others[-1:] + others[:-1]
-    return torch.tensor(rounds)
+    return torch.tensor(rounds, device=device)
 
 
 def eigh(A, upper=False):
@@ -39,7 +39,7 @@ def eigh(A, upper=False):
     V = torch.eye(m, dtype=S.dtype, device=S.device).expand_as(S)
     eyef = torch.eye(m, dtype=S.dtype, device=S.device).flatten().expand(*batch, m * m)
     rounds = []  # index tensors of each round, built once
-    for r in _schedule(m).to(S.device):
+    for r in _schedule(m, S.device):
         p, q = r[:, 0], r[:, 1]
         rounds.append((p * m + p, q * m + q, p * m + q, q * m + p))
     for _ in range(JACOBI_SWEEPS):
@@ -72,13 +72,17 @@ class Eigh(torch.autograd.Function):
     def forward(ctx, A, UPLO, compute_v):
         w, V = Eigh.compute(A, UPLO, compute_v)
         ctx.save_for_backward(w, V)
+        ctx.set_materialize_grads(False)  # a zero gV would make VhgV / E 0/0 on repeated eigenvalues
         return w, V
 
     @staticmethod
     def backward(ctx, gw, gV):
         w, V = ctx.saved_tensors
+        if gw is None and gV is None:
+            return None, None, None
+        if gV is None:  # eigenvalues only: V diag(gw) V^H, finite for repeated eigenvalues
+            return (V * gw.unsqueeze(-2)) @ V.mH, None, None
         gw = torch.zeros_like(w) if gw is None else gw
-        gV = torch.zeros_like(V) if gV is None else gV
         VhgV = V.mH @ gV
         VhgV = 0.5 * (VhgV - VhgV.mH)
         eye = torch.eye(w.shape[-1], dtype=torch.bool, device=w.device)

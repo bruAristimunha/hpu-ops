@@ -490,3 +490,23 @@ def test_eigh_compiled_has_no_native_op():
         w, _ = compiled(torch.linalg.eigh, nodes)(S)
     torch.testing.assert_close(w, torch.linalg.eigvalsh(S), rtol=0, atol=1e-10)
     assert "aten._linalg_eigh.default" not in ops(nodes), ops(nodes)
+
+
+@pytest.mark.parametrize("diagonal", [[1.0] * 3, [1.0, 1.0, 2.0], [3.0, 3.0, 3.0, 1.0]], ids=["I3", "112", "3331"])
+@pytest.mark.parametrize("use", ["eigvalsh", "eigenvalues_pow2"])
+def test_eigh_degenerate_grad_matches_torch(diagonal, use):
+    D = torch.diag(torch.tensor(diagonal, dtype=torch.float64))
+    fns = {"eigvalsh": lambda D: torch.linalg.eigvalsh(D).sum(),
+           "eigenvalues_pow2": lambda D: torch.linalg.eigh(D).eigenvalues.pow(2).sum()}
+
+    def grad():
+        x = D.clone().requires_grad_()
+        fns[use](x).backward()
+        return x.grad
+
+    want = grad()
+    with cpu_as_hpu(jacobi.install_eigh) as calls:
+        got = grad()
+        assert calls["eigh"] >= 1, dict(calls)
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got, want)
