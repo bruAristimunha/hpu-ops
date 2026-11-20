@@ -150,6 +150,17 @@ check('Conv1d padding="valid"', per_device(torch.nn.Conv1d(8, 16, 5, padding="va
       atol=1e-4)
 expect('compiled padding="valid" took full zero lists', calls["valid_conv"] > 0, f"{calls['valid_conv']} times")
 
+# ---- large-kernel convolutions (> 256): STaRNet(64) conv_spatial_fusion & TensorCSPNet(22, k=11) temporal_block
+calls.clear()
+check("Conv2d kernel (351, 1) (STaRNet(64) conv_spatial_fusion)",
+      per_device(torch.nn.Conv2d(1, 8, (351, 1), bias=False)), (torch.randn(4, 1, 351, 200),), atol=1e-4)
+check("Conv2d kernel (4, 1089) stride (1, 121) (TensorCSPNet(22, k=11))",
+      per_device(torch.nn.Conv2d(1, 16, (4, 1089), stride=(1, 121))), (torch.randn(4, 1, 4, 1089),), atol=1e-4)
+check("Conv2d kernel (351, 1) inference_mode",
+      per_device(torch.nn.Conv2d(1, 8, (351, 1), bias=False)), (torch.randn(4, 1, 351, 200),),
+      atol=1e-4, modes=("eager",), context=torch.inference_mode)
+expect("large-kernel convolutions took split_conv", calls["large_conv"] > 0, f"{calls['large_conv']} times")
+
 # ---- glu (BrainModule: a convolution, then a gated linear unit over the channels)
 calls.clear()
 check("Conv1d > F.glu (BrainModule)", per_device(torch.nn.Conv1d(8, 640, 3, padding=1), lambda m, x: F.glu(m(x), 1)),
