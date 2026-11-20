@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import traceback
+import warnings
 
 import habana_frameworks.torch.core as htcore
 import habana_frameworks.torch.hpu as hthpu
@@ -29,7 +30,7 @@ BATCH = 32
 WARMUP = 5
 STEPS = 20
 LINALG_OPS = ("solve_triangular", "cholesky_solve", "linalg_solve", "linalg_inv", "inverse", "linalg_det",
-              "linalg_slogdet", "eigh")  # substrings of the bridge's fallback op names
+              "linalg_slogdet", "eigh", "linalg_lu", "lu_unpack")  # substrings of the bridge's fallback op names
 
 
 def sync():
@@ -82,19 +83,22 @@ def run_model(name, P, info, X, y, baseline):
             opt.step()
             if LAZY:
                 htcore.mark_step()
-        for _ in range(WARMUP):
-            step()
-        sync()
-        f0 = fb_ops()
-        t = time.perf_counter()
-        for _ in range(STEPS):
-            step()
-        sync()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for _ in range(WARMUP):
+                step()
+            sync()
+            f0 = fb_ops()
+            t = time.perf_counter()
+            for _ in range(STEPS):
+                step()
+            sync()
+        row["cpu_warnings"] = sorted({str(w.message) for w in caught if "runs on the CPU" in str(w.message)})
         row["ms_per_step"] = round((time.perf_counter() - t) / STEPS * 1e3, 1)
         row["fallback_per_step"] = {k: v / STEPS for k, v in delta(f0, fb_ops()).items()}
         row["linalg_fallback_per_step"] = {k: v for k, v in row["fallback_per_step"].items()
                                            if any(s in k for s in LINALG_OPS)}
-        row["status"] = "fallback" if row["linalg_fallback_per_step"] else "ok"
+        row["status"] = "fallback" if row["linalg_fallback_per_step"] or row["cpu_warnings"] else "ok"
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         row.update(status="error", error=repr(e)[:400],
                    where=[f"{f.filename.split('site-packages/')[-1]}:{f.lineno}"
@@ -107,14 +111,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--baseline", action="store_true", help="skip hpu_ops.enable()")
     baseline = parser.parse_args().baseline
+    import hpu_ops
+    complex_state = "skipped (baseline)"
     if not baseline:
-        import hpu_ops
         hpu_ops.enable()
         try:
             import hpu_complex
             hpu_complex.enable()
+            complex_state = "enabled " + str(getattr(hpu_complex, "__version__", "?"))
         except ImportError:
-            pass
+            complex_state = "not found"
+    print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), "hpu_complex", complex_state, "baseline",
+          baseline, "lazy", LAZY, flush=True)
     from spd_diag import protocol as P
     from spd_diag.cache import open_cache
     from spd_diag.models import MODELS

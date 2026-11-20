@@ -37,6 +37,7 @@ TOL64 = 1e-12
 CPU_TEXT = "runs on the CPU"
 F64_TEXT = "hpu-ops#16"
 BASELINE = False
+EIGH_FALLBACKS = []  # baseline: the fallback deltas seen for eigh (the positive control)
 ops_linalg = None  # hpu_ops.linalg, imported in main
 L = torch.linalg
 
@@ -72,8 +73,9 @@ def as_tensors(out):
     return []
 
 
-# Inputs: SPD as in kernel_sweep, or general and well-conditioned (eigenvalues in a disc of radius sqrt(n) around
-# 2 sqrt(n)), so that the pivots of LU move. Determinants are scaled to stay near 1: float32 holds up to 3e38.
+# Inputs: SPD as in kernel_sweep, or a unit-scaled matrix (I + 0.05 G G^T / n, det near 1: float32 holds up to 3e38)
+# with its rows permuted by a different random permutation per batch element. The diagonal is dominant, so only
+# the permutation makes LU pivot; the det sign is the permutation's parity, and both signs occur in a batch.
 def make_spd(b, n, dtype):
     return [spd(b, n, dtype, "cpu")]
 
@@ -81,6 +83,19 @@ def make_spd(b, n, dtype):
 def make_spd_unit(b, n, dtype):
     g = torch.randn(b, n, n, dtype=dtype)
     return [torch.eye(n, dtype=dtype) + 0.05 * (g @ g.mT) / n]
+
+
+def pivoting(b, n, dtype):
+    """Unit-scaled matrices with permuted rows; asserts that LU swaps and that both det signs occur."""
+    M = make_spd_unit(b, n, dtype)[0]
+    perm = torch.stack([torch.randperm(n) for _ in range(b)])
+    A = M.gather(1, perm.unsqueeze(-1).expand(b, n, n))
+    pivots = L.lu_factor(A).pivots
+    swaps = int((pivots != torch.arange(1, n + 1, dtype=pivots.dtype)).sum())
+    signs = L.slogdet(A).sign
+    assert swaps > 0 and bool((signs > 0).any()) and bool((signs < 0).any()), (
+        f"inputs do not exercise pivoting: {swaps} swaps, signs {signs.unique().tolist()}")
+    return A
 
 
 def general(b, n, dtype):
@@ -96,7 +111,11 @@ def make_cholesky_solve(b, n, dtype):
 
 
 def make_solve(b, n, dtype):
-    return [general(b, n, dtype), torch.randn(b, n, 3, dtype=dtype)]
+    return [pivoting(b, n, dtype), torch.randn(b, n, 3, dtype=dtype)]
+
+
+def make_pivoting(b, n, dtype):
+    return [pivoting(b, n, dtype)]
 
 
 def make_general(b, n, dtype):
@@ -159,9 +178,9 @@ CASES = (
     Case("linalg.solve_triangular", make_triangular, lambda a, b: L.solve_triangular(a, b, upper=False)),
     Case("cholesky_solve", make_cholesky_solve, lambda b, c: torch.cholesky_solve(b, c)),
     Case("linalg.solve", make_solve, lambda a, b: L.solve(a, b)),
-    Case("linalg.inv", make_spd, lambda x: L.inv(x)),
-    Case("linalg.det", make_spd_unit, lambda x: L.det(x)),
-    Case("linalg.slogdet", make_spd, lambda x: L.slogdet(x), err_slogdet, loss_slogdet),
+    Case("linalg.inv", make_pivoting, lambda x: L.inv(x)),
+    Case("linalg.det", make_pivoting, lambda x: L.det(x)),
+    Case("linalg.slogdet", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet),
     Case("linalg.eigh", make_spd, lambda x: L.eigh(x), err_eigh, loss_eigh),
     Case("linalg.eigvalsh", make_spd, lambda x: L.eigvalsh(x)),
     Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False),
@@ -227,6 +246,8 @@ def run_case(case, n):
         ref = as_tensors(case.fn(*ref_in))
         out, row["hpu_ms"], rec = forward(case, [x.to(HPU) for x in cpu_in])
         row["fwd_fallback"] = rec["fallback"]
+        if BASELINE and case.name == "linalg.eigh" and rec["fallback"]:
+            EIGH_FALLBACKS.append(rec["fallback"])
         row["max_rel_err"], notes = case.err(out, ref, ref_in)
         hard += notes + ([f"error {row['max_rel_err']:.3g} > {TOL32}"] if not row["max_rel_err"] <= TOL32 else [])
         if case.scope == "all":
@@ -234,6 +255,7 @@ def run_case(case, n):
         if case.loss:
             row["grad_err"], rec = backward(case, cpu_in, ref_in)
             row["bwd_fallback"] = rec["fallback"]
+            hard += [f"gradient error {row['grad_err']:.3g} > {TOL32}"] * (not row["grad_err"] <= TOL32)
             soft += ["backward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
@@ -253,8 +275,10 @@ def run_float64(case):
     try:
         ops_linalg._WARNED.clear()  # the warning comes once per op name and process
         cpu_in = case.make(BATCH, F64_N, torch.float64)
-        ref = as_tensors(case.fn(*cpu_in))
         h_in = [x.to(HPU) for x in cpu_in]
+        # Gaudi2 rounds float64 to float32 at the host-to-card copy (hpu-ops#16): the reference runs over what the card holds.
+        cpu_in = [x.cpu() for x in h_in]
+        ref = as_tensors(case.fn(*cpu_in))
         with watch() as first:
             out = as_tensors(case.fn(*h_in))
             sync()
@@ -320,17 +344,26 @@ def main():
     from hpu_ops import linalg as ops_linalg
     if not BASELINE:
         hpu_ops.enable()
+    complex_state = "skipped (baseline)"
+    if not BASELINE:
         try:
             import hpu_complex
             hpu_complex.enable()
+            complex_state = "enabled " + str(getattr(hpu_complex, "__version__", "?"))
         except ImportError:
-            pass
-    print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), "baseline", BASELINE, "lazy", LAZY, flush=True)
+            complex_state = "not found"
+    print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), "hpu_complex", complex_state, "baseline",
+          BASELINE, "lazy", LAZY, flush=True)
     results = [probe_argmax_ties(), probe_argsort_int64()]
     for case in CASES:
         results += [run_case(case, n) for n in SIZES]
         if case.float64:
             results.append(run_float64(case))
+    if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
+        ok = bool(EIGH_FALLBACKS)
+        emit(op="metric_check", lazy=LAZY, baseline=True, status="ok" if ok else "error",
+             problems=[] if ok else ["no cpu_fallback delta for eigh under --baseline: the metric key is wrong"])
+        results.append(ok)
     print(f"SUMMARY {len(results)} cases, {results.count(False)} failed", flush=True)
     return 0 if all(results) else 1
 
