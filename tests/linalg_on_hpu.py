@@ -46,6 +46,8 @@ BASELINE = False
 EIGH_FALLBACKS = []  # baseline: the fallback deltas seen for eigh (the positive control)
 EIGH_STRICT = False  # eigh and eigvalsh are checked like the others (installed, or --with-eigh)
 ops_linalg = None  # hpu_ops.linalg, imported in main
+tpc_maxn = 32  # hpu_ops.tpc.MAXN, set in main
+SINGULAR_N = 22
 L = torch.linalg
 
 
@@ -191,15 +193,17 @@ class Case(NamedTuple):
     scope: str = "all"  # "bwd": only the backward must stay on the card (the forward is not ours)
     opt_in: bool = False  # eigh: not in hpu_ops.FIXES, so its fallback is expected unless --with-eigh
     float64: bool = True  # one of the ops that warns for float64 (hpu-ops#16)
+    tpc: bool = False  # routed through the TPC kernel (n <= hpu_ops.tpc.MAXN); past it Habana's fallback is expected
 
 
 CASES = (
-    Case("linalg.solve_triangular", make_triangular, lambda a, b: L.solve_triangular(a, b, upper=False)),
-    Case("cholesky_solve", make_cholesky_solve, lambda b, c: torch.cholesky_solve(b, c)),
-    Case("linalg.solve", make_solve, lambda a, b: L.solve(a, b)),
-    Case("linalg.inv", make_pivoting, lambda x: L.inv(x)),
-    Case("linalg.det", make_pivoting, lambda x: L.det(x)),
-    Case("linalg.slogdet", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet),
+    Case("linalg.solve_triangular", make_triangular, lambda a, b: L.solve_triangular(a, b, upper=False),
+         tpc=True),
+    Case("cholesky_solve", make_cholesky_solve, lambda b, c: torch.cholesky_solve(b, c), tpc=True),
+    Case("linalg.solve", make_solve, lambda a, b: L.solve(a, b), tpc=True),
+    Case("linalg.inv", make_pivoting, lambda x: L.inv(x), tpc=True),
+    Case("linalg.det", make_pivoting, lambda x: L.det(x), tpc=True),
+    Case("linalg.slogdet", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, tpc=True),
     Case("linalg.eigh", make_spd, lambda x: L.eigh(x), err_eigh, loss_eigh, opt_in=True),
     Case("linalg.eigvalsh", make_spd, lambda x: L.eigvalsh(x), opt_in=True),
     Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False),
@@ -294,7 +298,8 @@ def run_case(case, n):
             soft += ["backward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
-    expected = BASELINE or (case.opt_in and not EIGH_STRICT)  # fallbacks recorded, not failed
+    # fallbacks recorded, not failed: baseline, opt-in eigh, and the TPC ops past the kernel's n limit
+    expected = BASELINE or (case.opt_in and not EIGH_STRICT) or (case.tpc and n > tpc_maxn)
     problems = hard + ([] if expected else soft)
     row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft)
     emit(**row)
@@ -337,6 +342,59 @@ def run_float64(case):
     return not problems
 
 
+def singular_input():
+    """float32 matrices, batch 32 at n = 22: element 1 all zero (native and LU of A report the same message), element
+    2 with one zero row (a zero pivot in U, so det is exactly 0)."""
+    A = pivoting(BATCH, SINGULAR_N, torch.float32)
+    A[1] = 0
+    A[2, 5] = 0
+    return A
+
+
+def run_singular(op, fn):
+    """A singular batch on the card: ``det`` exactly 0 and ``slogdet`` (0, -inf) for elements 1 and 2; ``solve`` and
+    ``inv`` raise torch's own message, captured from a CPU run; no fallback, no CPU warning."""
+    row = {"op": f"singular.{op}", "n": SINGULAR_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY,
+           "baseline": BASELINE}
+    problems = []
+    try:
+        A = singular_input()
+        B = torch.randn(BATCH, SINGULAR_N, 3)
+        call = (lambda x: fn(x, B.to(HPU))) if op == "solve" else fn
+        call_cpu = (lambda x: fn(x, B)) if op == "solve" else fn
+        raises, want = op in ("solve", "inv"), None
+        if raises:
+            try:
+                call_cpu(A)
+            except RuntimeError as e:
+                want = str(e)
+            assert want is not None, "torch did not raise on the CPU"
+        with watch() as rec:
+            try:
+                got = as_tensors(call(A.to(HPU)))
+                sync()
+                err = None
+            except RuntimeError as e:
+                got, err = [], str(e)
+        row.update(fwd_fallback=rec["fallback"], raised=err)
+        if raises:
+            problems += [f"raised {err!r}, expected {want!r}"] * (err != want)
+        else:
+            problems += [f"raised {err!r}"] * (err is not None)
+            if not err:
+                out = [t.cpu() for t in got]
+                if op == "det":
+                    problems += ["det of a singular element is not exactly 0"] * bool((out[0][1:3] != 0).any())
+                else:
+                    zero = bool((out[0][1:3] != 0).any() or not torch.isneginf(out[1][1:3]).all())
+                    problems += ["slogdet of a singular element is not (0, -inf)"] * zero
+        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+    except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
+        problems.append(f"exception {e!r}"[:300])
+    emit(**row, status="fail" if problems else "ok", problems=problems)
+    return not problems
+
+
 def probe_argmax_ties():
     """Gaudi's argmax returns the first index among ties: [1, 3, 3, 0] gives 1."""
     row = {"op": "probe.argmax_first_of_ties", "lazy": LAZY, "baseline": BASELINE}
@@ -373,7 +431,7 @@ def probe_argsort_int64():
 
 
 def main():
-    global BASELINE, EIGH_STRICT, ops_linalg
+    global BASELINE, EIGH_STRICT, ops_linalg, tpc_maxn
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--baseline", action="store_true", help="skip hpu_ops.enable()")
     parser.add_argument("--with-eigh", action="store_true",
@@ -383,6 +441,8 @@ def main():
     BASELINE = args.baseline
     import hpu_ops
     from hpu_ops import linalg as ops_linalg
+    from hpu_ops import tpc
+    tpc_maxn = tpc.MAXN
     if not BASELINE:
         hpu_ops.enable()
         if args.with_eigh and hpu_ops.eigh.install_eigh not in hpu_ops.FIXES:
@@ -404,6 +464,9 @@ def main():
         results += [run_case(case, n) for n in sizes]
         if case.float64:
             results.append(run_float64(case))
+    if not BASELINE:
+        for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
+            results.append(run_singular(op, fn))
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
         ok = bool(EIGH_FALLBACKS)
         emit(op="metric_check", lazy=LAZY, baseline=True, status="ok" if ok else "error",

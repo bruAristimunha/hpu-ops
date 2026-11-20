@@ -2,8 +2,10 @@
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
  *   A [n, n, batch]  f32     B [m, n, batch]  f32     X [m, n, batch]  f32
- *   D [n, batch]  f32: the pivot at each step (U's diagonal of P A = L U)    S [1, batch]  f32: (-1)^swaps
- * D gives det = S * prod(D), slogdet, and LAPACK's info (1 + the first zero pivot), without another pass.
+ *   D [n, batch]  f32: the pivot at each step (U's diagonal of P A = L U)
+ *   S [2, batch]  f32: lane 0 = (-1)^swaps, lane 1 = LAPACK's info (1 + the first zero pivot, else 0)
+ * D and S give det = S0 * prod(D) and slogdet. A zero pivot zeroes the pivot row, so later pivots stay finite.
+ * With -DIDENTITY_B the kernel takes A alone and solves against the identity (inv): m = n, no B tensor.
  * Row i of A and of B is one 64-lane vector in local memory (lane j = column j), so n, m <= MAXN.
  * Lane k of a row is broadcast to all lanes by a masked reduce; no lane is ever moved to a scalar.
  * ponytail: masked-reduce broadcasts (~2n^2 per matrix); the shuffle broadcast is cheaper once its map is pinned.
@@ -18,7 +20,11 @@ float64 lane_bcast(float64 v, uint64 lane, int k)
     return v_f32_reduce_add(v_f32_sel_eq_u32_b(lane, (unsigned)k, v, 0.0f));
 }
 
+#ifdef IDENTITY_B
+void main(tensor A, tensor X, tensor D, tensor S)
+#else
 void main(tensor A, tensor B, tensor X, tensor D, tensor S)
+#endif
 {
     const int n = get_dim_size(A, 0);
     const uint64 lane = read_lane_id_4b_b();
@@ -31,10 +37,15 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
         {
             int5 c = {0, i, bt, 0, 0};
             a[i] = v_f32_ld_tnsr_b(c, A);
+#ifdef IDENTITY_B
+            b[i] = v_f32_sel_eq_u32_b(lane, (unsigned)i, 1.0f, 0.0f);
+#else
             b[i] = v_f32_ld_tnsr_b(c, B);
+#endif
         }
         float64 dv = 0.0f;
         float64 sv = 1.0f;
+        float64 infov = 0.0f;
         for (int k = 0; k < n; k++)
         {
             // column k as a vector over rows: lane i = A[i][k]
@@ -63,7 +74,9 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
             float64 pk = lane_bcast(ap, lane, k);
             dv = v_f32_sel_eq_u32_b(lane, (unsigned)k, pk, dv);
             sv = v_f32_sel_eq_u32_b(p, (unsigned)k, sv, v_f32_sub_b(0.0f, sv));
-            float64 inv = v_reciprocal_f32(pk);
+            infov = v_f32_sel_eq_f32_b(pk, 0.0f, v_f32_sel_eq_f32_b(infov, 0.0f, (float)(k + 1), infov), infov);
+            // a zero pivot gives a zero pivot row: its elimination is a no-op, as in LAPACK
+            float64 inv = v_f32_sel_eq_f32_b(pk, 0.0f, 0.0f, v_reciprocal_f32(pk));
             ak = v_f32_mul_b(ap, inv);
             bk = v_f32_mul_b(bp, inv);
             a[k] = ak;
@@ -86,6 +99,6 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
         }
         int5 cd = {0, bt, 0, 0, 0};
         v_f32_st_tnsr(cd, D, dv);
-        v_f32_st_tnsr_partial(cd, S, sv, 0, 0);
+        v_f32_st_tnsr_partial(cd, S, v_f32_sel_eq_u32_b(lane, 1u, infov, sv), 1, 0);
     }
 }

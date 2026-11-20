@@ -1,7 +1,8 @@
 """The Gaudi2 TPC Gauss-Jordan kernel behind ``linalg.solve``, ``inv``, ``det``, ``slogdet``, ``solve_triangular`` and
-``cholesky_solve``: ``torch.ops.linalg_tpc.gj_solve(A[b, n, n], B[b, n, m]) -> (X[b, n, m], D[b, n], S[b, 1])`` for
-float32, n and m <= 32. One matrix per index-space member, rows in local memory, partial pivoting. ``D`` holds the
-pivots (U's diagonal), ``S`` the sign (-1)^swaps of the row permutation.
+``cholesky_solve``: ``torch.ops.linalg_tpc.gj_solve(A[b, n, n], B[b, n, m]) -> (X[b, n, m], D[b, n], S[b, 2])`` and
+``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel) for float32, n and m <= 32. One matrix per index-space
+member, rows in local memory, partial pivoting. ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign (-1)^swaps
+of the row permutation, ``S[:, 1]`` LAPACK's info.
 
 The torch-op composites of ``hpu_ops.linalg`` are correct but 3-25x slower than Habana's CPU fallback on Gaudi2 (one
 launch per op). The kernel, eager, batch 32: n = 22 solve 0.20 ms against 4.7 ms for the fallback, n = 32 0.28 ms,
@@ -22,11 +23,13 @@ LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
 LATE_WARNING = ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off for this process "
                 "(call enable() before the first HPU op)")
+BUILD_WARNING = ("hpu_ops: building the TPC linalg extension failed ({error}); solve, inv, det, slogdet and the "
+                 "triangular solves keep Habana's CPU fallback.")
 _INSTALLED = False
 _LATE_WARNED = False
 
-# The registration strings are those measured on Gaudi2. CPP: the eager and compile API (bridge 2), CPP_LAZY: the
-# legacy API of lazy mode.
+# The registration strings are those measured on Gaudi2, plus gj_inv (A alone, identity right-hand side). CPP: the
+# eager and compile API (bridge 2), CPP_LAZY: the legacy API of lazy mode. S is [batch, 2]: sign and info.
 CPP = r"""
 #include <torch/extension.h>
 #include "hpu_custom_op_pt2.h"
@@ -36,10 +39,18 @@ static habana::PartialOutputMetaDataVector solve_meta(const at::Stack& inputs) {
   auto batch = a.size(0), n = a.size(1);
   return {habana::PartialOutputMetaData{b.scalar_type(), b.sizes().vec()},
           habana::PartialOutputMetaData{b.scalar_type(), {batch, n}},
-          habana::PartialOutputMetaData{b.scalar_type(), {batch, 1}}};
+          habana::PartialOutputMetaData{b.scalar_type(), {batch, 2}}};
+}
+static habana::PartialOutputMetaDataVector inv_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto batch = a.size(0), n = a.size(1);
+  return {habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, 2}}};
 }
 static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", solve_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", inv_meta, nullptr);
   return true;
 }();
 
@@ -49,24 +60,53 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor
   auto out = desc.execute(inputs);
   return {out[0], out[1], out[2]};
 }
-TORCH_LIBRARY(linalg_tpc, m) { m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)"); }
-TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) { m.impl("gj_solve", gj_solve); }
-TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) { m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
-  return std::make_tuple(b.new_empty(b.sizes()), b.new_empty({a.size(0), a.size(1)}), b.new_empty({a.size(0), 1})); }); }
+std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::gj_inv");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+TORCH_LIBRARY(linalg_tpc, m) {
+  m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
+  m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+}
+TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) { m.impl("gj_solve", gj_solve); m.impl("gj_inv", gj_inv); }
+TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
+  m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
+    return std::make_tuple(b.new_empty(b.sizes()), b.new_empty({a.size(0), a.size(1)}), b.new_empty({a.size(0), 2}));
+  });
+  m.impl("gj_inv", [](at::Tensor a) {
+    return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), a.size(1)}), a.new_empty({a.size(0), 2}));
+  });
+}
 """
 CPP_LAZY = r"""
 #include <torch/extension.h>
 #include "hpu_custom_op.h"
 
-static bool registered = [] {
+static auto xshape_b = [](const at::Stack& s) { return s[1].toTensor().sizes().vec(); };
+static auto xshape_a = [](const at::Stack& s) { return s[0].toTensor().sizes().vec(); };
+static auto dshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  return std::vector<int64_t>{a.size(0), a.size(1)};
+};
+static auto sshape = [](const at::Stack& s) { return std::vector<int64_t>{s[0].toTensor().size(0), 2}; };
+
+static bool registered_solve = [] {
   std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
                                                {habana::custom_op::input_type::TENSOR, 1}};
-  auto shape = [](const at::Stack& s) { return s[1].toTensor().sizes().vec(); };
-  auto dshape = [](const at::Stack& s) { auto a = s[0].toTensor(); return std::vector<int64_t>{a.size(0), a.size(1)}; };
-  auto sshape = [](const at::Stack& s) { return std::vector<int64_t>{s[0].toTensor().size(0), 1}; };
-  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, shape}, {1, c10::ScalarType::Float, dshape},
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_b},
+                                                 {1, c10::ScalarType::Float, dshape},
                                                  {2, c10::ScalarType::Float, sshape}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static bool registered_inv = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_a},
+                                                 {1, c10::ScalarType::Float, dshape},
+                                                 {2, c10::ScalarType::Float, sshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", in, out, nullptr);
   return true;
 }();
 
@@ -76,8 +116,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor
   auto out = op.execute(inputs);
   return {out[0], out[1], out[2]};
 }
-TORCH_LIBRARY(linalg_tpc, m) { m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)"); }
-TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) { m.impl("gj_solve", gj_solve); }
+std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_inv");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+TORCH_LIBRARY(linalg_tpc, m) {
+  m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
+  m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+}
+TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) { m.impl("gj_solve", gj_solve); m.impl("gj_inv", gj_inv); }
 """
 
 
@@ -100,9 +149,9 @@ def _habana_hpu():
 
 
 def install_kernel_path():
-    """Put ``LIB`` first on ``GC_KERNEL_PATH`` (default ``DEFAULT_KERNELS`` when unset, never duplicated) if the HPU is
-    not initialized yet and return True; otherwise warn once and return False, as Habana reads the path when the first
-    graph compiles: set later, the kernel's graph fails to compile."""
+    """Put ``LIB`` first on ``GC_KERNEL_PATH`` (default ``DEFAULT_KERNELS`` when unset or empty, never duplicated) if
+    the HPU is not initialized yet and return True; otherwise warn once and return False, as Habana reads the path
+    when the first graph compiles: set later, the kernel's graph fails to compile."""
     global _INSTALLED, _LATE_WARNED
     if _initialized():
         _INSTALLED = False
@@ -110,7 +159,7 @@ def install_kernel_path():
             _LATE_WARNED = True
             warnings.warn(LATE_WARNING, stacklevel=2)
         return False
-    entries = [e for e in os.environ.get("GC_KERNEL_PATH", DEFAULT_KERNELS).split(":") if e]
+    entries = [e for e in (os.environ.get("GC_KERNEL_PATH") or DEFAULT_KERNELS).split(":") if e]
     if str(LIB) not in entries:
         os.environ["GC_KERNEL_PATH"] = ":".join([str(LIB), *entries])
     _INSTALLED = True
@@ -118,52 +167,100 @@ def install_kernel_path():
 
 
 def available():
-    """True when ``install_kernel_path`` succeeded in this process."""
-    return _INSTALLED
+    """True when ``install_kernel_path`` succeeded in this process and the library is there."""
+    return _INSTALLED and LIB.exists()
+
+
+def ready():
+    """``available()`` and the C++ extension built. The build happens on the first call; if it fails, one warning,
+    then False for the rest of the process (the ops keep Habana's CPU fallback, with no retry mid-forward)."""
+    return available() and _built()
 
 
 @functools.cache
-def _op():
-    """``torch.ops.linalg_tpc.gj_solve``, compiled and loaded on the first call: the eager and compile API when
-    ``PT_HPU_LAZY_MODE`` is "0", the legacy API otherwise."""
+def _built():
+    global _INSTALLED
+    try:
+        _load()
+    except Exception as error:  # noqa: BLE001  (a missing toolchain or header: decline, do not crash the model)
+        _INSTALLED = False
+        warnings.warn(BUILD_WARNING.format(error=str(error)[:300]), stacklevel=2)
+        return False
+    return True
+
+
+@functools.cache
+def _load():
+    """Compile and load the C++ ops: the eager and compile API when ``PT_HPU_LAZY_MODE`` is "0", the legacy API of
+    lazy mode otherwise."""
     from habana_frameworks.torch.utils.lib_utils import get_include_dir, get_lib_dir
     from torch.utils.cpp_extension import load_inline
 
     lazy = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
     load_inline(name="linalg_tpc_plugin_lazy" if lazy else "linalg_tpc_plugin", cpp_sources=[CPP_LAZY if lazy else CPP],
-                verbose=False, is_python_module=False, extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
+                verbose=False, is_python_module=False,
+                extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
                 extra_ldflags=[f"-L{get_lib_dir()}", "-lhabana_pytorch_plugin" if lazy else "-lhabana_pytorch2_plugin"])
+
+
+def _op():
+    """``torch.ops.linalg_tpc.gj_solve``, built on first use."""
+    _load()
     return torch.ops.linalg_tpc.gj_solve
 
 
+def _inv_op():
+    """``torch.ops.linalg_tpc.gj_inv``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.gj_inv
+
+
 def _chunked(A, B):
-    """The kernel on ``A[b, n, n]`` and ``B[b, n, m]`` for any ``m``: columns of ``B`` in chunks of at most ``MAXN``,
-    ``X`` concatenated, ``D`` and ``S`` from the first chunk (they depend on ``A`` alone)."""
+    """The kernel on ``A[b, n, n]`` and ``B[b, n, m]`` for any ``m``: columns of ``B`` in contiguous chunks of at most
+    ``MAXN``, ``X`` concatenated, ``D`` and ``S`` from the first chunk (they depend on ``A`` alone)."""
     op = _op()
-    parts = [op(A, chunk) for chunk in B.split(MAXN, -1)]
-    X = parts[0][0] if len(parts) == 1 else torch.cat([p[0] for p in parts], -1)
-    return X, parts[0][1], parts[0][2]
+    if B.shape[-1] <= MAXN:
+        return op(A, B)
+    parts = [op(A, chunk.contiguous()) for chunk in B.split(MAXN, -1)]
+    return torch.cat([p[0] for p in parts], -1), parts[0][1], parts[0][2]
+
+
+def _check(A, n):
+    if n > MAXN or A.shape[-2] != n:
+        raise ValueError(f"hpu_ops.tpc takes square A with n <= {MAXN}, got {tuple(A.shape)}")
 
 
 def gj_solve(A, B):
     """``(X, D, S)`` for ``A[..., n, n]`` and ``B[..., n, m]`` (float32, n <= ``MAXN``) from the TPC kernel: ``X = A^-1
-    B``, ``D`` the pivots, ``S`` the sign of the permutation, shaped ``[..., n, m]``, ``[..., n]``, ``[..., 1]``."""
+    B``, ``D`` the pivots, ``S[..., 0]`` the sign of the permutation and ``S[..., 1]`` LAPACK's info (1 + the first
+    zero pivot, else 0); shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
     n, m = A.shape[-1], B.shape[-1]
-    if n > MAXN or A.shape[-2] != n or B.shape[-2] != n:
-        raise ValueError(f"hpu_ops.tpc.gj_solve takes square A with n <= {MAXN} and B with n rows, got {tuple(A.shape)}"
-                         f" and {tuple(B.shape)}")
+    _check(A, n)
+    if B.shape[-2] != n:
+        raise ValueError(f"hpu_ops.tpc.gj_solve takes B with n rows, got {tuple(A.shape)} and {tuple(B.shape)}")
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
     flat = lambda x, *shape: x.expand(*batch, *shape).reshape(-1, *shape).to(torch.float32).contiguous()  # noqa: E731
     X, D, S = _chunked(flat(A, n, n), flat(B, n, m))
-    return X.reshape(*batch, n, m), D.reshape(*batch, n), S.reshape(*batch, 1)
+    return X.reshape(*batch, n, m), D.reshape(*batch, n), S.reshape(*batch, 2)
+
+
+def gj_inv(A):
+    """``(A^-1, D, S)`` for ``A[..., n, n]``: ``gj_solve`` against the identity, which the kernel builds itself."""
+    n = A.shape[-1]
+    _check(A, n)
+    batch = A.shape[:-2]
+    X, D, S = _inv_op()(A.reshape(-1, n, n).to(torch.float32).contiguous())
+    return X.reshape(*batch, n, n), D.reshape(*batch, n), S.reshape(*batch, 2)
 
 
 def gj_solve_reference(A, B):
     """``gj_solve`` in plain torch, the contract of the kernel: ``lu`` and ``lu_solve`` of ``hpu_ops.linalg``, ``D``
-    the diagonal of U, ``S`` the parity of the pivots. For the CPU tests."""
+    the diagonal of U (a zero pivot leaves later pivots finite, as in the kernel), ``S[..., 0]`` the parity of the
+    pivots and ``S[..., 1]`` the info. For the CPU tests."""
     from .. import linalg
 
     LU, pivots = linalg.lu(A)
     X = linalg.lu_solve(LU, pivots, B)
     D = torch.diagonal(LU, dim1=-2, dim2=-1)
-    return X, D, linalg._parity(pivots).to(A.dtype)[..., None]
+    S = torch.stack([linalg._parity(pivots).to(A.dtype), linalg.lu_info_of_diagonal(D).to(A.dtype)], -1)
+    return X, D, S

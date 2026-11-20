@@ -15,6 +15,7 @@ On Gaudi2 these composites lose to Habana's CPU fallback (one launch per op), so
 triangular solves). Without the kernel, or past ``MAXN``, the call on ``hpu`` is declined and Habana's fallback runs.
 The composites stay the path of the CPU stand-in.
 """
+import functools
 import warnings
 
 import torch
@@ -30,7 +31,8 @@ FLOAT64_WARNING = ("hpu_ops: {name} of float64 HPU tensors runs on the CPU: Gaud
                    "precision (bruAristimunha/hpu-ops#16).")
 _WARNED = set()
 # The Gauss-Jordan solver ``(A, B) -> (X, D, S)`` the Functions call for float32 n <= tpc.MAXN. None means
-# ``tpc.gj_solve`` on HPU with the kernel loaded; the CPU tests set it to ``tpc.gj_solve_reference`` to exercise the wiring.
+# ``tpc.gj_solve`` on HPU with the kernel ready; the CPU tests set it to ``tpc.gj_solve_reference`` to exercise the
+# wiring.
 _GJ = None
 
 
@@ -62,30 +64,38 @@ def _takes(device_type, name, matrix_at=0):
 
 
 def _tpc_takes(device_type, takes, matrix_at=0):
-    """``takes``, and on ``hpu`` also: n <= ``tpc.MAXN`` and the TPC kernel loaded. Otherwise Habana's CPU fallback
-    runs, which is faster than the composites on Gaudi2."""
+    """``takes``, and on ``hpu`` also: n <= ``tpc.MAXN`` and the TPC kernel ready (path installed, extension built).
+    Otherwise Habana's CPU fallback runs, which is faster than the composites on Gaudi2."""
 
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
             return False
-        return device_type != "hpu" or (args[matrix_at].shape[-1] <= tpc.MAXN and tpc.available())
+        return device_type != "hpu" or (args[matrix_at].shape[-1] <= tpc.MAXN and tpc.ready())
 
     return tpc_takes
 
 
 def _use_tpc(A):
-    """Whether ``A`` goes through the Gauss-Jordan kernel: float32, n <= ``tpc.MAXN``, on HPU with the kernel loaded
-    or with the ``_GJ`` hook set."""
-    if A.dtype != torch.float32 or A.shape[-1] > tpc.MAXN:
+    """Whether ``A`` goes through the Gauss-Jordan kernel: n <= ``tpc.MAXN`` and, on HPU, float32 with the kernel
+    ready; or, with the ``_GJ`` hook set (CPU tests), any dtype."""
+    if A.shape[-1] > tpc.MAXN:
         return False
-    return _GJ is not None or (A.device.type == "hpu" and tpc.available())
+    return _GJ is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
 
 
 def _gj(A, B):
-    """``(X, D, S)`` of the Gauss-Jordan solver, the batch dimensions of ``A`` and ``B`` broadcast."""
+    """``(X, D, S)`` of the Gauss-Jordan solver, the batch dimensions of ``A`` and ``B`` broadcast. ``S[..., 0]`` is
+    the sign of the permutation, ``S[..., 1]`` LAPACK's ``info``."""
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
     solver = tpc.gj_solve if _GJ is None else _GJ
     return solver(A.expand(*batch, *A.shape[-2:]), B.expand(*batch, *B.shape[-2:]))
+
+
+def _gj_inv(A):
+    """``(A^-1, D, S)``: the kernel with the identity as right-hand side, built in the kernel."""
+    if _GJ is not None:
+        return _gj(A, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
+    return tpc.gj_inv(A)
 
 
 def _gj_solve(A, B, left=True):
@@ -96,20 +106,29 @@ def _gj_solve(A, B, left=True):
     return X.mT, D, S
 
 
-def _gj_info(D, batch):
-    """LAPACK's ``info`` (int32) from the pivots ``D``, as ``lu_info``, shaped like the batch of ``A``: ``D`` carries
-    the broadcast batch of ``A`` and ``B``."""
-    info = lu_info_of_diagonal(D)
-    index = tuple(slice(0, 1) if a == 1 and f > 1 else slice(None)
-                  for a, f in zip((1,) * (info.dim() - len(batch)) + tuple(batch), info.shape))
-    return info[index].reshape(batch)
+def _gj_info(S, batch):
+    """LAPACK's ``info`` (int32) from the kernel's ``S``, shaped like the batch of ``A`` (``S`` carries the broadcast
+    batch of ``A`` and ``B``; the slicing is static, no device sync)."""
+    info = S[..., 1].to(torch.int32)
+    if info.shape != batch:
+        info = info[(0,) * (info.dim() - len(batch))]
+        info = info[tuple(slice(0, 1) if a == 1 else slice(None) for a in batch)]
+    return info
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_pivots(n, device):
+    return torch.arange(1, n + 1, dtype=torch.int32, device=device)
 
 
 def _unused_factors(A):
-    """The ``LU`` and ``pivots`` outputs the schemas require and the kernel does not compute: zeros and the identity
-    permutation. Only torch's own derivative reads them, and the Functions here replace it."""
+    """The ``LU`` and ``pivots`` outputs the schemas require and the kernel does not compute: ``A`` itself, not its
+    LU, and the identity permutation (a cached ``arange`` expanded to the batch, a view). Only torch's own derivative
+    reads them, and the Functions here replace it."""
     n = A.shape[-1]
-    return torch.zeros_like(A), torch.arange(1, n + 1, dtype=torch.int32, device=A.device).expand(*A.shape[:-1])
+    pivots = (torch.arange(1, n + 1, dtype=torch.int32, device=A.device) if torch.compiler.is_compiling()
+              else _cached_pivots(n, A.device))
+    return A.detach(), pivots.expand(*A.shape[:-1])
 
 
 def _on_cpu(op, args, kwargs):
@@ -203,7 +222,7 @@ class SolveTriangular(torch.autograd.Function):
     def backward(ctx, grad):
         A, X = ctx.saved_tensors
         upper, left, unitriangular = ctx.options
-        gB = SolveTriangular.compute(A.mH, grad, not upper, left, unitriangular)
+        gB = SolveTriangular.apply(A.mH, grad, not upper, left, unitriangular)
         gA = None
         if ctx.needs_input_grad[0]:
             gA = -(gB @ X.mH) if left else -(X.mH @ gB)
@@ -246,7 +265,7 @@ class CholeskySolve(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         L, X = ctx.saved_tensors
-        gB = CholeskySolve.compute(grad, L, ctx.upper)
+        gB = CholeskySolve.apply(grad, L, ctx.upper)
         gL = None
         if ctx.needs_input_grad[1]:
             common = gB @ X.mH
@@ -337,16 +356,17 @@ class SolveEx(torch.autograd.Function):
     """``aten._linalg_solve_ex`` from the masked LU, with torch's backward (``linalg_solve_backward``) over the
     composite. ``LU``, ``pivots`` and ``info`` are not differentiable. ``LU`` and ``pivots`` are those of A (native's
     CPU kernel returns those of A^T); only torch's own derivative reads them, and this kernel replaces it. Through
-    the TPC kernel ``LU`` and ``pivots`` are not computed: they are zeros and the identity permutation."""
+    the TPC kernel ``LU`` and ``pivots`` are not computed: ``LU`` is ``A`` itself and ``pivots`` the identity
+    permutation."""
 
     @staticmethod
     def compute(A, B, left, check_errors):
         vector = _is_vector_rhs(A, B)
         rhs = B.unsqueeze(-1) if vector else B
         if _use_tpc(A):
-            result, D, _ = _gj_solve(A, rhs, left)
+            result, _, S = _gj_solve(A, rhs, left)
             LU, pivots = _unused_factors(A)
-            info = _gj_info(D, A.shape[:-2])
+            info = _gj_info(S, A.shape[:-2])
             if check_errors:
                 torch.ops.aten._linalg_check_errors(info, "torch.linalg.solve_ex", is_matrix=A.dim() == 2)
         else:
@@ -370,7 +390,7 @@ class SolveEx(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad, *_):
         A, X = ctx.saved_tensors
-        gB = SolveEx.compute(A.mH, grad, ctx.left, False)[0]
+        gB = SolveEx.apply(A.mH, grad, ctx.left, False)[0]
         gA = None
         if ctx.needs_input_grad[0]:
             g, x = (gB.unsqueeze(-1), X.unsqueeze(-1)) if ctx.vector else (gB, X)
@@ -415,8 +435,8 @@ class InvEx(torch.autograd.Function):
     @staticmethod
     def compute(A, check_errors):
         if _use_tpc(A):
-            X, D, _ = _gj(A, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
-            info = _gj_info(D, A.shape[:-2])
+            X, _, S = _gj_inv(A)
+            info = _gj_info(S, A.shape[:-2])
         else:
             LU, pivots = lu(A)
             info = lu_info(LU)

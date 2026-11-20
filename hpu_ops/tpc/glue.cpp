@@ -7,11 +7,14 @@
 extern "C" {
 extern const char _binary___gj_solve_f32_gaudi2_o_start[];
 extern const char _binary___gj_solve_f32_gaudi2_o_end[];
+extern const char _binary___gj_inv_f32_gaudi2_o_start[];
+extern const char _binary___gj_inv_f32_gaudi2_o_end[];
 }
 
 namespace {
 
 const char* kSolve = "gj_solve_f32_gaudi2";
+const char* kInv = "gj_inv_f32_gaudi2";  // the same source with -DIDENTITY_B: A alone, B is the identity
 constexpr uint64_t kMaxN = 32;      // MAXN of gj_solve
 
 void base_pattern(tpc_lib_api::TensorAccessPattern& p)
@@ -56,11 +59,13 @@ tpc_lib_api::GlueCodeReturn copy_elf(tpc_lib_api::HabanaKernelInstantiation* out
     return tpc_lib_api::GLUE_SUCCESS;
 }
 
-tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out)
+tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
+                                       bool identity)
 {
-    if (in->inputTensorNr != 2)
+    const unsigned inputs = identity ? 1 : 2;
+    if (in->inputTensorNr != inputs)
     {
-        in->inputTensorNr = 2;
+        in->inputTensorNr = inputs;
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
     }
     if (in->outputTensorNr != 3)
@@ -68,7 +73,7 @@ tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
         in->outputTensorNr = 3;
         return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     }
-    for (unsigned i = 0; i < 2; i++)
+    for (unsigned i = 0; i < inputs; i++)
     {
         if (in->inputTensors[i].geometry.dataType != tpc_lib_api::DATA_F32)
         {
@@ -76,10 +81,10 @@ tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
         }
     }
     const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
-    const uint64_t m = in->inputTensors[1].geometry.maxSizes[0];
+    const uint64_t m = identity ? n : in->inputTensors[1].geometry.maxSizes[0];
     const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
     if (n > kMaxN || m > kMaxN || in->inputTensors[0].geometry.maxSizes[1] != n ||
-        in->inputTensors[1].geometry.maxSizes[1] != n)
+        (!identity && in->inputTensors[1].geometry.maxSizes[1] != n))
     {
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
     }
@@ -92,11 +97,14 @@ tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
     full_dim(pa, 0, n);
     full_dim(pa, 1, n);
     batch_dim(pa, 2);
-    auto& pb = out->inputTensorAccessPattern[1];
-    base_pattern(pb);
-    full_dim(pb, 0, m);
-    full_dim(pb, 1, n);
-    batch_dim(pb, 2);
+    if (!identity)
+    {
+        auto& pb = out->inputTensorAccessPattern[1];
+        base_pattern(pb);
+        full_dim(pb, 0, m);
+        full_dim(pb, 1, n);
+        batch_dim(pb, 2);
+    }
     auto& px = out->outputTensorAccessPattern[0];
     base_pattern(px);
     full_dim(px, 0, m);
@@ -108,10 +116,11 @@ tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
     batch_dim(pd, 1);
     auto& ps = out->outputTensorAccessPattern[2];
     base_pattern(ps);
-    full_dim(ps, 0, 1);
+    full_dim(ps, 0, 2);
     batch_dim(ps, 1);
 
-    return copy_elf(out, _binary___gj_solve_f32_gaudi2_o_start, _binary___gj_solve_f32_gaudi2_o_end);
+    return identity ? copy_elf(out, _binary___gj_inv_f32_gaudi2_o_start, _binary___gj_inv_f32_gaudi2_o_end)
+                    : copy_elf(out, _binary___gj_solve_f32_gaudi2_o_start, _binary___gj_solve_f32_gaudi2_o_end);
 }
 
 }  // namespace
@@ -121,10 +130,11 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 1 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 2 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
+        strcpy(guids[1].name, kInv);
     }
     if (kernelCount != nullptr)
     {
@@ -138,7 +148,11 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
 {
     if (strcmp(params->guid.name, kSolve) == 0)
     {
-        return solve_defs(params, instance);
+        return solve_defs(params, instance, false);
+    }
+    if (strcmp(params->guid.name, kInv) == 0)
+    {
+        return solve_defs(params, instance, true);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }

@@ -551,9 +551,9 @@ def gj_hook(monkeypatch):
     """``linalg._GJ`` set to the reference; the list collects one entry per call."""
     calls = []
 
-    def hook(A, B):
+    def hook(A, B):  # detached, like the real op: no autograd through the kernel
         calls.append(tuple(A.shape))
-        return tpc.gj_solve_reference(A, B)
+        return tpc.gj_solve_reference(A.detach(), B.detach())
 
     monkeypatch.setattr(linalg, "_GJ", hook)
     return calls
@@ -565,11 +565,12 @@ def test_tpc_reference_contract(n, m):
     torch.manual_seed(0)
     A, B = torch.randn(4, n, n), torch.randn(4, n, m)
     X, D, S = tpc.gj_solve_reference(A, B)
-    assert X.shape == (4, n, m) and D.shape == (4, n) and S.shape == (4, 1)
+    assert X.shape == (4, n, m) and D.shape == (4, n) and S.shape == (4, 2)
     torch.testing.assert_close(X, torch.linalg.solve(A, B), rtol=1e-3, atol=1e-3)
     LU = torch.linalg.lu_factor(A).LU
     torch.testing.assert_close(D, torch.diagonal(LU, dim1=-2, dim2=-1), rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(S[:, 0] * D.prod(-1), torch.linalg.det(A), rtol=1e-3, atol=1e-3)
+    assert torch.equal(S[:, 1], torch.zeros(4))
 
 
 def test_tpc_chunks_columns(monkeypatch):
@@ -577,12 +578,12 @@ def test_tpc_chunks_columns(monkeypatch):
     seen = []
 
     def fake(A, B):
-        assert B.shape[-1] <= tpc.MAXN
+        assert B.shape[-1] <= tpc.MAXN and B.is_contiguous()
         seen.append(B.shape[-1])
         return tpc.gj_solve_reference(A, B)
 
     monkeypatch.setattr(tpc, "_op", lambda: fake)
-    A, B = f32(3, n=5), torch.randn(3, 5, 70)
+    A, B = f32(3, n=5), torch.randn(3, 70, 5).mT
     got = tpc._chunked(A, B)
     want = tpc.gj_solve_reference(A, B)
     assert seen == [32, 32, 6]
@@ -601,7 +602,7 @@ def test_tpc_gj_solve_flattens_batch_dims(monkeypatch):
     A, B = f32(2, 3, n=4).mT, torch.randn(2, 3, 4, 2)
     X, D, S = tpc.gj_solve(A, B)
     assert shapes == [(3, True, torch.float32)]
-    assert X.shape == (2, 3, 4, 2) and D.shape == (2, 3, 4) and S.shape == (2, 3, 1)
+    assert X.shape == (2, 3, 4, 2) and D.shape == (2, 3, 4) and S.shape == (2, 3, 2)
     torch.testing.assert_close(X, torch.linalg.solve(A, B), rtol=1e-3, atol=1e-3)
 
 
@@ -651,23 +652,106 @@ def test_linalg_routes_through_gj(case, gj_hook):
 def test_gj_is_declined_past_maxn_on_hpu_and_without_the_kernel(monkeypatch):
     A = torch.randn(2, 4, 4)
     takes = linalg._tpc_takes("hpu", linalg._takes("hpu", "solve"))
-    monkeypatch.setattr(tpc, "available", lambda: False)
+    monkeypatch.setattr(tpc, "ready", lambda: False)
     assert takes(A) is False
-    monkeypatch.setattr(tpc, "available", lambda: True)
+    monkeypatch.setattr(tpc, "ready", lambda: True)
     assert takes(A) is True
     assert takes(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is False
     assert takes(torch.randn(tpc.MAXN, tpc.MAXN)) is True
     cpu = linalg._tpc_takes("cpu", linalg._takes("cpu", "solve"))
-    monkeypatch.setattr(tpc, "available", lambda: False)
+    monkeypatch.setattr(tpc, "ready", lambda: False)
     assert cpu(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is True  # the CPU stand-in keeps the composite
 
 
-def test_gj_not_used_for_float64_or_past_maxn(gj_hook):
+def test_gj_not_used_past_maxn(gj_hook):
     torch.manual_seed(0)
     with cpu_as_hpu(linalg.install_solve):
-        torch.linalg.solve(general(3, n=5), torch.randn(3, 5, 2, dtype=torch.float64))
         torch.linalg.solve(f32(2, n=tpc.MAXN + 1), torch.randn(2, tpc.MAXN + 1, 2))
     assert gj_hook == []
+
+
+DOUBLE_BACKWARD = {
+    "solve": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b), lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
+    "solve_right": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b, left=False),
+                    lambda: (general(n=4), torch.randn(2, 4, dtype=torch.float64))),
+    "solve_triangular": (linalg.install_solve_triangular,
+                         lambda a, b: torch.linalg.solve_triangular(a, b, upper=True),
+                         lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
+    "cholesky_solve": (linalg.install_cholesky_solve, lambda b, l: torch.cholesky_solve(b, torch.tril(l)),
+                       lambda: (torch.randn(4, 2, dtype=torch.float64), torch.linalg.cholesky(spd(n=4)))),
+}
+
+
+@pytest.mark.parametrize("case", list(DOUBLE_BACKWARD))
+def test_double_backward_through_gj(case, gj_hook):
+    torch.manual_seed(0)
+    install, f, make = DOUBLE_BACKWARD[case]
+    inputs = [x.requires_grad_() for x in make()]
+    with cpu_as_hpu(install) as calls:
+        assert torch.autograd.gradgradcheck(f, inputs, atol=1e-5, rtol=1e-4)
+        assert sum(calls.values()) >= 1 and gj_hook
+
+
+def singular_hook(A, B):
+    """The kernel's contract on a singular A: D has a 0 and later entries stay finite; S carries the info."""
+    X, D, S = tpc.gj_solve_reference(A.detach(), B.detach())
+    return X, D, S
+
+
+def test_singular_det_is_zero_with_gj(monkeypatch):
+    monkeypatch.setattr(linalg, "_GJ", singular_hook)
+    A = torch.randn(3, 4, 4)
+    A[1] = 0  # the zero matrix: native and LU-of-A agree on the message
+    A[2, 2] = 0  # a zero row: a zero pivot at some step
+    with pytest.raises(RuntimeError) as native_solve:
+        torch.linalg.solve(A, torch.ones(3, 4, 2))
+    with pytest.raises(RuntimeError) as native_inv:
+        torch.linalg.inv(A)
+    with cpu_as_hpu(linalg.install_inv_det), cpu_as_hpu(linalg.install_solve):
+        D = singular_hook(A, torch.ones(3, 4, 1))[1]
+        assert (D[2] == 0).any() and torch.isfinite(D).all()
+        det = torch.linalg.det(A)
+        assert torch.equal(det[1:], torch.zeros(2)) and det[0] != 0
+        sign, logabsdet = torch.linalg.slogdet(A)
+        assert torch.equal(sign[1:], torch.zeros(2)) and torch.isinf(logabsdet[1:]).all()
+        with pytest.raises(RuntimeError, match=re.escape(str(native_solve.value))):
+            torch.linalg.solve(A, torch.ones(3, 4, 2))
+        with pytest.raises(RuntimeError, match=re.escape(str(native_inv.value))):
+            torch.linalg.inv(A)
+
+
+def test_info_from_the_kernels_second_lane(gj_hook):
+    A = f32(3, 2, n=4)
+    A[1, 0] = 0
+    want = torch.linalg.solve_ex(A, torch.ones(3, 2, 4, 1)).info
+    with cpu_as_hpu(linalg.install_solve):
+        got = torch.linalg.solve_ex(A, torch.ones(3, 2, 4, 1)).info
+    assert got.dtype == torch.int32 and torch.equal(got, want) and want.any()
+
+
+def test_chunks_and_flat_inv_contract(monkeypatch):
+    monkeypatch.setattr(tpc, "_inv_op", lambda: lambda A: tpc.gj_solve_reference(
+        A, torch.eye(A.shape[-1]).expand_as(A)))
+    A = f32(2, 3, n=5)
+    X, D, S = tpc.gj_inv(A)
+    torch.testing.assert_close(X, torch.linalg.inv(A), rtol=1e-3, atol=1e-3)
+    assert D.shape == (2, 3, 5) and S.shape == (2, 3, 2)
+
+
+def test_ready_declines_after_a_build_failure(monkeypatch):
+    monkeypatch.setattr(tpc, "_INSTALLED", True)
+    tpc._built.cache_clear()
+
+    def boom():
+        raise RuntimeError("no toolchain")
+
+    monkeypatch.setattr(tpc, "_load", boom)
+    with pytest.warns(UserWarning, match="no toolchain"):
+        assert tpc.ready() is False
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert tpc.ready() is False
+    tpc._built.cache_clear()
 
 
 def test_singular_info_from_pivots(gj_hook):
@@ -696,6 +780,9 @@ def test_install_kernel_path(monkeypatch):
     monkeypatch.delenv("GC_KERNEL_PATH", raising=False)
     assert tpc.install_kernel_path() is True and tpc.available() is True
     assert os.environ["GC_KERNEL_PATH"] == f"{tpc.LIB}:{default}"
+    assert tpc.install_kernel_path() is True
+    assert os.environ["GC_KERNEL_PATH"] == f"{tpc.LIB}:{default}"
+    monkeypatch.setenv("GC_KERNEL_PATH", "")  # empty is unset
     assert tpc.install_kernel_path() is True
     assert os.environ["GC_KERNEL_PATH"] == f"{tpc.LIB}:{default}"
     monkeypatch.setenv("GC_KERNEL_PATH", "/x/other.so")
