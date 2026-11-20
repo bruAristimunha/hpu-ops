@@ -15,13 +15,14 @@
 
 ``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
 n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Batch 32, n = 22,
-eager: 1.27 ms per call against about 3.7 ms for Habana's CPU fallback (the raw kernel takes 0.19 ms); batch 1024:
-3.7 ms against 52 ms. Accuracy within about 3.8x of CPU float32's, also on repeated eigenvalues, condition 1e6 and
-inputs scaled by 1e30.
+lazy: 0.54 / 1.0 ms per call in two processes against 2.4 / 2.7 for Habana's CPU fallback
+(``tests/linalg_percall.py``; the raw kernel took 0.19 ms in an older run); batch 1024: 3.7 ms against 52 ms (older
+run). Accuracy within about 3.8x of CPU float32's, also on repeated eigenvalues, condition 1e6 and inputs scaled by
+1e30.
 
 The torch-op composites of ``hpu_ops.linalg`` are correct but were measured 3-25x slower than Habana's CPU fallback
-per call on Gaudi2 (one launch per op). The solve kernel, batch 32, n = 22, eager: 2.7 ms against about 4.5 ms for
-the fallback (lazy 0.57 against about 2.2).
+per call on Gaudi2 (one launch per op). The solve kernel, batch 32, n = 22, eager: 2.9 / 1.3 ms in two processes against
+6.1 / 2.5 for the fallback; lazy 0.97 / 1.36 against 1.22 / 1.38, within the card's noise.
 
 Habana reads ``GC_KERNEL_PATH`` when the device initialises, so ``install_kernel_path`` must run before the first HPU
 op of the process; ``hpu_ops.enable()`` calls it. ``HPU_OPS_TPC=0`` in the environment keeps the kernels off.

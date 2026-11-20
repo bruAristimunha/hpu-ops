@@ -26,14 +26,19 @@ at the tensor's pickling:
 - On Gaudi2 those composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
   ``linalg.solve``, ``inv``, ``det`` and ``slogdet`` of float32 matrices
   with n <= 64 run through a TPC Gauss-Jordan kernel with partial pivoting (``tpc``), one matrix per index-space
-  member. Eager, batch 32, n = 22: solve 2.7 ms against about 4.5 ms for the fallback, inv 1.8 against 4.6, det 0.82
-  against 2.7 (lazy: 0.57, 0.48, 0.51 against about 2.2, 2.2, 1.4). Habana reads the kernel path when the device
-  initialises, so ``enable()`` must run before the first HPU op, else the kernel is off (one warning). The kernels
+  member. Eager, batch 32, n = 22, mean ms per call in two processes: solve 2.9 / 1.3 against 6.1 / 2.5 for the
+  fallback, inv 2.0 / 1.2 against 4.3 / 2.0, det 0.67 / 0.69 against 2.7 / 1.2. Lazy, per call, within the card's
+  noise of the fallback (slogdet slower); the card's noise is about 2x between processes
+  (``tests/linalg_percall.py``). Habana reads the kernel path when the device initialises, so ``enable()``
+  must run before the first HPU op, else the kernel is off (one warning). The kernels
   are off too on a device that is not a Gaudi2 and with ``HPU_OPS_TPC=0`` in the environment. Calls the kernel does
-  not take (n > 64, kernel off) run through hpu-ops' own CPU route, which is not Habana's fallback.
+  not take (n > 64, float64, kernel off): ``inv`` runs through hpu-ops' own CPU route, which is not Habana's
+  fallback; ``solve``, ``det`` and ``slogdet`` register only at the autograd key and reach Habana's own kernel and
+  its CPU fallback (bridge-counted).
 - ``linalg.eigh`` and ``eigvalsh`` of float32 matrices with n <= 32 run through a TPC one-sided Jacobi kernel
-  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32, n = 22: 1.27 ms
-  against about 3.7 ms for the fallback (lazy 0.80 against about 1.4); batch 1024 3.7 ms against 52 ms; within about
+  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32, n = 22: 0.81 / 2.6 ms
+  in two processes against 3.9 / 2.3 for the fallback (lazy 0.54 / 1.0 against 2.4 / 2.7); batch 1024 3.7 ms against
+  52 ms (older run); within about
   3.8x of CPU float32 accuracy, also on repeated eigenvalues, condition 1e6 and inputs scaled by 1e30.
   Without the kernel, or past n = 32, the call is declined and runs through hpu-ops' own CPU route, not Habana's
   fallback: the parallel-Jacobi composite of ``eigh`` was measured slower than the fallback on Gaudi2, so it only

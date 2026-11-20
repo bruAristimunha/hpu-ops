@@ -222,7 +222,8 @@ def solve_triangular(A, B, upper, left=True, unitriangular=False):
 
 
 class SolveTriangular(torch.autograd.Function):
-    """``linalg.solve_triangular`` with torch's backward (``linalg_solve_triangular_backward``) over the composite."""
+    """``linalg.solve_triangular`` with torch's backward (``linalg_solve_triangular_backward``). On HPU, float32 with
+    n <= ``tpc.MAXN`` runs the TPC substitution kernel (``tpc.tri_solve``); otherwise the composite (CPU stand-in)."""
 
     @staticmethod
     def compute(A, B, upper, left, unitriangular):
@@ -252,7 +253,9 @@ class SolveTriangular(torch.autograd.Function):
 
 
 def install_solve_triangular(device_type):
-    """``linalg.solve_triangular`` on ``device_type`` as a matmul with the block-recursive inverse. Returns an undo."""
+    """``linalg.solve_triangular`` on ``device_type``: on HPU, float32 with n <= ``tpc.MAXN`` through the TPC
+    substitution kernel (``tpc.tri_solve``), other calls through hpu-ops' CPU route; on the CPU stand-in, the
+    composite (a matmul with the block-recursive inverse). Returns an undo."""
     op = aten.linalg_solve_triangular.default
     base = _takes(device_type, "solve_triangular")
 
@@ -270,7 +273,8 @@ def cholesky_solve(B, L, upper=False):
 
 
 class CholeskySolve(torch.autograd.Function):
-    """``cholesky_solve`` with torch's backward (``cholesky_solve_backward``) over the composite."""
+    """``cholesky_solve`` with torch's backward (``cholesky_solve_backward``). On HPU, float32 with n <= ``tpc.MAXN``
+    runs two TPC substitutions (``tpc.tri_solve``, L then L^H); otherwise the composite (CPU stand-in)."""
 
     @staticmethod
     def compute(B, L, upper):
@@ -301,7 +305,9 @@ class CholeskySolve(torch.autograd.Function):
 
 
 def install_cholesky_solve(device_type):
-    """``cholesky_solve`` on ``device_type`` as two matmuls with the block-recursive inverse. Returns an undo."""
+    """``cholesky_solve`` on ``device_type``: on HPU, float32 with n <= ``tpc.MAXN`` as two TPC substitutions
+    (``tpc.tri_solve``), other calls through hpu-ops' CPU route; on the CPU stand-in, the composite (two matmuls with
+    the block-recursive inverse). Returns an undo."""
     base = _takes(device_type, "cholesky_solve", matrix_at=1)
 
     def shapes_ok(B, L, upper=False):
