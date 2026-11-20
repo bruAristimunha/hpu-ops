@@ -1098,3 +1098,21 @@ def test_tpc_eigh_1x1_needs_no_kernel(monkeypatch):
         assert w.shape == (4, 1) and V.shape == (4, 1, 1) and w.dtype == V.dtype == torch.float32
         assert torch.equal(w, A[..., 0, :]) and torch.equal(V, torch.ones(4, 1, 1))
         assert w.data_ptr() != A.data_ptr()  # a fresh tensor, never a view of the input
+
+
+@pytest.mark.parametrize("n", [3, 8, 22])
+def test_generic_singular_triangle_is_non_finite(monkeypatch, n):
+    """A zero diagonal entry, nonzero entries below it: pivots are rarely exactly zero, the diagonal flags it."""
+    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
+    torch.manual_seed(n)
+    A = torch.tril(0.3 * torch.randn(3, n, n)) + 2 * torch.eye(n)
+    A[1, n // 2, n // 2] = 0
+    B = torch.randn(3, n, 2)
+    want = torch.linalg.solve_triangular(A, B, upper=False)
+    assert not torch.isfinite(want[1]).all()
+    with cpu_as_hpu(linalg.install_solve_triangular):
+        got = torch.linalg.solve_triangular(A, B, upper=False)
+    with cpu_as_hpu(linalg.install_cholesky_solve):
+        chol = torch.cholesky_solve(B, A)
+    for out in (got, chol):
+        assert not torch.isfinite(out[1]).all() and torch.isfinite(out[0]).all() and torch.isfinite(out[2]).all()

@@ -96,7 +96,7 @@ def enable():
         import habana_frameworks.torch.core  # noqa: F401  (Habana's kernels first: they are never overridden)
     except ImportError:
         return
-    tpc.install_kernel_path()  # before any HPU op: Habana reads the kernel path when the first graph compiles
+    tpc.install_kernel_path()  # before the first HPU op: Habana reads the kernel path when the device initialises
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"

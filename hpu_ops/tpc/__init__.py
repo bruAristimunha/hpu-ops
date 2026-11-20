@@ -3,8 +3,8 @@
 ``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel) for float32, n and m <= 32. One matrix per index-space
 member, rows in local memory, partial pivoting. ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign (-1)^swaps
 of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can differ from
-LAPACK's, and is nonzero exactly when a pivot is exactly zero. A zero pivot gives a zero pivot row (as in LAPACK) and
-the pivots after it stay finite.
+LAPACK's, and is nonzero exactly when a pivot is exactly zero. The kernel zeroes the pivot row of a zero pivot so
+later pivots stay finite.
 
 ``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
 n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Batch 32, n = 22,

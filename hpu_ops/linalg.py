@@ -45,7 +45,8 @@ def _bind(op, args, kwargs):
 def _transformed():
     """Whether a functorch transform (vmap, grad, jvp, jacrev, ...) or forward-mode AD is active. The Functions here
     define no ``setup_context`` and no jvp, so those calls keep the op's own kernel."""
-    return torch._C._functorch.peek_interpreter_stack() is not None or torch.autograd.forward_ad._current_level >= 0
+    forward_ad = getattr(torch.autograd.forward_ad, "_current_level", -1) >= 0
+    return torch._C._functorch.peek_interpreter_stack() is not None or forward_ad
 
 
 def _takes(device_type, name, matrix_at=0):
@@ -127,11 +128,18 @@ def _gj_info(S, batch):
     return info
 
 
-def _nan_if_singular(X, S):
-    """``X`` with NaN where the kernel's info (``S[..., 1]``, one per matrix) is nonzero, as torch's triangular solves
-    give non-finite values for a zero diagonal: the kernel zeroes a zero pivot's row, which would leave finite
-    garbage. No host sync."""
-    return torch.where((S[..., 1] != 0)[..., None, None], float("nan"), X)
+def _bad_matrix(S, diagonal):
+    """``[...]`` bool: the kernel's info (``S[..., 1]``) is nonzero, or ``diagonal`` (the one torch's triangular solve
+    reads, ``None`` if none) has a zero. Partial pivoting rarely makes a singular triangle's pivot exactly zero, so
+    the info alone misses most of them. Broadcast to the batch of ``S``; no host sync."""
+    bad = S[..., 1] != 0
+    return bad if diagonal is None else bad | (diagonal == 0).any(-1)
+
+
+def _nan_if_singular(X, S, diagonal=None):
+    """``X`` with NaN for the matrices ``_bad_matrix`` flags, as torch's triangular solves give non-finite values for
+    a zero diagonal: the kernel zeroes a zero pivot's row, which would leave finite garbage."""
+    return torch.where(_bad_matrix(S, diagonal)[..., None, None], float("nan"), X)
 
 
 def _unused_factors(A):
@@ -221,7 +229,7 @@ class SolveTriangular(torch.autograd.Function):
     def compute(A, B, upper, left, unitriangular):
         if _use_tpc(A):
             X, _, S = _gj_solve(_triangle(A, upper, unitriangular), B, left)
-            return _nan_if_singular(X, S)
+            return _nan_if_singular(X, S, None if unitriangular else A.diagonal(dim1=-2, dim2=-1))
         return solve_triangular(A, B, upper, left, unitriangular)
 
     @staticmethod
@@ -266,7 +274,7 @@ class CholeskySolve(torch.autograd.Function):
         if _use_tpc(L):
             L = torch.triu(L) if upper else torch.tril(L)
             X, _, S = _gj(L.mH @ L if upper else L @ L.mH, B)
-            return _nan_if_singular(X, S)
+            return _nan_if_singular(X, S, L.diagonal(dim1=-2, dim2=-1))
         return cholesky_solve(B, L, upper)
 
     @staticmethod
@@ -475,11 +483,11 @@ class InvEx(torch.autograd.Function):
 
 class Det(torch.autograd.Function):
     """``aten._linalg_det`` as the signed product of U's diagonal, with torch's backward (``g det A^-H``), the inverse
-    recomputed from A, so double backward works. A singular matrix has det 0; the gradient of a singular matrix
-    through the TPC kernel is measured on Gaudi2: see README. ``LU`` and
+    recomputed from A, so double backward works. A singular matrix has det 0, and on Gaudi2 its gradient
+    equals torch's (measured). ``LU`` and
     ``pivots`` are not differentiable; they are those of A (native's CPU kernel returns those of A^T). Through the TPC
-    kernel D and S come from the identity kernel (``_gj_inv``), X discarded; the kernel zeroes a zero pivot's row,
-    as LAPACK does, and the pivots after it stay finite."""
+    kernel D and S come from the identity kernel (``_gj_inv``), X discarded; the kernel zeroes the pivot row so later
+    pivots stay finite."""
 
     @staticmethod
     def compute(A):
@@ -506,7 +514,8 @@ class Det(torch.autograd.Function):
 class Slogdet(torch.autograd.Function):
     """``aten._linalg_slogdet`` as the sign and log of U's diagonal, with torch's backward (``g A^-H``) for
     ``logabsdet``, the inverse recomputed from A, so double backward works. ``sign``, ``LU`` and ``pivots`` are
-    not differentiable; ``LU`` and ``pivots`` are those of A (native's CPU kernel returns those of A^T)."""
+    not differentiable; ``LU`` and ``pivots`` are those of A (native's CPU kernel returns those of A^T). On Gaudi2
+    a singular matrix gives ``logabsdet = -inf`` as in torch, but a finite gradient where torch's is non-finite."""
 
     @staticmethod
     def compute(A):

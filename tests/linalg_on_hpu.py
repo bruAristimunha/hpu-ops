@@ -12,7 +12,7 @@ native CPU float64 result to 1e-12, and hpu-ops#16's warning comes once. Two pro
 the first index among ties, and int64 argsort stays on the card.
 One ``RESULT {json}`` line per case; the last line counts them; exits 1 if any case failed.
 eigh and eigvalsh go through the TPC Jacobi kernel for n <= hpu_ops.tpc.EIGH_MAXN and are checked strictly there; past
-it (n = 64, 128) Habana's fallback is expected and recorded. ``--with-eigh`` is accepted and ignored (eigh is in
+it (n = 64, 128) hpu-ops' CPU route is expected and recorded. ``--with-eigh`` is accepted and ignored (eigh is in
 hpu_ops.FIXES).
 ``--baseline`` skips ``hpu_ops.enable()`` to time the stock stack: fallbacks are then recorded (status "fallback")
 and do not fail a case, and the float64 cases are skipped (no warning to expect)."""
@@ -238,7 +238,7 @@ class Case(NamedTuple):
     float64: bool = True  # one of the ops that warns for float64 (hpu-ops#16)
     factor: int = CPU32_FACTOR  # the card may be this many times worse than CPU float32 on this op
     sizes: tuple | None = None  # only these n (the variants run at n = 22)
-    # routed through a TPC kernel (n <= hpu_ops.tpc.MAXN, EIGH_MAXN for eigh); past it Habana's fallback is expected
+    # routed through a TPC kernel (n <= hpu_ops.tpc.MAXN, EIGH_MAXN for eigh); past it hpu-ops' CPU route is expected
     tpc: bool = False
     gate: bool = False  # also run at GATE_SIZES, without timing
 
@@ -426,6 +426,36 @@ def singular_input():
     A[1] = 0
     A[2, 5] = 0
     return A
+
+
+def singular_triangle(op):
+    """Batch 32 at n = 22: well-conditioned triangles (the lower one, as a Cholesky factor too), element 1 with a zero
+    diagonal entry and nonzero entries below it."""
+    n = SINGULAR_N
+    T = torch.tril(0.3 * torch.randn(BATCH, n, n)) + 2 * torch.eye(n)
+    T[1, 5, 5] = 0
+    return T
+
+
+def run_singular_triangle(op, fn):
+    """``solve_triangular`` and ``cholesky_solve`` of a triangle with a zero diagonal entry: non-finite for that
+    element, finite for the others, as torch's; no fallback, no CPU warning."""
+    row = {"op": f"singular.{op}", "n": SINGULAR_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY,
+           "baseline": BASELINE}
+    problems = []
+    try:
+        T, B = singular_triangle(op), torch.randn(BATCH, SINGULAR_N, 3)
+        with watch() as rec:
+            got = fn(T.to(HPU), B.to(HPU)).cpu()
+            sync()
+        row["fwd_fallback"] = rec["fallback"]
+        problems += ["the singular element is finite"] * bool(torch.isfinite(got[1]).all())
+        problems += ["a regular element is not finite"] * (not bool(torch.isfinite(got[2:]).all()))
+        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+    except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
+        problems.append(f"exception {e!r}"[:300])
+    emit(**row, status="fail" if problems else "ok", problems=problems)
+    return not problems
 
 
 def run_singular(op, fn):
@@ -643,6 +673,9 @@ def main():
                     for n in (16, 22) for seed in range(3)]
         for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
             results.append(run_singular(op, fn))
+        for op, fn in (("solve_triangular", lambda T, B: L.solve_triangular(T, B, upper=False)),
+                       ("cholesky_solve", lambda T, B: torch.cholesky_solve(B, T))):
+            results.append(run_singular_triangle(op, fn))
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
         ok = bool(EIGH_FALLBACKS)
         emit(op="metric_check", lazy=LAZY, baseline=True, status="ok" if ok else "error",

@@ -87,10 +87,10 @@ The linalg rows above run as single TPC kernels, one matrix per index-space memb
 - **Limit:** float32 matrices with n <= 32 on a Gaudi2. Calls the kernels do not take (n > 32, float64, kernels off) run through hpu-ops' own CPU route (`hpu_ops.linalg._on_cpu`: the tensors are copied to the CPU, the op runs there, the result is copied back). That is not Habana's fallback, and its cost is not the fallback's. Float64: see "float64".
 - **Order:** call `hpu_ops.enable()` before the first HPU op. Habana reads the kernel path when the device initialises; later, the kernels are off, with one warning, and the calls take the CPU route above.
 - **Opt-out:** `HPU_OPS_TPC=0` in the environment keeps the kernels off. They are also off on a device that is not a Gaudi2, and when `liblinalg_tpc.so` is missing (one warning).
-- **Transforms:** under `torch.func` transforms (`vmap`, `grad`, `jacrev`, `jvp`, ...) and forward-mode AD these ops keep torch's own kernel.
-- **Singular triangles:** `solve_triangular` and `cholesky_solve` of a matrix with an exactly zero pivot return NaN for that matrix, as torch's give non-finite values. `det` of a singular matrix is 0; its gradient on the card: to be measured on Gaudi2 and filled in here.
+- **Transforms:** under `torch.func` transforms and forward-mode AD, the transformed call goes through torch's own derivative rules (`jacfwd`, `jvp`, `hessian` and forward AD use torch's kernel; for `vmap`, `grad` and `jacrev` the inner calls may still use the TPC kernel; results match).
+- **Singular triangles:** `solve_triangular` and `cholesky_solve` of a triangle with a zero diagonal entry (or a zero pivot) return NaN for that matrix, as torch's give non-finite values. `det` of a singular matrix is 0 on the card and its gradient equals torch's (measured on Gaudi2). `slogdet` of a singular matrix gives `logabsdet = -inf`, as torch does, but its gradient is finite where torch's is non-finite, so a finiteness check on that gradient does not flag a singular input.
 - **Lazy mode:** works. Each kernel call ends its lazy graph.
-- **Accuracy:** within 10x of CPU float32 against float64 (`eigh` within about 3.8x), also with dense repeated eigenvalues, condition 1e6 and inputs scaled by 1e30. Measured at n = 16 and 22. The gate also runs n = 1, 3, 21, 31 and 32 and an indefinite `eigh` at n = 3, 22 and 32 (`tests/linalg_on_hpu.py`); their results: to be added after the run.
+- **Accuracy:** within 10x of CPU float32 against float64 (`eigh` within about 3.8x), also with dense repeated eigenvalues, condition 1e6 and inputs scaled by 1e30. Measured at n = 16 and 22. The gate runs 130 cases, including n = 1, 3, 21, 31 and 32 for the eight kernel ops and an indefinite `eigh` and `eigvalsh` at n = 3, 22 and 32: 130 of 130 pass in eager mode and 129 of 130 in lazy mode, measured before the 1x1 change below. The one lazy failure is the backward of `qr` at n = 22 (error 6.11e-6 against a bar of 6.05e-6), the known QR gap below. `eigh` and `eigvalsh` at n = 1 do not use the kernel (its graph does not compile at n = 1 in lazy mode): they return the entry and 1.
 
 ## Measured on Gaudi2 (habana 1.21.4 / torch 2.6.0)
 
@@ -210,8 +210,9 @@ It also checks:
 
 - TSMNet's `solve` has n = 40, above the kernel limit of 32. It runs through hpu-ops' own CPU route, not Habana's fallback, and its training step is slower than on `origin/main` (table above). The limit is being raised to 64.
 - `info`, the index of a singular pivot, follows the kernel's own elimination order and can differ from LAPACK's.
-- The backward of `qr` at n = 16 is less accurate than CPU float32. A substitution kernel is being written for it.
+- The backward of `qr` at n = 16 and, in lazy mode, at n = 22 (6.11e-6 against a 6.05e-6 bar) is less accurate than CPU float32. A substitution kernel is being written for it.
 - float64 linalg runs on the CPU (see "float64").
+- `slogdet` of a singular matrix: `logabsdet = -inf` as in torch, but the gradient is finite where torch's is non-finite (measured on Gaudi2).
 - Calls the kernels decline (n > 32, kernels off, another Gaudi generation) take hpu-ops' own CPU route, which is not Habana's fallback. Its per-call cost against the fallback is not measured.
 
 ## Limits
