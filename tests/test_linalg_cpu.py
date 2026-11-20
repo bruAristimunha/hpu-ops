@@ -8,6 +8,7 @@ import torch
 import torch.utils._pytree as pytree
 from test_cpu import compiled, cpu_as_hpu, ops
 
+import hpu_ops
 from hpu_ops import eigh as jacobi
 from hpu_ops import linalg
 
@@ -420,6 +421,10 @@ def test_det_slogdet_with_row_swaps(fn, perm):
 
 
 # ---- eigh
+def test_enable_does_not_install_eigh():
+    # measured on Gaudi2 (1.21.4): slower than the CPU fallback, and a device error in lazy mode at n >= 64
+    assert jacobi.install_eigh not in hpu_ops.FIXES
+
 
 
 @pytest.mark.parametrize("n", [2, 4, 22, 64])

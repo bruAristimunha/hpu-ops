@@ -5,6 +5,9 @@ The n/2 disjoint rotations of a round-robin round are one batched matmul, and a 
 convergence test, so the op count is static and nothing syncs with the host. The backward is torch's Hermitian
 ``linalg_eig_backward`` over differentiable ops. Input rules are those of ``hpu_ops.linalg``: real float32 matrices of
 static shape, float64 off ``hpu`` only.
+
+Opt-in, not installed by ``hpu_ops.enable()``: on Gaudi2 (bridge 1.21.4) it takes 760-7600 ms per call against 2.8-35 ms
+for Habana's CPU fallback (batch 32, n = 16-128), and in lazy mode it raises a Synapse critical device error at n = 64.
 """
 import torch
 import torch.nn.functional as F
