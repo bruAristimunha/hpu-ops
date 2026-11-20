@@ -19,6 +19,9 @@ at the tensor's pickling:
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
   roll wrongly (EMG2QwertyNet's input gradient).
+- ``linalg.solve_triangular`` as a matmul with a block-recursive inverse (``linalg``): it has no HPU kernel and ran
+  on the CPU; float64 stays on the CPU, as Gaudi2 computes it at float32 precision (hpu-ops#16). Cholesky's and QR's
+  backward use it.
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -39,7 +42,7 @@ import warnings
 
 import torch
 
-from . import composite, conv, serialization, upsample
+from . import composite, conv, linalg, serialization, upsample
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -47,7 +50,7 @@ __all__ = ["enable"]
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
-         composite.install_roll, serialization.install)
+         composite.install_roll, linalg.install_solve_triangular, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
