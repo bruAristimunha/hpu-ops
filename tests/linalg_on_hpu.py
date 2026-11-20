@@ -64,9 +64,9 @@ SINGULAR_N = 22
 L = torch.linalg
 TRI_FB = frozenset({"aten::linalg_solve_triangular"})  # bridge names of ops that run through Habana's fallback
 CHOL_FB = frozenset({"aten::_cholesky_solve_helper"})
-SOLVE_FB = frozenset({"aten::_linalg_solve_ex"})  # float64: no backend kernel, so Habana's fallback runs the op
-DET_FB = frozenset({"aten::_linalg_det"})
-SLOGDET_FB = frozenset({"aten::_linalg_slogdet"})
+SOLVE_FB = frozenset({"aten::_linalg_solve_ex.result"})  # float64: no backend kernel, so Habana's fallback runs the op
+DET_FB = frozenset({"aten::_linalg_det.result"})
+SLOGDET_FB = frozenset({"aten::_linalg_slogdet.sign"})
 
 
 def sync():
