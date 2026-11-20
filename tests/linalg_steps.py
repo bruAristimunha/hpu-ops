@@ -3,8 +3,8 @@
 SPDNet, TSMNet, TensorCSPNet, EEGSPDNet and GBWAtt on a real batch of 32 at BNCI2014_001's width (22 channels):
 five warm-up steps, then the mean ms of 20 steps and the CPU-fallback ops per step (bridge ``cpu_fallback`` metric).
 A model fails when its step errors or when one of the ops of the linalg composites falls back: solve_triangular,
-cholesky_solve, solve, inv, det and slogdet, and with ``--with-eigh`` (which installs the opt-in
-hpu_ops.eigh.install_eigh) eigh too. One ``RESULT {json}`` line per model; the last line
+cholesky_solve, solve, inv, det and slogdet, and eigh too when hpu_ops installs it (this branch's enable() does;
+``--with-eigh`` also installs it for an origin/main without it). One ``RESULT {json}`` line per model; the last line
 counts them; exits 1 if any model failed. The A/B is chosen by which ``hpu_ops`` is on PYTHONPATH (this branch or
 origin/main's): spd_diag's ``_enable_device("hpu")`` runs ``hpu_ops.enable()`` and ``hpu_complex.enable()`` in
 either case, and the PLUGINS line prints ``hpu_ops.__file__`` to show which package ran. ``--baseline`` only records
@@ -121,7 +121,7 @@ def main():
                         help="record linalg fallbacks instead of failing on them "
                              "(the A/B is the hpu_ops on PYTHONPATH)")
     parser.add_argument("--with-eigh", action="store_true",
-                        help="install hpu_ops.eigh.install_eigh and fail a model whose step makes eigh fall back")
+                        help="also fail a model whose step makes eigh fall back (installs eigh if enable() did not)")
     args = parser.parse_args()
     baseline = args.baseline
     import hpu_complex
@@ -141,7 +141,8 @@ def main():
     linalg_ops = LINALG_OPS + ("eigh",) * eigh_checked
     print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), hpu_ops.__file__, "hpu_complex",
           getattr(hpu_complex, "__version__", "?"), "enabled by spd_diag; baseline (fallbacks recorded)", baseline,
-          "eigh checked", eigh_checked, "lazy", LAZY, flush=True)
+          "eigh checked", eigh_checked, "tpc_ready",
+          getattr(getattr(hpu_ops, "tpc", None), "ready", lambda: None)(), "lazy", LAZY, flush=True)
     cache = open_cache(DATASET)
     info, sd = cache.info, cache.subject(cache.subjects[0], "X")
     X = torch.as_tensor(sd.X[:BATCH], dtype=torch.float32)

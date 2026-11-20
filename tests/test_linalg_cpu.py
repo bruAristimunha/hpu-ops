@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.utils._pytree as pytree
 from test_cpu import compiled, cpu_as_hpu, ops
+from torch._dynamo.backends.common import aot_autograd
 
 import hpu_ops
 from hpu_ops import eigh as jacobi
@@ -424,10 +425,110 @@ def test_det_slogdet_with_row_swaps(fn, perm):
 
 
 # ---- eigh
-def test_enable_does_not_install_eigh():
-    # measured on Gaudi2 (1.21.4): slower than the CPU fallback, and a device error in lazy mode at n >= 64
-    assert jacobi.install_eigh not in hpu_ops.FIXES
+def test_enable_installs_eigh():
+    # it declines without the TPC kernel (n > EIGH_MAXN, kernel not ready), so it cannot be slower than the fallback
+    assert jacobi.install_eigh in hpu_ops.FIXES
 
+
+@pytest.fixture
+def eigh_hook(monkeypatch):
+    """``eigh._EIGH`` set to the reference; the list collects one entry per call."""
+    calls = []
+
+    def hook(A, upper):  # detached, like the real op: no autograd through the kernel
+        calls.append((tuple(A.shape), upper))
+        return tpc.eigh_reference(A.detach(), upper)
+
+    monkeypatch.setattr(jacobi, "_EIGH", hook)
+    return calls
+
+
+def test_eigh_reference_contract():
+    torch.manual_seed(0)
+    S = spd(3, n=5)
+    for upper in (False, True):
+        w, V = tpc.eigh_reference(S, upper)
+        torch.testing.assert_close(w, torch.linalg.eigvalsh(S))
+        torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S)
+    assert tpc.EIGH_MAXN == 32
+
+
+@pytest.mark.parametrize("n", [1, 3, 22])
+def test_eigh_routes_through_the_hook(n, eigh_hook):
+    torch.manual_seed(0)
+    S = spd(3, n=n)
+    with cpu_as_hpu(jacobi.install_eigh) as calls:
+        w, V = torch.linalg.eigh(S)
+        assert calls["eigh"] >= 1, dict(calls)
+    assert eigh_hook == [((3, n, n), False)]
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(S), rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S, rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(V.mT @ V, torch.eye(n, dtype=S.dtype).expand_as(V), rtol=0, atol=1e-10)
+
+
+def test_eigvalsh_routes_through_the_hook_and_skips_v(eigh_hook):
+    torch.manual_seed(0)
+    S = spd(2, n=6)
+    with cpu_as_hpu(jacobi.install_eigh) as calls, torch.no_grad():
+        w = torch.linalg.eigvalsh(S)
+        assert calls["eigh"] >= 1, dict(calls)
+        w2, V = jacobi.Eigh.compute(S, "L", False)
+    assert len(eigh_hook) == 2 and V.numel() == 0
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(S), rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(w2, w)
+
+
+@pytest.mark.parametrize("uplo", ["L", "U"])
+def test_eigh_hook_uses_the_chosen_triangle(uplo, eigh_hook):
+    torch.manual_seed(0)
+    S = spd(3, n=8)
+    junk = S + (torch.tril(torch.randn_like(S), -1) if uplo == "U" else torch.triu(torch.randn_like(S), 1)) * 100
+    with cpu_as_hpu(jacobi.install_eigh):
+        w, V = torch.linalg.eigh(junk, UPLO=uplo)
+    assert eigh_hook[0][1] == (uplo == "U")
+    torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S, rtol=1e-10, atol=1e-10)
+
+
+def test_eigh_grad_through_the_hook(eigh_hook):
+    torch.manual_seed(0)
+    S = spd(3, n=8) / 8
+
+    def f(S):
+        w, V = torch.linalg.eigh(S)
+        return V @ torch.diag_embed(w.exp()) @ V.mT, w  # sign-invariant in V
+
+    compare(f, jacobi.install_eigh, S, name="eigh", rtol=1e-8, atol=1e-8)
+    assert eigh_hook
+
+
+def test_eigh_hook_degenerate(eigh_hook):
+    D = torch.diag(torch.tensor([1.0, 1.0, 2.0], dtype=torch.float64))
+    with cpu_as_hpu(jacobi.install_eigh):
+        w, V = torch.linalg.eigh(D)
+    assert eigh_hook
+    assert torch.equal(w, torch.tensor([1.0, 1.0, 2.0], dtype=torch.float64))
+    torch.testing.assert_close(V @ torch.diag(w) @ V.mT, D, rtol=0, atol=1e-12)
+
+
+def test_eigh_is_declined_past_maxn_on_hpu_and_without_the_kernel(monkeypatch):
+    A = torch.randn(2, 4, 4)
+    takes = jacobi._tpc_takes("hpu")
+    monkeypatch.setattr(tpc, "ready", lambda: False)
+    assert takes(A, "L", True) is False
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    assert takes(A, "L", True) is True
+    assert takes(torch.randn(tpc.EIGH_MAXN + 1, tpc.EIGH_MAXN + 1), "L", True) is False
+    assert takes(torch.randn(tpc.EIGH_MAXN, tpc.EIGH_MAXN), "L", True) is True
+    cpu = jacobi._tpc_takes("cpu")
+    monkeypatch.setattr(tpc, "ready", lambda: False)
+    assert cpu(torch.randn(tpc.EIGH_MAXN + 1, tpc.EIGH_MAXN + 1), "L", True) is True  # the stand-in keeps the composite
+
+
+def test_eigh_hook_not_used_past_maxn(eigh_hook):
+    torch.manual_seed(0)
+    with cpu_as_hpu(jacobi.install_eigh):
+        torch.linalg.eigvalsh(spd(1, n=tpc.EIGH_MAXN + 1))
+    assert eigh_hook == []
 
 
 @pytest.mark.parametrize("n", [2, 4, 22, 64])
@@ -643,7 +744,8 @@ GJ_CASES = {
 for _upper in (False, True):
     for _left in (True, False):
         for _unit in (False, True):
-            GJ_CASES[f"tri_{'upper' if _upper else 'lower'}_{'left' if _left else 'right'}_{'unit' if _unit else 'full'}"] = (
+            _key = f"tri_{'upper' if _upper else 'lower'}_{'left' if _left else 'right'}_{'unit' if _unit else 'full'}"
+            GJ_CASES[_key] = (
                 (lambda u=_upper, l=_left, t=_unit: _tri_case(u, l, t)), linalg.install_solve_triangular,
                 "solve_triangular")
 
@@ -679,7 +781,8 @@ def test_gj_not_used_past_maxn(gj_hook):
 
 
 DOUBLE_BACKWARD = {
-    "solve": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b), lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
+    "solve": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b),
+              lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
     "solve_right": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b, left=False),
                     lambda: (general(n=4), torch.randn(2, 4, dtype=torch.float64))),
     "solve_triangular": (linalg.install_solve_triangular,
@@ -755,6 +858,7 @@ def test_chunks_and_flat_inv_contract(monkeypatch):
 
 def test_ready_declines_after_a_build_failure(monkeypatch):
     monkeypatch.setattr(tpc, "_INSTALLED", True)
+    monkeypatch.setattr(tpc, "_device_name", lambda: "GAUDI2")
     tpc._built.cache_clear()
 
     def boom():
@@ -817,11 +921,12 @@ def test_install_kernel_path(monkeypatch):
         assert tpc.install_kernel_path() is False  # warned once
     assert len(record) == 1
     assert str(record[0].message) == ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off "
-                                      "for this process (call enable() before the first HPU op)")
+                                      "for this process (call enable() before the first HPU op). The linalg ops then "
+                                      "run through hpu-ops' own CPU route, not Habana's fallback.")
 
 
-@pytest.mark.parametrize("lazy, flushes", [("1", 2), ("0", 0)])
-def test_tpc_flushes_the_lazy_graph_around_the_op(monkeypatch, lazy, flushes):
+@pytest.mark.parametrize("lazy, flushes", [("1", 1), ("0", 0)])
+def test_tpc_flushes_the_lazy_graph_before_the_op(monkeypatch, lazy, flushes):
     marks = []
     core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
     torch_mod = types.SimpleNamespace(core=core)
@@ -903,7 +1008,7 @@ def test_tpc_svd_flattens_batch_and_makes_contiguous(monkeypatch):
     assert seen_vals == [((6, 4, 5), True, torch.float32), ((6, 4, 5), True, torch.float32)]
 
 
-@pytest.mark.parametrize("lazy, flushes", [("1", 2), ("0", 0)])
+@pytest.mark.parametrize("lazy, flushes", [("1", 1), ("0", 0)])
 def test_tpc_svd_flushes_lazy_graph(monkeypatch, lazy, flushes):
     marks = []
     core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
@@ -1665,3 +1770,350 @@ def test_orthogonal_matrix_exp_and_householder(omap, shape, expm_hook, hh_hook):
     k = min(rows, cols)
     gram = got_w.mT @ got_w if rows >= cols else got_w @ got_w.mT
     torch.testing.assert_close(gram, torch.eye(k, dtype=torch.float64), rtol=1e-10, atol=1e-10)
+
+
+def test_flush_comes_before_the_op_only(monkeypatch):
+    order = []
+    core = types.SimpleNamespace(mark_step=lambda: order.append("flush"))
+    torch_mod = types.SimpleNamespace(core=core)
+    for name, mod in (("habana_frameworks", types.SimpleNamespace(torch=torch_mod)),
+                      ("habana_frameworks.torch", torch_mod), ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    out = tpc._call(lambda x: order.append("op") or x, 1)
+    assert out == 1 and order == ["flush", "op"]
+
+
+def test_flush_is_skipped_when_compiling_or_without_habana(monkeypatch):
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    monkeypatch.setitem(sys.modules, "habana_frameworks", None)  # import raises ImportError
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch", None)
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.core", None)
+    tpc._flush()  # no Habana: no error
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.core", core)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    tpc._flush()
+    assert marks == []
+
+
+def test_lazy_cpp_registers_eigh_with_the_legacy_api():
+    assert "UserCustomOpDescriptor" not in tpc.CPP_LAZY
+    assert "HabanaCustomOpDescriptor::getCustomOpDescriptor(\"linalg_tpc::jacobi_eigh\")" in tpc.CPP_LAZY
+    assert "UserCustomOpDescriptor::getUserCustomOpDescriptor(\"linalg_tpc::jacobi_eigh\")" in tpc.CPP
+
+
+# ---- final-review fixes: device check, opt-out, key coupling, functorch, singular triangles, numpy-free import
+
+
+@pytest.mark.parametrize("name, ok", [("GAUDI2", True), ("Gaudi2", True), ("GAUDI3", False), ("GAUDI", False)])
+def test_ready_requires_a_gaudi2(monkeypatch, name, ok):
+    monkeypatch.setattr(tpc, "_INSTALLED", True)
+    monkeypatch.setattr(tpc, "_built", lambda: True)
+    monkeypatch.setattr(tpc, "_device_name", lambda: name)
+    assert tpc.ready() is ok
+
+
+def test_non_gaudi2_declines_so_the_ops_keep_the_native_path(monkeypatch):
+    monkeypatch.setattr(tpc, "_INSTALLED", True)
+    monkeypatch.setattr(tpc, "_built", lambda: True)
+    monkeypatch.setattr(tpc, "_device_name", lambda: "GAUDI3")
+    takes = linalg._tpc_takes("hpu", linalg._takes("hpu", "solve"))
+    assert takes(torch.randn(2, 4, 4)) is False
+
+
+def test_import_hpu_ops_does_not_need_numpy():
+    import subprocess
+    code = "import sys; sys.modules['numpy'] = None; import hpu_ops"
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=os.path.dirname(os.path.dirname(__file__)))
+
+
+def test_opt_out_env_turns_the_kernels_off(monkeypatch):
+    monkeypatch.setattr(tpc, "_INSTALLED", True)
+    monkeypatch.setattr(tpc, "_initialized", lambda: False)
+    monkeypatch.setenv("HPU_OPS_TPC", "0")
+    assert tpc.install_kernel_path() is False and tpc.available() is False
+
+
+def test_install_kernel_path_declines_without_the_library(monkeypatch, tmp_path):
+    monkeypatch.setattr(tpc, "_INSTALLED", False)
+    monkeypatch.setattr(tpc, "_LATE_WARNED", False)
+    monkeypatch.setattr(tpc, "_initialized", lambda: False)
+    monkeypatch.setattr(tpc, "LIB", tmp_path / "missing.so")
+    monkeypatch.delenv("HPU_OPS_TPC", raising=False)
+    with pytest.warns(UserWarning, match="not found"):
+        assert tpc.install_kernel_path() is False
+    assert tpc.available() is False
+
+
+def test_backend_kernel_is_registered_only_with_its_autograd_kernel(monkeypatch):
+    from hpu_ops import _dispatch
+
+    op = torch.ops.aten.linalg_inv_ex.default
+    groups = [[(op, "Autograd{}", lambda *a, **k: None), (op, "{}", lambda *a, **k: None)]]
+    taken, seen = set(), []
+    monkeypatch.setattr(torch._C, "_dispatch_has_kernel_for_dispatch_key", lambda name, key: key in taken)
+    monkeypatch.setattr(torch.library.Library, "impl", lambda self, op, fn, key: seen.append(key))
+    _dispatch.register_paired("cpu", groups)
+    assert sorted(seen) == ["AutogradCPU", "CPU"]
+    seen.clear()
+    taken.add("AutogradCPU")  # Habana's own autograd kernel: ours would split the two keys, so neither is registered
+    _dispatch.register_paired("cpu", groups)
+    assert seen == []
+    taken.clear()
+    taken.add("CPU")  # a taken backend key alone only skips that key (the CPU stand-in's case)
+    _dispatch.register_paired("cpu", groups)
+    assert seen == ["AutogradCPU"]
+
+
+def test_functorch_jacrev_and_vmap_take_the_native_path(gj_hook):  # the kernel hook may serve calls below the transform
+    A, b = general(3, n=4, dtype=torch.float32), torch.randn(3, 4)
+    want = torch.func.jacrev(torch.linalg.solve)(A, b)
+    with cpu_as_hpu(linalg.install_solve):
+        got = torch.func.jacrev(torch.linalg.solve)(A, b)  # the transformed call is declined: no setup_context error
+        v = torch.func.vmap(torch.linalg.solve)(A, b)
+    torch.testing.assert_close(got, want)
+    torch.testing.assert_close(v, torch.linalg.solve(A, b))
+
+
+def test_forward_ad_takes_the_native_path(gj_hook):
+    import torch.autograd.forward_ad as fwAD
+    A = general(n=4, dtype=torch.float32)
+    t = torch.randn(4, 4)
+    with fwAD.dual_level():
+        want = fwAD.unpack_dual(torch.linalg.det(fwAD.make_dual(A, t))).tangent
+    with cpu_as_hpu(linalg.install_inv_det):
+        with fwAD.dual_level():
+            got = fwAD.unpack_dual(torch.linalg.det(fwAD.make_dual(A, t))).tangent
+        jv = torch.func.jvp(torch.linalg.det, (A,), (t,))[1]
+    torch.testing.assert_close(got, want)
+    torch.testing.assert_close(jv, want)
+    assert gj_hook == []
+
+
+def zeroing_hook(A, B):
+    """The kernel's contract on a singular triangle: the pivot row is zeroed (a zero row in X), info is nonzero."""
+    X, D, S = tpc.gj_solve_reference(A.detach(), B.detach())
+    zero = (D == 0)
+    X = torch.where(zero.any(-1)[..., None, None], torch.zeros_like(X), X)
+    return X, D, S
+
+
+def test_singular_triangle_gives_nan_like_torch(monkeypatch):
+    monkeypatch.setattr(linalg, "_GJ", zeroing_hook)
+    A = torch.tril(torch.randn(2, 4, 4)) + 3 * torch.eye(4)
+    A[1, 2] = 0  # a zero row: an exact zero pivot
+    B = torch.randn(2, 4, 3)
+    want = torch.linalg.solve_triangular(A, B, upper=False)
+    assert torch.isnan(want[1]).any() or torch.isinf(want[1]).any()
+    with cpu_as_hpu(linalg.install_solve_triangular):
+        got = torch.linalg.solve_triangular(A, B, upper=False)
+    assert not torch.isfinite(got[1]).all() and torch.isfinite(got[0]).all()
+    torch.testing.assert_close(got[0], want[0])
+    L = A.clone()
+    with cpu_as_hpu(linalg.install_cholesky_solve):
+        out = torch.cholesky_solve(B, L, upper=False)
+    assert not torch.isfinite(out[1]).all() and torch.isfinite(out[0]).all()
+
+
+def test_tpc_eigh_1x1_needs_no_kernel(monkeypatch):
+    """n = 1 does not compile in lazy mode: w is the entry, V is 1, and the kernel op is never built."""
+    monkeypatch.setattr(tpc, "_eigh_op", lambda: pytest.fail("the kernel was used for n = 1"))
+    monkeypatch.setattr(tpc, "_eigh_refine_op", lambda: pytest.fail("the refine kernel was used for n = 1"))
+    A = torch.randn(4, 1, 1)
+    for upper in (False, True):
+        w, V = tpc.eigh(A, upper)
+        assert w.shape == (4, 1) and V.shape == (4, 1, 1) and w.dtype == V.dtype == torch.float32
+        assert torch.equal(w, A[..., 0, :]) and torch.equal(V, torch.ones(4, 1, 1))
+        assert w.data_ptr() != A.data_ptr()  # a fresh tensor, never a view of the input
+
+
+@pytest.mark.parametrize("upper", [False, True])
+def test_tpc_eigh_two_pass_refine_contract(monkeypatch, upper):
+    """tpc.eigh runs jacobi_eigh then jacobi_eigh_refine on symmetrized non-view S, then sorts ascending."""
+    torch.manual_seed(0)
+    S = spd(2, 3, n=4, dtype=torch.float32)
+    garbage = S + (torch.tril(torch.randn_like(S), -1) if upper else torch.triu(torch.randn_like(S), 1)) * 100
+    calls = []
+
+    def pass1(S_flat):
+        assert S_flat.is_contiguous() and S_flat.shape == (6, 4, 4) and S_flat.data_ptr() != garbage.data_ptr()
+        calls.append(("pass1", S_flat.clone()))
+        w, V = torch.linalg.eigh(S_flat)
+        perm = torch.tensor([2, 0, 3, 1])
+        return w[:, perm], V.mT[:, perm]
+
+    def pass2(S_flat, Vt1):
+        assert S_flat.is_contiguous() and Vt1.shape == (6, 4, 4)
+        calls.append(("pass2", S_flat.clone(), Vt1.clone()))
+        w, V = torch.linalg.eigh(S_flat)
+        perm = torch.tensor([3, 1, 0, 2])
+        return w[:, perm], V.mT[:, perm]
+
+    monkeypatch.setattr(tpc, "_eigh_op", lambda: pass1)
+    monkeypatch.setattr(tpc, "_eigh_refine_op", lambda: pass2)
+    w, V = tpc.eigh(garbage, upper)
+    assert [c[0] for c in calls] == ["pass1", "pass2"]
+    torch.testing.assert_close(calls[0][1], S.reshape(-1, 4, 4))
+    torch.testing.assert_close(calls[1][1], S.reshape(-1, 4, 4))
+    w_ref = torch.linalg.eigvalsh(S)
+    torch.testing.assert_close(w, w_ref)
+    torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("n", [3, 8, 22])
+def test_generic_singular_triangle_is_non_finite(monkeypatch, n):
+    """A zero diagonal entry, nonzero entries below it: pivots are rarely exactly zero, the diagonal flags it."""
+    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
+    torch.manual_seed(n)
+    A = torch.tril(0.3 * torch.randn(3, n, n)) + 2 * torch.eye(n)
+    A[1, n // 2, n // 2] = 0
+    B = torch.randn(3, n, 2)
+    want = torch.linalg.solve_triangular(A, B, upper=False)
+    assert not torch.isfinite(want[1]).all()
+    with cpu_as_hpu(linalg.install_solve_triangular):
+        got = torch.linalg.solve_triangular(A, B, upper=False)
+    with cpu_as_hpu(linalg.install_cholesky_solve):
+        chol = torch.cholesky_solve(B, A)
+    for out in (got, chol):
+        assert not torch.isfinite(out[1]).all() and torch.isfinite(out[0]).all() and torch.isfinite(out[2]).all()
+
+
+# ---- adversarial findings (tests/adversarial_linalg.py)
+
+
+def test_solve_det_slogdet_register_no_backend_kernel(monkeypatch):
+    """Their backend (``{}``) kernel would return placeholder LU factors to torch's own derivative in a compiled graph
+    (NaN gradients); calls below autograd must reach Habana's kernel. inv_ex's has no such factors and stays."""
+    seen = []
+    monkeypatch.setattr(linalg, "register_paired", lambda device_type, groups: seen.extend(groups))
+    linalg.install_solve("hpu")
+    linalg.install_inv_det("hpu")
+    keys = {group[0][0].name(): [key for _, key, _ in group] for group in seen}
+    for name in ("aten::_linalg_solve_ex", "aten::_linalg_det", "aten::_linalg_slogdet"):
+        assert keys[name] == ["Autograd{}"], keys
+    assert keys["aten::linalg_inv_ex"] == ["Autograd{}", "{}"]
+
+
+def test_enable_does_not_install_the_triangular_solves():
+    assert linalg.install_solve_triangular not in hpu_ops.FIXES
+    assert linalg.install_cholesky_solve not in hpu_ops.FIXES
+
+
+_COMPILE_FUNCTIONS = {
+    "solve": lambda a, b: torch.linalg.solve(a, b).sum(),
+    "det": lambda a, b: torch.linalg.det(a).sum() + b.sum(),
+    "slogdet": lambda a, b: torch.linalg.slogdet(a)[1].sum() + b.sum(),
+}
+
+
+def _compiled_below_autograd(f, **options):
+    """``torch.compile(f)`` through aot_autograd, its graphs run below autograd: on the card a compiled graph's ops
+    reach the ``HPU`` backend key, where only Habana's kernels are registered for solve_ex, det and slogdet. (The CPU
+    stand-in's inductor calls the autograd key at run time, which no card path does.)"""
+    from functorch.compile import make_boxed_func
+
+    def below(gm, example_inputs):
+        def run(*args):
+            with torch._C._AutoDispatchBelowAutograd():
+                return gm.forward(*args)
+
+        return make_boxed_func(run)
+
+    torch._dynamo.reset()
+    return torch.compile(f, backend=aot_autograd(fw_compiler=below, bw_compiler=below), **options)
+
+
+@pytest.mark.parametrize("name", list(_COMPILE_FUNCTIONS))
+@pytest.mark.parametrize("dynamic", [True, None])
+def test_compiled_gradients_survive_symbolic_shapes_and_recompiles(name, dynamic, gj_hook):
+    """The second batch size makes dynamo recompile with a symbolic batch, where the kernels decline and torch's own
+    backward (which reads LU) stays in the graph: its gradients must be finite and torch's. Calls below autograd reach
+    the native kernel (no backend kernel is registered), so the LU factors it reads are real."""
+    torch.manual_seed(0)
+    f = _COMPILE_FUNCTIONS[name]
+    a = (general(5, n=4, dtype=torch.float32)).requires_grad_()
+    b = torch.randn(5, 4, 2, requires_grad=True)
+    want = torch.autograd.grad(f(a, b), (a, b))
+    with cpu_as_hpu(lambda d: chain_install(d)):
+        g = _compiled_below_autograd(f, dynamic=dynamic)
+        g(a[:2], b[:2])
+        got = torch.autograd.grad(g(a, b), (a, b))
+    for x, y in zip(got, want):
+        assert torch.isfinite(x).all()
+    torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-4)
+
+
+def chain_install(device_type):
+    from hpu_ops._dispatch import chain
+    return chain([linalg.install_solve(device_type), linalg.install_inv_det(device_type)])
+
+
+@pytest.mark.parametrize("upper", ["u", "U", "l", "L"])
+@pytest.mark.parametrize("fn", [torch.linalg.eigvalsh, lambda G, UPLO: torch.linalg.eigh(G, UPLO)[0]])
+def test_eigh_uplo_is_case_insensitive(upper, fn, eigh_hook):
+    torch.manual_seed(0)
+    G = torch.randn(3, 6, 6)  # not symmetric: the triangle read matters
+    want = fn(G, UPLO=upper)
+    with cpu_as_hpu(jacobi.install_eigh) as calls:
+        got = fn(G, UPLO=upper)
+        assert calls["eigh"] >= 1, dict(calls)
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+    assert eigh_hook[-1][1] is (upper.upper() == "U")
+
+
+@pytest.mark.parametrize("a_batch, b_batch", [((1,), (4,)), ((4,), (1,)), ((3, 1), (1, 5))])
+def test_solve_broadcast_batches_with_info_check(a_batch, b_batch, gj_hook):
+    """``info`` sliced from the broadcast batch must be contiguous for ``_linalg_check_errors``."""
+    torch.manual_seed(0)
+    A = general(*a_batch, n=6, dtype=torch.float32)
+    B = torch.randn(*b_batch, 6, 3)
+    want = torch.linalg.solve(A, B)
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        got = torch.linalg.solve(A, B)
+        assert calls["solve"] >= 1, dict(calls)
+    assert gj_hook
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+
+def test_enable_reinstalls_after_the_undo(monkeypatch):
+    import sys
+    import types
+
+    names = ["habana_frameworks", "habana_frameworks.torch", "habana_frameworks.torch.core"]
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setattr(tpc, "install_kernel_path", lambda: None)
+    monkeypatch.setattr(hpu_ops, "_attention_fused", lambda device_type="hpu": True)
+    monkeypatch.delitem(hpu_ops._STATE, "undo", raising=False)
+    for name in hpu_ops.BROKEN_PASSES:
+        monkeypatch.setenv(f"PT_HPU_DISABLE_{name}", "True")
+
+    def registered():
+        return all(torch._C._dispatch_has_kernel_for_dispatch_key(op, "AutogradHPU")
+                   for op in ("aten::_linalg_solve_ex", "aten::linalg_inv_ex"))
+
+    try:
+        hpu_ops.enable()
+        assert registered()
+        first = hpu_ops._STATE["undo"]
+        hpu_ops.enable()
+        assert hpu_ops._STATE["undo"] is first  # idempotent while installed
+        first()
+        assert not registered() and "undo" not in hpu_ops._STATE
+        first()  # a second undo is a no-op
+        hpu_ops.enable()
+        assert registered()
+    finally:
+        if "undo" in hpu_ops._STATE:
+            hpu_ops._STATE["undo"]()
+
+
+def test_eigh_bad_uplo_raises_like_torch(eigh_hook):
+    G = torch.randn(2, 4, 4)
+    with pytest.raises(RuntimeError) as native:
+        torch.linalg.eigvalsh(G, UPLO="X")
+    with cpu_as_hpu(jacobi.install_eigh):
+        with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
+            torch.linalg.eigvalsh(G, UPLO="X")

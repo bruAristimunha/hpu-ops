@@ -6,17 +6,45 @@ convergence test, so the op count is static and nothing syncs with the host. The
 ``linalg_eig_backward`` over differentiable ops. Input rules are those of ``hpu_ops.linalg``: real float32 matrices of
 static shape, float64 off ``hpu`` only.
 
-Opt-in, not installed by ``hpu_ops.enable()``: on Gaudi2 (bridge 1.21.4) it takes 760-7600 ms per call against 2.8-35 ms
-for Habana's CPU fallback (batch 32, n = 16-128), and in lazy mode it raises a Synapse critical device error at n = 64.
+On Gaudi2 the composite loses to Habana's CPU fallback (760-7600 ms per call against 2.8-35 ms, batch 32, n = 16-128,
+and a Synapse critical device error in lazy mode at n = 64), so float32 matrices of n <= ``tpc.EIGH_MAXN`` go through
+the TPC one-sided Jacobi kernel of ``hpu_ops.tpc`` (n = 22, batch 32, eager: 1.27 ms against about 3.7 ms for the
+fallback). Without the kernel, or past ``EIGH_MAXN``, the call on ``hpu`` is declined and runs through hpu-ops' own
+CPU route (``linalg._on_cpu``), which is not Habana's fallback. The composite stays the path of the CPU stand-in.
 """
 import torch
 import torch.nn.functional as F
 
-from ._dispatch import register_kernels
+from . import tpc
+from ._dispatch import register_paired
 from .linalg import _kernels, _takes
 
 aten = torch.ops.aten
 JACOBI_SWEEPS = 10
+# The ``(A, upper) -> (w, V)`` solver ``Eigh.compute`` calls for n <= tpc.EIGH_MAXN. None means ``tpc.eigh`` on HPU with
+# the kernel ready; the CPU tests set it to ``tpc.eigh_reference`` to exercise the wiring.
+_EIGH = None
+
+
+def _use_tpc(A):
+    """Whether ``A`` goes through the Jacobi kernel: n <= ``tpc.EIGH_MAXN`` and, on HPU, float32 with the kernel ready;
+    or, with the ``_EIGH`` hook set (CPU tests), any dtype."""
+    if A.shape[-1] > tpc.EIGH_MAXN:
+        return False
+    return _EIGH is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
+
+
+def _tpc_takes(device_type):
+    """``_takes`` for eigh, and on ``hpu`` also: n <= ``tpc.EIGH_MAXN`` and the TPC kernel ready. Otherwise the call is
+    declined and takes hpu-ops' own CPU route, which beats the composite on Gaudi2."""
+    takes = _takes(device_type, "eigh")
+
+    def tpc_takes(*args, **kwargs):
+        if not takes(*args, **kwargs):
+            return False
+        return device_type != "hpu" or (args[0].shape[-1] <= tpc.EIGH_MAXN and tpc.ready())
+
+    return tpc_takes
 
 
 def _schedule(n, device=None):
@@ -68,7 +96,12 @@ class Eigh(torch.autograd.Function):
 
     @staticmethod
     def compute(A, UPLO, compute_v):
-        w, V = eigh(A, UPLO == "U")
+        if UPLO.upper() not in ("L", "U"):  # torch's own message
+            raise RuntimeError(f"Expected UPLO argument to be 'L' or 'U', but got {UPLO}")
+        if _use_tpc(A):
+            w, V = (tpc.eigh if _EIGH is None else _EIGH)(A, UPLO.upper() == "U")
+        else:
+            w, V = eigh(A, UPLO.upper() == "U")
         return w, (V if compute_v else A.new_empty(0))
 
     @staticmethod
@@ -96,6 +129,7 @@ class Eigh(torch.autograd.Function):
 
 
 def install_eigh(device_type):
-    """``linalg.eigh`` and ``eigvalsh`` on ``device_type`` as parallel Jacobi. Returns an undo."""
+    """``linalg.eigh`` and ``eigvalsh`` on ``device_type``: the TPC Jacobi kernel on HPU (declined without it, then
+    hpu-ops' CPU route), parallel Jacobi composites on the CPU stand-in. Returns an undo."""
     op = aten._linalg_eigh.default
-    return register_kernels(device_type, _kernels(device_type, op, "eigh", Eigh, _takes(device_type, "eigh")))
+    return register_paired(device_type, [_kernels(device_type, op, "eigh", Eigh, _tpc_takes(device_type))])

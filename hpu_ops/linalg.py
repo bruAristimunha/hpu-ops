@@ -3,17 +3,21 @@
 
 Each is a ``torch.autograd.Function`` registered at ``Autograd{}``: its backward is torch's formula over the same
 composites, so gradients match torch's. Its forward is also registered at the backend key, for calls below autograd
-(inference mode, the tracers' decompositions). Real float32 matrices of static shape are taken; float64 on ``hpu`` is
+(inference mode, the tracers' decompositions), except for solve_ex, det and slogdet, whose backend call reaches Habana's
+own kernel (its real LU factors feed torch's derivative when a compiled graph keeps it). Real float32 matrices of static shape are taken; float64 on ``hpu`` is
 not: Gaudi2 computes float64 at float32 precision (hpu-ops#16), so those inputs keep the native kernel at ``Autograd{}``
 and run on the CPU below it, with one warning per op. Complex, empty, non-square and symbolic-shape inputs go to the
 op's own kernel, which raises its usual error.
 
 Composites contain no host sync: loops run over Python ints from static shapes.
 
-On Gaudi2 these composites lose to Habana's CPU fallback (one launch per op), so with the TPC Gauss-Jordan kernel of
-``hpu_ops.tpc`` loaded, float32 matrices of n <= ``tpc.MAXN`` go through it instead (solve, inv, det, slogdet and both
-triangular solves). Without the kernel, or past ``MAXN``, the call on ``hpu`` is declined and Habana's fallback runs.
-The composites stay the path of the CPU stand-in.
+On Gaudi2 these composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
+with the TPC Gauss-Jordan kernel of ``hpu_ops.tpc`` loaded, float32 matrices of n <= ``tpc.MAXN`` go through it
+instead (solve, inv, det, slogdet). The triangular solves (``solve_triangular``, ``cholesky_solve``) are not installed
+by default: pivoted Gauss-Jordan on a triangle loses accuracy and ``cholesky_solve`` squares the condition number;
+a substitution kernel is coming. Their code and tests stay. Without the kernel, or past ``MAXN``, the call on
+``hpu`` is declined and runs through hpu-ops' own CPU route (``_on_cpu``), which is not Habana's fallback. The
+composites stay the path of the CPU stand-in.
 """
 import math
 import warnings
@@ -24,7 +28,7 @@ import torch.utils._pytree as pytree
 from torch._C import DispatchKey
 
 from . import tpc
-from ._dispatch import count, register_kernels, static
+from ._dispatch import count, register_kernels, register_paired, static
 
 aten = torch.ops.aten
 FLOAT64_WARNING = ("hpu_ops: {name} of float64 HPU tensors runs on the CPU: Gaudi2 computes float64 at float32 "
@@ -71,12 +75,21 @@ def _takes_tensors(device_type, name, tensors):
     return all(t.dtype in allowed and static(*t.shape) and t.numel() > 0 for t in tensors)
 
 
+def _transformed():
+    """Whether a functorch transform (vmap, grad, jvp, jacrev, ...) or forward-mode AD is active. The Functions here
+    define no ``setup_context`` and no jvp, so those calls keep the op's own kernel."""
+    forward_ad = getattr(torch.autograd.forward_ad, "_current_level", -1) >= 0
+    return torch._C._functorch.peek_interpreter_stack() is not None or forward_ad
+
+
 def _takes(device_type, name, matrix_at=0):
-    """A predicate on a call's arguments: the positional tensor at ``matrix_at`` is a square matrix and every tensor
-    argument is a float32 (or float64, only off ``hpu``, with one warning per ``name``) tensor of static, non-empty
-    shape."""
+    """A predicate on a call's arguments: no functorch transform or forward-mode AD is active, the positional tensor
+    at ``matrix_at`` is a square matrix and every tensor argument is a float32 (or float64, only off ``hpu``, with one
+    warning per ``name``) tensor of static, non-empty shape."""
 
     def takes(*args, **kwargs):
+        if _transformed():
+            return False
         tensors = [x for x in (*args, *kwargs.values()) if isinstance(x, torch.Tensor)]
         if not _takes_tensors(device_type, name, tensors):
             return False
@@ -87,8 +100,9 @@ def _takes(device_type, name, matrix_at=0):
 
 
 def _tpc_takes(device_type, takes, matrix_at=0):
-    """``takes``, and on ``hpu`` also: n <= ``tpc.MAXN`` and the TPC kernel ready (path installed, extension built).
-    Otherwise Habana's CPU fallback runs, which is faster than the composites on Gaudi2."""
+    """``takes``, and on ``hpu`` also: n <= ``tpc.MAXN`` and the TPC kernel ready (path installed, Gaudi2, extension
+    built). Otherwise the call is declined and takes hpu-ops' own CPU route (``_on_cpu``), which beats the composites
+    on Gaudi2."""
 
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
@@ -108,7 +122,8 @@ def _use_tpc(A):
 
 def _gj(A, B):
     """``(X, D, S)`` of the Gauss-Jordan solver, the batch dimensions of ``A`` and ``B`` broadcast. ``S[..., 0]`` is
-    the sign of the permutation, ``S[..., 1]`` LAPACK's ``info``."""
+    the sign of the permutation, ``S[..., 1]`` the info (the index follows the kernel's elimination order, can
+    differ from LAPACK's, and is nonzero exactly when a pivot is exactly zero)."""
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
     solver = tpc.gj_solve if _GJ is None else _GJ
     return solver(A.expand(*batch, *A.shape[-2:]), B.expand(*batch, *B.shape[-2:]))
@@ -130,13 +145,28 @@ def _gj_solve(A, B, left=True):
 
 
 def _gj_info(S, batch):
-    """LAPACK's ``info`` (int32) from the kernel's ``S``, shaped like the batch of ``A`` (``S`` carries the broadcast
-    batch of ``A`` and ``B``; the slicing is static, no device sync)."""
+    """The ``info`` (int32; the index follows the kernel's elimination order, can differ from LAPACK's, and is nonzero
+    exactly when a pivot is exactly zero) from the kernel's ``S``, shaped like the batch of ``A`` (``S`` carries the
+    broadcast batch of ``A`` and ``B``; the slicing is static, no device sync)."""
     info = S[..., 1].to(torch.int32)
     if info.shape != batch:
         info = info[(0,) * (info.dim() - len(batch))]
         info = info[tuple(slice(0, 1) if a == 1 else slice(None) for a in batch)]
-    return info
+    return info.contiguous()  # a slice of the broadcast batch is strided; _linalg_check_errors asserts contiguity
+
+
+def _bad_matrix(S, diagonal):
+    """``[...]`` bool: the kernel's info (``S[..., 1]``) is nonzero, or ``diagonal`` (the one torch's triangular solve
+    reads, ``None`` if none) has a zero. Partial pivoting rarely makes a singular triangle's pivot exactly zero, so
+    the info alone misses most of them. Broadcast to the batch of ``S``; no host sync."""
+    bad = S[..., 1] != 0
+    return bad if diagonal is None else bad | (diagonal == 0).any(-1)
+
+
+def _nan_if_singular(X, S, diagonal=None):
+    """``X`` with NaN for the matrices ``_bad_matrix`` flags, as torch's triangular solves give non-finite values for
+    a zero diagonal: the kernel zeroes a zero pivot's row, which would leave finite garbage."""
+    return torch.where(_bad_matrix(S, diagonal)[..., None, None], float("nan"), X)
 
 
 def _unused_factors(A):
@@ -159,7 +189,9 @@ def _on_cpu(op, args, kwargs):
 
 def _kernels(device_type, op, name, function, takes, backend=True):
     """The ``(op, key, kernel)`` entries for ``register_kernels``: ``function`` for the calls ``takes`` accepts, else
-    ``op``'s own kernel at autograd, and the CPU below it."""
+    ``op``'s own kernel at autograd, and the CPU below it. With ``backend=False`` only the autograd entry is made:
+    ops whose torch derivative reads the LU factors (solve_ex, det, slogdet) must reach Habana's own kernel below
+    autograd, as our placeholder factors would turn a traced native backward into NaN (symbolic shapes, recompiles)."""
 
     def autograd_kernel(*args, **kwargs):
         if takes(*args, **kwargs):
@@ -173,10 +205,8 @@ def _kernels(device_type, op, name, function, takes, backend=True):
             return function.compute(*_bind(op, args, kwargs))
         return _on_cpu(op, args, kwargs)
 
-    entries = [(op, "Autograd{}", autograd_kernel)]
-    if backend or device_type != "cpu":
-        entries.append((op, "{}", backend_kernel))
-    return entries
+    entries = [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
+    return entries if backend else entries[:1]
 
 
 def tri_inverse(T, upper, unitriangular=False):
@@ -228,7 +258,8 @@ class SolveTriangular(torch.autograd.Function):
     @staticmethod
     def compute(A, B, upper, left, unitriangular):
         if _use_tpc(A):
-            return _gj_solve(_triangle(A, upper, unitriangular), B, left)[0]
+            X, _, S = _gj_solve(_triangle(A, upper, unitriangular), B, left)
+            return _nan_if_singular(X, S, None if unitriangular else A.diagonal(dim1=-2, dim2=-1))
         return solve_triangular(A, B, upper, left, unitriangular)
 
     @staticmethod
@@ -256,7 +287,7 @@ def install_solve_triangular(device_type):
     """``linalg.solve_triangular`` on ``device_type`` as a matmul with the block-recursive inverse. Returns an undo."""
     op = aten.linalg_solve_triangular.default
     takes = _tpc_takes(device_type, _takes(device_type, "solve_triangular"))
-    return register_kernels(device_type, _kernels(device_type, op, "solve_triangular", SolveTriangular, takes))
+    return register_paired(device_type, [_kernels(device_type, op, "solve_triangular", SolveTriangular, takes)])
 
 
 def cholesky_solve(B, L, upper=False):
@@ -272,7 +303,8 @@ class CholeskySolve(torch.autograd.Function):
     def compute(B, L, upper):
         if _use_tpc(L):
             L = torch.triu(L) if upper else torch.tril(L)
-            return _gj(L.mH @ L if upper else L @ L.mH, B)[0]
+            X, _, S = _gj(L.mH @ L if upper else L @ L.mH, B)
+            return _nan_if_singular(X, S, L.diagonal(dim1=-2, dim2=-1))
         return cholesky_solve(B, L, upper)
 
     @staticmethod
@@ -302,7 +334,7 @@ def install_cholesky_solve(device_type):
     autograd = _kernels(device_type, aten.cholesky_solve.default, "cholesky_solve", CholeskySolve, takes)[0]
     # The other two entries are dropped: the helper is the backend key of the same op, so each key gets one kernel.
     backend = _kernels(device_type, aten._cholesky_solve_helper.default, "cholesky_solve", CholeskySolve, takes)[1]
-    return register_kernels(device_type, [autograd, backend])
+    return register_paired(device_type, [[autograd, backend]])
 
 
 def lu(A):
@@ -433,7 +465,7 @@ def install_solve(device_type):
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
     takes = _tpc_takes(device_type, shapes_ok)
-    return register_kernels(device_type, _kernels(device_type, op, "solve", SolveEx, takes))
+    return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes, backend=False)])
 
 
 def _inverse(LU, pivots):
@@ -481,10 +513,11 @@ class InvEx(torch.autograd.Function):
 
 class Det(torch.autograd.Function):
     """``aten._linalg_det`` as the signed product of U's diagonal, with torch's backward (``g det A^-H``), the inverse
-    recomputed from A, so double backward works. A singular matrix has det 0 and a non-finite gradient. ``LU`` and
+    recomputed from A, so double backward works. A singular matrix has det 0, and on Gaudi2 its gradient
+    equals torch's (measured). ``LU`` and
     ``pivots`` are not differentiable; they are those of A (native's CPU kernel returns those of A^T). Through the TPC
-    kernel D and S come from the identity kernel (``_gj_inv``) with X discarded: a view of the input (``A[..., :1]``)
-    as the right-hand side breaks lazy mode on Gaudi2."""
+    kernel D and S come from the identity kernel (``_gj_inv``), X discarded; the kernel zeroes the pivot row so later
+    pivots stay finite."""
 
     @staticmethod
     def compute(A):
@@ -511,7 +544,8 @@ class Det(torch.autograd.Function):
 class Slogdet(torch.autograd.Function):
     """``aten._linalg_slogdet`` as the sign and log of U's diagonal, with torch's backward (``g A^-H``) for
     ``logabsdet``, the inverse recomputed from A, so double backward works. ``sign``, ``LU`` and ``pivots`` are
-    not differentiable; ``LU`` and ``pivots`` are those of A (native's CPU kernel returns those of A^T)."""
+    not differentiable; ``LU`` and ``pivots`` are those of A (native's CPU kernel returns those of A^T). On Gaudi2
+    a singular matrix gives ``logabsdet = -inf`` as in torch, but a finite gradient where torch's is non-finite."""
 
     @staticmethod
     def compute(A):
@@ -539,11 +573,12 @@ class Slogdet(torch.autograd.Function):
 def install_inv_det(device_type):
     """``linalg.inv``/``inv_ex``, ``det`` and ``slogdet`` on ``device_type`` from the masked LU and two triangular
     matmuls. Returns an undo."""
-    entries = []
+    groups = []
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
-        entries += _kernels(device_type, op, name, function, _tpc_takes(device_type, _takes(device_type, name)))
-    return register_kernels(device_type, entries)
+        takes = _tpc_takes(device_type, _takes(device_type, name))
+        groups.append(_kernels(device_type, op, name, function, takes, backend=name == "inv"))
+    return register_paired(device_type, groups)
 
 
 # ---- SVD family (#9): svd, svdvals, pinv, lstsq, matrix_norm(2/-2/'nuc'), matrix_rank
@@ -831,7 +866,7 @@ def install_pinv(device_type):
     """``linalg.pinv`` (``hermitian=False``) on ``device_type`` via ``Svd``. Returns an undo."""
     op = aten.linalg_pinv.atol_rtol_tensor
     takes = _pinv_takes(device_type)
-    return register_kernels(device_type, _kernels(device_type, op, "pinv", Pinv, takes, backend=False))
+    return register_kernels(device_type, _kernels(device_type, op, "pinv", Pinv, takes, backend=device_type != "cpu"))
 
 
 def _lstsq_eval(A, B, rcond, driver):
