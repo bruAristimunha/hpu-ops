@@ -11,7 +11,7 @@ Measured on Gaudi2 (one process per case, 3 iterations of forward + backward, a 
                    torch.logsumexp(x, 0).sum() (Habana's kernel), x.view(1, -1).exp().sum(1).log().sum()
     passes, eager: x.sum(0).sum(), the logsumexp composite
 
-Workaround: reduce with keepdim=True and reshape to the result's shape (hpu_ops.perf.logsumexp does).
+Workaround: reduce with keepdim=True and reshape to the result's shape.
 """
 import sys
 
