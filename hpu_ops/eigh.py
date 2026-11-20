@@ -102,10 +102,12 @@ class Eigh(torch.autograd.Function):
 
     @staticmethod
     def compute(A, UPLO, compute_v):
+        if UPLO.upper() not in ("L", "U"):  # torch's own message
+            raise RuntimeError(f"Expected UPLO argument to be 'L' or 'U', but got {UPLO}")
         if _use_tpc(A):
-            w, V = (tpc.eigh if _EIGH is None else _EIGH)(A, UPLO == "U")
+            w, V = (tpc.eigh if _EIGH is None else _EIGH)(A, UPLO.upper() == "U")
         else:
-            w, V = eigh(A, UPLO == "U")
+            w, V = eigh(A, UPLO.upper() == "U")
         return w, (V if compute_v else A.new_empty(0))
 
     @staticmethod

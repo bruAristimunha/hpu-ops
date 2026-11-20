@@ -3,7 +3,8 @@
 
 Each is a ``torch.autograd.Function`` registered at ``Autograd{}``: its backward is torch's formula over the same
 composites, so gradients match torch's. Its forward is also registered at the backend key, for calls below autograd
-(inference mode, the tracers' decompositions). Real float32 matrices of static shape are taken; float64 on ``hpu`` is
+(inference mode, the tracers' decompositions), except for solve_ex, det and slogdet, whose backend call reaches Habana's
+own kernel (its real LU factors feed torch's derivative when a compiled graph keeps it). Real float32 matrices of static shape are taken; float64 on ``hpu`` is
 not: Gaudi2 computes float64 at float32 precision (hpu-ops#16), so those inputs keep the native kernel at ``Autograd{}``
 and run on the CPU below it, with one warning per op. Complex, empty, non-square and symbolic-shape inputs go to the
 op's own kernel, which raises its usual error.
@@ -12,7 +13,9 @@ Composites contain no host sync: loops run over Python ints from static shapes.
 
 On Gaudi2 these composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
 with the TPC Gauss-Jordan kernel of ``hpu_ops.tpc`` loaded, float32 matrices of n <= ``tpc.MAXN`` go through it
-instead (solve, inv, det, slogdet and both triangular solves). Without the kernel, or past ``MAXN``, the call on
+instead (solve, inv, det, slogdet). The triangular solves (``solve_triangular``, ``cholesky_solve``) are not installed
+by default: pivoted Gauss-Jordan on a triangle loses accuracy and ``cholesky_solve`` squares the condition number;
+a substitution kernel is coming. Their code and tests stay. Without the kernel, or past ``MAXN``, the call on
 ``hpu`` is declined and runs through hpu-ops' own CPU route (``_on_cpu``), which is not Habana's fallback. The
 composites stay the path of the CPU stand-in.
 """
@@ -125,7 +128,7 @@ def _gj_info(S, batch):
     if info.shape != batch:
         info = info[(0,) * (info.dim() - len(batch))]
         info = info[tuple(slice(0, 1) if a == 1 else slice(None) for a in batch)]
-    return info
+    return info.contiguous()  # a slice of the broadcast batch is strided; _linalg_check_errors asserts contiguity
 
 
 def _bad_matrix(S, diagonal):
@@ -160,9 +163,11 @@ def _on_cpu(op, args, kwargs):
     return pytree.tree_map(lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, out)
 
 
-def _kernels(device_type, op, name, function, takes):
+def _kernels(device_type, op, name, function, takes, backend=True):
     """The ``(op, key, kernel)`` entries for ``register_kernels``: ``function`` for the calls ``takes`` accepts, else
-    ``op``'s own kernel at autograd, and the CPU below it."""
+    ``op``'s own kernel at autograd, and the CPU below it. With ``backend=False`` only the autograd entry is made:
+    ops whose torch derivative reads the LU factors (solve_ex, det, slogdet) must reach Habana's own kernel below
+    autograd, as our placeholder factors would turn a traced native backward into NaN (symbolic shapes, recompiles)."""
 
     def autograd_kernel(*args, **kwargs):
         if takes(*args, **kwargs):
@@ -176,7 +181,8 @@ def _kernels(device_type, op, name, function, takes):
             return function.compute(*_bind(op, args, kwargs))
         return _on_cpu(op, args, kwargs)
 
-    return [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
+    entries = [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
+    return entries if backend else entries[:1]
 
 
 def tri_inverse(T, upper, unitriangular=False):
@@ -435,7 +441,7 @@ def install_solve(device_type):
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
     takes = _tpc_takes(device_type, shapes_ok)
-    return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes)])
+    return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes, backend=False)])
 
 
 def _inverse(LU, pivots):
@@ -546,5 +552,6 @@ def install_inv_det(device_type):
     groups = []
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
-        groups.append(_kernels(device_type, op, name, function, _tpc_takes(device_type, _takes(device_type, name))))
+        takes = _tpc_takes(device_type, _takes(device_type, name))
+        groups.append(_kernels(device_type, op, name, function, takes, backend=name == "inv"))
     return register_paired(device_type, groups)

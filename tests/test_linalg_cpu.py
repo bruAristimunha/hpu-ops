@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.utils._pytree as pytree
 from test_cpu import compiled, cpu_as_hpu, ops
+from torch._dynamo.backends.common import aot_autograd
 
 import hpu_ops
 from hpu_ops import eigh as jacobi
@@ -1133,3 +1134,142 @@ def test_generic_singular_triangle_is_non_finite(monkeypatch, n):
         chol = torch.cholesky_solve(B, A)
     for out in (got, chol):
         assert not torch.isfinite(out[1]).all() and torch.isfinite(out[0]).all() and torch.isfinite(out[2]).all()
+
+
+# ---- adversarial findings (tests/adversarial_linalg.py)
+
+
+def test_solve_det_slogdet_register_no_backend_kernel(monkeypatch):
+    """Their backend (``{}``) kernel would return placeholder LU factors to torch's own derivative in a compiled graph
+    (NaN gradients); calls below autograd must reach Habana's kernel. inv_ex's has no such factors and stays."""
+    seen = []
+    monkeypatch.setattr(linalg, "register_paired", lambda device_type, groups: seen.extend(groups))
+    linalg.install_solve("hpu")
+    linalg.install_inv_det("hpu")
+    keys = {group[0][0].name(): [key for _, key, _ in group] for group in seen}
+    for name in ("aten::_linalg_solve_ex", "aten::_linalg_det", "aten::_linalg_slogdet"):
+        assert keys[name] == ["Autograd{}"], keys
+    assert keys["aten::linalg_inv_ex"] == ["Autograd{}", "{}"]
+
+
+def test_enable_does_not_install_the_triangular_solves():
+    assert linalg.install_solve_triangular not in hpu_ops.FIXES
+    assert linalg.install_cholesky_solve not in hpu_ops.FIXES
+
+
+_COMPILE_FUNCTIONS = {
+    "solve": lambda a, b: torch.linalg.solve(a, b).sum(),
+    "det": lambda a, b: torch.linalg.det(a).sum() + b.sum(),
+    "slogdet": lambda a, b: torch.linalg.slogdet(a)[1].sum() + b.sum(),
+}
+
+
+def _compiled_below_autograd(f, **options):
+    """``torch.compile(f)`` through aot_autograd, its graphs run below autograd: on the card a compiled graph's ops
+    reach the ``HPU`` backend key, where only Habana's kernels are registered for solve_ex, det and slogdet. (The CPU
+    stand-in's inductor calls the autograd key at run time, which no card path does.)"""
+    from functorch.compile import make_boxed_func
+
+    def below(gm, example_inputs):
+        def run(*args):
+            with torch._C._AutoDispatchBelowAutograd():
+                return gm.forward(*args)
+
+        return make_boxed_func(run)
+
+    torch._dynamo.reset()
+    return torch.compile(f, backend=aot_autograd(fw_compiler=below, bw_compiler=below), **options)
+
+
+@pytest.mark.parametrize("name", list(_COMPILE_FUNCTIONS))
+@pytest.mark.parametrize("dynamic", [True, None])
+def test_compiled_gradients_survive_symbolic_shapes_and_recompiles(name, dynamic, gj_hook):
+    """The second batch size makes dynamo recompile with a symbolic batch, where the kernels decline and torch's own
+    backward (which reads LU) stays in the graph: its gradients must be finite and torch's. Calls below autograd reach
+    the native kernel (no backend kernel is registered), so the LU factors it reads are real."""
+    torch.manual_seed(0)
+    f = _COMPILE_FUNCTIONS[name]
+    a = (general(5, n=4, dtype=torch.float32)).requires_grad_()
+    b = torch.randn(5, 4, 2, requires_grad=True)
+    want = torch.autograd.grad(f(a, b), (a, b))
+    with cpu_as_hpu(lambda d: chain_install(d)):
+        g = _compiled_below_autograd(f, dynamic=dynamic)
+        g(a[:2], b[:2])
+        got = torch.autograd.grad(g(a, b), (a, b))
+    for x, y in zip(got, want):
+        assert torch.isfinite(x).all()
+    torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-4)
+
+
+def chain_install(device_type):
+    from hpu_ops._dispatch import chain
+    return chain([linalg.install_solve(device_type), linalg.install_inv_det(device_type)])
+
+
+@pytest.mark.parametrize("upper", ["u", "U", "l", "L"])
+@pytest.mark.parametrize("fn", [torch.linalg.eigvalsh, lambda G, UPLO: torch.linalg.eigh(G, UPLO)[0]])
+def test_eigh_uplo_is_case_insensitive(upper, fn, eigh_hook):
+    torch.manual_seed(0)
+    G = torch.randn(3, 6, 6)  # not symmetric: the triangle read matters
+    want = fn(G, UPLO=upper)
+    with cpu_as_hpu(jacobi.install_eigh) as calls:
+        got = fn(G, UPLO=upper)
+        assert calls["eigh"] >= 1, dict(calls)
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+    assert eigh_hook[-1][1] is (upper.upper() == "U")
+
+
+@pytest.mark.parametrize("a_batch, b_batch", [((1,), (4,)), ((4,), (1,)), ((3, 1), (1, 5))])
+def test_solve_broadcast_batches_with_info_check(a_batch, b_batch, gj_hook):
+    """``info`` sliced from the broadcast batch must be contiguous for ``_linalg_check_errors``."""
+    torch.manual_seed(0)
+    A = general(*a_batch, n=6, dtype=torch.float32)
+    B = torch.randn(*b_batch, 6, 3)
+    want = torch.linalg.solve(A, B)
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        got = torch.linalg.solve(A, B)
+        assert calls["solve"] >= 1, dict(calls)
+    assert gj_hook
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+
+def test_enable_reinstalls_after_the_undo(monkeypatch):
+    import sys
+    import types
+
+    names = ["habana_frameworks", "habana_frameworks.torch", "habana_frameworks.torch.core"]
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setattr(tpc, "install_kernel_path", lambda: None)
+    monkeypatch.setattr(hpu_ops, "_attention_fused", lambda device_type="hpu": True)
+    monkeypatch.delitem(hpu_ops._STATE, "undo", raising=False)
+    for name in hpu_ops.BROKEN_PASSES:
+        monkeypatch.setenv(f"PT_HPU_DISABLE_{name}", "True")
+
+    def registered():
+        return all(torch._C._dispatch_has_kernel_for_dispatch_key(op, "AutogradHPU")
+                   for op in ("aten::_linalg_solve_ex", "aten::linalg_inv_ex"))
+
+    try:
+        hpu_ops.enable()
+        assert registered()
+        first = hpu_ops._STATE["undo"]
+        hpu_ops.enable()
+        assert hpu_ops._STATE["undo"] is first  # idempotent while installed
+        first()
+        assert not registered() and "undo" not in hpu_ops._STATE
+        first()  # a second undo is a no-op
+        hpu_ops.enable()
+        assert registered()
+    finally:
+        if "undo" in hpu_ops._STATE:
+            hpu_ops._STATE["undo"]()
+
+
+def test_eigh_bad_uplo_raises_like_torch(eigh_hook):
+    G = torch.randn(2, 4, 4)
+    with pytest.raises(RuntimeError) as native:
+        torch.linalg.eigvalsh(G, UPLO="X")
+    with cpu_as_hpu(jacobi.install_eigh):
+        with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
+            torch.linalg.eigvalsh(G, UPLO="X")
