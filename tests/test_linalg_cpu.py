@@ -1087,3 +1087,14 @@ def test_singular_triangle_gives_nan_like_torch(monkeypatch):
     with cpu_as_hpu(linalg.install_cholesky_solve):
         out = torch.cholesky_solve(B, L, upper=False)
     assert not torch.isfinite(out[1]).all() and torch.isfinite(out[0]).all()
+
+
+def test_tpc_eigh_1x1_needs_no_kernel(monkeypatch):
+    """n = 1 does not compile in lazy mode: w is the entry, V is 1, and the kernel op is never built."""
+    monkeypatch.setattr(tpc, "_eigh_op", lambda: pytest.fail("the kernel was used for n = 1"))
+    A = torch.randn(4, 1, 1)
+    for upper in (False, True):
+        w, V = tpc.eigh(A, upper)
+        assert w.shape == (4, 1) and V.shape == (4, 1, 1) and w.dtype == V.dtype == torch.float32
+        assert torch.equal(w, A[..., 0, :]) and torch.equal(V, torch.ones(4, 1, 1))
+        assert w.data_ptr() != A.data_ptr()  # a fresh tensor, never a view of the input

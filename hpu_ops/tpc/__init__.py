@@ -388,6 +388,9 @@ def eigh(A, upper):
     if n > EIGH_MAXN or A.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.eigh takes square A with n <= {EIGH_MAXN}, got {tuple(A.shape)}")
     batch = A.shape[:-2]
+    if n == 1:  # trivial, and the kernel's graph does not compile at n = 1 in lazy mode (synStatus 26)
+        A = A.to(torch.float32)
+        return A.reshape(*batch, 1).clone(), torch.ones_like(A)
     # a fresh tensor, never a view of the caller's input: views break lazy mode
     S = torch.triu(A) + torch.triu(A, 1).mT if upper else torch.tril(A) + torch.tril(A, -1).mT
     W, Vt = _call(_eigh_op(), S.reshape(-1, n, n).to(torch.float32).contiguous())
