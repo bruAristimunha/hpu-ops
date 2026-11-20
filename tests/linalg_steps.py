@@ -140,7 +140,8 @@ def main():
     linalg_ops = LINALG_OPS + ("eigh",) * eigh_checked
     print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), hpu_ops.__file__, "hpu_complex",
           getattr(hpu_complex, "__version__", "?"), "enabled by spd_diag; baseline (fallbacks recorded)", baseline,
-          "eigh checked", eigh_checked, "lazy", LAZY, flush=True)
+          "eigh checked", eigh_checked, "tpc_ready",
+          getattr(getattr(hpu_ops, "tpc", None), "ready", lambda: None)(), "lazy", LAZY, flush=True)
     cache = open_cache(DATASET)
     info, sd = cache.info, cache.subject(cache.subjects[0], "X")
     X = torch.as_tensor(sd.X[:BATCH], dtype=torch.float32)

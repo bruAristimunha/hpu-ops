@@ -2,7 +2,8 @@
 ``cholesky_solve``: ``torch.ops.linalg_tpc.gj_solve(A[b, n, n], B[b, n, m]) -> (X[b, n, m], D[b, n], S[b, 2])`` and
 ``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel) for float32, n and m <= 32. One matrix per index-space
 member, rows in local memory, partial pivoting. ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign (-1)^swaps
-of the row permutation, ``S[:, 1]`` LAPACK's info.
+of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can differ from
+LAPACK's, and is nonzero exactly when a pivot is exactly zero.
 
 ``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
 n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Eager, batch 32: n = 22
@@ -163,9 +164,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   return {out[0], out[1], out[2]};
 }
 std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_eigh");
   std::vector<c10::IValue> inputs{a};
-  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_eigh");
-  auto out = desc.execute(inputs);
+  auto out = op.execute(inputs);
   return {out[0], out[1]};
 }
 TORCH_LIBRARY(linalg_tpc, m) {
@@ -277,10 +278,14 @@ def _eigh_op():
 # before and after each call keeps the op alone in its graph. The cost is two graph boundaries per call; eager mode
 # needs none.
 def _flush():
-    if os.environ.get("PT_HPU_LAZY_MODE", "1") != "0":
+    """``mark_step`` in lazy mode; nothing in eager mode, while tracing under ``torch.compile``, or without Habana."""
+    if os.environ.get("PT_HPU_LAZY_MODE", "1") == "0" or torch.compiler.is_compiling():
+        return
+    try:
         import habana_frameworks.torch.core as htcore
-
-        htcore.mark_step()
+    except ImportError:
+        return
+    htcore.mark_step()
 
 
 def _call(op, *args):
@@ -308,8 +313,9 @@ def _check(A, n):
 
 def gj_solve(A, B):
     """``(X, D, S)`` for ``A[..., n, n]`` and ``B[..., n, m]`` (float32, n <= ``MAXN``) from the TPC kernel: ``X = A^-1
-    B``, ``D`` the pivots, ``S[..., 0]`` the sign of the permutation and ``S[..., 1]`` LAPACK's info (1 + the first
-    zero pivot, else 0); shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
+    B``, ``D`` the pivots, ``S[..., 0]`` the sign of the permutation and ``S[..., 1]`` the info (1 + the first
+    zero pivot in the kernel's elimination order, else 0; it can differ from LAPACK's);
+    shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
     n, m = A.shape[-1], B.shape[-1]
     _check(A, n)
     if B.shape[-2] != n:

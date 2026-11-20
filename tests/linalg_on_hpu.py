@@ -123,6 +123,39 @@ def make_solve(b, n, dtype):
     return [pivoting(b, n, dtype), torch.randn(b, n, 3, dtype=dtype)]
 
 
+def make_solve_right(b, n, dtype):
+    return [pivoting(b, n, dtype), torch.randn(b, 3, n, dtype=dtype)]
+
+
+def make_solve_vector(b, n, dtype):
+    return [pivoting(b, n, dtype), torch.randn(b, n, dtype=dtype)]
+
+
+def make_solve_2d(b, n, dtype):
+    return [pivoting(b, n, dtype)[0], torch.randn(n, 3, dtype=dtype)]
+
+
+def make_solve_chunked(b, n, dtype):
+    return [pivoting(b, n, dtype), torch.randn(b, n, 70, dtype=dtype)]
+
+
+def make_solve_broadcast(b, n, dtype):
+    return [pivoting(b, n, dtype)[:1].contiguous(), torch.randn(b, n, 3, dtype=dtype)]
+
+
+def make_solve_big(b, n, dtype):
+    """A batch of ``b + 4`` matrices; the case solves with the slice ``[2:2 + b]``, a view with an offset."""
+    return [pivoting(b + 4, n, dtype), torch.randn(b, n, 3, dtype=dtype)]
+
+
+def make_triangular_upper_unit(b, n, dtype):
+    return [torch.triu(torch.randn(b, n, n, dtype=dtype), 1) / n, torch.randn(b, n, 3, dtype=dtype)]
+
+
+def make_cholesky_solve_upper(b, n, dtype):
+    return [torch.randn(b, n, 3, dtype=dtype), L.cholesky(spd(b, n, dtype, "cpu"), upper=True)]
+
+
 def make_pivoting(b, n, dtype):
     return [pivoting(b, n, dtype)]
 
@@ -193,7 +226,9 @@ class Case(NamedTuple):
     scope: str = "all"  # "bwd": only the backward must stay on the card (the forward is not ours)
     float64: bool = True  # one of the ops that warns for float64 (hpu-ops#16)
     factor: int = CPU32_FACTOR  # the card may be this many times worse than CPU float32 on this op
-    tpc: bool = False  # routed through a TPC kernel (n <= hpu_ops.tpc.MAXN, EIGH_MAXN for eigh); past it Habana's fallback is expected
+    sizes: tuple | None = None  # only these n (the variants run at n = 22)
+    # routed through a TPC kernel (n <= hpu_ops.tpc.MAXN, EIGH_MAXN for eigh); past it Habana's fallback is expected
+    tpc: bool = False
 
 
 CASES = (
@@ -206,6 +241,23 @@ CASES = (
     Case("linalg.slogdet", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, tpc=True),
     Case("linalg.eigh", make_spd, lambda x: L.eigh(x), err_eigh, loss_eigh, tpc=True),
     Case("linalg.eigvalsh", make_spd, lambda x: L.eigvalsh(x), tpc=True),
+    Case("linalg.solve.left_false", make_solve_right, lambda a, b: L.solve(a, b, left=False), float64=False,
+         tpc=True, sizes=(22,)),
+    Case("linalg.solve.vector_rhs", make_solve_vector, lambda a, b: L.solve(a, b), float64=False, tpc=True,
+         sizes=(22,)),
+    Case("linalg.solve.matrix_2d", make_solve_2d, lambda a, b: L.solve(a, b), float64=False, tpc=True, sizes=(22,)),
+    Case("linalg.solve.m70_chunked", make_solve_chunked, lambda a, b: L.solve(a, b), float64=False, tpc=True,
+         sizes=(22,)),
+    Case("linalg.solve.broadcast_batch", make_solve_broadcast, lambda a, b: L.solve(a, b), float64=False, tpc=True,
+         sizes=(22,)),
+    Case("linalg.solve.aliased", make_pivoting, lambda a: L.solve(a, a), float64=False, tpc=True, sizes=(22,)),
+    Case("linalg.solve.sliced_offset", make_solve_big, lambda big, b: L.solve(big[2:2 + b.shape[0]], b),
+         float64=False, tpc=True, sizes=(22,)),
+    Case("linalg.inv.of_batch_item", make_pivoting, lambda big: L.inv(big[3]), float64=False, tpc=True, sizes=(22,)),
+    Case("linalg.solve_triangular.upper_unit", make_triangular_upper_unit,
+         lambda a, b: L.solve_triangular(a, b, upper=True, unitriangular=True), float64=False, tpc=True, sizes=(22,)),
+    Case("cholesky_solve.upper", make_cholesky_solve_upper, lambda b, c: torch.cholesky_solve(b, c, upper=True),
+         float64=False, tpc=True, sizes=(22,)),
     Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False),
     # factor 20: the forward is Habana's native qr, not an hpu_ops kernel (measured 10.2x at n=16)
     Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20),
@@ -397,6 +449,48 @@ def run_singular(op, fn):
     return not problems
 
 
+def double_backward_grads(solve, A, B, wx, wa, wb):
+    """Gradients of a second-order loss through ``solve``: the first gradients kept in the graph, weighted, summed."""
+    A, B = A.detach().requires_grad_(), B.detach().requires_grad_()
+    x = solve(A, B)
+    ga, gb = torch.autograd.grad((x * wx).sum(), (A, B), create_graph=True)
+    (g2a, g2b) = torch.autograd.grad((ga * wa).sum() + (gb * wb).sum(), (A, B))
+    return g2a, g2b
+
+
+def run_double_backward(tol=1e-2):
+    """``solve`` differentiated twice on the card in float32 against the CPU float64 result, bar ``tol``; no fallback,
+    no CPU warning."""
+    row = {"op": "linalg.solve.double_backward", "n": F64_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY,
+           "baseline": BASELINE}
+    problems = []
+    try:
+        A, B = make_solve(BATCH, F64_N, torch.float32)
+        wx, wa, wb = torch.randn_like(B), torch.randn_like(A), torch.randn_like(B)
+        ref = double_backward_grads(L.solve, A.double(), B.double(), wx.double(), wa.double(), wb.double())
+        with watch() as rec:
+            got = double_backward_grads(L.solve, A.to(HPU), B.to(HPU), wx.to(HPU), wa.to(HPU), wb.to(HPU))
+            sync()
+        err = max(rel_err(g, r) for g, r in zip(got, ref, strict=True))
+        row.update(max_rel_err=err, fwd_fallback=rec["fallback"])
+        problems += [f"double-backward error {err:.3g} > {tol:.3g}"] * (not err <= tol)
+        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+    except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
+        problems.append(f"exception {e!r}"[:300])
+    emit(**row, status="fail" if problems else "ok", problems=problems)
+    return not problems
+
+
+def check_tpc(tpc):
+    """After the first op: with ``hpu_ops.enable()`` the TPC extension must be ready, else every kernel-routed op
+    silently fell back."""
+    ready = tpc.ready()
+    emit(op="tpc_check", lazy=LAZY, baseline=False, ready=ready, status="ok" if ready else "error",
+         problems=[] if ready else ["hpu_ops.tpc.ready() is False: the TPC kernels are not in use (late enable() or "
+                                    "the extension failed to build)"])
+    return ready
+
+
 def probe_argmax_ties():
     """Gaudi's argmax returns the first index among ties: [1, 3, 3, 0] gives 1."""
     row = {"op": "probe.argmax_first_of_ties", "lazy": LAZY, "baseline": BASELINE}
@@ -455,13 +549,16 @@ def main():
         except ImportError:
             complex_state = "not found"
     print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), "hpu_complex", complex_state, "baseline",
-          BASELINE, "lazy", LAZY, flush=True)
+          BASELINE, "tpc_ready", None if BASELINE else tpc.ready(), "lazy", LAZY, flush=True)
     results = [probe_argmax_ties(), probe_argsort_int64()]
+    if not BASELINE:
+        results.append(check_tpc(tpc))
     for case in CASES:
-        results += [run_case(case, n) for n in SIZES]
+        results += [run_case(case, n) for n in case.sizes or SIZES]
         if case.float64:
             results.append(run_float64(case))
     if not BASELINE:
+        results.append(run_double_backward())
         for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
             results.append(run_singular(op, fn))
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong

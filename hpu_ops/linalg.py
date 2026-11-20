@@ -84,7 +84,8 @@ def _use_tpc(A):
 
 def _gj(A, B):
     """``(X, D, S)`` of the Gauss-Jordan solver, the batch dimensions of ``A`` and ``B`` broadcast. ``S[..., 0]`` is
-    the sign of the permutation, ``S[..., 1]`` LAPACK's ``info``."""
+    the sign of the permutation, ``S[..., 1]`` the info (the index follows the kernel's elimination order, can
+    differ from LAPACK's, and is nonzero exactly when a pivot is exactly zero)."""
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
     solver = tpc.gj_solve if _GJ is None else _GJ
     return solver(A.expand(*batch, *A.shape[-2:]), B.expand(*batch, *B.shape[-2:]))
@@ -106,8 +107,9 @@ def _gj_solve(A, B, left=True):
 
 
 def _gj_info(S, batch):
-    """LAPACK's ``info`` (int32) from the kernel's ``S``, shaped like the batch of ``A`` (``S`` carries the broadcast
-    batch of ``A`` and ``B``; the slicing is static, no device sync)."""
+    """The ``info`` (int32; the index follows the kernel's elimination order, can differ from LAPACK's, and is nonzero
+    exactly when a pivot is exactly zero) from the kernel's ``S``, shaped like the batch of ``A`` (``S`` carries the
+    broadcast batch of ``A`` and ``B``; the slicing is static, no device sync)."""
     info = S[..., 1].to(torch.int32)
     if info.shape != batch:
         info = info[(0,) * (info.dim() - len(batch))]
@@ -456,8 +458,7 @@ class Det(torch.autograd.Function):
     """``aten._linalg_det`` as the signed product of U's diagonal, with torch's backward (``g det A^-H``), the inverse
     recomputed from A, so double backward works. A singular matrix has det 0 and a non-finite gradient. ``LU`` and
     ``pivots`` are not differentiable; they are those of A (native's CPU kernel returns those of A^T). Through the TPC
-    kernel D and S come from the identity kernel (``_gj_inv``) with X discarded: a view of the input (``A[..., :1]``)
-    as the right-hand side breaks lazy mode on Gaudi2."""
+    kernel D and S come from the identity kernel (``_gj_inv``), X discarded."""
 
     @staticmethod
     def compute(A):

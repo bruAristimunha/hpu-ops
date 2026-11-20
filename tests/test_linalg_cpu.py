@@ -743,7 +743,8 @@ GJ_CASES = {
 for _upper in (False, True):
     for _left in (True, False):
         for _unit in (False, True):
-            GJ_CASES[f"tri_{'upper' if _upper else 'lower'}_{'left' if _left else 'right'}_{'unit' if _unit else 'full'}"] = (
+            _key = f"tri_{'upper' if _upper else 'lower'}_{'left' if _left else 'right'}_{'unit' if _unit else 'full'}"
+            GJ_CASES[_key] = (
                 (lambda u=_upper, l=_left, t=_unit: _tri_case(u, l, t)), linalg.install_solve_triangular,
                 "solve_triangular")
 
@@ -779,7 +780,8 @@ def test_gj_not_used_past_maxn(gj_hook):
 
 
 DOUBLE_BACKWARD = {
-    "solve": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b), lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
+    "solve": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b),
+              lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
     "solve_right": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b, left=False),
                     lambda: (general(n=4), torch.randn(2, 4, dtype=torch.float64))),
     "solve_triangular": (linalg.install_solve_triangular,
@@ -938,3 +940,35 @@ def test_tpc_flushes_the_lazy_graph_around_the_op(monkeypatch, lazy, flushes):
     marks.clear()
     tpc.gj_inv(f32(2, n=4))
     assert len(marks) == flushes
+
+
+def test_flush_comes_before_and_after_the_op(monkeypatch):
+    order = []
+    core = types.SimpleNamespace(mark_step=lambda: order.append("flush"))
+    torch_mod = types.SimpleNamespace(core=core)
+    for name, mod in (("habana_frameworks", types.SimpleNamespace(torch=torch_mod)),
+                      ("habana_frameworks.torch", torch_mod), ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    out = tpc._call(lambda x: order.append("op") or x, 1)
+    assert out == 1 and order == ["flush", "op", "flush"]
+
+
+def test_flush_is_skipped_when_compiling_or_without_habana(monkeypatch):
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    monkeypatch.setitem(sys.modules, "habana_frameworks", None)  # import raises ImportError
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch", None)
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.core", None)
+    tpc._flush()  # no Habana: no error
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.core", core)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    tpc._flush()
+    assert marks == []
+
+
+def test_lazy_cpp_registers_eigh_with_the_legacy_api():
+    assert "UserCustomOpDescriptor" not in tpc.CPP_LAZY
+    assert "HabanaCustomOpDescriptor::getCustomOpDescriptor(\"linalg_tpc::jacobi_eigh\")" in tpc.CPP_LAZY
+    assert "UserCustomOpDescriptor::getUserCustomOpDescriptor(\"linalg_tpc::jacobi_eigh\")" in tpc.CPP
