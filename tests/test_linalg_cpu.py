@@ -1092,12 +1092,46 @@ def test_singular_triangle_gives_nan_like_torch(monkeypatch):
 def test_tpc_eigh_1x1_needs_no_kernel(monkeypatch):
     """n = 1 does not compile in lazy mode: w is the entry, V is 1, and the kernel op is never built."""
     monkeypatch.setattr(tpc, "_eigh_op", lambda: pytest.fail("the kernel was used for n = 1"))
+    monkeypatch.setattr(tpc, "_eigh_refine_op", lambda: pytest.fail("the refine kernel was used for n = 1"))
     A = torch.randn(4, 1, 1)
     for upper in (False, True):
         w, V = tpc.eigh(A, upper)
         assert w.shape == (4, 1) and V.shape == (4, 1, 1) and w.dtype == V.dtype == torch.float32
         assert torch.equal(w, A[..., 0, :]) and torch.equal(V, torch.ones(4, 1, 1))
         assert w.data_ptr() != A.data_ptr()  # a fresh tensor, never a view of the input
+
+
+@pytest.mark.parametrize("upper", [False, True])
+def test_tpc_eigh_two_pass_refine_contract(monkeypatch, upper):
+    """tpc.eigh runs jacobi_eigh then jacobi_eigh_refine on symmetrized non-view S, then sorts ascending."""
+    torch.manual_seed(0)
+    S = spd(2, 3, n=4, dtype=torch.float32)
+    garbage = S + (torch.tril(torch.randn_like(S), -1) if upper else torch.triu(torch.randn_like(S), 1)) * 100
+    calls = []
+
+    def pass1(S_flat):
+        assert S_flat.is_contiguous() and S_flat.shape == (6, 4, 4) and S_flat.data_ptr() != garbage.data_ptr()
+        calls.append(("pass1", S_flat.clone()))
+        w, V = torch.linalg.eigh(S_flat)
+        perm = torch.tensor([2, 0, 3, 1])
+        return w[:, perm], V.mT[:, perm]
+
+    def pass2(S_flat, Vt1):
+        assert S_flat.is_contiguous() and Vt1.shape == (6, 4, 4)
+        calls.append(("pass2", S_flat.clone(), Vt1.clone()))
+        w, V = torch.linalg.eigh(S_flat)
+        perm = torch.tensor([3, 1, 0, 2])
+        return w[:, perm], V.mT[:, perm]
+
+    monkeypatch.setattr(tpc, "_eigh_op", lambda: pass1)
+    monkeypatch.setattr(tpc, "_eigh_refine_op", lambda: pass2)
+    w, V = tpc.eigh(garbage, upper)
+    assert [c[0] for c in calls] == ["pass1", "pass2"]
+    torch.testing.assert_close(calls[0][1], S.reshape(-1, 4, 4))
+    torch.testing.assert_close(calls[1][1], S.reshape(-1, 4, 4))
+    w_ref = torch.linalg.eigvalsh(S)
+    torch.testing.assert_close(w, w_ref)
+    torch.testing.assert_close(V @ torch.diag_embed(w) @ V.mT, S, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("n", [3, 8, 22])

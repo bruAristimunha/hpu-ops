@@ -71,6 +71,8 @@ static habana::PartialOutputMetaDataVector eigh_meta(const at::Stack& inputs) {
 }
 static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", eigh_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh_refine", "jacobi_eigh_refine_f32_gaudi2",
+                                          eigh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", solve_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", inv_meta, nullptr);
   return true;
@@ -94,15 +96,23 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   auto out = desc.execute(inputs);
   return {out[0], out[1]};
 }
+std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v1) {
+  std::vector<c10::IValue> inputs{a, v1};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_eigh_refine");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
+  m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
   m.impl("jacobi_eigh", jacobi_eigh);
+  m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
@@ -112,6 +122,9 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
     return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), a.size(1)}), a.new_empty({a.size(0), 2}));
   });
   m.impl("jacobi_eigh", [](at::Tensor a) {
+    return std::make_tuple(a.new_empty({a.size(0), a.size(1)}), a.new_empty(a.sizes()));
+  });
+  m.impl("jacobi_eigh_refine", [](at::Tensor a, at::Tensor v1) {
     return std::make_tuple(a.new_empty({a.size(0), a.size(1)}), a.new_empty(a.sizes()));
   });
 }
@@ -157,6 +170,14 @@ static bool registered_eigh = [] {
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", in, out, nullptr);
   return true;
 }();
+static bool registered_eigh_refine = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
+                                               {habana::custom_op::input_type::TENSOR, 1}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, wshape},
+                                                 {1, c10::ScalarType::Float, xshape_a}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_eigh_refine", "jacobi_eigh_refine_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor b) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_solve");
@@ -176,15 +197,23 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   auto out = op.execute(inputs);
   return {out[0], out[1]};
 }
+std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v1) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_eigh_refine");
+  std::vector<c10::IValue> inputs{a, v1};
+  auto out = op.execute(inputs);
+  return {out[0], out[1]};
+}
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
+  m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
   m.impl("jacobi_eigh", jacobi_eigh);
+  m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
 """
 
@@ -318,6 +347,12 @@ def _eigh_op():
     return torch.ops.linalg_tpc.jacobi_eigh
 
 
+def _eigh_refine_op():
+    """``torch.ops.linalg_tpc.jacobi_eigh_refine``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_eigh_refine
+
+
 # Lazy mode on bridge 1.21.4 can drop the unused outputs of a multi-output custom op (the callers use some of X, D and
 # S), and the next graph then fails at mark_step with "ValidateSyncInputTensors tensor_data is empty". A mark_step
 # before and after each call keeps the op alone in its graph. The cost is two graph boundaries per call; eager mode
@@ -393,7 +428,9 @@ def eigh(A, upper):
         return A.reshape(*batch, 1).clone(), torch.ones_like(A)
     # a fresh tensor, never a view of the caller's input: views break lazy mode
     S = torch.triu(A) + torch.triu(A, 1).mT if upper else torch.tril(A) + torch.tril(A, -1).mT
-    W, Vt = _call(_eigh_op(), S.reshape(-1, n, n).to(torch.float32).contiguous())
+    S_flat = S.reshape(-1, n, n).to(torch.float32).contiguous()
+    _, Vt1 = _call(_eigh_op(), S_flat)
+    W, Vt = _call(_eigh_refine_op(), S_flat, Vt1)
     w, order = W.sort(-1)
     V = Vt.gather(-2, order[..., :, None].expand_as(Vt)).mT
     return w.reshape(*batch, n), V.reshape(*batch, n, n)

@@ -11,6 +11,8 @@ extern const char _binary___gj_inv_f32_gaudi2_o_start[];
 extern const char _binary___gj_inv_f32_gaudi2_o_end[];
 extern const char _binary___jacobi_eigh_f32_gaudi2_o_start[];
 extern const char _binary___jacobi_eigh_f32_gaudi2_o_end[];
+extern const char _binary___jacobi_eigh_refine_f32_gaudi2_o_start[];
+extern const char _binary___jacobi_eigh_refine_f32_gaudi2_o_end[];
 }
 
 namespace {
@@ -18,6 +20,7 @@ namespace {
 const char* kSolve = "gj_solve_f32_gaudi2";
 const char* kInv = "gj_inv_f32_gaudi2";  // the same source with -DIDENTITY_B: A alone, B is the identity
 const char* kEigh = "jacobi_eigh_f32_gaudi2";
+const char* kEighRefine = "jacobi_eigh_refine_f32_gaudi2";
 constexpr uint64_t kMaxN = 32;      // MAXN of gj_solve
 constexpr uint64_t kMaxEighN = 32;  // MAXN of jacobi_eigh
 
@@ -127,11 +130,13 @@ tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
                     : copy_elf(out, _binary___gj_solve_f32_gaudi2_o_start, _binary___gj_solve_f32_gaudi2_o_end);
 }
 
-tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out)
+tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
+                                       bool refine)
 {
-    if (in->inputTensorNr != 1)
+    const unsigned inputs = refine ? 2 : 1;
+    if (in->inputTensorNr != inputs)
     {
-        in->inputTensorNr = 1;
+        in->inputTensorNr = inputs;
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
     }
     if (in->outputTensorNr != 2)
@@ -139,13 +144,18 @@ tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_l
         in->outputTensorNr = 2;
         return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     }
-    if (in->inputTensors[0].geometry.dataType != tpc_lib_api::DATA_F32)
+    for (unsigned i = 0; i < inputs; i++)
     {
-        return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+        if (in->inputTensors[i].geometry.dataType != tpc_lib_api::DATA_F32)
+        {
+            return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+        }
     }
     const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
     const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
-    if (n > kMaxEighN || in->inputTensors[0].geometry.maxSizes[1] != n)
+    if (n > kMaxEighN || in->inputTensors[0].geometry.maxSizes[1] != n ||
+        (refine && (in->inputTensors[1].geometry.maxSizes[0] != n || in->inputTensors[1].geometry.maxSizes[1] != n ||
+                    in->inputTensors[1].geometry.maxSizes[2] != batch)))
     {
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
     }
@@ -157,6 +167,14 @@ tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_l
     full_dim(pa, 0, n);
     full_dim(pa, 1, n);
     batch_dim(pa, 2);
+    if (refine)
+    {
+        auto& pv1 = out->inputTensorAccessPattern[1];
+        base_pattern(pv1);
+        full_dim(pv1, 0, n);
+        full_dim(pv1, 1, n);
+        batch_dim(pv1, 2);
+    }
     auto& pw = out->outputTensorAccessPattern[0];
     base_pattern(pw);
     full_dim(pw, 0, n);
@@ -166,7 +184,9 @@ tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_l
     full_dim(pv, 0, n);
     full_dim(pv, 1, n);
     batch_dim(pv, 2);
-    return copy_elf(out, _binary___jacobi_eigh_f32_gaudi2_o_start, _binary___jacobi_eigh_f32_gaudi2_o_end);
+    return refine ? copy_elf(out, _binary___jacobi_eigh_refine_f32_gaudi2_o_start,
+                             _binary___jacobi_eigh_refine_f32_gaudi2_o_end)
+                  : copy_elf(out, _binary___jacobi_eigh_f32_gaudi2_o_start, _binary___jacobi_eigh_f32_gaudi2_o_end);
 }
 
 }  // namespace
@@ -176,12 +196,13 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 3 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 4 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
         strcpy(guids[1].name, kInv);
         strcpy(guids[2].name, kEigh);
+        strcpy(guids[3].name, kEighRefine);
     }
     if (kernelCount != nullptr)
     {
@@ -203,7 +224,11 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     }
     if (strcmp(params->guid.name, kEigh) == 0)
     {
-        return eigh_defs(params, instance);
+        return eigh_defs(params, instance, false);
+    }
+    if (strcmp(params->guid.name, kEighRefine) == 0)
+    {
+        return eigh_defs(params, instance, true);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }
