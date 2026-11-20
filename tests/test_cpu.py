@@ -16,7 +16,7 @@ from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 
 import hpu_ops
-from hpu_ops import autocast, composite, conv, serialization, upsample
+from hpu_ops import autocast, composite, conv, indexing, serialization, upsample
 
 
 @contextlib.contextmanager
@@ -792,6 +792,204 @@ def test_autocast_files_hold_torchs_cuda_lists():
     assert autocast.exports() == [f"export {name}={shlex.quote(path)}" for name, path in files.items()]
 
 
+# ---- indexing whose indexed dims do not lead: one index_select; a boolean-mask put of one value: where
+
+
+def _vech(x):
+    rows, cols = torch.triu_indices(x.shape[-1], x.shape[-1])
+    return x[..., rows, cols]
+
+
+def _vech_scaled(x):  # spd_learn's sym_to_upper: an index, then a boolean-mask put of sqrt(2)
+    rows, cols = torch.triu_indices(x.shape[-1], x.shape[-1])
+    v = x[..., rows, cols]
+    m = torch.ones_like(v)
+    m[..., rows != cols] = 2 ** 0.5
+    return v * m
+
+
+def _vec_to_sym(v):  # spd_learn's vec_to_sym: index puts into zeros and index reads of them
+    n = int(((1 + 8 * v.shape[-1]) ** 0.5 - 1) / 2)
+    ixs = torch.triu_indices(n, n)
+    od = ixs[0] != ixs[1]
+    x = torch.zeros((*v.shape[:-1], n, n), dtype=v.dtype)
+    x[..., ixs[0], ixs[1]] = v
+    x[..., ixs[0, od], ixs[1, od]] /= 2 ** 0.5
+    x[..., ixs[1, od], ixs[0, od]] = x[..., ixs[0, od], ixs[1, od]]
+    return x
+
+
+INDEXINGS = {
+    "vech": _vech,
+    "middle dim": lambda x: x[:, torch.tensor([2, 0, 2, 1])],
+    "last dim, 2-d index": lambda x: x[..., torch.tensor([[0, 3], [3, 3]])],
+    "two adjacent, broadcast": lambda x: x[:, torch.tensor([[0], [2]]), torch.tensor([1, 3, 1])],
+    "separated by a slice": lambda x: x[torch.tensor([0, 1, 1]), :, torch.tensor([3, 0, 3])],
+    "separated, not first": lambda x: x[:, torch.tensor([0, 2]), :, torch.tensor([1, 1])],
+    "negative indices": lambda x: x[..., torch.tensor([-1, 0, -4]), torch.tensor([2, -2, 1])],
+    "int32 index": lambda x: x[..., torch.tensor([1, 1, 0], dtype=torch.int32)],
+    "empty index": lambda x: x[..., torch.tensor([], dtype=torch.long)],
+    "non-contiguous input": lambda x: x.transpose(0, 2)[:, torch.tensor([0, 0, 3])],
+}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+@pytest.mark.parametrize("name", sorted(INDEXINGS))
+def test_index_goes_through_index_select(name, dtype):
+    torch.manual_seed(0)
+    x = torch.randn(3, 4, 4, 4, dtype=dtype) if name == "separated, not first" else torch.randn(5, 4, 4, dtype=dtype)
+    f = INDEXINGS[name]
+    want = train_step(f, x)
+    with cpu_as_hpu(indexing.install_index) as calls:
+        got = train_step(f, x)
+        out = f(x)
+    assert calls["index_select_flat"] == 2
+    assert_same(got, want, tol=0)
+    if name != "non-contiguous input":  # ATen's result follows the input's layout; index_select's is contiguous
+        assert out.stride() == f(x).stride()
+
+
+def test_leading_indices_and_masks_keep_the_native_index():
+    x = torch.randn(5, 4, 4)
+    cases = [lambda x: x[torch.tensor([0, 4, 4])], lambda x: x[torch.tensor([0, 1]), torch.tensor([3, 3])],
+             lambda x: x[:, x[0, 0] > 0], lambda x: x[x > 0], lambda x: x[:, 1:3], lambda x: x[..., 2],
+             lambda x: x[:, torch.tensor(2)]]
+    for f in cases:
+        want = train_step(f, x)
+        with cpu_as_hpu(indexing.install_index) as calls:
+            got = train_step(f, x)
+        assert not calls["index_select_flat"]
+        assert_same(got, want, tol=0)
+
+
+def test_index_errors_reach_the_native_op():
+    x = torch.randn(5, 4, 4)
+    with cpu_as_hpu(indexing.install_index) as calls:
+        for f in (lambda: x[:, torch.tensor([4])], lambda: x[..., torch.tensor([0, 1]), torch.tensor([-5])],
+                  lambda: x[:, torch.tensor([0, 1]), torch.tensor([0, 1, 2])]):
+            with pytest.raises((IndexError, RuntimeError)):
+                f()
+    assert not calls["index_select_flat"]
+
+
+def test_index_under_no_grad_and_inference_mode():
+    x = torch.randn(5, 4, 4)
+    with cpu_as_hpu(indexing.install_index) as calls:
+        with torch.no_grad():
+            a = _vech(x)
+        with torch.inference_mode():
+            b = _vech(x)
+    assert calls["index_select_flat"] == 1  # inference mode skips the autograd key
+    assert_same([a, b], [_vech(x)] * 2, tol=0)
+
+
+def test_index_compiled():
+    x = torch.randn(5, 6, 6)
+    want = train_step(_vech_scaled, x)
+    with cpu_as_hpu(hpu_ops._install):
+        got = train_step(compiled(_vech_scaled, []), x)
+    assert_same(got, want, tol=0)
+
+
+@pytest.mark.parametrize("make", [
+    lambda: torch.randn(1, 1, 1),  # n = 1
+    lambda: torch.randn(1, 7, 7),  # batch 1
+    lambda: torch.randn(6, 5, 5)[2:],  # an offset view
+    lambda: torch.randn(5, 5)[None].expand(3, 5, 5),  # a stride-0 batch
+    lambda: torch.randn(2, 3, 6, 6, dtype=torch.float64).transpose(-1, -2),  # 4-d, transposed
+])
+def test_vech_adversarial_shapes_and_layouts(make):
+    torch.manual_seed(0)
+    x = make()
+    want = train_step(_vech_scaled, x)
+    with cpu_as_hpu(hpu_ops._install) as calls:
+        got = train_step(_vech_scaled, x)
+    assert calls["index_select_flat"] == 1 and calls["mask_fill"] == 1
+    assert_same(got, want, tol=0)
+
+
+def test_index_twice_in_a_row_and_extreme_values():
+    x = torch.tensor([[[1e30, -1e-30], [float("inf"), 3.0]]]).repeat(4, 1, 1)
+    with cpu_as_hpu(indexing.install_index):
+        a, b = _vech(x), _vech(x)
+    assert torch.equal(a, _vech(x)) and torch.equal(b, a)
+
+
+def test_index_compiled_with_the_index_as_an_input():
+    x, rows = torch.randn(5, 6, 6), torch.tensor([0, 5, 2])
+    f = lambda x, rows: x[:, rows, rows.flip(0)]  # noqa: E731
+    want = train_step(lambda x: f(x, rows), x)
+    with cpu_as_hpu(indexing.install_index):
+        got = train_step(lambda x: compiled(f, [])(x, rows), x)
+    assert_same(got, want, tol=0)
+
+
+def test_index_double_backward():
+    x = torch.randn(5, 4, 4, dtype=torch.float64, requires_grad=True)
+    f = lambda x: (_vech(x) ** 3).sum()  # noqa: E731
+    with cpu_as_hpu(indexing.install_index):
+        assert torch.autograd.gradgradcheck(f, (x,))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_vech_and_vec_to_sym_as_in_spd_learn(dtype):
+    torch.manual_seed(0)
+    v = torch.randn(8, 21, dtype=dtype)
+    f = lambda v: _vech_scaled(_vec_to_sym(v))  # noqa: E731
+    want = train_step(f, v)
+    with cpu_as_hpu(hpu_ops._install) as calls:
+        got = train_step(f, v)
+    assert calls["mask_fill"] == 1 and calls["index_select_flat"] >= 3
+    assert_same(got, want, tol=0)
+
+
+MASK_PUTS = {
+    "trailing mask": lambda m, x: m.__setitem__((Ellipsis, x[0] > 0), 2.5),
+    "middle mask": lambda m, x: m.__setitem__((slice(None), x[0, :, 0] > 0), -1.0),
+    "full mask": lambda m, x: m.__setitem__(x > 0, 0.5),
+    "0-d tensor value": lambda m, x: m.__setitem__((Ellipsis, x[0] > 0), torch.tensor(3.0)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(MASK_PUTS))
+def test_mask_put_of_one_value_is_where(name):
+    torch.manual_seed(0)
+    x = torch.randn(5, 4, 4)
+    want = torch.ones(5, 4, 4)
+    MASK_PUTS[name](want, x)
+    got = torch.ones(5, 4, 4)
+    with cpu_as_hpu(indexing.install_mask_fill) as calls:
+        MASK_PUTS[name](got, x)
+    assert calls["mask_fill"] == 1
+    assert_same([got], [want], tol=0)
+
+
+def test_mask_put_gradient_and_other_puts_keep_the_native_op():
+    torch.manual_seed(0)
+    x = torch.randn(5, 4, 4)
+
+    def f(x):
+        y = x * 1
+        y[..., x[0] > 0] = 0.0
+        return y
+
+    want = train_step(f, x)
+    with cpu_as_hpu(indexing.install_mask_fill) as calls:
+        got = train_step(f, x)
+    assert calls["mask_fill"] == 1
+    assert_same(got, want, tol=0)
+    with cpu_as_hpu(indexing.install_mask_fill) as calls:
+        y, z = torch.zeros(5, 4, 4), torch.zeros(5, 4, 4)
+        y[..., x[0] > 0] = torch.arange(float((x[0] > 0).sum()))  # several values
+        y[:, torch.tensor([0, 2])] = 1.0  # integer index
+        y.index_put_((torch.tensor([0, 0]),), torch.tensor(1.0), accumulate=True)
+    assert not calls["mask_fill"]
+    z[..., x[0] > 0] = torch.arange(float((x[0] > 0).sum()))
+    z[:, torch.tensor([0, 2])] = 1.0
+    z.index_put_((torch.tensor([0, 0]),), torch.tensor(1.0), accumulate=True)
+    assert_same([y], [z], tol=0)
+
+
 # ---- installing and undoing
 
 
@@ -809,7 +1007,7 @@ def test_undo_restores_torch():
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
                  "aten::embedding_dense_backward", "aten::convolution_backward", "aten::roll",
-                 "aten::upsample_linear1d"):
+                 "aten::upsample_linear1d", "aten::index.Tensor", "aten::index_put_"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
 
 
