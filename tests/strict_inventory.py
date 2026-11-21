@@ -22,7 +22,26 @@ def load(directory):
     return rows
 
 
-BY_CALLER = ("cpu op", "host sync", "host copy")
+BY_CALLER = ("cpu op", "host sync", "host copy", "h2d copy")
+
+
+# rows of sweeps run before the watch skipped views, metadata ops and host-to-device copies (8e157c4): dropped here
+VIEWS = {"aten::view", "aten::select.int", "aten::expand", "aten::alias", "aten::detach", "aten::unsqueeze",
+         "aten::slice.Tensor", "aten::t", "aten::transpose.int", "aten::permute", "aten::as_strided",
+         "aten::squeeze.dim", "aten::_unsafe_view", "aten::lift_fresh", "aten::empty.memory_format",
+         "aten::set_.source_Storage_storage_offset", "aten::unbind.int", "aten::split.Tensor", "aten::clone"}
+COPIES = {"aten::_to_copy", "aten::to.device", "aten::to.dtype_layout", "aten::to.dtype", "aten::copy_"}
+
+
+def normalize(row):
+    """The row as the committed watch records it: None for a view, a host-to-device copy as ``h2d copy``."""
+    if row["source"] != "cpu op":
+        return row
+    if row["op"] in VIEWS:
+        return None
+    if row["op"] in COPIES:
+        return dict(row, source="h2d copy")
+    return row
 
 
 def key(row):
@@ -38,6 +57,9 @@ def collect(results):
     for r in results:
         for part in ("step_rows", "infer_rows", "trace_rows"):
             for row in r.get(part) or []:
+                row = normalize(row)
+                if row is None:
+                    continue
                 k = key(row)
                 e = entries[k]
                 n = row["per_step"]
@@ -89,7 +111,8 @@ def main():
             elif r["status"] == "ok":
                 cells.append(f"{r['ms_per_step']}")
             else:
-                cells.append(f"{r['status']}: {r.get('stage', '')} {r.get('error', '')[:70]}".replace("|", "/"))
+                ms = f"{r['ms_per_step']}, " if r.get("ms_per_step") is not None else ""
+                cells.append(f"{ms}{r['status']}: {r.get('stage', '')} {r.get('error', '')[:70]}".replace("|", "/"))
         print(f"| {family} | {model} | " + " | ".join(cells) + " |")
 
 
