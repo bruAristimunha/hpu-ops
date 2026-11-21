@@ -321,7 +321,7 @@ tpc_lib_api::GlueCodeReturn large_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
     const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
     const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
     const uint64_t w = 64 * ((n + 63) / 64);
-    if (n <= 64 || n > kMaxLargeN || in->inputTensors[0].geometry.maxSizes[1] != n)
+    if (!rank3(in, 1) || n <= 64 || n > kMaxLargeN || in->inputTensors[0].geometry.maxSizes[1] != n)
     {
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
     }
