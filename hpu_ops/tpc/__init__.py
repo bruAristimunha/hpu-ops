@@ -40,6 +40,10 @@ The torch-op composites of ``hpu_ops.linalg`` are correct but were measured 3-25
 per call on Gaudi2 (one launch per op). The solve kernel, batch 32, n = 22, eager: 2.9 / 1.3 ms in two processes against
 6.1 / 2.5 for the fallback; lazy 0.97 / 1.36 against 1.22 / 1.38, within the card's noise.
 
+complex64 kernels (planar re/im rows, for hpu-complex) are behind ``hpu_ops.tpc.complex_linalg``: ``cgj_solve`` /
+``cgj_inv`` (Gauss-Jordan, cabs1 pivoting, the determinant's phase), ``jacobi_ceigh`` + ``jacobi_ceigh_refine``
+(Hermitian eigh) and ``jacobi_csvd`` / ``jacobi_csvdvals`` (one-sided SVD), n <= 32.
+
 Habana reads ``GC_KERNEL_PATH`` when the device initialises, so ``install_kernel_path`` must run before the first HPU
 op of the process; ``hpu_ops.enable()`` calls it. ``HPU_OPS_TPC=0`` in the environment keeps the kernels off.
 """
