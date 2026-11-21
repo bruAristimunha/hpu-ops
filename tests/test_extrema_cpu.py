@@ -917,3 +917,13 @@ def test_internal_sort_skips_the_rewrite_under_compile(card):
     got = compiled(lambda t: extrema.internal_sort(t, -1, True), nodes, dynamic=False)(x)
     same(tuple(got), _reference(lambda t: tuple(torch.sort(t, -1, True)), x))
     assert card["sort"] == 0
+
+
+def test_inplace_ops_keep_a_cpu_scalar_self_on_the_cpu():
+    """In-place ops keep ``self`` where it is (review of #48): moving it made ``clamp_`` write into a moved copy and
+    return it, where torch raises its device error; out of place, a CPU 0-d operand moves as before."""
+    s, bound = torch.tensor(5.0), torch.tensor(7.0, device="meta")
+    assert extrema._onto_device((s, bound), keep_self=True)[0] is s
+    assert extrema._onto_device((s, bound))[0].device.type == "meta"
+    with pytest.raises(RuntimeError, match="device"):  # what the native kernel then does with a CPU self
+        torch.ops.aten.clamp_.Tensor(s, bound, None)
