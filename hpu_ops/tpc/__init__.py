@@ -46,6 +46,11 @@ import torch
 
 MAXN = 64
 LARGE_MAXN = 512  # NMAX of gj_large_f32_gaudi2.c: gj_solve and gj_inv take 64 < n <= LARGE_MAXN through it
+# The in-place kernel runs one matrix per TPC (24 on Gaudi2), so a small batch leaves the card idle: measured on
+# Gaudi2 (bridge 1.21.4, eager, mean of synced calls), batch 1 n = 384 and batch 1 to 4 n = 512 were slower than
+# Habana's CPU fallback, batch 1 n <= 300 and batch 32 n <= 256 not (see ``large_pays``).
+LARGE_ANY_BATCH_N = 256  # up to here the kernel takes any batch
+LARGE_MIN_BATCH = 8  # past it, at least this many matrices
 EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
@@ -560,6 +565,12 @@ def _tri_chunked(op, A, B):
 def _check(A, n, limit=MAXN):
     if A.dim() < 2 or n > limit or A.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc takes square A with n <= {limit}, got {tuple(A.shape)}")
+
+
+def large_pays(n, batch):
+    """Whether the routing sends ``batch`` matrices of order ``n`` (``MAXN`` < n <= ``LARGE_MAXN``) to the in-place
+    kernel: n <= ``LARGE_ANY_BATCH_N``, or at least ``LARGE_MIN_BATCH`` matrices."""
+    return n <= LARGE_MAXN and (n <= LARGE_ANY_BATCH_N or batch >= LARGE_MIN_BATCH)
 
 
 def _parity(P):

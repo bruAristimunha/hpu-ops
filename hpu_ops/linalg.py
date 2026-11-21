@@ -78,15 +78,21 @@ def _takes(device_type, name, matrix_at=0):
     return takes
 
 
-def _tpc_takes(device_type, takes, matrix_at=0, limit=None):
-    """``takes``, and on ``hpu`` also: n <= ``limit`` (default ``tpc.MAXN``) and the TPC kernel ready (path installed,
-    Gaudi2, extension built). Otherwise the call is declined and takes hpu-ops' own CPU route (``_on_cpu``), which
-    beats the composites on Gaudi2."""
+def _tpc_takes(device_type, takes, matrix_at=0, large=False):
+    """``takes``, and on ``hpu`` also: n <= ``tpc.MAXN``, or with ``large`` (solve, inv, det, slogdet) n <=
+    ``tpc.LARGE_MAXN`` with a batch the in-place kernel pays for (``tpc.large_pays``), and the TPC kernel ready (path
+    installed, Gaudi2, extension built). Otherwise the call is declined and takes hpu-ops' own CPU route
+    (``_on_cpu``), which beats the composites on Gaudi2."""
 
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
             return False
-        return device_type != "hpu" or (args[matrix_at].shape[-1] <= (limit or tpc.MAXN) and tpc.ready())
+        if device_type != "hpu":
+            return True
+        A = args[matrix_at]
+        n = A.shape[-1]
+        fits = n <= tpc.MAXN or (large and tpc.large_pays(n, A.numel() // (n * n)))
+        return fits and tpc.ready()
 
     return tpc_takes
 
@@ -557,7 +563,7 @@ def install_solve(device_type):
             return left and B.shape[-1] == A.shape[-1]
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
-    takes = _tpc_takes(device_type, shapes_ok, limit=tpc.LARGE_MAXN)
+    takes = _tpc_takes(device_type, shapes_ok, large=True)
     return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes, backend=False)])
 
 
@@ -669,6 +675,6 @@ def install_inv_det(device_type):
     groups = []
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
-        takes = _tpc_takes(device_type, _takes(device_type, name), limit=tpc.LARGE_MAXN)
+        takes = _tpc_takes(device_type, _takes(device_type, name), large=True)
         groups.append(_kernels(device_type, op, name, function, takes, backend=name == "inv"))
     return register_paired(device_type, groups)

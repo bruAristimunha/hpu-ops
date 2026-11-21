@@ -806,9 +806,12 @@ def test_gj_is_declined_past_maxn_on_hpu_and_without_the_kernel(monkeypatch):
     assert takes(A) is True
     assert takes(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is False
     assert takes(torch.randn(tpc.MAXN, tpc.MAXN)) is True
-    large = linalg._tpc_takes("hpu", linalg._takes("hpu", "solve"), limit=tpc.LARGE_MAXN)
-    assert large(torch.randn(tpc.LARGE_MAXN, tpc.LARGE_MAXN)) is True
-    assert large(torch.randn(tpc.LARGE_MAXN + 1, tpc.LARGE_MAXN + 1)) is False
+    large = linalg._tpc_takes("hpu", linalg._takes("hpu", "solve"), large=True)
+    n = tpc.LARGE_ANY_BATCH_N
+    assert large(torch.randn(n, n)) is True and large(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is True
+    assert large(torch.randn(tpc.LARGE_MIN_BATCH - 1, n + 1, n + 1)) is False  # past it, a small batch: fallback
+    assert large(torch.randn(tpc.LARGE_MIN_BATCH, n + 1, n + 1)) is True
+    assert large(torch.randn(tpc.LARGE_MIN_BATCH, tpc.LARGE_MAXN + 1, tpc.LARGE_MAXN + 1)) is False
     cpu = linalg._tpc_takes("cpu", linalg._takes("cpu", "solve"))
     monkeypatch.setattr(tpc, "ready", lambda: False)
     assert cpu(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is True  # the CPU stand-in keeps the composite

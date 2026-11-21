@@ -49,11 +49,14 @@ def cases():
     yield "cayley_b1_n220", L.solve, (A, B), {}
     yield "cayley_2d_n220", L.solve, (A[0], B[0]), {}
     yield "cayley_grad_b1_n220", L.solve, (A, B), {"grad": True}
-    for n in (65, 127, 128, 129, 300, 449, 512):
+    for n in (65, 127, 128, 129, 256):
         yield f"solve_n{n}", L.solve, (permuted(2, n), rn(2, n, 3)), {}
-    yield "inv_n512_b1", L.inv, (permuted(1, 512),), {}
-    yield "det_n512", L.det, (permuted(2, 512),), {}
-    yield "slogdet_n512", slog, (permuted(2, 512),), {}
+    for n in (257, 300, 449, 512):  # past tpc.LARGE_ANY_BATCH_N the kernel takes batch >= tpc.LARGE_MIN_BATCH
+        yield f"solve_n{n}_b8", L.solve, (permuted(8, n), rn(8, n, 3)), {}
+    yield "solve_n300_b1_declined", L.solve, (permuted(1, 300), rn(1, 300, 3)), {"route": "any"}
+    yield "inv_n512_b8", L.inv, (permuted(8, 512),), {}
+    yield "det_n512_b8", L.det, (permuted(8, 512),), {}
+    yield "slogdet_n512_b8", slog, (permuted(8, 512),), {}
     yield "solve_m600", L.solve, (permuted(2, 100), rn(2, 100, 600)), {}
     yield "solve_vector_b1", L.solve, (permuted(1, 220), rn(1, 220)), {}
     yield "solve_left_false_b1", lambda a, b: L.solve(a, b, left=False), (permuted(1, 220), rn(1, 4, 220)), {}
