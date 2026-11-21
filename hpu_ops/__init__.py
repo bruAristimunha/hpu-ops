@@ -86,7 +86,9 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
          composite.install_roll, composite.install_unfold, indexing.install_index, indexing.install_mask_fill, im2col.install,
          linalg.install_solve_triangular, linalg.install_cholesky_solve,
-         linalg.install_solve, linalg.install_inv_det, eigh.install_eigh, serialization.install)
+         linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
+         linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
+         linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Rebuilds liblinalg_tpc.so, the Gaudi2 TPC linalg kernels (gj_solve and gj_inv, Gauss-Jordan; jacobi_eigh and
-# jacobi_eigh_refine, one-sided Jacobi; tri_solve_{lower,upper}[_unit], substitution), and copies it next to this
+# jacobi_eigh_refine, one-sided Jacobi; tri_solve_{lower,upper}[_unit], substitution; jacobi_svd[_full], jacobi_svdvals;
+# householder_product; matrix_exp[_frechet]; lu_factor, lu_perm, lu_solve), and copies it next to this
 # script.
 # Run it inside the Gaudi image (it needs tpc-clang from habanalabs-tools 1.21.4, cmake, objcopy). The build happens
 # in a temporary directory; the sha256 of the library is printed so a rebuild can be compared with the committed one.
