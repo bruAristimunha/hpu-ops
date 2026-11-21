@@ -122,7 +122,7 @@ def gj_solve(A, B=None, legacy=False):
         cs = mul(col, s)
         q = mul(cs, ninv)
         r = mac(q, pks, cs)
-        q = mac(r, ninv, q)
+        q = q if ninv == 0 else mac(r, ninv, q)
         for i in range(n):
             if i != k:
                 a[i] = mac(a[k], q[i], a[i])

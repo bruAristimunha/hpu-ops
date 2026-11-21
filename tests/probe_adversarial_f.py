@@ -178,8 +178,9 @@ def cases():
     yield "tri_n2", st(upper=True), (tri(7, 2, 2, upper=True), rn(7, 2, 1)), {}
     yield "solve_n1_b37", L.solve, (spd(37, 1, 1), rn(37, 1, 2)), {}
     yield "inv_n1", L.inv, (spd(1, 1),), {}
-    yield "tri_batch_empty", st(), (tri(0, 22, 22), rn(0, 22, 3)), {}
-    yield "tri_m0", st(), (tri(2, 22, 22), rn(2, 22, 0)), {}
+    # empty inputs are declined (``_takes`` needs numel > 0) and take hpu-ops' CPU route: a copy of nothing
+    yield "tri_batch_empty", st(), (tri(0, 22, 22), rn(0, 22, 3)), {"route": "declined"}
+    yield "tri_m0", st(), (tri(2, 22, 22), rn(2, 22, 0)), {"route": "declined"}
     yield "tri_batch_1000_n64", st(), (tri(1000, 64, 64), rn(1000, 64, 5)), {}
     yield "solve_batch_997_n40", L.solve, (spd(997, 40, 40), rn(997, 40, 1)), {}
     yield "tri_expand_A", lambda a, b: L.solve_triangular(a.expand(16, 40, 40), b, upper=False), \

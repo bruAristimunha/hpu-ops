@@ -196,6 +196,21 @@ def test_replica_accuracy_random(n):
         assert np.abs(x - r).max() / np.abs(r).max() < 1e-5
 
 
+def test_replica_infinite_pivot_stays_finite():
+    """Found by the re-run probe (solve_inf_in_A): an infinite pivot must not turn the FMA-corrected multipliers into
+    NaN; torch gives a finite solution (the multipliers a_i0 / inf are 0)."""
+    torch.manual_seed(0)
+    X = torch.randn(16, 32)
+    A = X @ X.T / 32 + 0.1 * torch.eye(16)
+    A[0, 0] = float("inf")
+    B = torch.randn(16, 3)
+    want = torch.linalg.solve(A, B)
+    assert torch.isfinite(want).all()
+    got = replica_gj(A, B)[0]
+    assert np.isfinite(got).all()
+    np.testing.assert_allclose(got, want.numpy(), rtol=1e-4, atol=1e-5)
+
+
 # ---- 5. solve_triangular(out=): int destination and a destination that requires grad raise as in torch ----
 
 def _tri(n=6):

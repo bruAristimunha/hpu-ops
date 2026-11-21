@@ -133,11 +133,22 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
         for (int k = 0; k < n; k++)
         {
             // column k as a vector over rows: lane i = A[i][k], every row (the multipliers need the rows above k too)
-            float64 col = 0.0f;
-            for (int i = 0; i < n; i++)
+            // four independent select chains (rows i mod 4), so the n dependent selects do not serialize; lanes are
+            // disjoint, so the sum of the four is exact
+            float64 c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+            int i4 = 0;
+            for (; i4 + 3 < n; i4 += 4)
             {
-                col = v_f32_sel_eq_u32_b(lane, (unsigned)i, lane_bcast(a[i], k), col);
+                c0 = v_f32_sel_eq_u32_b(lane, (unsigned)i4, lane_bcast(a[i4], k), c0);
+                c1 = v_f32_sel_eq_u32_b(lane, (unsigned)(i4 + 1), lane_bcast(a[i4 + 1], k), c1);
+                c2 = v_f32_sel_eq_u32_b(lane, (unsigned)(i4 + 2), lane_bcast(a[i4 + 2], k), c2);
+                c3 = v_f32_sel_eq_u32_b(lane, (unsigned)(i4 + 3), lane_bcast(a[i4 + 3], k), c3);
             }
+            for (; i4 < n; i4++)
+            {
+                c0 = v_f32_sel_eq_u32_b(lane, (unsigned)i4, lane_bcast(a[i4], k), c0);
+            }
+            float64 col = v_f32_add_b(v_f32_add_b(c0, c1), v_f32_add_b(c2, c3));
             float64 cand = v_f32_abs_b(col);
             cand = v_f32_sel_less_u32_b(lane, (unsigned)k, -1.0f, cand);
             cand = v_f32_sel_geq_u32_b(lane, (unsigned)n, -1.0f, cand);
@@ -177,7 +188,8 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
             float64 cs = v_f32_mul_b(col, scale);
             float64 q = v_f32_mul_b(cs, ninv);
             float64 r = v_f32_mac_b(q, pks, cs);  // cs + q * pivot, exact in one FMA
-            q = v_f32_mac_b(r, ninv, q);
+            // no correction when 1/pivot is 0 (an infinite or zero pivot): 0 * inf in r would make every q NaN
+            q = v_f32_sel_eq_f32_b(ninv, 0.0f, q, v_f32_mac_b(r, ninv, q));
             for (int i = 0; i < n; i++)
             {
                 if (i == k)
