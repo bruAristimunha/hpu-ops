@@ -260,7 +260,8 @@ def gj_large_op(legacy=False, legacy_growth=False):
 # ``v_rsqrt_f32`` as the correctly rounded float32 1/sqrt (the SVD kernel follows it with one Newton step). Lane
 # reductions follow the kernels' butterflies (``reduce_*_half32``: partners at lane distance 16, 8, 4, 2, 1).
 
-THETA_13 = F32(5.371920351148152)
+THETA_13 = F32(2.0)  # THETA of matrix_exp_f32_gaudi2.c
+THETA_LEGACY = F32(5.371920351148152)  # its theta before code review #8
 EXPM_S_MAX = 126  # S_MAX of matrix_exp_f32_gaudi2.c
 EXPM_S_LEGACY = 16  # its cap before review round 3
 
@@ -305,9 +306,10 @@ def rcp_newton(x, legacy=False):
     return np.where(x == 0, F32(0), y).astype(F32)
 
 
-def expm_scaling(A, legacy=False, transpose=False):
+def expm_scaling(A, legacy=False, transpose=False, theta=THETA_13):
     """The kernel's scaling count of one matrix: halvings of ||A||_1 (column sums in row order; of A^T with
-    ``transpose``) until <= theta_13, at most ``EXPM_S_MAX`` (``EXPM_S_LEGACY`` with ``legacy``); 0 if not finite."""
+    ``transpose``) until <= ``theta`` (the kernel's THETA; ``THETA_LEGACY`` before code review #8), at most
+    ``EXPM_S_MAX`` (``EXPM_S_LEGACY`` with ``legacy``); 0 if not finite."""
     a = _ftz(np.array(A, dtype=F32))
     a = a.T if transpose else a
     col = np.zeros(a.shape[1], F32)
@@ -317,7 +319,7 @@ def expm_scaling(A, legacy=False, transpose=False):
     if not np.isfinite(norm):  # the kernel's bit test (Codex review #10: the literal 3.4e38 was below FLT_MAX)
         return 0
     s = 0
-    while norm > THETA_13 and s < (EXPM_S_LEGACY if legacy else EXPM_S_MAX):
+    while norm > F32(theta) and s < (EXPM_S_LEGACY if legacy else EXPM_S_MAX):
         norm = mul(norm, F32(0.5))
         s += 1
     return s
@@ -340,13 +342,14 @@ def _gj_expm(M, B, legacy_rcp=False):
     return B
 
 
-def matrix_exp(A, legacy=False, legacy_rcp=False):
+def matrix_exp(A, legacy=False, legacy_rcp=False, theta=THETA_13):
     """``exp(A)`` of matrix_exp_f32_gaudi2.c for one matrix ``A[n, n]``: scaling by 2^-s, Padé-13 in the kernel's
     order, the Gauss-Jordan solve, s squarings. ``legacy``: the scaling capped at 16, as before review round 3;
-    ``legacy_rcp``: the reciprocal before Codex review #8 (four plain Newton steps)."""
+    ``legacy_rcp``: the reciprocal before Codex review #8 (four plain Newton steps); ``theta``: the bound on the
+    scaled norm (``THETA_LEGACY`` before code review #8)."""
     a = _ftz(np.array(A, dtype=F32))
     n = a.shape[0]
-    s = expm_scaling(a, legacy)
+    s = expm_scaling(a, legacy, theta=theta)
     a = mul(a, F32(2.0 ** -s))
     c = [F32(v) for v in (1.0, 0.5, 0.12, 11.0 / 600.0, 11.0 / 5520.0, 3.0 / 18400.0, 1.0 / 96600.0, 1.0 / 1932000.0,
                           1.0 / 48944000.0, 1.0 / 1585785600.0, 1.0 / 67395888000.0, 1.0 / 3953892096000.0,
@@ -443,9 +446,15 @@ def _red_add(v):
     return v[0]
 
 
-def _rsqrt_newton(x):
-    r = hw_rsqrt(x)
-    return mul(r, mac(mul(F32(-0.5), x), mul(r, r), F32(1.5)))
+def _rsqrt_newton(x, legacy=False, estimate=None):
+    """``rsqrt_newton`` of jacobi_svd_f32_gaudi2.c: the hardware estimate (``hw_rsqrt``, or ``estimate``), then one
+    Newton step in residual form, r + (r / 2) (1 - (x r) r) with an FMA; ``legacy``: the plain step r (1.5 - x r^2 / 2)
+    of before, whose fixed point keeps an estimate 1 ulp low near 1."""
+    r = hw_rsqrt(x) if estimate is None else estimate(x)
+    if legacy:
+        return mul(r, mac(mul(F32(-0.5), x), mul(r, r), F32(1.5)))
+    e = mac(sub(F32(0), mul(x, r)), r, F32(1))
+    return mac(mul(r, F32(0.5)), e, r)
 
 
 def _rr_pairs(r, n):

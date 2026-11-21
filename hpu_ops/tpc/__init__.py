@@ -43,10 +43,12 @@ per call on Gaudi2 (one launch per op). The solve kernel, batch 32, n = 22, eage
 Habana reads ``GC_KERNEL_PATH`` when the device initialises, so ``install_kernel_path`` must run before the first HPU
 op of the process; ``hpu_ops.enable()`` calls it. ``HPU_OPS_TPC=0`` in the environment keeps the kernels off.
 """
+import contextlib
 import functools
 import math
 import os
 import pathlib
+import time
 import warnings
 
 import torch
@@ -769,18 +771,105 @@ def lazy_mode():
     return os.environ.get("PT_HPU_LAZY_MODE", "0") == "1"
 
 
+# The build of the C++ ops (``_load``) waits at most this many seconds (environment variable, default 600) for another
+# process's build; past it ``ready()`` warns once and is False. torch's own lock (``FileBaton``, a ``lock`` file in the
+# build directory) is a file that a killed builder leaves behind, and every later process then waited for it forever
+# (code review #4: a job preempted during its first linalg op hung the next one at its first linalg op).
+BUILD_TIMEOUT = "HPU_OPS_BUILD_TIMEOUT"
+# hpu-ops' own build lock: an ``flock`` (released by the kernel when its holder dies, never stale) on this file in the
+# build directory, which also records the holder (host and pid).
+BUILD_LOCK = "hpu_ops.flock"
+# A torch ``lock`` file found while holding ``BUILD_LOCK`` is removed when the builder recorded there ran on this host
+# and is gone, or when it is older than this (s): a process without ``BUILD_LOCK`` (an older hpu-ops) may hold it.
+STALE_LOCK_S = 120.0
+STALE_WARNING = "hpu_ops: removed the stale build lock {path} ({age:.0f} s old, {why})."
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # another user's process
+        return True
+    return True
+
+
+@contextlib.contextmanager
+def _exclusive(path, deadline):
+    """An exclusive ``flock`` on ``path`` (created if missing), waited for until ``deadline`` (``time.monotonic``),
+    else ``TimeoutError``. Yields the previous holder's record ``(host, pid)`` (None if unreadable) and writes this
+    process's."""
+    import fcntl
+    import socket
+
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"another process holds {path}") from None
+                time.sleep(0.2)
+        try:
+            host, pid = os.pread(fd, 256, 0).decode().split()
+            previous = (host, int(pid))
+        except (ValueError, UnicodeDecodeError):
+            previous = None
+        record = f"{socket.gethostname()} {os.getpid()}\n".encode()
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, record, 0)
+        yield previous
+    finally:
+        os.close(fd)  # releases the lock
+
+
+def _clear_baton(path, deadline, previous):
+    """Wait for torch's ``FileBaton`` file ``path`` to go, holding ``BUILD_LOCK``. Every hpu-ops builder holds that
+    lock while it builds, so the file is left by a dead builder or held by a process without the lock (an older
+    hpu-ops). It is removed, with one warning, when ``previous`` (the last holder of ``BUILD_LOCK``) ran on this host
+    and is gone, or when it is older than ``STALE_LOCK_S``; past ``deadline``, ``TimeoutError``."""
+    import socket
+
+    dead = previous is not None and previous[0] == socket.gethostname() and not _alive(previous[1])
+    while True:
+        try:
+            age = time.time() - os.stat(path).st_mtime
+        except FileNotFoundError:
+            return
+        if dead or age > STALE_LOCK_S:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                return
+            why = f"its builder, pid {previous[1]}, is gone" if dead else "no builder holds hpu-ops' lock"
+            warnings.warn(STALE_WARNING.format(path=path, age=age, why=why), stacklevel=3)
+            return
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"{path} is held by another process ({age:.0f} s)")
+        time.sleep(0.2)
+
+
 @functools.cache
 def _load():
     """Compile and load the C++ ops: the legacy API of lazy mode when ``lazy_mode()``, the eager and compile API
-    otherwise."""
+    otherwise. The build waits at most ``HPU_OPS_BUILD_TIMEOUT`` seconds for another builder (``TimeoutError``,
+    which ``ready()`` turns into one warning and False) and clears a stale torch lock (``_clear_baton``)."""
     from habana_frameworks.torch.utils.lib_utils import get_include_dir, get_lib_dir
-    from torch.utils.cpp_extension import load_inline
+    from torch.utils.cpp_extension import _get_build_directory, load_inline
 
     lazy = lazy_mode()
-    load_inline(name="linalg_tpc_plugin_lazy" if lazy else "linalg_tpc_plugin", cpp_sources=[CPP_LAZY if lazy else CPP],
-                verbose=False, is_python_module=False,
-                extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
-                extra_ldflags=[f"-L{get_lib_dir()}", "-lhabana_pytorch_plugin" if lazy else "-lhabana_pytorch2_plugin"])
+    name = "linalg_tpc_plugin_lazy" if lazy else "linalg_tpc_plugin"
+    build_dir = _get_build_directory(name, verbose=False)
+    deadline = time.monotonic() + float(os.environ.get(BUILD_TIMEOUT) or 600)
+    with _exclusive(os.path.join(build_dir, BUILD_LOCK), deadline) as previous:
+        _clear_baton(os.path.join(build_dir, "lock"), deadline, previous)
+        load_inline(name=name, cpp_sources=[CPP_LAZY if lazy else CPP], verbose=False, is_python_module=False,
+                    build_directory=build_dir, extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
+                    extra_ldflags=[f"-L{get_lib_dir()}",
+                                   "-lhabana_pytorch_plugin" if lazy else "-lhabana_pytorch2_plugin"])
 
 
 def _op():
@@ -1093,6 +1182,19 @@ def tri_solve_reference(A, B, upper=False, left=True, unitriangular=False):
     return torch.stack(rows, dim=-2)
 
 
+def _sort(x, descending=False):
+    """``(values, indices)`` of ``x`` sorted along the last dimension, NaN kept as NaN with an index in range: Gaudi's
+    sort returns NaN as +inf with out-of-range indices (measured, ``hpu_ops.extrema``), so the eigenvalues and singular
+    values of a matrix with a NaN came out +-inf, the vectors gathered with bad indices (code review #13). The order
+    key is ``x`` with NaN as +inf (``nan_to_num``, one op; NaN and +inf then tie, where torch puts NaN last); Gaudi
+    sorts a key without NaN right at these sizes (n <= 32; its non-stable sort went wrong past 1000 elements with
+    infs, and its 1-D stable sort runs on the CPU, so the sort is the plain one). The values are gathered from ``x``
+    (float data, an int64 index): two ops more than the sort alone."""
+    key = torch.nan_to_num(x, nan=float("inf"), posinf=float("inf"), neginf=float("-inf"))
+    order = internal_sort(key, -1, descending)[1]  # Gaudi's own sort: the key has no NaN
+    return x.gather(-1, order), order
+
+
 def eigh(A, upper):
     """``(w, V)`` of the symmetric matrix held in one triangle of ``A[..., n, n]`` (float32, n <= ``EIGH_MAXN``) from
     the TPC kernel: ``w`` ascending, the columns of ``V`` the eigenvectors. The kernel returns ``w`` unsorted and the
@@ -1109,7 +1211,7 @@ def eigh(A, upper):
     S_flat = S.reshape(-1, n, n).to(torch.float32).contiguous()
     _, Vt1 = _call(_eigh_op(), S_flat)
     W, Vt = _call(_eigh_refine_op(), S_flat, Vt1)
-    w, order = internal_sort(W, -1)
+    w, order = _sort(W)
     V = Vt.gather(-2, order[..., :, None].expand_as(Vt)).mT
     return w.reshape(*batch, n), V.reshape(*batch, n, n)
 
@@ -1178,7 +1280,7 @@ def jacobi_svd(A, full_matrices=False, sort=True, flush=True):
     S = S.reshape(*batch, k)
     if not sort:
         return U, S, Vh
-    S, order = internal_sort(S, -1, descending=True)
+    S, order = _sort(S, descending=True)
     if full:
         full_order = torch.cat([order, torch.arange(k, big, device=order.device).expand(*batch, big - k)], -1)
         u_ord, v_ord = (order, full_order) if swap else (full_order, order)
@@ -1198,7 +1300,7 @@ def jacobi_svdvals(A, sort=True, flush=True):
     no_t = m < n or (m == n and A.is_contiguous())
     A_t = _fresh((A if no_t else A.mT).reshape(-1, k, max(m, n)).to(torch.float32).contiguous())
     S = (_call(_svdvals_op(), A_t) if flush else _svdvals_op()(A_t)).reshape(*batch, k)
-    return internal_sort(S, -1, descending=True)[0] if sort else S
+    return _sort(S, descending=True)[0] if sort else S
 
 
 def _ftz32(t):

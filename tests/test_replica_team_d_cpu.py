@@ -49,7 +49,9 @@ def test_expm_past_the_old_scaling_cap_is_finite():
     """REVISION 1: skew 6x6 of 1-norm 1e7 needs 21 halvings; the old cap of 16 left ||A|| / 2^16 = 152 for Padé-13,
     and the result was NaN (measured on the card too). With the cap at 126 it is as accurate as CPU float32."""
     a = skew(6, 1e7)
-    assert R.expm_scaling(a.numpy()) == 21 and R.expm_scaling(a.numpy(), legacy=True) == 16
+    # 21 halvings at the theta of then, 23 at the kernel's THETA = 2 (code review #8)
+    assert R.expm_scaling(a.numpy(), theta=R.THETA_LEGACY) == 21 and R.expm_scaling(a.numpy()) == 23
+    assert R.expm_scaling(a.numpy(), legacy=True) == 16
     assert not np.isfinite(R.matrix_exp(a.numpy(), legacy=True, legacy_rcp=True)).all()  # the kernel of then
     truth = torch.linalg.matrix_exp(a.double()).numpy()
     bar = rel(torch.linalg.matrix_exp(a).numpy(), truth)
@@ -59,7 +61,7 @@ def test_expm_past_the_old_scaling_cap_is_finite():
 
 
 def test_expm_scaling_count_covers_float32():
-    theta = float(np.float32(5.371920351148152))
+    theta = 2.0  # the kernels' THETA (code review #8)
     assert linalg._expm_scaling(theta) == 0
     assert linalg._expm_scaling(theta * 2 ** 20) == 20
     assert linalg._expm_scaling(theta * 2 ** 20 * 1.0000001) == 21
