@@ -665,7 +665,7 @@ def run_singular(op, fn, n=SINGULAR_N):
                 else:
                     zero = bool((out[0][1:3] != 0).any() or not torch.isneginf(out[1][1:3]).all())
                     problems += ["slogdet of a singular element is not (0, -inf)"] * zero
-        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+        problems += ["fell back"] * bool(rec["fallback"] and n <= large_maxn) + cpu_warnings(rec)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         problems.append(f"exception {e!r}"[:300])
     emit(**row, status="fail" if problems else "ok", problems=problems)
@@ -1183,7 +1183,8 @@ def main():
     from hpu_ops import linalg as ops_linalg
     from hpu_ops import tpc
     ops_tpc = tpc
-    tpc_maxn, eigh_maxn, large_maxn = tpc.MAXN, tpc.EIGH_MAXN, tpc.LARGE_MAXN
+    # past n = 64 the in-place kernel runs in eager mode only (tpc.large_pays); lazy mode expects main's route
+    tpc_maxn, eigh_maxn, large_maxn = tpc.MAXN, tpc.EIGH_MAXN, tpc.MAXN if LAZY else tpc.LARGE_MAXN
     if not BASELINE:
         hpu_ops.enable()
     complex_state = "skipped (baseline)"

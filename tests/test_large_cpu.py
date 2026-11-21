@@ -199,3 +199,19 @@ def test_batch_threshold_counts_the_broadcast_batch(monkeypatch):
     assert takes(A, torch.empty(1, n, 3)) is False
     assert takes(A[0], torch.empty(tpc.LARGE_MIN_BATCH, n, 1)) is True  # 2-D A
 
+
+
+@pytest.mark.parametrize("lazy, want", [("0", True), ("1", False)])
+def test_large_route_is_eager_only(lazy, want, monkeypatch):
+    """Coordinator's ruling: past tpc.MAXN the in-place kernel in eager mode only; lazy mode keeps main's route."""
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", lazy)
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    takes = linalg._tpc_takes("hpu", lambda *a, **k: True, large=True)
+    assert takes(torch.empty(1, 220, 220), torch.empty(1, 220, 220)) is want
+    assert takes(torch.empty(1, 64, 64), torch.empty(1, 64, 3)) is True  # n <= 64: the kernel in both modes
+
+
+def test_large_route_declines_under_compile(monkeypatch):
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "0")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    assert tpc.large_pays(220, 1) is False

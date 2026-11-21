@@ -586,8 +586,12 @@ def _check(A, n, *others, limit=MAXN):
 
 def large_pays(n, batch):
     """Whether the routing sends ``batch`` matrices of order ``n`` (``MAXN`` < n <= ``LARGE_MAXN``) to the in-place
-    kernel: n <= ``LARGE_ANY_BATCH_N``, or at least ``LARGE_MIN_BATCH`` matrices."""
-    return n <= LARGE_MAXN and (n <= LARGE_ANY_BATCH_N or batch >= LARGE_MIN_BATCH)
+    kernel: eager mode, not tracing under ``torch.compile``, and n <= ``LARGE_ANY_BATCH_N`` or at least
+    ``LARGE_MIN_BATCH`` matrices. In lazy mode (and compiled) the call keeps main's route (Habana's fallback):
+    measured on Gaudi2, bridge 1.21.4, EEGSPDNet's lazy step was 73.2 against 63.0 ms median with the kernel (its graph
+    boundary, gathers and checks), and the compiled path was not measured faster."""
+    eager = os.environ.get("PT_HPU_LAZY_MODE", "1") == "0" and not torch.compiler.is_compiling()
+    return eager and n <= LARGE_MAXN and (n <= LARGE_ANY_BATCH_N or batch >= LARGE_MIN_BATCH)
 
 
 def _parity(P):
