@@ -185,6 +185,23 @@ def make_cayley(b, n, dtype):
     return [eye - S / 2, eye + S / 2]
 
 
+def make_tiny_multiplier(b, n, dtype):
+    """Review round (gj_large): the pivot row [1e30, 1e-9] divided by its pivot would flush 1e-39 to zero."""
+    A = torch.eye(n, dtype=dtype).repeat(b, 1, 1) + 0.01 * torch.randn(b, n, n, dtype=dtype) / n
+    A[:, :2, :] = 0
+    A[:, 0, 0], A[:, 0, 1], A[:, 1, 0], A[:, 1, 1] = 1e30, 1e-9, 1e30, 2e-9
+    return [A]
+
+
+def make_huge_pivot(b, n, dtype):
+    """Review round (gj_large): a pivot >= 2^126, whose reciprocal is subnormal."""
+    A = torch.eye(n, dtype=dtype).repeat(b, 1, 1) + 0.01 * torch.randn(b, n, n, dtype=dtype) / n
+    A[:, :2, :] = 0
+    A[:, 0, :2] = 1e38
+    A[:, 1, 0], A[:, 1, 1] = 1.0, 2.0
+    return [A]
+
+
 def make_triangular_upper_unit(b, n, dtype):
     return [torch.triu(torch.randn(b, n, n, dtype=dtype), 1) / n, torch.randn(b, n, 3, dtype=dtype)]
 
@@ -360,6 +377,14 @@ CASES = (
          sizes=INDEFINITE_SIZES),
     Case("linalg.eigvalsh.indefinite", make_indefinite, lambda x: L.eigvalsh(x), float64=False, tpc=True,
          sizes=INDEFINITE_SIZES),
+    Case("linalg.inv.tiny_multiplier", make_tiny_multiplier, lambda x: L.inv(x), loss=None, float64=False, tpc=True,
+         sizes=(70,)),
+    Case("linalg.det.tiny_multiplier", make_tiny_multiplier, lambda x: L.det(x), loss=None, float64=False, tpc=True,
+         sizes=(70,)),
+    Case("linalg.inv.huge_pivot", make_huge_pivot, lambda x: L.inv(x), loss=None, float64=False, tpc=True,
+         sizes=(70,)),
+    Case("linalg.slogdet.huge_pivot", make_huge_pivot, lambda x: L.slogdet(x), err_slogdet, None, float64=False,
+         tpc=True, sizes=(70,)),
     Case("linalg.solve.cayley", make_cayley, lambda a, b: L.solve(a, b), float64=False, tpc=True, sizes=(96, 220)),
     Case("linalg.solve.left_false_large", make_solve_right, lambda a, b: L.solve(a, b, left=False), float64=False,
          tpc=True, sizes=(220,)),
