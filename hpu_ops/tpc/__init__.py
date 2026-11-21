@@ -50,6 +50,8 @@ import warnings
 
 import torch
 
+from ..extrema import internal_sort
+
 MAXN = 64  # MAXN of gj_solve and tri_solve (main)
 SMALL_MAXN = 32  # MAXN of jacobi_svd, matrix_exp, lu_factor, lu_perm and lu_solve
 MAXHH = 64
@@ -1106,7 +1108,7 @@ def eigh(A, upper):
     S_flat = S.reshape(-1, n, n).to(torch.float32).contiguous()
     _, Vt1 = _call(_eigh_op(), S_flat)
     W, Vt = _call(_eigh_refine_op(), S_flat, Vt1)
-    w, order = W.sort(-1)
+    w, order = internal_sort(W, -1)
     V = Vt.gather(-2, order[..., :, None].expand_as(Vt)).mT
     return w.reshape(*batch, n), V.reshape(*batch, n, n)
 
@@ -1175,7 +1177,7 @@ def jacobi_svd(A, full_matrices=False, sort=True, flush=True):
     S = S.reshape(*batch, k)
     if not sort:
         return U, S, Vh
-    S, order = S.sort(-1, descending=True)
+    S, order = internal_sort(S, -1, descending=True)
     if full:
         full_order = torch.cat([order, torch.arange(k, big, device=order.device).expand(*batch, big - k)], -1)
         u_ord, v_ord = (order, full_order) if swap else (full_order, order)
@@ -1195,7 +1197,7 @@ def jacobi_svdvals(A, sort=True, flush=True):
     no_t = m < n or (m == n and A.is_contiguous())
     A_t = _fresh((A if no_t else A.mT).reshape(-1, k, max(m, n)).to(torch.float32).contiguous())
     S = (_call(_svdvals_op(), A_t) if flush else _svdvals_op()(A_t)).reshape(*batch, k)
-    return S.sort(-1, descending=True).values if sort else S
+    return internal_sort(S, -1, descending=True)[0] if sort else S
 
 
 def svd_reference(A, compute_uv=True, full_matrices=False):

@@ -35,6 +35,7 @@ from torch._subclasses.fake_tensor import is_fake
 
 from . import _strict
 from ._dispatch import chain, count, register_kernels, replace_py_kernels
+from .extrema import internal_sort
 
 aten = torch.ops.aten
 INTERPOLATIONS = ("linear", "lower", "higher", "midpoint", "nearest")
@@ -72,10 +73,10 @@ def _sorted_positions(x):
     posinf = key == float("inf")
     code = key.dtype  # sort indices as float data, exact to 2**24
     inf = float("inf")
-    by_value = torch.sort(key.nan_to_num(nan=inf, posinf=inf, neginf=-inf), dim=-1).indices.to(code)
+    by_value = internal_sort(key.nan_to_num(nan=inf, posinf=inf, neginf=-inf), -1)[1].to(code)
     pos = torch.arange(n, device=key.device)
     j = pos.to(code)
-    by_kind = torch.sort(torch.where(posinf, j - n, j.masked_fill(~nan, inf)), dim=-1).indices.to(code)
+    by_kind = internal_sort(torch.where(posinf, j - n, j.masked_fill(~nan, inf)), -1)[1].to(code)
     n_valid = n - nan.sum(-1, keepdim=True)
     n_finite = n_valid - posinf.sum(-1, keepdim=True)
     order = torch.where(pos < n_finite, by_value, by_kind.gather(-1, (pos - n_finite).clamp(min=0)))

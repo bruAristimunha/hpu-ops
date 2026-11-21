@@ -135,8 +135,18 @@ def gaudi(op):
         if not (isinstance(x, torch.Tensor) and x.is_floating_point()):
             return real(*args, **kwargs)
         if op in (aten.sort.default, aten.sort.stable):
-            desc = kwargs.get("descending", rest[1] if len(rest) > 1 else False)
-            return real(drop(x, -INF if desc else INF), *rest, **kwargs)
+            stable = op is aten.sort.stable and bool(kwargs.get("stable", rest[0] if rest else False))
+            dim = kwargs.get("dim", -1) if op is aten.sort.stable else (rest[0] if rest else -1)
+            desc = kwargs.get("descending", rest[1] if len(rest) > 1 and op is aten.sort.default else False)
+            pad = -INF if desc else INF
+            v, i = real(drop(x, pad), *rest, **kwargs)
+            n = x.shape[dim] if x.dim() else 1
+            # out of range (measured): a NaN's index, and a non-stable sort's index of an infinity that ties with
+            # the padding to a power of two (+inf ascending, -inf descending)
+            bad = torch.isnan(x.gather(dim, i)) if x.dim() else torch.isnan(x)
+            if not stable and n & (n - 1):
+                bad = bad | (v == pad)
+            return v, i.masked_fill(bad, n)
         return real(*args, **kwargs)
 
     return fn
@@ -811,23 +821,72 @@ def test_sorts_of_integers_scalars_and_empty_keep_the_native_op(card):
     assert card["sort"] == card["topk"] == 0
 
 
-def test_the_sort_family_is_opt_in(monkeypatch):
+def test_the_sort_family_is_on_by_default_with_an_opt_out(monkeypatch):
     monkeypatch.delenv("HPU_OPS_EXACT_SORT", raising=False)
     x = rows()
     with cpu_as_hpu(extrema.install) as calls:
         x.sort(-1), x.topk(2, -1), x.amax(-1)
-    assert calls["amax"] and not calls["sort"] and not calls["topk"]
-    monkeypatch.setenv("HPU_OPS_EXACT_SORT", "1")
+    assert calls["amax"] and calls["sort"] and calls["topk"]
+    monkeypatch.setenv("HPU_OPS_EXACT_SORT", "0")
     with cpu_as_hpu(extrema.install) as calls:
-        x.sort(-1)
-    assert calls["sort"]
+        x.sort(-1), x.amax(-1)
+    assert calls["amax"] and not calls["sort"]
 
 
-def test_the_sort_family_keeps_the_native_op_under_compile(card):
+@pytest.mark.parametrize("dtype", FLOATS)
+@pytest.mark.parametrize("n", [1, 2, 3, 22, 64, 65, 1000])
+@pytest.mark.parametrize("descending", [False, True])
+def test_sorts_exact_over_the_padding_and_nan_stand_in(card, dtype, n, descending):
+    """The stand-in returns out-of-range indices as Gaudi does (a NaN's; a non-stable sort's infinity tied with
+    its power-of-two padding): the rewrite never feeds it either, at any n."""
+    g = torch.Generator().manual_seed(n)
+    x = torch.randn(6, n, generator=g, dtype=torch.float64)
+    x[:, ::7], x[:, 3::5], x[:, 1::4], x[:, 2::6] = INF, -INF, NAN, -0.0
+    x[1] = NAN
+    x[2] = INF
+    x[3, ::2] = torch.finfo(dtype).max
+    x[4, ::3] = -torch.finfo(dtype).max
+    x = x.to(dtype)
+    want = _reference(lambda t: tuple(t.sort(dim=-1, descending=descending, stable=True)), x)
+    same(tuple(x.sort(dim=-1, descending=descending, stable=True)), want)
+    same(tuple(x.mT.sort(dim=0, descending=descending, stable=True)), tuple(w.mT for w in want))
+    same_selection(tuple(x.sort(-1, descending)), want, x, -1, False)
+    k = min(n, 3)
+    same_selection(tuple(x.topk(k, -1, largest=descending)),
+                   _reference(lambda t: tuple(t.topk(k, -1, largest=descending)), x), x, -1, False)
+    same_selection(tuple(x.kthvalue(k, -1)), _reference(lambda t: tuple(t.kthvalue(k, -1)), x), x, -1, False)
+    assert card["sort"] > 0
+
+
+def test_internal_sort_is_gaudi_s_sort(card):
+    """hpu-ops' own eigenvalue / singular-value sorts skip the rewrite (its cost): Gaudi's sort as is."""
+    x = torch.randn(4, 22, dtype=torch.float64)
+    v, i = extrema.internal_sort(x, -1, descending=True)
+    assert card["sort"] == 0
+    same((v, i), _reference(lambda t: tuple(torch.sort(t, -1, True)), x))
+
+
+def test_eigh_and_svd_sorts_skip_the_rewrite(monkeypatch):
+    from hpu_ops import eigh as eigh_mod
+
+    A = torch.randn(3, 6, 6, dtype=torch.float64)
+    A = A @ A.mT + torch.eye(6)
+    with cpu_as_hpu(extrema.install) as calls:
+        w, V = eigh_mod.eigh(A, False)
+    assert not calls["sort"]
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(A))
+
+
+@pytest.mark.parametrize("name", ["sort", "sort_stable_desc_dim0", "topk3", "kthvalue2", "msort"])
+def test_the_sort_family_is_rewritten_under_compile(card, name):
+    x = rows(dtype=torch.float32)
+    x[6, 2], x[6, 0] = INF, NAN
+    f = SORTS[name]
     nodes = []
-    f = lambda t: t.sort(-1).values  # noqa: E731
-    compiled(f, nodes, dynamic=False)(rows(dtype=torch.float32))
-    assert "aten.sort.stable" not in ops(nodes) and card["sort"] == 0
+    got = compiled(f, nodes, dynamic=False)(x)
+    dim = 0 if ("dim0" in name or name == "msort") else -1
+    same_selection(got, _reference(f, x), x, dim, name in STABLE)
+    assert card["sort"] + card["topk"] + card["kthvalue"] > 0
 
 
 def test_nan_propagation_opt_out(monkeypatch):
@@ -842,3 +901,11 @@ def test_nan_propagation_opt_out(monkeypatch):
     with cpu_as_hpu(extrema.install) as calls:
         assert torch.isnan(x.amax(-1)[0])
     assert calls["amax"]
+
+
+def test_internal_sort_skips_the_rewrite_under_compile(card):
+    x = torch.randn(4, 22)
+    nodes = []
+    got = compiled(lambda t: extrema.internal_sort(t, -1, True), nodes, dynamic=False)(x)
+    same(tuple(got), _reference(lambda t: tuple(torch.sort(t, -1, True)), x))
+    assert card["sort"] == 0
