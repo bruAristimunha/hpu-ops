@@ -211,6 +211,7 @@ def test_svd_tiny_matrix_is_scaled():
     _, s_old, _ = R.jacobi_svd(a.numpy(), compute_uv=False, legacy_tiny=True)
     assert (s_old == 0).all()
     U, S, Vh = R.jacobi_svd(a.numpy())
-    truth = np.linalg.svd(a.double().numpy(), compute_uv=False)
+    flushed = torch.where(a.abs() < 2.0 ** -126, 0.0, a)  # the card's FTZ of the input (also in the replica)
+    truth = np.linalg.svd(flushed.double().numpy(), compute_uv=False)
     assert rel(S, truth) < 1e-5
-    assert rel(tpc.svd_reference(a)[1].numpy(), truth) < 1e-5
+    assert rel(tpc.svd_reference(flushed)[1].numpy(), truth) < 1e-5
