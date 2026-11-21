@@ -39,7 +39,9 @@ def test_triangular_matmul_cumsum_breaks_on_inf_so_cumsum_stays_native():
     with cpu_as_hpu(hpu_ops._install) as calls:
         torch.cumsum(torch.randn(64, 22, 22), -1)
         torch.logsumexp(torch.randn(64, 22, 22), -1)
-    assert sum(calls.values()) == 0  # cumsum and logsumexp keep Habana's kernels (measured, see the README)
+    # cumsum and logsumexp keep Habana's kernels (measured, see the README); logsumexp's inner amax goes through
+    # extrema's NaN fix, which is not a rewrite of logsumexp
+    assert not {"cumsum", "logsumexp"} & set(calls), calls
 
 
 # ---- bincount -------------------------------------------------------------------------------------------------------
