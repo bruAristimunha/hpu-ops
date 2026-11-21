@@ -40,6 +40,7 @@ MISSING_WARNING = ("hpu_ops: {path} not found; TPC linalg kernels are off for th
                    "through hpu-ops' own CPU route, not Habana's fallback.")
 OPT_OUT = "HPU_OPS_TPC"
 _INSTALLED = False
+_PATH_SET = False  # install_kernel_path put LIB on GC_KERNEL_PATH before the device initialised
 _LATE_WARNED = False
 _MISSING_WARNED = False
 _DEVICE = None
@@ -535,7 +536,7 @@ def install_kernel_path():
     the HPU is not initialized yet and return True; otherwise warn once and return False, as Habana reads the path
     when the device initialises: set later, the kernel's graph fails to compile. Also False, silently, with
     ``HPU_OPS_TPC=0`` in the environment, and, with one warning, when ``LIB`` does not exist."""
-    global _INSTALLED, _LATE_WARNED, _MISSING_WARNED
+    global _INSTALLED, _PATH_SET, _LATE_WARNED, _MISSING_WARNED
     if os.environ.get(OPT_OUT) == "0":
         _INSTALLED = False
         return False
@@ -546,6 +547,10 @@ def install_kernel_path():
             warnings.warn(MISSING_WARNING.format(path=LIB), stacklevel=2)
         return False
     if _initialized():
+        # enable() again after its undo: the path set by an earlier successful call is still the one Habana read
+        if _PATH_SET and str(LIB) in (os.environ.get("GC_KERNEL_PATH") or "").split(":"):
+            _INSTALLED = True
+            return True
         _INSTALLED = False
         if not _LATE_WARNED:
             _LATE_WARNED = True
@@ -554,7 +559,7 @@ def install_kernel_path():
     entries = [e for e in (os.environ.get("GC_KERNEL_PATH") or DEFAULT_KERNELS).split(":") if e]
     if str(LIB) not in entries:
         os.environ["GC_KERNEL_PATH"] = ":".join([str(LIB), *entries])
-    _INSTALLED = True
+    _INSTALLED = _PATH_SET = True
     return True
 
 
@@ -609,14 +614,29 @@ def _built():
     return True
 
 
+def lazy_mode():
+    """Whether the bridge runs in lazy mode: Habana's own ``is_lazy()`` once ``habana_frameworks.torch`` is imported,
+    else ``PT_HPU_LAZY_MODE == "1"``. Bridge 1.21.4 is eager when the variable is unset (measured in the pod)."""
+    import sys
+
+    if "habana_frameworks.torch" in sys.modules:
+        try:
+            from habana_frameworks.torch.utils.internal import is_lazy
+        except ImportError:
+            pass
+        else:
+            return bool(is_lazy())
+    return os.environ.get("PT_HPU_LAZY_MODE", "0") == "1"
+
+
 @functools.cache
 def _load():
-    """Compile and load the C++ ops: the eager and compile API when ``PT_HPU_LAZY_MODE`` is "0", the legacy API of
-    lazy mode otherwise."""
+    """Compile and load the C++ ops: the legacy API of lazy mode when ``lazy_mode()``, the eager and compile API
+    otherwise."""
     from habana_frameworks.torch.utils.lib_utils import get_include_dir, get_lib_dir
     from torch.utils.cpp_extension import load_inline
 
-    lazy = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
+    lazy = lazy_mode()
     load_inline(name="linalg_tpc_plugin_lazy" if lazy else "linalg_tpc_plugin", cpp_sources=[CPP_LAZY if lazy else CPP],
                 verbose=False, is_python_module=False,
                 extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
@@ -707,7 +727,7 @@ def _eigh_refine_op():
 # either. The cost is one graph boundary per call; eager mode needs none.
 def _flush():
     """``mark_step`` in lazy mode; nothing in eager mode, while tracing under ``torch.compile``, or without Habana."""
-    if os.environ.get("PT_HPU_LAZY_MODE", "1") == "0" or torch.compiler.is_compiling():
+    if not lazy_mode() or torch.compiler.is_compiling():
         return
     try:
         import habana_frameworks.torch.core as htcore

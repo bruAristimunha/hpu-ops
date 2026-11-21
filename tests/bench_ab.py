@@ -20,7 +20,7 @@ import torch
 import hpu_ops  # enable() must run before the first HPU op (kernel path)
 from hpu_ops import _dispatch
 
-LAZY = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
+LAZY = os.environ.get("PT_HPU_LAZY_MODE", "0") == "1"  # bridge 1.21.4: unset is eager
 TIMED = 20
 REPS = 3  # timed blocks per side; the minimum block mean is reported, all are recorded
 CPU_TEXT = "runs on the CPU"

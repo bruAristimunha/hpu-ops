@@ -1280,12 +1280,14 @@ def test_lstsq_declines_rank_deficient_and_double_backward(svd_hook):
         assert torch.autograd.gradgradcheck(lambda a, b: torch.linalg.lstsq(a, b).solution, (A, B))
         assert calls["lstsq"] >= 1
 
-    # compiled executes cleanly via eager fallback
-    nodes = []
-    with cpu_as_hpu(linalg.install_lstsq) as calls:
-        got_c = compiled(lambda a, b: torch.linalg.lstsq(a, b).solution, nodes)(A.detach(), B.detach())
-        assert calls["lstsq"] >= 1
-    torch.testing.assert_close(got_c, torch.linalg.lstsq(A.detach(), B.detach()).solution)
+    # compiled: the rank-revealing default driver is declined while tracing (rank and residuals need the values),
+    # gels is taken; both match torch
+    for driver, taken in ((None, False), ("gels", True)):
+        nodes = []
+        with cpu_as_hpu(linalg.install_lstsq) as calls:
+            got_c = compiled(lambda a, b: torch.linalg.lstsq(a, b, driver=driver).solution, nodes)(A.detach(), B.detach())
+            assert (calls["lstsq"] >= 1) == taken
+        torch.testing.assert_close(got_c, torch.linalg.lstsq(A.detach(), B.detach(), driver=driver).solution)
 
 
 @pytest.mark.parametrize("ord_", [2, -2, "nuc"])
@@ -2427,7 +2429,7 @@ LU_OPS = ("linalg_lu_factor_ex", "linalg_lu", "linalg_lu_solve", "lu_unpack")
 
 
 @pytest.mark.parametrize("lazy, knob, installed", [
-    ("1", None, ()), (None, None, ()), ("1", "0", ()), ("1", "1", LU_OPS), ("0", "1", LU_OPS),
+    ("1", None, ()), (None, None, ("linalg_lu_factor_ex", "linalg_lu_solve", "lu_unpack")), ("1", "0", ()), ("1", "1", LU_OPS), ("0", "1", LU_OPS),
     ("0", None, ("linalg_lu_factor_ex", "linalg_lu_solve", "lu_unpack"))])
 def test_lu_ops_installed_only_where_measured_faster(monkeypatch, lazy, knob, installed):
     """Lazy-mode LU, and linalg.lu in both modes, were measured at parity or slower than Habana's fallback: on HPU they

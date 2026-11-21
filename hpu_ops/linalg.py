@@ -604,6 +604,8 @@ def _tol_tensor_ok(tol, batch_shape):
 
 def _svd_takes(device_type, name="svd"):
     def takes(A, full_matrices=False, compute_uv=True, driver=None, **_out):
+        if _transformed():  # no jvp / vmap rule in these Functions: torch's own kernel
+            return False
         if driver is not None or not _takes_tensors(device_type, name, [A]):
             return False
         if A.dim() < 2 or A.shape[-2] > tpc.MAXN or A.shape[-1] > tpc.MAXN:
@@ -615,6 +617,8 @@ def _svd_takes(device_type, name="svd"):
 
 def _pinv_takes(device_type, name="pinv"):
     def takes(A, *, atol=None, rtol=None, hermitian=False):
+        if _transformed():  # no jvp / vmap rule in these Functions: torch's own kernel
+            return False
         if hermitian or not _takes_tensors(device_type, name, [A]):
             return False
         if A.dim() < 2 or A.shape[-2] > tpc.MAXN or A.shape[-1] > tpc.MAXN:
@@ -631,6 +635,8 @@ def _pinv_takes(device_type, name="pinv"):
 
 def _lstsq_takes(device_type, name="lstsq"):
     def takes(A, B, rcond=None, *, driver=None):
+        if _transformed():  # no jvp / vmap rule in these Functions: torch's own kernel
+            return False
         if driver not in (None, "gels", "gelsy", "gelsd", "gelss"):
             return False
         if rcond is not None and (isinstance(rcond, bool) or not isinstance(rcond, (int, float))):
@@ -804,7 +810,7 @@ def install_svd(device_type):
             def ag(*args, **kwargs):
                 A, ord_, dim, keepdim, dtype = _bind(op_, args, kwargs)
                 dims = _norm_dims(A, dim) if dtype is None and pred_(ord_) else None
-                if dims is not None and _takes_tensors(device_type, "svd", [A]) and \
+                if dims is not None and not _transformed() and _takes_tensors(device_type, "svd", [A]) and \
                         A.shape[dims[0]] <= tpc.MAXN and A.shape[dims[1]] <= tpc.MAXN and \
                         (device_type != "hpu" or tpc.ready()):
                     return _norm_run(A, ord_, dims[0], dims[1], keepdim)
@@ -879,6 +885,10 @@ def install_pinv(device_type):
 
 
 def _lstsq_eval(A, B, rcond, driver):
+    if driver != "gels" and _is_fake(A):
+        # Tracing (torch.compile): the rank check below needs the values, and torch's rank and residuals (empty when
+        # rank < n) depend on them. Only gels, which reports no rank and assumes full rank, is taken.
+        return None
     m, n = A.shape[-2], A.shape[-1]
     k = min(m, n)
     need_sort = driver in ("gelsd", "gelss")
@@ -1383,6 +1393,8 @@ class HouseholderProduct(torch.autograd.Function):
 
 def _householder_takes(device_type, max_m=None):
     def takes(A, tau, **_out):
+        if _transformed():  # no jvp / vmap rule in these Functions: torch's own kernel
+            return False
         if not _takes_tensors(device_type, "householder_product", [A]):
             return False
         if A.dim() < 2 or A.shape[-2] < A.shape[-1]:
@@ -1640,8 +1652,7 @@ def _lu_wanted(device_type, op_name):
     """Whether ``install_lu`` installs ``op_name`` ("lu" for ``linalg.lu``, else the factor, solve and unpack ops)."""
     if device_type != "hpu" or os.environ.get(LU_SLOW) == "1":
         return True
-    lazy = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
-    return not lazy and op_name != "lu"
+    return not tpc.lazy_mode() and op_name != "lu"
 
 
 def install_lu(device_type):
