@@ -247,6 +247,16 @@ def part_sweep(name, ctx):
     return row
 
 
+def grad_failures(eh, e32):
+    """Per-parameter thresholds max(GRAD_TOL, GRAD_CPU32_FACTOR x the CPU float32 error) and the failing parameters,
+    worst first. A nan error fails, and so does a nan e32 (nan threshold). An inf e32 (a gradient missing or misshapen
+    on CPU float32 too) does not make the threshold infinite, so a gradient missing on the HPU (inf) still fails."""
+    thr = {n: GRAD_TOL if e32.get(n, 0.0) == math.inf else max(GRAD_TOL, GRAD_CPU32_FACTOR * e32.get(n, 0.0))
+           for n in eh}
+    failed = sorted((n for n in eh if not eh[n] <= thr[n]), key=lambda n: -(eh[n] if eh[n] == eh[n] else math.inf))
+    return thr, failed
+
+
 def part_grads(name, ctx):
     runs, n_drop = {}, 0
     for tag, device, dtype in (("hpu", HPU, torch.float32), ("cpu64", CPU, torch.float64),
@@ -258,8 +268,7 @@ def part_grads(name, ctx):
     (lh, gh), (l64, g64), (l32, g32) = runs["hpu"], runs["cpu64"], runs["cpu32"]
     floor = abs_floor(g64)
     eh, e32 = rel_errs(gh, g64, floor), rel_errs(g32, g64, floor)
-    thr = {n: max(GRAD_TOL, GRAD_CPU32_FACTOR * e32.get(n, 0.0)) for n in eh}  # a nan e32 gives a nan threshold: fails
-    failed = sorted((n for n in eh if not eh[n] <= thr[n]), key=lambda n: -(eh[n] if eh[n] == eh[n] else math.inf))
+    thr, failed = grad_failures(eh, e32)
     loss_err, loss_err32 = rel(lh, l64), rel(l32, l64)
     loss_ok = loss_err <= max(GRAD_TOL, GRAD_CPU32_FACTOR * loss_err32)
     worst = sorted(eh, key=lambda n: -(eh[n] if eh[n] == eh[n] else math.inf))[:5]

@@ -97,7 +97,7 @@ def main():
                     ms, fallback, cpu_warn, lsum = time_steps(P, name, X, y, cache.info)
                     row = {"ms_per_step": ms, "fallback_per_step": fallback, "cpu_warnings": cpu_warn,
                            "rewrites_per_step": {k: v / (WARMUP + STEPS) for k, v in hpu_ops._STATE["calls"].items()
-                                                 if k in ("index_select_flat", "mask_fill")},
+                                                 if k in ("index", "mask_fill")},
                            "loss_sum": lsum}
                 except Exception as e:  # noqa: BLE001
                     row = {"error": repr(e)[:300]}

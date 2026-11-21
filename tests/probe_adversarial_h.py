@@ -210,8 +210,11 @@ def err(a, b):
         return float("inf")
     if not b.numel():
         return 0.0
+    if torch.isnan(a).any() and not torch.isnan(b).any():
+        return float("nan")  # a NaN the reference does not have fails (nan <= tol is False)
     if not torch.isfinite(a).all() or not torch.isfinite(b).all():
-        return 0.0 if torch.equal(torch.nan_to_num(a), torch.nan_to_num(b)) else float("inf")
+        same = torch.equal(torch.isnan(a), torch.isnan(b)) and torch.equal(torch.nan_to_num(a), torch.nan_to_num(b))
+        return 0.0 if same else float("inf")
     return float((a - b).abs().max() / b.abs().max().clamp_min(1e-300))
 
 
@@ -242,7 +245,8 @@ def run_case(name, f, make, grad, tol, compiled, fused=False):
             if ref is None:
                 e, status = float("nan"), "NO_ERROR_RAISED"
             else:
-                e = max(err(a, b) for res in runs for a, b in zip(res, ref))
+                es = [err(a, b) for res in runs for a, b in zip(res, ref)]
+                e = float("nan") if any(v != v for v in es) else max(es)  # max() drops a NaN after a number
                 status = "ok" if e <= tol else "FAIL"
             dtypes = [str(r.dtype).replace("torch.", "") for r in runs[0]]
             msg = f"err={e:.2e} dtypes={dtypes}"
