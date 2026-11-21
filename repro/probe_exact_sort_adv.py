@@ -72,5 +72,36 @@ res.append(check("topk_nan_largest", base, lambda t: tuple(t.topk(5, -1)), exact
 res.append(check("kthvalue_last", base, lambda t: tuple(t.kthvalue(22, -1, keepdim=True)), exact_index=False))
 for i in range(2):
     res.append(check(f"repeat_{i}", base, lambda t: tuple(t.sort(-1)), exact_index=False))
-inf_ok = check("inference_mode_not_rewritten", base, lambda t: tuple(t.sort(-1)), exact_index=False, inference=True)
-print(f"SUMMARY {sum(res)}/{len(res)} ok; inference mode (not rewritten) ok={inf_ok}", flush=True)
+for nm, f, ex in (("sort", lambda t: tuple(t.sort(-1)), False), ("sort_stable", stable, True),
+                  ("topk", lambda t: tuple(t.topk(5, -1)), False),
+                  ("kthvalue", lambda t: tuple(t.kthvalue(4, -1, keepdim=True)), False)):
+    res.append(check(f"inference_mode_{nm}", base, f, exact_index=ex, inference=True))
+
+
+def with_out(call):
+    def f(t):
+        o = (torch.empty(0, dtype=t.dtype, device=t.device), torch.empty(0, dtype=torch.int64, device=t.device))
+        got = call(t, o)
+        assert got[0].data_ptr() == o[0].data_ptr()
+        return tuple(got)
+    return f
+
+
+for nm, call, ex in (("sort_out", lambda t, o: torch.sort(t, -1, out=o), False),
+                     ("sort_stable_out", lambda t, o: torch.sort(t, dim=-1, stable=True, out=o), True),
+                     ("topk_out", lambda t, o: torch.topk(t, 5, -1, out=o), False),
+                     ("kthvalue_out", lambda t, o: torch.kthvalue(t, 4, -1, keepdim=True, out=o), False)):
+    for inf_mode in (False, True):
+        res.append(check(f"{nm}{'_inference' if inf_mode else ''}", base, with_out(call), exact_index=ex,
+                         inference=inf_mode))
+big = torch.randn(4, 50257, generator=g)
+big[:, ::97], big[:, 5::131], big[:, 7::50] = NAN, INF, -INF
+res.append(check("topk_logits_50257", big, lambda t: tuple(t.topk(50, -1)), exact_index=False))
+res.append(check("topk_smallest_50257", big, lambda t: tuple(t.topk(50, -1, largest=False)), exact_index=False))
+res.append(check("kthvalue_50257", big, lambda t: tuple(t.kthvalue(1000, -1, keepdim=True)), exact_index=False))
+from hpu_ops import extrema  # noqa: E402
+v, i = extrema.internal_sort(base.to("hpu"), -1)
+sync()
+res.append(bool(((i.cpu() >= 0) & (i.cpu() < 22)).all()) and torch.isnan(v.cpu()[1]).all().item())
+print("ADV " + json.dumps(dict(case="internal_sort_nan_inf", lazy=LAZY, ok=res[-1])), flush=True)
+print(f"SUMMARY {sum(res)}/{len(res)} ok", flush=True)

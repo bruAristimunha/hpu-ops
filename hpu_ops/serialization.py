@@ -21,6 +21,7 @@ import weakref
 import torch
 from torch.utils.hooks import warn_if_has_hooks
 
+from . import _strict
 from ._dispatch import count
 
 _HOST_COPIES = weakref.WeakValueDictionary()  # id -> copy; with the CPU in the role of the device (the tests), a
@@ -40,7 +41,8 @@ def install(device_type):
             raise RuntimeError(f"Cannot serialize {device_type} tensors under skip_data: hpu_ops saves them through "
                                "host copies")
         count("save")
-        host = self.detach().cpu()  # Habana's tensor-level copy undoes the permutation
+        with _strict.allowed():  # saving is I/O, not a step's compute
+            host = self.detach().cpu()  # Habana's tensor-level copy undoes the permutation
         _HOST_COPIES[id(host)] = host
         return torch._utils._rebuild_device_tensor_from_cpu_tensor, (host, self.dtype, str(self.device),
                                                                        self.requires_grad)

@@ -33,6 +33,7 @@ import torch
 from torch._C import DispatchKey
 from torch._subclasses.fake_tensor import is_fake
 
+from . import _strict
 from ._dispatch import chain, count, register_kernels, replace_py_kernels
 from .extrema import internal_sort
 
@@ -72,10 +73,10 @@ def _sorted_positions(x):
     posinf = key == float("inf")
     code = key.dtype  # sort indices as float data, exact to 2**24
     inf = float("inf")
-    by_value = internal_sort(key.nan_to_num(nan=inf, posinf=inf, neginf=-inf), -1)[1].to(code)
+    by_value = internal_sort(key.nan_to_num(nan=inf, posinf=inf, neginf=-inf), -1, keys=True)[1].to(code)
     pos = torch.arange(n, device=key.device)
     j = pos.to(code)
-    by_kind = internal_sort(torch.where(posinf, j - n, j.masked_fill(~nan, inf)), -1)[1].to(code)
+    by_kind = internal_sort(torch.where(posinf, j - n, j.masked_fill(~nan, inf)), -1, keys=True)[1].to(code)
     n_valid = n - nan.sum(-1, keepdim=True)
     n_finite = n_valid - posinf.sum(-1, keepdim=True)
     order = torch.where(pos < n_finite, by_value, by_kind.gather(-1, (pos - n_finite).clamp(min=0)))
@@ -106,7 +107,19 @@ def quantile_of(self, q, dim=None, keepdim=False, interpolation="linear", ignore
         weights = ranks - below if interpolation == "linear" else torch.full_like(ranks, 0.5)
         lo = x.gather(-1, at(below.long()))
         hi = x.gather(-1, at(ranks.ceil().long()))
-        values = torch.lerp(lo, hi, weights.to(x.dtype))
+        # next to an infinity, torch's two-branch lerp (ATen: a + w (b - a) for |w| < 0.5, else b - (b - a) (1 - w)):
+        # Gaudi's lerp takes one form for every w, and quantile([inf, max], .5) gave inf (torch nan),
+        # quantile([max, inf, -inf, -max], .3) nan (torch -inf). Finite ends keep lerp (its rounding and gradient).
+        # Each side sees zeros where the other is taken, so neither's gradient (inf * 0) leaks through the where.
+        w = weights.to(x.dtype)
+        finite = torch.isfinite(lo) & torch.isfinite(hi)
+        lo_f, hi_f = torch.where(finite, lo, 0.0), torch.where(finite, hi, 0.0)
+        lo_i, hi_i = torch.where(finite, 0.0, lo), torch.where(finite, 0.0, hi)
+        small = w.abs() < 0.5
+        lo_a, hi_a = torch.where(small, lo_i, 0.0), torch.where(small, hi_i, 0.0)
+        lo_b, hi_b = torch.where(small, 0.0, lo_i), torch.where(small, 0.0, hi_i)
+        branches = torch.where(small, lo_a + w * (hi_a - lo_a), hi_b - (hi_b - lo_b) * (1 - w))
+        values = torch.where(finite, torch.lerp(lo_f, hi_f, w), branches)
     else:
         pick = {"lower": torch.floor, "higher": torch.ceil, "nearest": torch.round}[interpolation](ranks)
         values = x.gather(-1, at(pick.long()))
@@ -156,7 +169,8 @@ def _takes(self, q, dim=None, keepdim=False, interpolation="linear"):
             return False
         if not _concrete(q):  # traced: checked at run time by the graph (_check_traced_range)
             return True
-        return q.numel() == 0 or bool(((q >= 0) & (q <= 1)).all())
+        with _strict.host_read("quantile: q range check", q) if q.device.type != "cpu" else _strict.quiet():
+            return q.numel() == 0 or bool(((q >= 0) & (q <= 1)).all())
     return 0.0 <= float(q) <= 1.0
 
 
