@@ -43,12 +43,16 @@ x)``) is moved to the device first. Integer and bool dtypes keep the native
 result. A NaN scalar bound of ``clamp``
 (``clamp(x, min=nan)``) is not rewritten: Gaudi gives FLT_MAX / inf (torch: ``x`` for one NaN bound, NaN for two).
 
-- With ``HPU_OPS_EXACT_SORT=1`` (off by default, see ``install``): ``sort`` / ``argsort`` / ``msort`` / ``topk`` /
-  ``kthvalue`` with NaN above +inf, as torch: a stable sort of the values with NaN as +inf, then a stable sort of the
-  NaN mask. Gaudi's sort returns NaN as +inf with out-of-range indices, and its non-stable sort of 1000+ elements
-  with infs returns out-of-range indices even without NaN; its stable sort is right. Eager and lazy, with autograd
-  on: traced by ``torch.compile`` the native op stays (compiled on the card, two of the rewritten sorts came out
-  wrong), and so in inference mode.
+- ``sort`` / ``argsort`` / ``msort`` / ``topk`` / ``kthvalue`` (on by default, off with ``HPU_OPS_EXACT_SORT=0``):
+  torch's order, NaN above +inf, and indices in range. Gaudi's float sort reads NaN as +inf with an out-of-range
+  index, and its non-stable sort pads each row to a power of two with +inf (descending: -inf), so a real infinity
+  ties with the padding and its index comes back out of range, at any n that is not a power of two (measured n = 3
+  to 5000); its descending sort along a non-last dim returns indices that are no permutation for rows holding -max.
+  Two sorts of finite keys along the last dim (see ``_sorted``), eager, lazy and under ``torch.compile`` (compiled on
+  the card: right in 390 of 390 cases), with autograd on. hpu-ops' own sorts of eigenvalues and singular values (and
+  quantile's NaN-free keys) keep Gaudi's sort (``internal_sort``), at main's cost. Not rewritten: inference mode and
+  ``out=`` (Gaudi's sort), and a stable sort past what Gaudi's stable kernel takes (n ~1000 or a non-last dim: its
+  own CPU fallback, as on main).
 """
 import functools
 import math
@@ -593,45 +597,95 @@ def _pool_kernel(op, backward_op, name, nd):
 # ---- sort / topk / kthvalue: NaN greatest, as torch
 
 
-def _sorted(x, d, descending):
-    """``x`` sorted along ``d`` with NaN above +inf (torch's order), and the indices. Gaudi's sort returns NaN as
-    +inf with an out-of-range index, and its non-stable sort of 1000+ elements with infs returns out-of-range indices
-    (measured, also without NaN); its stable sort is right. So: a stable sort of the values with NaN as +inf, then a
-    stable sort of the NaN mask, which puts the NaNs after the infs (before them when descending) and keeps the rest
-    in order."""
+SORT_MAXN = (1 << 24) // 3  # the second key (positions + 3 class offsets of n) is exact in float32 up to here
+
+
+def internal_sort(x, dim=-1, descending=False):
+    """``(values, indices)`` of Gaudi's own sort of ``x``, below the exact rewrite: for hpu-ops' sorts of
+    eigenvalues, singular values and NaN-free keys (eigh, the SVDs, quantile), whose rows hold no +-inf and whose
+    order is the same either way. They ran Gaudi's sort before the rewrite was on by default and keep its cost
+    (2-39 sorts per SPD step), traced by ``torch.compile`` too."""
+    return native(aten.sort.default)(x, dim, descending)
+
+
+_POSITIONS = {}  # (n, device) -> arange(n) in float32, built once
+
+
+def _positions(n, device, like):
+    if not _concrete(like):  # traced: a fresh one (a cached tensor belongs to another fake mode)
+        return torch.arange(n, dtype=torch.float32, device=device)
+    key = (n, str(device))
+    if key not in _POSITIONS:
+        _POSITIONS[key] = torch.arange(n, dtype=torch.float32, device=device)
+    return _POSITIONS[key]
+
+
+def _sorted(x, d, descending, stable=False):
+    """``x`` sorted along ``d`` in torch's order (NaN above +inf, ascending; first, descending), and the indices.
+    Gaudi's float sort reads NaN as +inf with an out-of-range index, and its non-stable sort pads a row to a power of
+    two with +inf (descending: -inf): a real infinity ties with the padding and its index comes back out of range
+    (measured at n = 3 to 5000). Its stable sort is right without NaN but falls back to the CPU at 1000 elements or
+    along a non-last dim (14-52 ms at 22000 rows of 1000; non-stable: 0.1-0.3 ms). So two sorts of finite keys. First ``nan_to_num(x)`` (NaN and +-inf as +-max; stable
+    when asked): right but for the order among max, +inf and NaN (among -max and -inf). Then the positions ``p`` of
+    that order (a scatter of the first sort's indices) shifted by ``n`` per class, read off ``x - key`` (0 for a
+    finite value, +-inf for +-inf, NaN for NaN): ``p + n`` for +inf, ``p + 2n`` for NaN, ``p - n`` for -inf
+    (mirrored descending). These are unique and finite, so a non-stable sort orders them exactly and keeps the first
+    sort's order within a class (stable: the input's). An int32 key of the float bits would need one sort, but ``view(torch.int32)`` in a lazy graph converts
+    the value instead of reinterpreting its bits (measured: inf to INT_MAX), and in eager it was no cheaper."""
+    n = x.shape[d]
+    if n == 1:  # Gaudi's bfloat16 sort of a dim of size 1 fails graph compile (measured); torch: x and index 0
+        return x.clone(), torch.zeros(x.shape, dtype=torch.int64, device=x.device)
     sort = native(aten.sort.stable)
+    last = d == x.dim() - 1
     with torch.no_grad():
-        nan = torch.isnan(x)
-        _, i = sort(torch.where(nan, float("inf"), x), stable=True, dim=d, descending=descending)
-        # gather of float data: Gaudi's graph compile of a bool (and int64) gather fails ("Can not compile graph")
-        _, j = sort(nan.to(torch.float32).gather(d, i), stable=True, dim=d, descending=descending)
-        i = i.to(torch.float32).gather(d, j).to(torch.int64)  # float data again; indices < 2**24 are exact
+        # along the last dim: Gaudi's descending sort along another dim returns indices that are no permutation
+        # when a row holds -max (measured at n = 8, 22)
+        xt = x if last else x.movedim(d, -1).contiguous()
+        # the largest finite value of the dtype as the card holds it: float64 is stored as float32 there (hpu-ops#16),
+        # so float64's max would become +inf, which ties with the padding
+        held = torch.float32 if x.dtype == torch.float64 and x.device.type != "cpu" else x.dtype
+        key = torch.nan_to_num(xt, nan=torch.finfo(held).max, posinf=torch.finfo(held).max,
+                               neginf=-torch.finfo(held).max)
+        _, i = sort(key, stable=stable, dim=-1, descending=descending)
+        # each element's position in that order (float data, int64 index)
+        p = torch.empty(xt.shape, dtype=torch.float32, device=x.device).scatter_(
+            -1, i, _positions(n, x.device, x).expand(xt.shape))
+        shift = (key - xt) if descending else (xt - key)
+        shift = torch.nan_to_num(shift.to(torch.float32), nan=-2.0 * n if descending else 2.0 * n,
+                                 posinf=float(n), neginf=-float(n))
+        _, i = sort(p + shift, stable=False, dim=-1)
+        if not last:
+            i = i.movedim(-1, d).contiguous()
     return x.gather(d, i), i  # autograd: the gradient to the index, torch's backward of sort
 
 
-def _sortable(x):
-    # not under torch.compile: compiled on the card, sort(dim=0, descending) and msort came out wrong (measured)
-    return _floating(x) and x.dim() > 0 and x.numel() > 0 and max(x.shape) < POOL_PLANE_MAX and _concrete(x)
+def _sortable(x, dim):
+    # traced by torch.compile too: compiled on the card (hpu_backend) the composite is right (measured)
+    if not (_floating(x) and x.dim() > 0 and x.numel() > 0):
+        return False
+    return x.shape[_dims(x, dim)[0]] <= SORT_MAXN
 
 
 def _sort_kernel(op, name, overload_stable):
     def kernel(self, *args, **kwargs):
         if overload_stable:
+            stable = bool(args[0] if len(args) > 0 else kwargs.get("stable", False))
             dim, descending = kwargs.get("dim", -1), kwargs.get("descending", False)
         else:
+            stable = False
             dim = args[0] if len(args) > 0 else kwargs.get("dim", -1)
             descending = args[1] if len(args) > 1 else kwargs.get("descending", False)
-        if not _sortable(self):
+        if not _sortable(self, dim):
             return native(op)(self, *args, **kwargs)
         count(name)
-        return _sorted(self, _dims(self, dim)[0], descending)
+        return _sorted(self, _dims(self, dim)[0], descending, stable)
 
     return kernel
 
 
 def _topk_kernel(op, name):
     def kernel(self, k, dim=-1, largest=True, sorted=True):
-        if not _sortable(self) or not 0 <= k <= self.shape[_dims(self, dim)[0]]:
+        if not _sortable(self, dim) or not 0 <= k <= self.shape[_dims(self, dim)[0]]:
             return native(op)(self, k, dim, largest, sorted)  # its own error for a k out of range
         count(name)
         d = _dims(self, dim)[0]
@@ -643,7 +697,7 @@ def _topk_kernel(op, name):
 
 def _kthvalue_kernel(op, name):
     def kernel(self, k, dim=-1, keepdim=False):
-        if not _sortable(self) or not 1 <= k <= self.shape[_dims(self, dim)[0]]:
+        if not _sortable(self, dim) or not 1 <= k <= self.shape[_dims(self, dim)[0]]:
             return native(op)(self, k, dim, keepdim)
         count(name)
         d = _dims(self, dim)[0]
@@ -997,14 +1051,14 @@ def install(device_type, exact_sort=None):
     """NaN propagation of Gaudi's max/min ops on ``device_type``: the backend layer at its backend key, the traced
     composites (and the inf-norms, the whole-tensor reductions' backward, the out= overloads) at its autograd key.
     Returns an undo. ``HPU_OPS_NAN_PROPAGATION=0`` in the environment installs nothing (Gaudi's NaN-dropping ops
-    stay; measured, the rewrite costs eager SPD steps up to about 9%, lazy within noise). The sort family (``sort``, ``argsort``, ``msort``, ``topk``, ``kthvalue``) only with
-    ``exact_sort`` (default: the environment's ``HPU_OPS_EXACT_SORT=1``): measured eager, it made the training steps
-    of the SPD models up to 22% slower (hpu-ops' own eigh and SVD sort their eigenvalues; TensorCSPNet 205 to 250 ms),
-    lazy within noise."""
+    stay; measured, the rewrite costs eager SPD steps up to about 9%, lazy within noise). The sort family (``sort``,
+    ``argsort``, ``msort``, ``topk``, ``kthvalue``) unless ``exact_sort`` is false (default: on, off with the
+    environment's ``HPU_OPS_EXACT_SORT=0``). hpu-ops' own sorts of eigenvalues and singular values keep Gaudi's sort
+    (``internal_sort``): with them through the rewrite, eager SPD steps were up to 22% slower."""
     nan = os.environ.get("HPU_OPS_NAN_PROPAGATION") != "0"  # opt-out, read when enable() runs (like HPU_OPS_TPC=0)
     if exact_sort is None:
-        exact_sort = os.environ.get("HPU_OPS_EXACT_SORT") == "1"
-    if not (nan or exact_sort):
+        exact_sort = os.environ.get("HPU_OPS_EXACT_SORT") != "0"
+    if not (nan or exact_sort):  # the opt-out keeps the sort family's own switch
         return lambda: None
     traced = []  # (op, composite): handed to torch's autograd kernel outside a tracer
     for op, name in ((aten.amax.default, "amax"), (aten.amin.default, "amin")):

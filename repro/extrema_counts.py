@@ -38,7 +38,7 @@ def main():
 
     extrema.native_out = counting
     if a.no_sort:
-        extrema._sortable = lambda x: False
+        extrema._sortable = lambda x, dim: False
     from spd_diag import protocol as P
     from spd_diag.cache import open_cache
 

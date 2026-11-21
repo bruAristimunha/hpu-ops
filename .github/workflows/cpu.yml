@@ -2,7 +2,7 @@ name: cpu
 
 on:
   push:
-    branches: [main, "ci/**"]  # ci/*: throwaway branches that probe CI before a PR
+    branches: [main]
   pull_request:
 
 jobs:

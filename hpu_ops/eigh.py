@@ -18,6 +18,7 @@ import torch.nn.functional as F
 
 from . import tpc
 from ._dispatch import register_paired
+from .extrema import internal_sort
 from .linalg import _kernels, _takes
 
 aten = torch.ops.aten
@@ -86,7 +87,7 @@ def eigh(A, upper=False):
             S = J.mT @ S @ J
             V = V @ J
         S = (S + S.mT) / 2
-    w, order = torch.diagonal(S, dim1=-2, dim2=-1)[..., :n].sort(-1)
+    w, order = internal_sort(torch.diagonal(S, dim1=-2, dim2=-1)[..., :n], -1)
     V = V[..., :n, :n]
     return w, V.gather(-1, order[..., None, :].expand_as(V))
 
