@@ -124,6 +124,10 @@ static habana::PartialOutputMetaDataVector lu_solve_meta(const at::Stack& inputs
   auto b = inputs[2].toTensor();
   return {habana::PartialOutputMetaData{b.scalar_type(), b.sizes().vec()}};
 }
+static habana::PartialOutputMetaDataVector big_meta(const at::Stack& inputs) {
+  auto u = inputs[0].toTensor();
+  return {habana::PartialOutputMetaData{u.scalar_type(), u.sizes().vec()}};
+}
 static habana::PartialOutputMetaDataVector eigh_meta(const at::Stack& inputs) {
   auto a = inputs[0].toTensor();
   return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1)}},
@@ -145,6 +149,9 @@ static habana::PartialOutputMetaDataVector large_meta(const at::Stack& inputs) {
 static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_large", "gj_large_f32_gaudi2", large_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", eigh_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_big", "jacobi_big_f32_gaudi2", big_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_big_refine", "jacobi_big_refine_f32_gaudi2", big_meta,
+                                          nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh_refine", "jacobi_eigh_refine_f32_gaudi2",
                                           eigh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", solve_meta, nullptr);
@@ -263,6 +270,14 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v
   auto out = desc.execute(inputs);
   return {out[0], out[1]};
 }
+static at::Tensor run_big(const char* name, at::Tensor s0) {
+  std::vector<c10::IValue> inputs{s0};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(name);
+  auto out = desc.execute(inputs);
+  return out[0];
+}
+at::Tensor jacobi_big(at::Tensor s0) { return run_big("linalg_tpc::jacobi_big", s0); }
+at::Tensor jacobi_big_refine(at::Tensor s0) { return run_big("linalg_tpc::jacobi_big_refine", s0); }
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_large(Tensor a) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
@@ -282,6 +297,8 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("tri_solve_lower_unit(Tensor a, Tensor b) -> Tensor");
   m.def("tri_solve_upper_unit(Tensor a, Tensor b) -> Tensor");
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
+  m.def("jacobi_big(Tensor s0) -> Tensor");
+  m.def("jacobi_big_refine(Tensor s0) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_large", gj_large);
@@ -302,6 +319,8 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("tri_solve_lower_unit", tri_solve_lower_unit);
   m.impl("tri_solve_upper_unit", tri_solve_upper_unit);
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
+  m.impl("jacobi_big", jacobi_big);
+  m.impl("jacobi_big_refine", jacobi_big_refine);
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("gj_large", [](at::Tensor a) {
@@ -354,6 +373,8 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("jacobi_eigh_refine", [](at::Tensor a, at::Tensor v1) {
     return std::make_tuple(a.new_empty({a.size(0), a.size(1)}), a.new_empty(a.sizes()));
   });
+  m.impl("jacobi_big", [](at::Tensor s0) { return s0.new_empty(s0.sizes()); });
+  m.impl("jacobi_big_refine", [](at::Tensor s0) { return s0.new_empty(s0.sizes()); });
 }
 """
 CPP_LAZY = r"""
@@ -503,6 +524,13 @@ static bool registered_tri = [] {
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::tri_solve_upper_unit", "tri_solve_upper_unit_f32_gaudi2", in, out, nullptr);
   return true;
 }();
+static bool registered_big = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_a}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_big", "jacobi_big_f32_gaudi2", in, out, nullptr);
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_big_refine", "jacobi_big_refine_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
 static bool registered_eigh_refine = [] {
   std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
                                                {habana::custom_op::input_type::TENSOR, 1}};
@@ -606,6 +634,14 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v
   auto out = op.execute(inputs);
   return {out[0], out[1]};
 }
+static at::Tensor run_big(const char* name, at::Tensor s0) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor(name);
+  std::vector<c10::IValue> inputs{s0};
+  auto out = op.execute(inputs);
+  return out[0];
+}
+at::Tensor jacobi_big(at::Tensor s0) { return run_big("linalg_tpc::jacobi_big", s0); }
+at::Tensor jacobi_big_refine(at::Tensor s0) { return run_big("linalg_tpc::jacobi_big_refine", s0); }
 TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_large(Tensor a) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
@@ -625,6 +661,8 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("tri_solve_lower_unit(Tensor a, Tensor b) -> Tensor");
   m.def("tri_solve_upper_unit(Tensor a, Tensor b) -> Tensor");
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
+  m.def("jacobi_big(Tensor s0) -> Tensor");
+  m.def("jacobi_big_refine(Tensor s0) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_large", gj_large);
@@ -645,6 +683,8 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("tri_solve_lower_unit", tri_solve_lower_unit);
   m.impl("tri_solve_upper_unit", tri_solve_upper_unit);
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
+  m.impl("jacobi_big", jacobi_big);
+  m.impl("jacobi_big_refine", jacobi_big_refine);
 }
 """
 
@@ -855,6 +895,12 @@ def _eigh_op():
     """``torch.ops.linalg_tpc.jacobi_eigh``, built on first use."""
     _load()
     return torch.ops.linalg_tpc.jacobi_eigh
+
+
+def _big_op(refine=False):
+    """``torch.ops.linalg_tpc.jacobi_big`` (``_refine``: the short pass), built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_big_refine if refine else torch.ops.linalg_tpc.jacobi_big
 
 
 def _eigh_refine_op():
@@ -1284,6 +1330,77 @@ def eigh(A, upper):
     w, order = W.sort(-1)
     V = Vt.gather(-2, order[..., :, None].expand_as(Vt)).mT
     return w.reshape(*batch, n), V.reshape(*batch, n, n)
+
+
+BIG_EIGH_MAXN = 128  # jacobi_big: 32 < n <= BIG_EIGH_MAXN (VA = 1, 2); past it the block Jacobi of hpu_ops.jacobi
+BIG_SHIFT = 1.001  # S = A / ||A||_inf + BIG_SHIFT I: positive definite, eigenvalues in [0.001, 2.001]
+
+
+def _big_pass(X, sigma, refine):
+    """One kernel pass (``jacobi_big``, 8 sweeps; ``refine``: 3) on ``X[b, n, n]`` symmetric, shifted positive
+    definite by its row-sum bound ``sigma[b]``: the rows of the eigenvector estimate ``[b, n, n]``."""
+    b, n, _ = X.shape
+    w = 64 * (-(-n // 64))
+    eye = torch.eye(n, dtype=X.dtype, device=X.device)
+    S = X / sigma[:, None, None] + BIG_SHIFT * eye
+    U = _call(_big_op(refine), _fresh(torch.nn.functional.pad(S, (0, w - n)).contiguous()))[..., :n]
+    # the rows of S V are lambda_j v_j at convergence (S positive definite): normalized, the eigenvectors
+    return U * torch.rsqrt((U * U).sum(-1, keepdim=True))
+
+
+def eigh_big(A):
+    """``(w, V)`` of the symmetric ``A[..., n, n]`` (both triangles read; float32, 32 < n <= ``BIG_EIGH_MAXN``): ``w``
+    ascending, the columns of ``V`` the eigenvectors. The one-sided Jacobi kernel ``jacobi_big`` (rows in global
+    memory, one matrix per TPC) on ``A`` shifted positive definite (``BIG_SHIFT``), then a refinement pass on
+    ``V A V^T`` (nearly diagonal: 3 sweeps), two Newton-Schulz steps on the composed rows and Rayleigh quotients with
+    ``A`` itself. Measured on Gaudi2 (bridge 1.21.4, batch 32): EEGSPDNet's eigh at n = 110 and 55 took 360 and 121
+    ms through the block Jacobi of 32 x 32 launches (``hpu_ops.jacobi``), 27 and 13 on hpu-ops' CPU route."""
+    batch, n = A.shape[:-2], A.shape[-1]
+    if A.dim() < 2 or A.shape[-2] != n or not EIGH_MAXN < n <= BIG_EIGH_MAXN:
+        raise ValueError(f"hpu_ops.tpc.eigh_big takes square A with {EIGH_MAXN} < n <= {BIG_EIGH_MAXN}, got {tuple(A.shape)}")
+    X = A.reshape(-1, n, n).to(torch.float32)
+    sigma = X.abs().sum(-1).amax(-1)
+    sigma = torch.where(sigma > 0, sigma, 1.0)
+    V = _big_pass(X, sigma, False)  # rows
+    T = V @ X @ V.mT
+    V = _big_pass((T + T.mT) / 2, sigma, True) @ V
+    eye = torch.eye(n, dtype=X.dtype, device=X.device)
+    for _ in range(2):
+        V = (1.5 * eye - 0.5 * (V @ V.mT)) @ V
+    w = ((V @ X) * V).sum(-1)
+    w, order = w.sort(-1)
+    V = V.gather(-2, order[..., :, None].expand_as(V)).mT
+    return w.reshape(*batch, n), V.reshape(*batch, n, n)
+
+
+def jacobi_big_reference(S0, sweeps=8):
+    """``jacobi_big`` in float64 numpy, the kernel's contract (round-robin one-sided Jacobi on the rows of ``S0``; a
+    pair orthogonal to 1e-7 left alone), for the CPU tests."""
+    import numpy as np
+
+    U = S0.detach().cpu().double().numpy().copy()
+    V = U.copy()
+    n = U.shape[-2]
+    M = n if n % 2 else n - 1
+    for b in range(U.shape[0]):
+        u, v = U[b], V[b]
+        for _ in range(sweeps):
+            for r in range(M):
+                pairs = [(r, M)] if M < n else []
+                for k in range(1, (M + 1) // 2):
+                    x, y = (r + k) % M, (r - k) % M
+                    pairs.append((min(x, y), max(x, y)))
+                for p, q in pairs:
+                    a, bb, g = u[p] @ u[p], u[q] @ u[q], u[p] @ u[q]
+                    if g * g <= 1e-14 * a * bb:
+                        continue
+                    zeta = (bb - a) / (2 * g)
+                    t = np.sign(zeta) / (abs(zeta) + np.sqrt(1 + zeta * zeta)) if zeta != 0 else 1.0
+                    c = 1 / np.sqrt(1 + t * t)
+                    s = c * t
+                    u[p], u[q] = c * u[p] - s * u[q], s * u[p] + c * u[q]
+                    v[p], v[q] = c * v[p] - s * v[q], s * v[p] + c * v[q]
+    return torch.from_numpy(U).to(S0.dtype)
 
 
 def eigh_reference(A, upper):

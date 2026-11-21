@@ -52,11 +52,24 @@ def _tpc_takes(device_type):
     return tpc_takes
 
 
-# Past tpc.EIGH_MAXN eigh runs the block Jacobi on the card: measured on Gaudi2 (bridge 1.21.4) it is slower than the
-# CPU route it replaces (EEGSPDNet's step, eigh at n = 220: 575 against 164 ms eager, 200 against 64 lazy, medians of 3
-# alternating rounds; tests/linalg_steps.py). ``HPU_OPS_LARGE_EIGH=cpu`` (read per call) asks for the CPU route there
-# instead: faster, not on the card.
+# Past tpc.EIGH_MAXN eigh runs on the card: the one-sided Jacobi kernel jacobi_big up to tpc.BIG_EIGH_MAXN (batch 32:
+# 11.6 / 21.9 / 29 ms at n = 55 / 110 / 128, hpu-ops' CPU route 9.6 / 26.2 / 34.7; tests/probe_eigh_big.py), the block
+# Jacobi past it (10x slower than the CPU route). ``HPU_OPS_LARGE_EIGH=cpu`` (read per call) asks for the CPU route
+# past tpc.EIGH_MAXN instead.
 LARGE_EIGH = "HPU_OPS_LARGE_EIGH"
+
+
+# The ``(A) -> (w, V)`` solver for EIGH_MAXN < n <= BIG_EIGH_MAXN (both triangles of A filled) in the CPU tests; None
+# means ``tpc.eigh_big`` on HPU.
+_EIGH_BIG = None
+
+
+def _use_big(A):
+    """Whether ``A`` goes through the one-sided Jacobi kernel ``jacobi_big`` (``tpc.eigh_big``): ``tpc.EIGH_MAXN`` <
+    n <= ``tpc.BIG_EIGH_MAXN`` on HPU, float32 with the kernel ready (or the ``_EIGH_BIG`` hook, CPU tests)."""
+    if not tpc.EIGH_MAXN < A.shape[-1] <= tpc.BIG_EIGH_MAXN:
+        return False
+    return _EIGH_BIG is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
 
 
 def _use_block(A):
@@ -123,6 +136,10 @@ class Eigh(torch.autograd.Function):
         upper = UPLO.upper() == "U"
         if _use_tpc(A):
             w, V = (tpc.eigh if _EIGH is None else _EIGH)(A, upper)
+        elif _use_big(A):
+            S = torch.triu(A) + torch.triu(A, 1).mT if upper else torch.tril(A) + torch.tril(A, -1).mT
+            w, V = (tpc.eigh_big if _EIGH_BIG is None else _EIGH_BIG)(S)
+            V = V if compute_v else A.new_empty(0)
         elif _use_block(A):
             from . import jacobi, linalg
 

@@ -19,7 +19,8 @@ foreach(KERNEL
         gj_large2_f32_gaudi2 gj_large3_f32_gaudi2 gj_large4_f32_gaudi2 gj_large5_f32_gaudi2
         gj_large6_f32_gaudi2 gj_large7_f32_gaudi2 gj_large8_f32_gaudi2
         gj_tall2_f32_gaudi2 gj_tall3_f32_gaudi2 gj_tall4_f32_gaudi2 gj_tall5_f32_gaudi2
-        gj_tall6_f32_gaudi2 gj_tall7_f32_gaudi2 gj_tall8_f32_gaudi2)
+        gj_tall6_f32_gaudi2 gj_tall7_f32_gaudi2 gj_tall8_f32_gaudi2
+        jacobi_big1_f32_gaudi2 jacobi_big2_f32_gaudi2 jacobi_big1r_f32_gaudi2 jacobi_big2r_f32_gaudi2)
     set(SOURCE ${KERNEL})
     set(DEFINES "")
     if(KERNEL STREQUAL "gj_inv_f32_gaudi2")
@@ -28,6 +29,13 @@ foreach(KERNEL
     elseif(KERNEL MATCHES "^gj_large([0-9])_")
         set(SOURCE gj_large_f32_gaudi2)
         set(DEFINES -DVA=${CMAKE_MATCH_1})
+    elseif(KERNEL MATCHES "^jacobi_big([0-9])(r?)_")
+        set(SOURCE jacobi_big_f32_gaudi2)
+        if(CMAKE_MATCH_2 STREQUAL "r")
+            set(DEFINES -DVA=${CMAKE_MATCH_1} -DSWEEPS=3)
+        else()
+            set(DEFINES -DVA=${CMAKE_MATCH_1} -DSWEEPS=8)
+        endif()
     elseif(KERNEL MATCHES "^gj_tall([0-9])_")
         set(SOURCE gj_large_f32_gaudi2)
         set(DEFINES -DVA=${CMAKE_MATCH_1} -DTALL)

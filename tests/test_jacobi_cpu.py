@@ -84,3 +84,24 @@ def test_large_eigh_opt_out(monkeypatch):
     assert takes(big, "L", True) is True
     monkeypatch.setenv(E.LARGE_EIGH, "cpu")
     assert takes(big, "L", True) is False and takes(small, "L", True) is True
+
+
+@pytest.mark.parametrize("n", [33, 55, 110])
+def test_eigh_big_wiring_on_the_reference(n, monkeypatch):
+    """``tpc.eigh_big`` (shift, kernel pass, refinement pass, Newton-Schulz, Rayleigh quotients) with the kernel replaced
+    by its float64 contract (``tpc.jacobi_big_reference``); and Eigh's route to it for 32 < n <= 128."""
+    from hpu_ops import tpc
+
+    monkeypatch.setattr(tpc, "_big_op", lambda refine=False: (lambda S0: tpc.jacobi_big_reference(S0, 3 if refine else 8)))
+    g = torch.Generator().manual_seed(n)
+    G = torch.randn(2, n, n, generator=g)
+    A = (G + G.mT) / 2
+    w, V = tpc.eigh_big(A)
+    w64 = torch.linalg.eigvalsh(A.double())
+    assert rel(w, w64) <= 2 * rel(torch.linalg.eigvalsh(A), w64) + 1e-7
+    assert (V.mT @ V - torch.eye(n)).abs().max() < 1e-5
+    monkeypatch.setattr(E, "_EIGH_BIG", tpc.eigh_big)
+    wl, Vl = E.Eigh.compute(torch.tril(A), "L", True)
+    assert torch.equal(wl, w)
+    wu, _ = E.Eigh.compute(torch.triu(A), "U", False)
+    assert torch.equal(wu, w)
