@@ -131,8 +131,9 @@ def _bool_index_put_takes(self, indices, values, accumulate=False):
 
 
 def _bool_index_put_inplace_takes(self, indices, values, accumulate=False):
-    # an expanded self (several elements on one memory location) is written by ATen's kernel but refused by copy_
-    return _bool_index_put_takes(self, indices, values, accumulate) and torch._debug_has_internal_overlap(self) == 0
+    # an expanded self (several elements on one memory location: overlap YES = 1) is written by ATen's kernel but
+    # refused by copy_; non-dense views (TOO_HARD = 2, e.g. x[:, 1:]) are fine for copy_
+    return _bool_index_put_takes(self, indices, values, accumulate) and torch._debug_has_internal_overlap(self) != 1
 
 
 def _concrete(t):
@@ -157,9 +158,9 @@ def index_2d(self, indices):
     inside = (ix0 >= -h) & (ix0 < h) & (ix1 >= -w) & (ix1 < w)
     if on.type == "cpu" and _concrete(inside) and not bool(inside.all()):
         bad0 = ~((ix0 >= -h) & (ix0 < h))
-        dim, size, idx = (-2, h, ix0[bad0]) if bad0.any() else (-1, w, ix1[~((ix1 >= -w) & (ix1 < w))])
-        raise IndexError(f"index {int(idx.reshape(-1)[0])} is out of bounds for dimension "
-                         f"{self.dim() + dim} with size {size}")
+        # ATen numbers the dimension among the advanced indices (0 for ix0, 1 for ix1), not in ``self``
+        dim, size, idx = (0, h, ix0[bad0]) if bad0.any() else (1, w, ix1[~((ix1 >= -w) & (ix1 < w))])
+        raise IndexError(f"index {int(idx.reshape(-1)[0])} is out of bounds for dimension {dim} with size {size}")
     i0 = torch.where(ix0 < 0, ix0 + h, ix0)
     i1 = torch.where(ix1 < 0, ix1 + w, ix1)
     # an index out of its own dimension must not land on a neighbouring row: send it past the end instead
@@ -169,6 +170,10 @@ def index_2d(self, indices):
 
 def _index_2d_takes(self, indices):
     if self.dim() < 2 or len(indices) != self.dim():
+        return False
+    # a plain 2-D gather with card indices is one native op; the rewrite's ~10 small ops are 6-18x slower there
+    # (Gaudi2 eager, 64x64, 512 indices: 0.28 vs 5.07 ms). Keep it for leading dims (Vech) or host indices.
+    if self.dim() == 2 and all(idx is not None and idx.device == self.device for idx in indices):
         return False
     if self.shape[-2] <= 0 or self.shape[-1] <= 0:
         return False

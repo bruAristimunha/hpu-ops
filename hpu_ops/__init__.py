@@ -13,9 +13,10 @@ at the tensor's pickling:
   convolution needs (ATCNet, EEGInceptionERP, EEGITNet).
 - The weight gradient of one-channel convolutions with a stride (``conv``): Gaudi's compiled
   ``convolution_backward`` returns about half of it plus an unrelated part (EEGDINO, CodeBrain, LaBraM).
-- Large-kernel convolutions above 256 (``conv``): Gaudi2's MME AGU rejects spatial kernel sizes ``> 256``
-  (``setAssociatedDimAndSize`` in ``STaRNet(64)`` and ``TensorCSPNet(22)``); splitting into ``<= 256`` slices keeps
-  every Synapse ``Conv`` node in range, eager, lazy, and compiled.
+- Large-kernel convolutions above 128 (``conv``): Gaudi2's MME AGU rejects spatial kernel sizes ``> 256``
+  (``setAssociatedDimAndSize`` in ``STaRNet(64)`` and ``TensorCSPNet(22)``), and in lazy mode kernels 248..256 fail too
+  while kernels 129..255 can get a wrong input gradient; splitting into ``<= 128`` slices avoids both, eager, lazy, and
+  compiled.
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's

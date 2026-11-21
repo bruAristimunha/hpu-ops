@@ -150,7 +150,7 @@ check('Conv1d padding="valid"', per_device(torch.nn.Conv1d(8, 16, 5, padding="va
       atol=1e-4)
 expect('compiled padding="valid" took full zero lists', calls["valid_conv"] > 0, f"{calls['valid_conv']} times")
 
-# ---- large-kernel convolutions (> 256): STaRNet(64) conv_spatial_fusion & TensorCSPNet(22, k=11) temporal_block
+# ---- large-kernel convolutions (> 256; > 128 in lazy mode): STaRNet(64) conv_spatial_fusion & TensorCSPNet(22, k=11) temporal_block
 calls.clear()
 check("Conv2d kernel (351, 1) (STaRNet(64) conv_spatial_fusion)",
       per_device(torch.nn.Conv2d(1, 8, (351, 1), bias=False)), (torch.randn(4, 1, 351, 200),), atol=1e-4)
@@ -159,6 +159,17 @@ check("Conv2d kernel (4, 1089) stride (1, 121) (TensorCSPNet(22, k=11))",
 check("Conv2d kernel (351, 1) inference_mode",
       per_device(torch.nn.Conv2d(1, 8, (351, 1), bias=False)), (torch.randn(4, 1, 351, 200),),
       atol=1e-4, modes=("eager",), context=torch.inference_mode)
+# lazy mode (bridge 1.21.4): 256-wide chunks failed graph compile over long inputs, and native kernels 129..255 give
+# wrong input gradients when the input is longer than 256 but shorter than twice the kernel (k=351 over 400).
+# Compiled, k=351 over 1000 still fails (graph compiler: "Cannot add a node DEDW to bundle", with any chunking but
+# 256+256; repro/probe_compile_chunks.py) and so does (4, 1089) over 1500 (setAssociatedDimAndSize with 256-wide
+# chunks), as the native op does: those two shapes are checked eager only (lazy: repro/sweep_conv_k.sh).
+check("Conv1d k=351 over 1000 (256-wide chunks failed in lazy)",
+      per_device(torch.nn.Conv1d(8, 16, 351)), (torch.randn(4, 8, 1000),), atol=1e-3, modes=("eager",))
+check("Conv1d k=351 over 400 (lazy input gradient of a 240-wide chunk was wrong)",
+      per_device(torch.nn.Conv1d(8, 16, 351)), (torch.randn(4, 8, 400),), atol=1e-3)
+check("Conv2d kernel (4, 1089) over width 1500",
+      per_device(torch.nn.Conv2d(4, 8, (4, 1089))), (torch.randn(2, 4, 4, 1500),), atol=1e-3, modes=("eager",))
 expect("large-kernel convolutions took split_conv", calls["large_conv"] > 0, f"{calls['large_conv']} times")
 
 # ---- glu (BrainModule: a convolution, then a gated linear unit over the channels)

@@ -1177,7 +1177,8 @@ def test_index_2d_edge_cases_dynamic_and_passthrough():
     cases = [
         (torch.randn(2, 3, 5, 4, dtype=torch.float64), (torch.tensor([0, -1, 2], dtype=torch.int32),
                                                         torch.tensor([1, 3, -2], dtype=torch.int64))),
-        (torch.randn(5, 4, dtype=torch.float64).t(), (torch.tensor([[0, 1], [2, -1]]), torch.tensor([1, -2]))),
+        (torch.randn(1, 5, 4, dtype=torch.float64).transpose(-1, -2),
+         (torch.tensor([[0, 1], [2, -1]]), torch.tensor([1, -2]))),
         (torch.randn(3, 5, 4, dtype=torch.float64), (torch.tensor(2), torch.tensor(-1))),
         (torch.randn(0, 5, 4, dtype=torch.float64), (torch.tensor([0, 1]), torch.tensor([2, 3]))),
         (torch.randn(2, 5, 4, dtype=torch.float64),
@@ -1192,10 +1193,11 @@ def test_index_2d_edge_cases_dynamic_and_passthrough():
         assert_same(got, want)
         assert calls["index_2d"] == 1
 
-    # 2-D self with two 0-d indices via aten.index.Tensor (eager + compiled)
-    x2 = torch.arange(16.0, dtype=torch.float64).reshape(4, 4)
+    # two 0-d indices via aten.index.Tensor (eager + compiled); a plain 2-D self with indices on its own device
+    # keeps the native op (one kernel), so the leading dim keeps the rewrite here
+    x2 = torch.arange(16.0, dtype=torch.float64).reshape(1, 4, 4)
     i0_0d, i1_0d = torch.tensor(2), torch.tensor(-1)
-    f_2d_0d = lambda t: torch.ops.aten.index.Tensor(t, [i0_0d, i1_0d])  # noqa: E731
+    f_2d_0d = lambda t: torch.ops.aten.index.Tensor(t, [None, i0_0d, i1_0d])  # noqa: E731
     want_2d_0d = train_step(f_2d_0d, x2)
     for mode in ("eager", "compiled"):
         nodes_0d = []
@@ -1203,7 +1205,7 @@ def test_index_2d_edge_cases_dynamic_and_passthrough():
             fn = f_2d_0d if mode == "eager" else compiled(f_2d_0d, nodes_0d, dynamic=True, fullgraph=True)
             got_2d_0d = train_step(fn, x2)
         assert_same(got_2d_0d, want_2d_0d)
-        assert got_2d_0d[0].shape == ()
+        assert got_2d_0d[0].shape == (1,)
         assert calls["index_2d"] > 0
         if mode == "compiled":
             assert "aten.index.Tensor" not in ops(nodes_0d), ops(nodes_0d)
@@ -1237,22 +1239,23 @@ def test_index_2d_edge_cases_dynamic_and_passthrough():
 
 def test_index_2d_out_of_range_raises_instead_of_reading_a_neighbour():
     # flat index i0 * w + i1 is in range for x[0, 4] of a 3 x 4 tensor (it is x[1, 0]); torch raises
-    x = torch.arange(12.0).reshape(3, 4)
+    x = torch.arange(12.0).reshape(1, 3, 4)
     cases = [(torch.tensor([0]), torch.tensor([4])), (torch.tensor([0]), torch.tensor([-5])),
              (torch.tensor([3]), torch.tensor([0])), (torch.tensor([-4, 0]), torch.tensor([0, 1]))]
     for i0, i1 in cases:
-        with pytest.raises(IndexError):
-            _ = x[i0, i1]
+        with pytest.raises(IndexError) as native:
+            _ = x[..., i0, i1]
         with cpu_as_hpu(composite.install_index_2d) as calls:
-            with pytest.raises(IndexError, match="out of bounds"):
-                _ = x[i0, i1]
+            with pytest.raises(IndexError, match="out of bounds") as rewritten:
+                _ = x[..., i0, i1]
         assert calls["index_2d"] == 1
+        assert str(rewritten.value) == str(native.value)
     # traced (fake) indices cannot be checked on the host: an out-of-range index goes past the end of the flat
     # index_select (which raises on the CPU) instead of reading a neighbouring element
     i0, i1 = torch.tensor([0]), torch.tensor([4])
     with cpu_as_hpu(composite.install_index_2d):
-        with pytest.raises(Exception, match="out of range|out of bounds"):
-            torch.compile(lambda t: t[i0, i1], backend="aot_eager", fullgraph=True)(x)
+        with pytest.raises(Exception, match="out of range|out of bounds|out of DATA bounds"):
+            torch.compile(lambda t: t[..., i0, i1], backend="aot_eager", fullgraph=True)(x)
 
 
 # ---- torch.save: tensor-level host copies
