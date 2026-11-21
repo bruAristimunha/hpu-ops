@@ -62,8 +62,11 @@ for groups, channels, length in ((4, 16, 100), (8, 64, 60), (8, 128, 1000)):
     torch._dynamo.reset()
     dyn = torch.compile(m, backend="hpu_backend")
     bench(dyn, x[16])  # first batch size: static graph
-    t_dyn = bench(dyn, x[128])  # second: symbolic graph
+    try:
+        t_dyn = f"{bench(dyn, x[128]):.3f} ms"  # second: symbolic graph
+    except RuntimeError as e:  # without hpu-ops: IntImplicit
+        t_dyn = f"fails ({str(e)[:40]})"
     new = {k: v - before.get(k, 0) for k, v in fallbacks().items() if v - before.get(k, 0)}
     print(f"{MODE} GroupNorm({groups},{channels}) x(128,{channels},{length}): eager {eager:.3f} ms, "
-          f"compiled static {t_static:.3f} ms, compiled symbolic {t_dyn:.3f} ms | "
+          f"compiled static {t_static:.3f} ms, compiled symbolic {t_dyn} | "
           f"group_norm rewrites {_STATE['calls'].get('group_norm', 0)} | cpu_fallback {new}", flush=True)

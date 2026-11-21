@@ -21,7 +21,8 @@ at the tensor's pickling:
 - ``group_norm`` with a symbolic size under compile (``norm``, #42) as a reshape into groups, ``var_mean`` and the
   affine terms: with the default dynamic shapes a second batch size traced ``native_group_norm`` with the batch as
   a SymInt argument, and Habana's backend failed ("aten::IntImplicit isn't registered in KernelRegistry!":
-  FNIRSCNN1D, NeuroRVQ, SAMBA, SignalJEPA). Static shapes and eager keep Gaudi's kernel.
+  FNIRSCNN1D, SAMBA, SignalJEPA_PostLocal now compile; NeuroRVQ, DIVER1, LaBraM and SignalJEPA_PreLocal then meet
+  other dynamic-shape failures). Static shapes and eager keep Gaudi's kernel.
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's
