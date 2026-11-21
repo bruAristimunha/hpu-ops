@@ -260,16 +260,34 @@ def _out_on_cpu(op, args, kwargs, outs):
     return values[0] if len(values) == 1 else values
 
 
-def _kernels(device_type, op, name, function, takes, backend=True):
+def _traced_with_grad(args, kwargs):
+    """Whether a declined call is being traced (compile, AOT, make_fx) with its autograd recorded: grad mode on, a
+    real floating tensor argument that requires grad, all on one device, no functorch transform."""
+    tensors = [x for x in pytree.tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor)]
+    if not tensors or _transformed() or not torch.is_grad_enabled() or not any(t.requires_grad for t in tensors):
+        return False
+    if len({t.device for t in tensors}) > 1 or not all(t.is_floating_point() for t in tensors):
+        return False
+    return any(_tracing(t) for t in tensors)
+
+
+def _kernels(device_type, op, name, function, takes, backend=True, traced=None):
     """The ``(op, key, kernel)`` entries for ``register_kernels``: ``function`` for the calls ``takes`` accepts, else
     ``op``'s own kernel at autograd, and the CPU below it. With ``backend=False`` only the autograd entry is made:
     ops whose torch derivative reads the LU factors (solve_ex, det, slogdet) must reach Habana's own kernel below
-    autograd, as our placeholder factors would turn a traced native backward into NaN (symbolic shapes, recompiles)."""
+    autograd, as our placeholder factors would turn a traced native backward into NaN (symbolic shapes, recompiles).
+    ``traced`` (those ops) takes the calls a tracer sees declined with grad recorded: the graph's node is still the
+    op, but at run time it reaches the autograd kernel again with real tensors, where ``takes`` may accept it (the
+    large route is eager-only, a symbolic shape is static) and return placeholder factors. torch's traced derivative
+    would read them (NaN gradients of STaRNet(64)'s n = 96 Cayley solve compiled); ``traced``'s backward reads ``A``
+    and the outputs only, so either run-time route gives torch's gradient."""
 
     def autograd_kernel(*args, **kwargs):
         if takes(*args, **kwargs):
             count(name)
             return function.apply(*_bind(op, args, kwargs))
+        if traced is not None and _traced_with_grad(args, kwargs):
+            return traced.apply(op, *_bind(op, args, kwargs))
         return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
 
     def backend_kernel(*args, **kwargs):  # below autograd: inference mode, tracers' decompositions
@@ -722,7 +740,8 @@ def install_solve(device_type):
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
     takes = _tpc_takes(device_type, shapes_ok, large=True)
-    return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes, backend=False)])
+    return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes, backend=False,
+                                                         traced=_TracedSolveEx)])
 
 
 def _inverse(LU, pivots):
@@ -796,14 +815,26 @@ class Det(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad, *_):
         A, det = ctx.saved_tensors
-        cofactor = (grad * det)[..., None, None] * InvEx.apply(A, False)[0].mH
-        if torch.is_grad_enabled():
-            # torch's derivative in grad mode (double backward): the SVD formula for |det| < 100 eps, whose cofactor
-            # is right on a singular matrix, where det * A^-H is 0. The check is a host sync, in grad mode only.
-            singular = det.abs() < 100 * torch.finfo(A.dtype).eps
-            if bool(singular.any()):
-                return torch.where(singular[..., None, None], _det_grad_singular(A, grad), cofactor)
-        return cofactor
+        return _det_backward(A, det, grad, lambda M: InvEx.apply(M, False)[0])
+
+
+def _det_backward(A, det, grad, inverse):
+    """``g det A^-H`` with ``inverse(A)``; in grad mode (double backward) a singular A takes torch's SVD formula."""
+    cofactor = (grad * det)[..., None, None] * inverse(A).mH
+    if torch.is_grad_enabled():
+        # torch's derivative in grad mode (double backward): the SVD formula for |det| < 100 eps, whose cofactor
+        # is right on a singular matrix, where det * A^-H is 0. The check is a host sync, in grad mode only.
+        singular = det.abs() < 100 * torch.finfo(A.dtype).eps
+        if _tracing(A):
+            # no host read in a traced graph: both formulas, selected per matrix; the cofactor of a singular matrix
+            # is taken on the identity instead, so its non-finite inverse does not reach where's derivative
+            mask = singular[..., None, None]
+            safe = torch.where(mask, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device), A)
+            cofactor = (grad * det)[..., None, None] * inverse(safe).mH
+            return torch.where(mask, _det_grad_singular(A, grad), cofactor)
+        if bool(singular.any()):
+            return torch.where(singular[..., None, None], _det_grad_singular(A, grad), cofactor)
+    return cofactor
 
 
 def _det_grad_singular(A, grad):
@@ -856,6 +887,80 @@ class Slogdet(torch.autograd.Function):
         return grad[..., None, None] * InvEx.apply(A, False)[0].mH
 
 
+def _below_autograd(op, *args, **kwargs):
+    """``op`` at the key below autograd: the native kernel (Habana's on ``hpu``), a plain node to a tracer."""
+    with torch._C._AutoDispatchBelowAutograd():
+        return op(*args, **kwargs)
+
+
+def _plain_inverse(A):
+    """``A^-1`` through the public op: in a traced backward, whatever route ``linalg.inv_ex`` takes."""
+    return torch.linalg.inv_ex(A)[0]
+
+
+class _TracedSolveEx(torch.autograd.Function):
+    """A traced ``_linalg_solve_ex`` that ``takes`` declined (``_kernels``' ``traced``): the op's own forward, torch's
+    backward from ``A`` and ``X`` (``gB = solve(A^H, g)``, ``gA = -gB X^H``), never from ``LU`` and ``pivots``,
+    which the node may return as placeholders at run time."""
+
+    @staticmethod
+    def forward(ctx, op, A, B, left, check_errors):
+        X, LU, pivots, info = _below_autograd(op, A, B, left=left, check_errors=check_errors)
+        ctx.save_for_backward(A, X)
+        ctx.left = left
+        ctx.vector = _is_vector_rhs(A, B)
+        ctx.B_shape = B.shape
+        ctx.mark_non_differentiable(LU, pivots, info)
+        return X, LU, pivots, info
+
+    @staticmethod
+    def backward(ctx, grad, *_):
+        A, X = ctx.saved_tensors
+        gB = torch.linalg.solve(A.mH, grad, left=ctx.left)
+        gA = None
+        if ctx.needs_input_grad[1]:
+            g, x = (gB.unsqueeze(-1), X.unsqueeze(-1)) if ctx.vector else (gB, X)
+            gA = (-(g @ x.mH) if ctx.left else -(x.mH @ g)).sum_to_size(A.shape)
+        return None, gA, gB.sum_to_size(ctx.B_shape), None, None
+
+
+class _TracedDet(torch.autograd.Function):
+    """A traced ``_linalg_det`` that ``takes`` declined: the op's forward, ``Det``'s backward through the public
+    inverse, never from ``LU`` and ``pivots`` (see ``_TracedSolveEx``)."""
+
+    @staticmethod
+    def forward(ctx, op, A):
+        det, LU, pivots = _below_autograd(op, A)
+        ctx.save_for_backward(A, det)
+        ctx.mark_non_differentiable(LU, pivots)
+        return det, LU, pivots
+
+    @staticmethod
+    def backward(ctx, grad, *_):
+        A, det = ctx.saved_tensors
+        return None, _det_backward(A, det, grad, _plain_inverse)
+
+
+class _TracedSlogdet(torch.autograd.Function):
+    """A traced ``_linalg_slogdet`` that ``takes`` declined: the op's forward, ``Slogdet``'s backward
+    (``g A^-H``) through the public inverse, never from ``LU`` and ``pivots`` (see ``_TracedSolveEx``)."""
+
+    @staticmethod
+    def forward(ctx, op, A):
+        sign, logabsdet, LU, pivots = _below_autograd(op, A)
+        ctx.save_for_backward(A)
+        ctx.mark_non_differentiable(LU, pivots)
+        ctx.set_materialize_grads(False)
+        return sign, logabsdet, LU, pivots
+
+    @staticmethod
+    def backward(ctx, _sign, grad, *_):
+        if grad is None:  # only sign was used: real sign has no gradient
+            return None, None
+        (A,) = ctx.saved_tensors
+        return None, grad[..., None, None] * _plain_inverse(A).mH
+
+
 def install_inv_det(device_type):
     """``linalg.inv``/``inv_ex``, ``det`` and ``slogdet`` on ``device_type`` from the masked LU and two triangular
     matmuls. Returns an undo."""
@@ -863,7 +968,8 @@ def install_inv_det(device_type):
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
         takes = _tpc_takes(device_type, _takes(device_type, name), large=True)
-        groups.append(_kernels(device_type, op, name, function, takes, backend=name == "inv"))
+        traced = {"det": _TracedDet, "slogdet": _TracedSlogdet}.get(name)
+        groups.append(_kernels(device_type, op, name, function, takes, backend=name == "inv", traced=traced))
     return register_paired(device_type, groups)
 
 
