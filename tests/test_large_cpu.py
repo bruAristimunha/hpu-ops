@@ -53,7 +53,7 @@ def test_replica_contract(n):
     A = permuted(2, n)
     R, P, Q, D, S = (torch.from_numpy(np.stack(o)) for o in zip(*[kr.gj_large(a.numpy()) for a in A]))
     assert R.shape == (2, n, 64 * ((n + 63) // 64)) and torch.all(R[..., n:] == 0)
-    rows = R[..., :n].gather(1, P.long()[..., None].expand(2, n, n)) / D[..., None]
+    rows = R[..., :n].gather(1, P.long()[..., None].expand(2, n, n))
     inv = rows.gather(2, Q.long()[:, None, :].expand(2, n, n))
     assert rel(inv, torch.linalg.inv(A.double())) < 1e-5
     assert torch.equal(Q.long(), P.long().argsort(-1))
@@ -199,18 +199,3 @@ def test_batch_threshold_counts_the_broadcast_batch(monkeypatch):
     assert takes(A, torch.empty(1, n, 3)) is False
     assert takes(A[0], torch.empty(tpc.LARGE_MIN_BATCH, n, 1)) is True  # 2-D A
 
-
-def test_division_by_a_huge_pivot_never_uses_a_subnormal_reciprocal(replica, monkeypatch):
-    """Measured on Gaudi2: Y / 1e38 multiplied by a flushed reciprocal and zeroed the row. Emulate that division."""
-    real_div = torch.Tensor.__truediv__
-
-    def card_div(a, b):
-        r = 1.0 / b if isinstance(b, torch.Tensor) else 1.0 / torch.tensor(b)
-        r = torch.where(r.abs() < 2.0 ** -126, 0.0, r)
-        return a * r
-
-    monkeypatch.setattr(torch.Tensor, "__truediv__", card_div)
-    A = huge_pivot()[None]
-    X, _, _ = tpc.gj_inv(A)
-    monkeypatch.setattr(torch.Tensor, "__truediv__", real_div)
-    assert rel(X, torch.linalg.inv(A.double())) < 1e-5

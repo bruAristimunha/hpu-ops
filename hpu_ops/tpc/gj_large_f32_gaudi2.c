@@ -4,8 +4,8 @@
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
  *   A [n, n, batch]   f32
- *   R [w, n, batch]   f32, w = 64 * ceil(n / 64): the in-place result, A^-1 = (R[P, :] / D[:, None])[:, Q] (lanes
- *                     >= n are 0); the caller does the gathers and the division by the pivots
+ *   R [w, n, batch]   f32, w = 64 * ceil(n / 64): the in-place result, A^-1 = R[P, :][:, Q] (lanes >= n are 0);
+ *                     each row is divided by its pivot at the end, the caller does the gathers
  *   P [n, batch]      f32: p_k, the row taken as the k-th pivot (exact integers)
  *   Q [n, batch]      f32: the inverse permutation, Q[p_k] = k
  *   D [n, batch]      f32: the k-th pivot (U's diagonal of P A = L U)
@@ -14,7 +14,7 @@
  * NaN counts as 0, so the order stays a permutation), stores 1 at (p, k) and leaves the rest of row p unnormalized;
  * every other row i gets q_i = -R[i][k] / pivot at (i, k) and q_i times the pivot row added elsewhere (LU-style, as
  * gj_solve: nothing is scaled by 1 / pivot, small quotients are carried scaled by 2^64, huge pivots scaled by 2^-64).
- * So column k of the storage ends up holding column p_k of the transform T with T A = diag(D) in rows p_k. The pivot
+ * So column k of the storage ends up holding column p_k of the transform T with T A = diag(D) in rows p_k, and dividing row p_k by D[k] gives T A = (rows p_k = e_k). The pivot
  * row of step k + 1 is found and copied to local memory during the pass of step k, so each step is one
  * read-modify-write pass over the rows. A zero pivot makes its step a no-op (info set). One ASO per pass: a vector
  * load after a vector store to the same address is not coherent without it. LUT-free (lane broadcast, Newton
@@ -28,7 +28,7 @@
 #else
 #define NR 1
 #endif
-#define CACHE 240  // vectors of local memory for the first rows (60 KB)
+#define CACHE 232  // vectors of local memory for the first rows (58 KB; VA = 8 spills past it)
 
 __local__ float64 cache[CACHE];  // row i < RC, vector v at cache[i * VA + v]
 __local__ float64 nwl[VA];       // the next pivot row, spilled once per step for its lanes k, k + 1
@@ -38,6 +38,7 @@ __local__ float64 used[VA];      // lane i % 64 of used[i / 64]: 1 once row i wa
 __local__ float64 dvv[VA];
 __local__ float64 pvv[VA];
 __local__ float64 qvv[VA];
+__local__ float64 drv[VA];  // lane i % 64 of drv[i / 64]: the pivot of the step that took row i
 
 static inline float64 lane_bcast(float64 v, int k)
 {
@@ -125,6 +126,7 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
             dvv[v] = 0.0f;
             pvv[v] = 0.0f;
             qvv[v] = 0.0f;
+            drv[v] = 0.0f;
             nw[v] = 0.0f;
         }
         float64 infov = 0.0f;
@@ -207,6 +209,7 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                 float64 rowid = v_f32_add_b(lanef, (float)(64 * v));
                 used[v] = v_f32_sel_eq_f32_b(rowid, p, 1.0f, used[v]);
                 qvv[v] = v_f32_sel_eq_f32_b(rowid, p, (float)k, qvv[v]);
+                drv[v] = v_f32_sel_eq_f32_b(rowid, p, pk, drv[v]);
                 zl[v] = v == vk ? (unsigned)lk : 64u;
                 pw[v] = v_f32_sel_eq_u32_b(lane, zl[v], 1.0f, nw[v]);
                 pws[v] = v_f32_sel_less_u32_b(v_u32_and_b(as_uint64(pw[v]), 0x7FFFFFFFu), 0x7F800000u,
@@ -314,14 +317,26 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
             aso(SW_VPU);
         }
 
-        // the cached rows to R
-        for (int i = 0; i < RC; i++)
+        // Each row divided by its pivot (as gj_solve's B / diag(D)): |pivot| >= 2^64 scaled by 2^-64 first, so its
+        // reciprocal is never subnormal; a zero pivot gives a zero row. Cached rows from local memory, the others
+        // re-read (after the last step's ASO) and written back.
+#pragma unroll
+        for (int v = 0; v < VA; v++)
         {
+            float64 ds = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(drv[v]), 0x7FFFFFFFu), 0x5F800000u, 0x1p-64f, 1.0f);
+            pwl[v] = ds;
+            pwsl[v] = lut_free_recip(v_f32_mul_b(drv[v], ds));
+        }
+        for (int i = 0; i < n; i++)
+        {
+            const float64 ds = lane_bcast(pwl[i / 64], i % 64);
+            const float64 dinv = lane_bcast(pwsl[i / 64], i % 64);
 #pragma unroll
             for (int v = 0; v < VA; v++)
             {
                 int5 c = {64 * v, i, bt, 0, 0};
-                v_f32_st_tnsr(c, R, cache[i * VA + v]);
+                float64 y = i < RC ? cache[i * VA + v] : v_f32_ld_tnsr_b(c, R);
+                v_f32_st_tnsr(c, R, v_f32_mul_b(v_f32_mul_b(y, ds), dinv));
             }
         }
 #pragma unroll

@@ -625,18 +625,14 @@ def large_factors(A):
 def _large(A, B=None):
     """``(X, D, S)`` of the in-place Gauss-Jordan kernel for ``A[b, n, n]`` (64 < n <= ``LARGE_MAXN``): ``X =
     A^-1`` (``B`` None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel
-    leaves the pivot rows unnormalized: ``A^-1 = (R[P, :] / D[:, None])[:, Q]``, and ``A^-1 B = (R @ B[P])[P] /
-    D[:, None]`` (with ``Q = P^-1``, ``R[:, Q] @ B = R @ B[P]``). The division is torch's, so a pivot near the float32
-    range's ends is never inverted in the kernel; a zero pivot gives a zero row (info is set)."""
+    divides each row by its pivot at the end: ``A^-1 = R[P, :][:, Q]``, and ``A^-1 B = (R @ B[P])[P]`` (with ``Q =
+    P^-1``, ``R[:, Q] @ B = R @ B[P]``); a zero pivot gives a zero row (info is set)."""
     n = A.shape[-1]
     R, P, Q, D, S, nan = _large_raw(A)
     R = R[..., :n]
-    zero = D == 0
+    # the kernel divides each row by its pivot itself (a torch division by a pivot of 1e38 zeroed the row in lazy mode:
+    # the card's division multiplies by a reciprocal, subnormal hence flushed, and a 2^-64 prescale was folded away)
     Y = _rows(R, P) if B is None else _rows(R @ _rows(B, P), P)
-    # |pivot| >= 2^64: numerator and pivot scaled by 2^-64 (exact) first, as the kernels do, since the card's division
-    # multiplies by a reciprocal that is subnormal, hence flushed, past 2^126 (measured: a 1e38 pivot zeroed its row)
-    s = torch.where(D.abs() >= 2.0 ** 64, 2.0 ** -64, 1.0)
-    Y = ((Y * s[..., None]) / torch.where(zero, 1.0, D * s)[..., None]).masked_fill(zero[..., None], 0.0)
     if B is None:
         # no Newton step: on the kernel's float32 replica it gained little at condition <= 1e4 and lost past 1e6
         # (n = 220, condition 1e7: 6.8e-2 against 4.5e-2 without, LAPACK 4.7e-2)

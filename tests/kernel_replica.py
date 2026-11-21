@@ -231,6 +231,11 @@ def gj_large(A, legacy=False):
             cand = np.where(used, F32(-1), np.abs(R[:, k + 1]))
             p = pick(cand)
             nw = R[p].copy()
+    if not legacy:  # each row divided by its pivot: |pivot| >= 2^64 scaled by 2^-64 first
+        dr = np.zeros(n, F32)
+        dr[P.astype(int)] = D
+        ds = _scale(dr)
+        R = mul(mul(R, ds[:, None]), recip(mul(dr, ds), zero_to_inf=False)[:, None])
     return R, P, Q, D, np.array([0, info], F32)
 
 
