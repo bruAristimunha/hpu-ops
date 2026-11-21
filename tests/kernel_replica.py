@@ -660,3 +660,466 @@ def householder_product(A, tau, legacy=False):
             e = np.where(lanes == i, F32(1), F32(0)).astype(F32)
             q[i] = add(e, ntv) if legacy or tau_i != 0 else e
     return np.stack([x[:m] for x in q], 1)
+
+
+# ---- complex64 kernels (planar re/im rows): cgj_solve / cgj_inv ----------------------------------------------------
+# LUT-free throughout (lut_free_recip, rsqrt_fine, power-of-two scaling), so these replays are
+# meant to be bit-identical to the card.
+
+
+def _nonfinite(*xs):
+    return any(bool(np.any((_u32(np.asarray(x, F32)) & 0x7F800000) == 0x7F800000)) for x in xs)
+
+
+def _pow2_scale(m):
+    """``pow2_scale``: 2^(127 - e) for the biased exponent e of m (1 for m = 0)."""
+    e = (_u32(m) >> 23) & 0xFF
+    return np.where(e == 0, F32(1), _f32(((254 - e) & 0xFFFFFFFF) << 23)).astype(F32)
+
+
+def _pow2_unscale(m):
+    e = _u32(m) & 0x7F800000
+    return np.where(e == 0, F32(1), _f32(e)).astype(F32)
+
+
+def _big_scale(m):
+    return np.where((_u32(m) & 0x7FFFFFFF) >= 0x5F800000, F32(2.0 ** -64), F32(1)).astype(F32)
+
+
+def rsqrt_fine(x):
+    """``rsqrt_fine`` of the Jacobi kernels: 0 -> 1, the guess, two Newton steps, then one in residual form
+    y += y/2 (1 - (x y) y) with the product in an FMA, so the result is unbiased (rsqrt(1) = 1; the plain three-step
+    form returned 0.99999994 there, which shrank every rotation by an ulp)."""
+    x = np.where(np.asarray(x, F32) == 0, F32(1), np.asarray(x, F32)).astype(F32)
+    y = _f32((0x5F375A86 - (_u32(x) >> 1)) & 0xFFFFFFFF)
+    hx = mul(x, F32(-0.5))
+    for _ in range(2):
+        y = mul(y, mac(hx, mul(y, y), F32(1.5)))
+    e = mac(sub(F32(0), mul(x, y)), y, F32(1))
+    return mac(mul(y, F32(0.5)), e, y)
+
+
+def _cneg_recip_parts(pr, pi, pm):
+    """The kernel's -1/p, with the 2^-64 prescale: (scale, psr, psi, ninvr, ninvi)."""
+    scale = _big_scale(pm)
+    psr, psi = mul(pr, scale), mul(pi, scale)
+    t = _pow2_scale(mul(pm, scale))
+    tr, ti = mul(psr, t), mul(psi, t)
+    rt = mul(recip(mac(ti, ti, mul(tr, tr)), zero_to_inf=False), t)
+    return scale, psr, psi, mul(sub(F32(0), tr), rt), mul(ti, rt)
+
+
+def cgj_solve(A, B=None):
+    with np.errstate(all="ignore"):
+        return _cgj_solve(A, B)
+
+
+def _cgj_solve(A, B=None):
+    """``(X, D, S)`` of cgj_solve_f32_gaudi2.c (cgj_inv with ``B=None``) for one planar ``A[2n, n]`` (rows 0..n-1
+    real parts, n..2n-1 imaginary parts) and ``B[2n, m]``; ``X[2n, m]``, ``D[3, n]`` (pivot re, im, abs), ``S[4]``
+    (phase re, im, info, (-1)^swaps)."""
+    A = np.array(A, dtype=F32)
+    n = A.shape[1]
+    ar, ai = _ftz(A[:n].copy()), _ftz(A[n:].copy())
+    if B is None:
+        br, bi = np.eye(n, dtype=F32), np.zeros((n, n), F32)
+    else:
+        B = np.array(B, dtype=F32)
+        br, bi = _ftz(B[:n].copy()), _ftz(B[n:].copy())
+    m = br.shape[1]
+    if _nonfinite(A) or (B is not None and _nonfinite(B)):
+        return np.full((2 * n, m), np.nan, F32), np.full((3, n), np.nan, F32), np.full(4, np.nan, F32)
+    dvr, dvi = np.zeros(n, F32), np.zeros(n, F32)
+    sv, info = F32(1), F32(0)
+    for k in range(n):
+        colr, coli = ar[:, k].copy(), ai[:, k].copy()
+        cand = add(np.abs(colr), np.abs(coli))
+        cand[:k] = -1
+        top = max(F32(0), np.max(cand))
+        hits = np.nonzero(cand == top)[0]
+        p = int(hits[0]) if hits.size else k
+        if p != k:
+            for x in (ar, ai, br, bi):
+                x[[k, p]] = x[[p, k]]
+            colr[[k, p]], coli[[k, p]] = colr[[p, k]], coli[[p, k]]
+            sv = -sv
+        pr, pi = ar[k, k], ai[k, k]
+        dvr[k], dvi[k] = pr, pi
+        pm = max(abs(pr), abs(pi))
+        if pm == 0 and info == 0:
+            info = F32(k + 1)
+        scale, psr, psi, ninvr, ninvi = _cneg_recip_parts(pr, pi, pm)
+        csr, csi = mul(colr, scale), mul(coli, scale)
+        qr = mac(sub(F32(0), csi), ninvi, mul(csr, ninvr))
+        qi = mac(csi, ninvr, mul(csr, ninvi))
+        rr = mac(sub(F32(0), qi), psi, mac(qr, psr, csr))
+        ri = mac(qi, psr, mac(qr, psi, csi))
+        qr = mac(sub(F32(0), ri), ninvi, mac(rr, ninvr, qr))
+        qi = mac(ri, ninvr, mac(rr, ninvi, qi))
+        nqi = sub(F32(0), qi)
+        apr, api, bpr, bpi = ar[k].copy(), ai[k].copy(), br[k].copy(), bi[k].copy()
+        for i in range(n):
+            if i != k:
+                ar[i] = mac(api, nqi[i], mac(apr, qr[i], ar[i]))
+                ai[i] = mac(apr, qi[i], mac(api, qr[i], ai[i]))
+                br[i] = mac(bpi, nqi[i], mac(bpr, qr[i], br[i]))
+                bi[i] = mac(bpr, qi[i], mac(bpi, qr[i], bi[i]))
+    dm = np.maximum(np.abs(dvr), np.abs(dvi)).astype(F32)
+    dscale = _big_scale(dm)
+    dms = mul(dm, dscale)
+    t, inv_t = _pow2_scale(dms), _pow2_unscale(dms)
+    tr, ti = mul(mul(dvr, dscale), t), mul(mul(dvi, dscale), t)
+    den = mac(ti, ti, mul(tr, tr))
+    rt = mul(recip(den, zero_to_inf=False), t)
+    invr, invi = mul(tr, rt), mul(sub(F32(0), ti), rt)
+    rs = rsqrt_fine(den)
+    # |t| = den * rsqrt(den), then one residual step sq += rs/2 ((a - sq)(a + sq) + b^2), a = max(|tr|, |ti|),
+    # b = min: the residual is taken against the components, not the rounded den, so |t| = |tr| exactly when ti = 0
+    ta, tb = np.abs(tr).astype(F32), np.abs(ti).astype(F32)
+    ta, tb = np.maximum(ta, tb).astype(F32), np.minimum(ta, tb).astype(F32)
+    sq = mul(den, rs)
+    sq = mac(mul(rs, F32(0.5)), mac(tb, tb, mul(sub(ta, sq), add(ta, sq))), sq)
+    absd = mul(mul(sq, inv_t), np.where(dscale == 1, F32(1), F32(2.0 ** 64)).astype(F32))
+    # u = t / |t|: q = t rs, then one division residual step q += rs (t - q |t|) (u = 1 exactly for a positive pivot)
+    ur, ui = mul(tr, rs), mul(ti, rs)
+    ur = mac(mac(sub(F32(0), ur), sq, tr), rs, ur)
+    ui = mac(mac(sub(F32(0), ui), sq, ti), rs, ui)
+    X = np.zeros((2 * n, m), F32)
+    for i in range(n):
+        bsr, bsi = mul(br[i], dscale[i]), mul(bi[i], dscale[i])
+        X[i] = mac(sub(F32(0), bsi), invi[i], mul(bsr, invr[i]))
+        X[n + i] = mac(bsi, invr[i], mul(bsr, invi[i]))
+    phr, phi = F32(sv), F32(0)
+    for k in range(n):
+        phr, phi = mac(sub(F32(0), phi), ui[k], mul(phr, ur[k])), mac(phi, ur[k], mul(phr, ui[k]))
+    pn = rsqrt_fine(mac(phi, phi, mul(phr, phr)))
+    phr, phi = mul(phr, pn), mul(phi, pn)
+    return X, np.stack([dvr, dvi, absd]), np.array([phr, phi, info, sv], F32)
+
+
+def cgj_op(identity=False):
+    """A stand-in for ``torch.ops.linalg_tpc.cgj_solve`` (``cgj_inv`` with ``identity``): the replica per batch
+    element on the planar tensors, torch tensors out."""
+    import torch
+
+    def op(A, B=None):
+        outs = [cgj_solve(a.detach().cpu().numpy(), None if identity else b.detach().cpu().numpy())
+                for a, b in zip(A, A if identity else B)]
+        return tuple(torch.from_numpy(np.stack([o[j] for o in outs])) for j in range(3))
+
+    return (lambda A: op(A)) if identity else op
+
+
+# ---- complex64 Jacobi: jacobi_ceigh (two passes) and jacobi_csvd ---------------------------------------------------
+# Planar rows, two matrices per vector (lanes 0-31 and 32-63) on the card; one matrix at a time here (the halves never
+# mix: every reduction is the 32-lane butterfly ``_red_add``). LUT-free: rsqrt_fine / lut_free_recip.
+
+
+def _rr_rounds(n):
+    """Round-robin rounds of the kernels (``RR_PAIR``): disjoint pairs per round, so their order within a round does
+    not change the result."""
+    return [_rr_pairs(r, n) for r in range(((n + 1) & ~1) - 1)]
+
+
+def _crot_coeffs(ur, ui, p, q, skip_tol=None):
+    """The complex one-sided Jacobi rotation of rows p, q: the real rotation of (p, e q) with e = <p, q> / |<p, q>|,
+    so p' = c p - s e q and q' = s p + c e q are orthogonal. Returns the coefficients ``_capply`` uses."""
+    upr, upi, uqr, uqi = ur[p], ui[p], ur[q], ui[q]
+    alpha = _red_add(mac(upi, upi, mul(upr, upr)))
+    beta = _red_add(mac(uqi, uqi, mul(uqr, uqr)))
+    gr = _red_add(mac(upi, uqi, mul(upr, uqr)))
+    gi = _red_add(mac(sub(F32(0), upr), uqi, mul(upi, uqr)))
+    # |g| and e = g / |g| from g scaled by a power of two into [1, 2): squaring the raw parts flushed a tiny one
+    # (|e| came out 2.6 on a rank-deficient matrix); g = 0 gives e = 0 (and the rotation is skipped)
+    gm = max(np.abs(gr), np.abs(gi))
+    t = _pow2_scale(gm)
+    grt, git = mul(gr, t), mul(gi, t)
+    n2 = mac(git, git, mul(grt, grt))
+    rn = rsqrt_fine(n2)
+    ag = mul(mul(n2, rn), _pow2_unscale(gm))
+    er, ei = mul(grt, rn), mul(git, rn)
+    g2s = mul(ag, ag)
+    d = sub(beta, alpha)
+    g2 = add(ag, ag)
+    r2 = mac(g2, g2, mul(d, d))
+    inv_r = rsqrt_fine(r2)
+    c2 = mul(F32(0.5), mac(np.abs(d), inv_r, F32(1)))
+    inv_c = rsqrt_fine(c2)
+    c = mul(c2, inv_c)
+    s = mul(ag, mul(inv_r, inv_c))
+    s = sub(F32(0), s) if d < 0 else s
+    skip = g2s == 0 or r2 == 0
+    if skip_tol is not None:  # the SVD's rule: |g|^2 <= tol alpha beta, or r2 < 1e-34
+        skip = skip or not mul(F32(skip_tol), mul(alpha, beta)) < g2s or r2 < F32(1e-34)
+    if skip:
+        c, s, er, ei = F32(1), F32(0), F32(1), F32(0)
+    cer, cei, ser, sei = mul(c, er), mul(c, ei), mul(s, er), mul(s, ei)
+    return c, s, cer, cei, sei, sub(F32(0), ser), sub(F32(0), sei), sub(F32(0), cei)
+
+
+def _capply(ur, ui, p, q, co):
+    c, s, cer, cei, sei, nser, nsei, ncei = co
+    upr, upi, uqr, uqi = ur[p].copy(), ui[p].copy(), ur[q].copy(), ui[q].copy()
+    ur[p] = mac(uqi, sei, mac(uqr, nser, mul(upr, c)))
+    ui[p] = mac(uqr, nsei, mac(uqi, nser, mul(upi, c)))
+    ur[q] = mac(uqi, ncei, mac(uqr, cer, mul(upr, s)))
+    ui[q] = mac(uqr, cei, mac(uqi, cer, mul(upi, s)))
+
+
+def _csweeps(ur, ui, n, sweeps):
+    for _ in range(sweeps):
+        for pairs_ in _rr_rounds(n):
+            for p, q in pairs_:
+                _capply(ur, ui, p, q, _crot_coeffs(ur, ui, p, q))
+
+
+def _cnormalize(ur, ui, n):
+    for j in range(n):
+        rn = rsqrt_fine(_red_add(mac(ui[j], ui[j], mul(ur[j], ur[j]))))
+        ur[j], ui[j] = mul(ur[j], rn), mul(ui[j], rn)
+
+
+def _prescale(max_abs):
+    """The real eigh kernel's prescale / inv_prescale from max|a|."""
+    pre = F32(2.0 ** -20) if max_abs > F32(1e33) else F32(1)
+    inv = F32(2.0 ** 20) if max_abs > F32(1e33) else F32(1)
+    if max_abs < F32(1e-20):
+        pre, inv = (pre, inv) if max_abs == 0 else (F32(2.0 ** 40), F32(2.0 ** -40))
+    return pre, inv
+
+
+def _safe_inv_sigma(sigma, hi):
+    safe = F32(1) if (sigma == 0 or sigma > F32(hi) or sigma < F32(1e-37)) else sigma
+    return recip(safe, zero_to_inf=False)[0]
+
+
+def _pad32(x):
+    out = np.zeros((x.shape[0], 32), F32)
+    out[:, :x.shape[1]] = x
+    return out
+
+
+def ceigh_pass1(A):
+    """``(V1, H)`` of jacobi_ceigh_f32_gaudi2.c for one planar ``A[2n, n]``: H the Hermitian matrix of A's lower
+    triangle (the imaginary parts of the diagonal dropped), V1 the rows u_j = x_j^H (planar ``[2n, n]``) of the
+    eigenvectors of S = H/sigma + 1.001 I after one-sided Jacobi, normalized. Non-finite input: NaN."""
+    with np.errstate(all="ignore"):
+        A = np.array(A, dtype=F32)
+        n = A.shape[1]
+        ar, ai = _pad32(_ftz(A[:n])), _pad32(_ftz(A[n:]))
+        hr, hi = np.zeros_like(ar), np.zeros_like(ai)
+        for i in range(n):
+            for j in range(n):
+                if j < i:
+                    hr[i, j], hi[i, j] = ar[i, j], ai[i, j]
+                elif j > i:
+                    hr[i, j], hi[i, j] = ar[j, i], sub(F32(0), ai[j, i])
+                else:
+                    hr[i, j] = ar[i, i]
+        H = np.concatenate([hr[:, :n], hi[:, :n]])
+        if _nonfinite(H):
+            return np.full((2 * n, n), np.nan, F32), np.full((2 * n, n), np.nan, F32)
+        max_abs = max(F32(np.max(np.abs(hr))), F32(np.max(np.abs(hi))))
+        pre, _ = _prescale(max_abs)
+        ur, ui = mul(hr, pre), mul(hi, pre)
+        sigma = F32(0)
+        for i in range(n):
+            sigma = max(sigma, _red_add(add(np.abs(ur[i]), np.abs(ui[i]))))
+        inv_sigma = _safe_inv_sigma(sigma, 1e35)
+        ur, ui = mul(ur, inv_sigma), mul(ui, inv_sigma)
+        for i in range(n):
+            ur[i, i] = add(ur[i, i], F32(1.001))
+        sweeps = 4 if n <= 4 else 8 if n <= 16 else 9 if n <= 22 else 10
+        _csweeps(ur, ui, n, sweeps)
+        _cnormalize(ur, ui, n)
+        return np.concatenate([ur[:n, :n], ui[:n, :n]]), H
+
+
+def _crow_combo(wr, wi, Mr, Mi, n):
+    """sum_i w[i] M_i for the complex row w and planar rows M (the kernels' order: re*Mr, -im*Mi, re*Mi, im*Mr)."""
+    yr, yi = np.zeros(32, F32), np.zeros(32, F32)
+    for i in range(n):
+        br, bi = wr[i], wi[i]
+        nbi = sub(F32(0), bi)
+        yr = mac(Mi[i], nbi, mac(Mr[i], br, yr))
+        yi = mac(Mr[i], bi, mac(Mi[i], br, yi))
+    return yr, yi
+
+
+def ceigh_pass2(H, V1):
+    """``(W, V)`` of jacobi_ceigh_refine_f32_gaudi2.c for one planar Hermitian ``H[2n, n]`` and the pass-1 rows
+    ``V1[2n, n]``: T = V1 (H * prescale) V1^H, adaptive shift max(0, 0.01 - g_min / sigma_T), 2/4 sweeps, rows
+    composed with V1 and renormalized; W the Rayleigh quotients u_j H u_j^H (unsorted)."""
+    with np.errstate(all="ignore"):
+        H, V1 = np.array(H, dtype=F32), np.array(V1, dtype=F32)
+        n = H.shape[1]
+        if _nonfinite(H) or _nonfinite(V1):
+            return np.full(n, np.nan, F32), np.full((2 * n, n), np.nan, F32)
+        hr0, hi0 = _pad32(H[:n]), _pad32(H[n:])
+        vr, vi = _pad32(V1[:n]), _pad32(V1[n:])
+        max_abs = max(F32(np.max(np.abs(hr0))), F32(np.max(np.abs(hi0))))
+        pre, inv_pre = _prescale(max_abs)
+        hr, hi = mul(hr0, pre), mul(hi0, pre)
+        ur, ui = np.zeros((n, 32), F32), np.zeros((n, 32), F32)
+        for j in range(n):
+            yr, yi = _crow_combo(vr[j], vi[j], hr, hi, n)
+            for l in range(n):
+                ur[j, l] = _red_add(mac(yi, vi[l], mul(yr, vr[l])))
+                ui[j, l] = _red_add(mac(sub(F32(0), yr), vi[l], mul(yi, vr[l])))
+        sigma, g_min = F32(0), F32(0)
+        for i in range(n):
+            row_sum = _red_add(add(np.abs(ur[i]), np.abs(ui[i])))
+            sigma = max(sigma, row_sum)
+            dg = ur[i, i]
+            g = sub(add(dg, np.abs(dg)), row_sum)
+            g_min = g if i == 0 else min(g_min, g)
+        inv_sigma = _safe_inv_sigma(sigma, 1e36)
+        shift = max(F32(0), sub(F32(0.01), mul(g_min, inv_sigma)))
+        ur, ui = mul(ur, inv_sigma), mul(ui, inv_sigma)
+        for i in range(n):
+            ur[i, i] = add(ur[i, i], shift)
+        _csweeps(ur, ui, n, 2 if n <= 4 else 4)
+        _cnormalize(ur, ui, n)
+        fr, fi = np.zeros((n, 32), F32), np.zeros((n, 32), F32)
+        for j in range(n):
+            fr[j], fi[j] = _crow_combo(ur[j], ui[j], vr, vi, n)
+        _cnormalize(fr, fi, n)
+        W = np.zeros(n, F32)
+        for j in range(n):
+            yr, yi = _crow_combo(fr[j], fi[j], hr, hi, n)
+            W[j] = mul(_red_add(mac(yi, fi[j], mul(yr, fr[j]))), inv_pre)
+        return W, np.concatenate([fr[:, :n], fi[:, :n]])
+
+
+def ceigh(A):
+    """Both passes on one planar ``A[2n, n]``: ``(W unsorted, V planar rows)``."""
+    V1, H = ceigh_pass1(A)
+    return ceigh_pass2(H, V1)
+
+
+def _cdot(ar_, ai_, br_, bi_):
+    """<a, b> = sum a conj(b): (re, im) by the 32-lane butterfly."""
+    return (_red_add(mac(ai_, bi_, mul(ar_, br_))), _red_add(mac(sub(F32(0), ar_), bi_, mul(ai_, br_))))
+
+
+def _caxpy_neg(xr, xi, dr, di, ur_, ui_):
+    """x - d u for the complex scalar d."""
+    ndr, ndi = sub(F32(0), dr), sub(F32(0), di)
+    return mac(ui_, di, mac(ur_, ndr, xr)), mac(ur_, ndi, mac(ui_, ndr, xi))
+
+
+def csvd_kernel(A_t, compute_uv=True, polish=True):
+    """``(Wn, S, J)`` of jacobi_csvd_f32_gaudi2.c (jacobi_csvdvals with ``compute_uv=False``: S alone) for one planar
+    ``A_t[2k, big]`` (k <= big <= 32): one-sided Jacobi on the k complex rows, A_t = J^H diag(S) Wn with Wn's rows
+    orthonormal (rows of tiny norm completed by complex MGS) and J [2k, k] unitary rows. S unsorted."""
+    with np.errstate(all="ignore"):
+        A_t = np.array(A_t, dtype=F32)
+        k, big = A_t.shape[0] // 2, A_t.shape[1]
+        if _nonfinite(A_t):
+            nan = np.full
+            return (nan((2 * k, big), np.nan, F32) if compute_uv else None, nan(k, np.nan, F32),
+                    nan((2 * k, k), np.nan, F32) if compute_uv else None)
+        wr, wi = _pad32(_ftz(A_t[:k])), _pad32(_ftz(A_t[k:]))
+        vr, vi = np.eye(k, 32, dtype=F32), np.zeros((k, 32), F32)
+        sigma = max(F32(np.max(np.abs(wr))), F32(np.max(np.abs(wi))))
+        pre = F32(1e-4) if F32(1e35) < sigma else F32(1)
+        safe_sigma = F32(1) if sigma == 0 else sigma
+        inv = recip(mul(safe_sigma, pre), zero_to_inf=False)[0]
+        wr, wi = mul(mul(wr, pre), inv), mul(mul(wi, pre), inv)
+        ar_, ai_ = wr.copy(), wi.copy()  # the scaled A_t, for W = J A_t after J is reorthonormalized
+        sweeps = 6 if k <= 4 else 10 if k <= 16 else 12
+
+        def run(count):
+            for _ in range(count):
+                for pairs_ in _rr_rounds(k):
+                    for p, q in pairs_:
+                        co = _crot_coeffs(wr, wi, p, q, skip_tol=1e-14)
+                        _capply(wr, wi, p, q, co)
+                        if compute_uv:
+                            _capply(vr, vi, p, q, co)
+
+        run(sweeps)
+        if compute_uv and polish:
+            # the accumulated rotations drift from unitary by ~sqrt(#rotations) ulp (5e-6 at k = 16, as in the real
+            # kernel): two MGS passes make J unitary to ~1 ulp, W = J A_t, and two polish sweeps of near-identity
+            # rotations (c rounds to 1) re-orthogonalize W's rows without moving J off the unitary group
+            for _ in range(2):
+                for j in range(k):
+                    for kk in range(j):
+                        dr, di = _cdot(vr[j], vi[j], vr[kk], vi[kk])
+                        vr[j], vi[j] = _caxpy_neg(vr[j], vi[j], dr, di, vr[kk], vi[kk])
+                    rn = rsqrt_fine(_red_add(mac(vi[j], vi[j], mul(vr[j], vr[j]))))
+                    vr[j], vi[j] = mul(vr[j], rn), mul(vi[j], rn)
+            for j in range(k):
+                wr[j], wi[j] = _crow_combo(vr[j], vi[j], ar_, ai_, k)
+            run(2)
+        S, sq_all = np.zeros(k, F32), np.zeros(k, F32)
+        for j in range(k):
+            sq = _red_add(mac(wi[j], wi[j], mul(wr[j], wr[j])))
+            sq_all[j] = sq
+            tiny = sq < F32(1e-36)
+            rn = rsqrt_fine(F32(1) if tiny else sq)
+            S[j] = F32(0) if tiny else mul(mul(sq, rn), safe_sigma)
+            if compute_uv:
+                f = F32(0) if tiny else rn
+                wr[j], wi[j] = mul(wr[j], f), mul(wi[j], f)
+        if not compute_uv:
+            return None, S, None
+        thresh = max(F32(1e-36), mul(F32(1e-10), np.max(sq_all)))
+        done = (~(sq_all < thresh)).astype(F32)
+        diag = np.where(np.arange(32) < big, F32(1), F32(-1)).astype(F32)
+        for j in range(k):
+            ukr, uki = mul(wr[j], done[j]), mul(wi[j], done[j])
+            diag = sub(diag, mac(uki, uki, mul(ukr, ukr)))
+        for j in range(k):
+            c1r, c1i = wr[j].copy(), wi[j].copy()
+            c2r, c2i = np.zeros(32, F32), np.zeros(32, F32)
+            c2r[_first_max(diag)] = 1
+            for _ in range(2):
+                for kk in range(k):
+                    ukr, uki = mul(wr[kk], done[kk]), mul(wi[kk], done[kk])
+                    d1r, d1i = _cdot(c1r, c1i, ukr, uki)
+                    d2r, d2i = _cdot(c2r, c2i, ukr, uki)
+                    c1r, c1i = _caxpy_neg(c1r, c1i, d1r, d1i, ukr, uki)
+                    c2r, c2i = _caxpy_neg(c2r, c2i, d2r, d2i, ukr, uki)
+            cn1 = _red_add(mac(c1i, c1i, mul(c1r, c1r)))
+            cn2 = _red_add(mac(c2i, c2i, mul(c2r, c2r)))
+            cr, ci, cn = (c1r, c1i, cn1) if F32(0.25) < cn1 else (c2r, c2i, cn2)
+            rn = rsqrt_fine(F32(1) if cn < F32(1e-36) else cn)
+            cr, ci = mul(cr, rn), mul(ci, rn)
+            if done[j] == 0:
+                wr[j], wi[j] = cr, ci
+                diag = sub(diag, mac(ci, ci, mul(cr, cr)))
+            done[j] = 1
+        return (np.concatenate([wr[:, :big], wi[:, :big]]), S, np.concatenate([vr[:, :k], vi[:, :k]]))
+
+
+def _torch_op(fn, n_out):
+    import torch
+
+    def op(*tensors):
+        outs = [fn(*[t.detach().cpu().numpy() for t in ts]) for ts in zip(*tensors)]
+        res = tuple(torch.from_numpy(np.stack([o[j] for o in outs])) for j in range(n_out))
+        return res if n_out > 1 else res[0]
+
+    return op
+
+
+def ceigh_op():
+    """Stand-in for ``torch.ops.linalg_tpc.jacobi_ceigh``: planar A [b, 2n, n] -> (V1, H)."""
+    return _torch_op(ceigh_pass1, 2)
+
+
+def ceigh_refine_op():
+    """Stand-in for ``torch.ops.linalg_tpc.jacobi_ceigh_refine``: (H, V1) -> (W, V)."""
+    return _torch_op(ceigh_pass2, 2)
+
+
+def csvd_op():
+    """Stand-in for ``torch.ops.linalg_tpc.jacobi_csvd``: planar A_t [b, 2k, big] -> (Wn, S, J)."""
+    return _torch_op(lambda a: csvd_kernel(a), 3)
+
+
+def csvdvals_op():
+    """Stand-in for ``torch.ops.linalg_tpc.jacobi_csvdvals``: S alone."""
+    return _torch_op(lambda a: (csvd_kernel(a, compute_uv=False)[1],), 1)
