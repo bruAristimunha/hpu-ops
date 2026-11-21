@@ -90,16 +90,58 @@ def test_noncontiguous_input_and_symbolic_length():
     assert calls["group_norm"] and not _symbolic_sizes(nodes)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_16_bit_inputs_compute_in_float32(dtype):
-    """As torch's kernel: statistics in float32, the input dtype back."""
+@pytest.mark.parametrize("dtype, ulps", [(torch.bfloat16, 0), (torch.float16, 1)])
+def test_16_bit_inputs_compute_in_float32(dtype, ulps):
+    """Against torch's own 16-bit kernel: bfloat16 bit for bit, float16 within one ulp (one rounding of the
+    float32 result)."""
     x = torch.randn(4, 8, 33).to(dtype) * 3 + 1
     w, b = torch.rand(8).to(dtype) + 0.5, torch.randn(8).to(dtype)
-    want = F.group_norm(x.float(), 4, w.float(), b.float()).to(dtype)
+    want = F.group_norm(x, 4, w, b)
     with cpu_as_hpu(norm.install_group_norm) as calls:
         got = compiled(lambda x: F.group_norm(x, 4, w, b), [], dynamic=True)(x)
     assert got.dtype == dtype and calls["group_norm"]
-    torch.testing.assert_close(got, want, atol=0, rtol=0)
+    ulp = torch.finfo(dtype).eps * want.float().abs().clamp_min(1)
+    assert bool(((got.float() - want.float()).abs() <= ulps * ulp).all())
+
+
+@pytest.mark.parametrize("which", ["weight", "bias"])
+def test_weight_only_or_bias_only(which):
+    x = torch.randn(3, 6, 5, dtype=torch.float64)
+    kw = {which: torch.rand(6, dtype=torch.float64) + 0.5}
+    f = lambda x: F.group_norm(x, 3, **kw)  # noqa: E731
+    with cpu_as_hpu(norm.install_group_norm) as calls:
+        got = train_step(compiled(f, [], dynamic=True), x)
+    assert_same(got, train_step(f, x), tol=1e-10)
+    assert calls["group_norm"]
+
+
+def test_batch_only_symbolic_training_graph_has_no_symbolic_scalars():
+    """With only the batch symbolic (the issue's case), no op of the forward or backward graph takes a symbolic
+    scalar argument, the kind of value Habana's backend failed on."""
+    m = _module(4, 16)
+    nodes = []
+    with cpu_as_hpu(norm.install_group_norm):
+        g = compiled(m, nodes)
+        for batch in (16, 128):
+            train_step(g, torch.randn(batch, 16, 10, dtype=torch.float64))
+
+    def symbolic_scalar(a):
+        return isinstance(a, (torch.SymInt, torch.SymFloat)) or (
+            isinstance(a, torch.fx.Node) and isinstance(a.meta.get("val"), (torch.SymInt, torch.SymFloat)))
+
+    bad = [n for n in nodes if str(n.target).startswith("aten.") and "sym_size" not in str(n.target)
+           and str(n.target) not in ("aten.view.default", "aten.reshape.default", "aten.expand.default",
+                                     "aten._unsafe_view.default")
+           and any(symbolic_scalar(a) for a in n.args)]
+    assert not bad, [(str(n.target), n.args) for n in bad]
+
+
+def test_wrong_weight_size_raises_torchs_error():
+    """A weight that is not one value per channel: torch's own error, not a broadcast."""
+    f = lambda x: F.group_norm(x, 2, weight=torch.ones(1))  # noqa: E731
+    with cpu_as_hpu(norm.install_group_norm) as calls, pytest.raises(Exception, match="weight"):
+        compiled(f, [], dynamic=True)(torch.randn(3, 4, 5))
+    assert not calls["group_norm"]
 
 
 def test_inference_mode_and_extreme_values():

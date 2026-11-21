@@ -20,7 +20,7 @@ at the tensor's pickling:
   only in its last dim, e.g. TensorCSPNet's default ``(4, 4356)`` stride ``(1, 484)``) keeps the native op.
 - ``group_norm`` with a symbolic size under compile (``norm``, #42) as a reshape into groups, ``var_mean`` and the
   affine terms: with the default dynamic shapes a second batch size traced ``native_group_norm`` with the batch as
-  an int argument, which Habana's backend fails on ("aten::IntImplicit isn't registered in KernelRegistry!":
+  a SymInt argument, and Habana's backend failed ("aten::IntImplicit isn't registered in KernelRegistry!":
   FNIRSCNN1D, NeuroRVQ, SAMBA, SignalJEPA). Static shapes and eager keep Gaudi's kernel.
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).

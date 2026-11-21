@@ -1,7 +1,8 @@
 """Issue #42: bare GroupNorm under torch.compile(backend="hpu_backend"), batch 16 then 128 (and 128 then 16).
 
 Run with PT_HPU_LAZY_MODE=0. PLUGINS=0 runs without hpu-ops and hpu-complex. TRAIN=1 also runs a backward pass
-(affine GroupNorm in train mode) and compares the gradients with the CPU's.
+(affine GroupNorm in train mode) and compares the gradients with the CPU's. VARY_LEN=1 gives the second batch size
+another length too (60 samples, not 100), so the length is symbolic as well.
 """
 import os
 
@@ -37,7 +38,8 @@ module = module.train() if TRAIN else module.eval()
 with torch.no_grad():
     module.weight.uniform_(0.5, 1.5)
     module.bias.uniform_(-0.5, 0.5)
-x = {b: torch.randn(b, CHANNELS, 100) for b in (16, 128)}
+VARY_LEN = os.environ.get("VARY_LEN", "0") == "1"
+x = {b: torch.randn(b, CHANNELS, 60 if VARY_LEN and b == 128 else 100) for b in (16, 128)}
 ref, ref_grads = {}, {}
 for b in x:
     xr = x[b].clone().requires_grad_(TRAIN)
