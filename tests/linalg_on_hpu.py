@@ -1,6 +1,7 @@
 """On a Gaudi card: the linalg composites through their public torch calls, against torch on the CPU in float64.
     PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_on_hpu.py [--baseline]
-Per op and n in 16, 22, 64, 128 (batch 32, float32): forward, and backward where differentiable. The eight kernel ops
+Per op and n in 16, 22, 64, 128, and for solve, inv, det and slogdet also 96, 220, 256 (batch 32, float32): forward,
+and backward where differentiable. The eight kernel ops
 (solve, inv, det, slogdet, solve_triangular, cholesky_solve, eigh, eigvalsh) also run at the kernel's edges, n in
 1, 3, 21, 31, 32, for correctness and fallback only (no timing loop), and eigh and eigvalsh on an indefinite
 (G + G^T) / 2 at n = 3, 22, 32. A case fails when
@@ -47,6 +48,7 @@ HPU = torch.device("hpu")
 torch.manual_seed(0)
 
 SIZES = (16, 22, 64, 128)
+LARGE_SIZES = (96, 220, 256)  # also for solve, inv, det and slogdet: the in-place kernel (gj_large) past n = 64
 GATE_SIZES = (1, 3, 21, 31, 32)  # the kernels' edges: n = 1, odd sizes, one below, at the limit; no timing
 INDEFINITE_SIZES = (3, 22, 32)
 BATCH = 32
@@ -61,7 +63,12 @@ EIGH_FALLBACKS = []  # baseline: the fallback deltas seen for eigh (the positive
 ops_linalg = None  # hpu_ops.linalg, imported in main
 ops_tpc = None  # hpu_ops.tpc, imported in main
 tpc_maxn = 64  # hpu_ops.tpc.MAXN, set in main
+large_maxn = 512  # hpu_ops.tpc.LARGE_MAXN (solve, inv, det, slogdet), set in main
+LARGE_OPS = ("linalg.solve", "linalg.inv", "linalg.det", "linalg.slogdet")  # and their variants, not solve_triangular
 eigh_maxn = 32  # hpu_ops.tpc.EIGH_MAXN, set in main
+small_maxn = 32  # hpu_ops.tpc.SMALL_MAXN (SVD family, matrix_exp, LU ops), set in main
+SMALL_OPS = ("linalg.svd", "linalg.svdvals", "linalg.pinv", "linalg.lstsq", "linalg.matrix_norm", "linalg.matrix_rank",
+             "linalg.matrix_exp", "linalg.lu", "lu_unpack")
 SINGULAR_N = 22
 L = torch.linalg
 SOLVE_FB = frozenset({"aten::_linalg_solve_ex.result"})  # float64: no backend kernel, so Habana's fallback runs the op
@@ -172,6 +179,32 @@ def make_solve_big(b, n, dtype):
     return [pivoting(b + 4, n, dtype), torch.randn(b, n, 3, dtype=dtype)]
 
 
+def make_cayley(b, n, dtype):
+    """``(I - S / 2, I + S / 2)`` for a skew-symmetric S: the Cayley map of torch's orthogonal parametrization
+    (EEGSPDNet's BiMap, n = 220)."""
+    g = torch.randn(b, n, n, dtype=dtype) / math.sqrt(n)
+    S = g - g.mT
+    eye = torch.eye(n, dtype=dtype)
+    return [eye - S / 2, eye + S / 2]
+
+
+def make_tiny_multiplier(b, n, dtype):
+    """Review round (gj_large): the pivot row [1e30, 1e-9] divided by its pivot would flush 1e-39 to zero."""
+    A = torch.eye(n, dtype=dtype).repeat(b, 1, 1) + 0.01 * torch.randn(b, n, n, dtype=dtype) / n
+    A[:, :2, :] = 0
+    A[:, 0, 0], A[:, 0, 1], A[:, 1, 0], A[:, 1, 1] = 1e30, 1e-9, 1e30, 2e-9
+    return [A]
+
+
+def make_huge_pivot(b, n, dtype):
+    """Review round (gj_large): a pivot >= 2^126, whose reciprocal is subnormal."""
+    A = torch.eye(n, dtype=dtype).repeat(b, 1, 1) + 0.01 * torch.randn(b, n, n, dtype=dtype) / n
+    A[:, :2, :] = 0
+    A[:, 0, :2] = 1e38
+    A[:, 1, 0], A[:, 1, 1] = 1.0, 2.0
+    return [A]
+
+
 def make_triangular_upper_unit(b, n, dtype):
     return [torch.triu(torch.randn(b, n, n, dtype=dtype), 1) / n, torch.randn(b, n, 3, dtype=dtype)]
 
@@ -259,6 +292,8 @@ def rel_err(got, ref):
     got, ref = got.detach().cpu().double(), ref.detach().double()
     if got.shape != ref.shape:
         return math.inf
+    if got.numel() == 0:
+        return 0.0
     scale = float(ref.abs().max())
     e = float((got - ref).abs().max()) / (scale if scale > 0 else 1.0)
     return math.inf if math.isnan(e) else e
@@ -286,6 +321,23 @@ def err_qr(out, ref, ins):
     return rel_err(Q @ R, ins[0]), []
 
 
+def err_svd(out, ref, ins):
+    U, S, Vh = (o.detach().cpu().double() for o in out)
+    k = S.shape[-1]
+    Uk, Vhk = U[..., :k], Vh[..., :k, :]
+    rec_err = rel_err((Uk * S.unsqueeze(-2)) @ Vhk, ins[0])
+    s_err = rel_err(S, ref[1])
+    eye_u = torch.eye(U.shape[-1], dtype=torch.float64).expand(*U.shape[:-2], U.shape[-1], U.shape[-1])
+    eye_v = torch.eye(Vh.shape[-2], dtype=torch.float64).expand(*Vh.shape[:-2], Vh.shape[-2], Vh.shape[-2])
+    u_orth = rel_err(U.mT @ U, eye_u)
+    v_orth = rel_err(Vh @ Vh.mT, eye_v)
+    return max(s_err, rec_err, u_orth, v_orth), []
+
+
+def err_lstsq(out, ref, ins):
+    return rel_err(out[0], ref[0]), []
+
+
 def loss_sum(out):
     return sum(o.sum() for o in out if o.requires_grad)
 
@@ -305,6 +357,39 @@ def loss_qr(out):
     them."""
     Q, R = out
     return (Q @ R).sum() + R.abs().sum()
+
+
+def loss_svd(out):
+    U, S, Vh = out
+    k = S.shape[-1]
+    return S.sum() + ((U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :]).sum()
+
+
+def loss_lstsq(out):
+    return out[0].sum()
+
+
+def make_rect_tall(b, n, dtype):
+    return [torch.randn(b, n + 8, n, dtype=dtype)]
+
+
+def make_rect_wide(b, n, dtype):
+    return [torch.randn(b, n, n + 8, dtype=dtype)]
+
+
+def make_lstsq(b, n, dtype):
+    return [torch.randn(b, n + 6, n, dtype=dtype), torch.randn(b, n + 6, 3, dtype=dtype)]
+
+
+def make_skew(b, n, dtype):
+    a = torch.randn(b, n, n, dtype=dtype)
+    return [0.1 * (a - a.mT)]
+
+
+def make_householder(b, n, dtype):
+    a = torch.randn(b, n, n, dtype=dtype).tril(-1)
+    tau = 2.0 / (1.0 + (a * a).sum(-2))
+    return [a, tau]
 
 
 class Case(NamedTuple):
@@ -332,6 +417,12 @@ def fallback_problems(got, expected, what):
     return [f"{what} fell back on {extra}"] * bool(extra), [f"{what}: expected {k} did not fall back" for k in missing]
 
 
+# The LU ops are installed in eager mode only and linalg.lu not at all (measured slower than the fallback; see
+# install_lu and HPU_OPS_LU_SLOW): their Habana fallback is expected, not a failure
+LU_OFF_FB = frozenset({"aten::linalg_lu.out"})
+LU_LAZY_FB = (frozenset({"aten::linalg_lu_factor_ex.out", "aten::linalg_lu_solve.out", "aten::lu_unpack.out"})
+              if LAZY and os.environ.get("HPU_OPS_LU_SLOW") != "1" else frozenset())
+
 CASES = (
     Case("linalg.solve_triangular", make_triangular, lambda a, b: L.solve_triangular(a, b, upper=False), tpc=True,
          gate=True),
@@ -347,6 +438,21 @@ CASES = (
          sizes=INDEFINITE_SIZES),
     Case("linalg.eigvalsh.indefinite", make_indefinite, lambda x: L.eigvalsh(x), float64=False, tpc=True,
          sizes=INDEFINITE_SIZES),
+    Case("linalg.inv.tiny_multiplier", make_tiny_multiplier, lambda x: L.inv(x), loss=None, float64=False, tpc=True,
+         sizes=(70,)),
+    Case("linalg.det.tiny_multiplier", make_tiny_multiplier, lambda x: L.det(x), loss=None, float64=False, tpc=True,
+         sizes=(70,)),
+    Case("linalg.inv.huge_pivot", make_huge_pivot, lambda x: L.inv(x), loss=None, float64=False, tpc=True,
+         sizes=(70,)),
+    Case("linalg.slogdet.huge_pivot", make_huge_pivot, lambda x: L.slogdet(x), err_slogdet, None, float64=False,
+         tpc=True, sizes=(70,)),
+    Case("linalg.solve.cayley", make_cayley, lambda a, b: L.solve(a, b), float64=False, tpc=True, sizes=(96, 220)),
+    Case("linalg.solve.left_false_large", make_solve_right, lambda a, b: L.solve(a, b, left=False), float64=False,
+         tpc=True, sizes=(220,)),
+    Case("linalg.solve.vector_rhs_large", make_solve_vector, lambda a, b: L.solve(a, b), float64=False, tpc=True,
+         sizes=(220,)),
+    Case("linalg.solve.broadcast_batch_large", make_solve_broadcast, lambda a, b: L.solve(a, b), float64=False,
+         tpc=True, sizes=(130,)),
     Case("linalg.solve.left_false", make_solve_right, lambda a, b: L.solve(a, b, left=False), float64=False,
          tpc=True, sizes=(22,)),
     Case("linalg.solve.vector_rhs", make_solve_vector, lambda a, b: L.solve(a, b), float64=False, tpc=True,
@@ -391,6 +497,35 @@ CASES = (
          lambda a, b: L.solve_triangular(a, b, upper=True, unitriangular=True), float64=False, tpc=True, sizes=(22,)),
     Case("cholesky_solve.ignored_upper_nan", make_cholesky_nan_other,
          lambda b, c: torch.cholesky_solve(b, c), loss=None, float64=False, tpc=True, sizes=(22,)),
+    Case("linalg.svd", make_general, lambda x: L.svd(x, full_matrices=False), err_svd, loss_svd, tpc=True),
+    Case("linalg.svd_tall", make_rect_tall, lambda x: L.svd(x, full_matrices=False), err_svd, loss_svd, tpc=True),
+    Case("linalg.svd_tall_full", make_rect_tall, lambda x: L.svd(x, full_matrices=True), err_svd, loss_svd, tpc=True),
+    Case("linalg.svd_wide", make_rect_wide, lambda x: L.svd(x, full_matrices=False), err_svd, loss_svd, tpc=True),
+    Case("linalg.svd_wide_full", make_rect_wide, lambda x: L.svd(x, full_matrices=True), err_svd, loss_svd, tpc=True),
+    Case("linalg.svdvals", make_general, lambda x: L.svdvals(x), tpc=True),
+    Case("linalg.pinv", make_general, lambda x: L.pinv(x), tpc=True),
+    Case("linalg.lstsq", make_lstsq, lambda a, b: L.lstsq(a, b), err_lstsq, loss_lstsq, tpc=True),
+    Case("linalg.matrix_norm_2", make_general, lambda x: L.matrix_norm(x, ord=2), tpc=True),
+    Case("linalg.matrix_norm_neg2", make_general, lambda x: L.matrix_norm(x, ord=-2), tpc=True),
+    # matrix_norm_nuc sums S on HPU at float32 precision after _linalg_svd declines float64 (~6.7e-8 vs CPU f64)
+    Case("linalg.matrix_norm_nuc", make_general, lambda x: L.matrix_norm(x, ord="nuc"), float64=False, tpc=True),
+    Case("linalg.matrix_rank", make_general, lambda x: L.matrix_rank(x), err_all, None, tpc=True),
+    Case("linalg.matrix_exp", make_skew, lambda x: L.matrix_exp(x), tpc=True),
+    Case("linalg.householder_product", make_householder, lambda a, t: L.householder_product(a, t)),
+    # standalone LU (#10): the TPC LU kernel (LAPACK's factors and pivots) and the pivots-to-permutation kernel
+    Case("linalg.lu_factor", make_pivoting, lambda x: L.lu_factor(x), float64=False, tpc=True, gate=True,
+         fallback=LU_LAZY_FB),
+    Case("linalg.lu_factor_ex", make_pivoting, lambda x: L.lu_factor_ex(x), float64=False, tpc=True, gate=True,
+         fallback=LU_LAZY_FB),
+    Case("linalg.lu", make_pivoting, lambda x: L.lu(x), float64=False, tpc=True, gate=True,
+         fallback=LU_OFF_FB | LU_LAZY_FB),
+    Case("linalg.lu_solve", make_solve, lambda a, b: L.lu_solve(*L.lu_factor(a), b), float64=False, tpc=True,
+         gate=True, fallback=LU_LAZY_FB),
+    Case("linalg.lu_solve.adjoint_right", make_solve_right,
+         lambda a, b: L.lu_solve(*L.lu_factor(a), b, left=False, adjoint=True), float64=False, tpc=True, sizes=(22,),
+         fallback=LU_LAZY_FB),
+    Case("lu_unpack", make_pivoting, lambda x: torch.lu_unpack(*L.lu_factor(x)), float64=False, tpc=True,
+         gate=True, fallback=LU_LAZY_FB),
 )
 
 
@@ -412,19 +547,27 @@ def cpu_warnings(rec, allow=None):
     return [m for _, m in rec["caught"] if CPU_TEXT in m and not (allow and allow in m)]
 
 
+TIMED_CALLS = 20
+
+
 def forward(case, h_in, timed=True):
-    """The first call (the warm-up) and, if ``timed``, five timed calls, synced. Returns the first output and the ms
-    per call (None when not timed)."""
+    """The first call (the warm-up) and, if ``timed``, TIMED_CALLS synced calls, keeping the outputs alive (lazy mode
+    skips work whose outputs are dropped). Returns the first output and the ms per call (None when not timed)."""
     ms = None
     with watch() as rec:
         out = as_tensors(case.fn(*h_in))
         sync()
         if timed:
+            outs = []
             t = time.perf_counter()
-            for _ in range(5):
-                case.fn(*h_in)
-            sync()
-            ms = (time.perf_counter() - t) / 5 * 1e3
+            for _ in range(TIMED_CALLS):
+                outs.append(case.fn(*h_in))
+                if LAZY:
+                    sync()
+            if not LAZY:
+                sync()
+            ms = (time.perf_counter() - t) / TIMED_CALLS * 1e3
+            del outs
     return out, ms, rec
 
 
@@ -491,7 +634,9 @@ def run_case(case, n, timed=True):
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
     # fallbacks recorded, not failed: baseline, and the TPC ops past the kernel's n limit
-    limit = eigh_maxn if case.name in ("linalg.eigh", "linalg.eigvalsh") else tpc_maxn
+    large = case.name.split(".")[:2] in [op.split(".") for op in LARGE_OPS]
+    limit = (eigh_maxn if case.name in ("linalg.eigh", "linalg.eigvalsh")
+             else small_maxn if case.name.startswith(SMALL_OPS) else large_maxn if large else tpc_maxn)
     expected = BASELINE or (case.tpc and n > limit)
     problems = hard + ([] if expected else soft)
     row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft, notes=notes)
@@ -542,10 +687,10 @@ def run_float64(case):
     return not problems
 
 
-def singular_input():
-    """float32 matrices, batch 32 at n = 22: element 1 all zero (native and LU of A report the same message), element
-    2 with one zero row (a zero pivot in U, so det is exactly 0)."""
-    A = pivoting(BATCH, SINGULAR_N, torch.float32)
+def singular_input(n=SINGULAR_N):
+    """float32 matrices, batch 32 at n (22, and 220 for the in-place kernel): element 1 all zero (native and LU of A
+    report the same message), element 2 with one zero row (a zero pivot in U, so det is exactly 0)."""
+    A = pivoting(BATCH, n, torch.float32)
     A[1] = 0
     A[2, 5] = 0
     return A
@@ -582,15 +727,15 @@ def run_singular_triangle(op, fn, expected):
     return not problems
 
 
-def run_singular(op, fn):
+def run_singular(op, fn, n=SINGULAR_N):
     """A singular batch on the card: ``det`` exactly 0 and ``slogdet`` (0, -inf) for elements 1 and 2; ``solve`` and
     ``inv`` raise torch's own message, captured from a CPU run; no fallback, no CPU warning."""
-    row = {"op": f"singular.{op}", "n": SINGULAR_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY,
+    row = {"op": f"singular.{op}", "n": n, "batch": BATCH, "dtype": "float32", "lazy": LAZY,
            "baseline": BASELINE}
     problems = []
     try:
-        A = singular_input()
-        B = torch.randn(BATCH, SINGULAR_N, 3)
+        A = singular_input(n)
+        B = torch.randn(BATCH, n, 3)
         call = (lambda x: fn(x, B.to(HPU))) if op == "solve" else fn
         call_cpu = (lambda x: fn(x, B)) if op == "solve" else fn
         raises, want = op in ("solve", "inv"), None
@@ -619,7 +764,7 @@ def run_singular(op, fn):
                 else:
                     zero = bool((out[0][1:3] != 0).any() or not torch.isneginf(out[1][1:3]).all())
                     problems += ["slogdet of a singular element is not (0, -inf)"] * zero
-        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+        problems += ["fell back"] * bool(rec["fallback"] and n <= large_maxn) + cpu_warnings(rec)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         problems.append(f"exception {e!r}"[:300])
     emit(**row, status="fail" if problems else "ok", problems=problems)
@@ -961,6 +1106,342 @@ def probe_argsort_int64():
     return not problems
 
 
+def run_svd_edges():
+    """Edge cases for Issue #9 SVD family: zeros, cond=1e4, rank-1, repeated spectrum, no_grad svdvals, declines."""
+    out_results = []
+
+    def check(label, fn, cpu_in, err_fn=err_all, grad_fn=None, expect_fb=False):
+        row = {"op": f"svd_edge.{label}", "n": SINGULAR_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY}
+        problems = []
+        try:
+            ref_in = [x.double() for x in cpu_in]
+            ref = as_tensors(fn(*ref_in))
+            with watch() as rec:
+                got = as_tensors(fn(*(x.to(HPU) for x in cpu_in)))
+                sync()
+            row["fwd_fallback"] = rec["fallback"]
+            e, notes = err_fn(got, ref, ref_in)
+            e32, _ = err_fn(as_tensors(fn(*cpu_in)), ref, ref_in)
+            row["max_rel_err"], row["err_cpu32"] = e, e32
+            problems += notes + over_bar("error", e, e32)
+            if not expect_fb:
+                problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+            if grad_fn is not None:
+                xs = [x.to(HPU).detach().requires_grad_() for x in cpu_in]
+                loss = grad_fn(as_tensors(fn(*xs)))
+                sync()
+                with watch() as brec:
+                    loss.backward()
+                    sync()
+                row["bwd_fallback"] = brec["fallback"]
+                for x in xs:
+                    if not torch.isfinite(x.grad).all():
+                        problems.append("non-finite grad")
+                if not expect_fb:
+                    problems += ["bwd fell back"] * bool(brec["fallback"]) + cpu_warnings(brec)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"exception {e!r}"[:300])
+        emit(**row, status="fail" if problems else "ok", problems=problems)
+        out_results.append(not problems)
+
+    n = SINGULAR_N
+    zeros = [torch.zeros(BATCH, n, n)]
+    check("zeros_svd", lambda x: L.svd(x, full_matrices=False), zeros, err_svd)
+    check("zeros_svdvals", lambda x: L.svdvals(x), zeros, grad_fn=loss_sum)
+
+    q1, _ = L.qr(torch.randn(BATCH, n, n))
+    q2, _ = L.qr(torch.randn(BATCH, n, n))
+    s_cond = torch.logspace(0, -4, n).expand(BATCH, n)
+    cond1e4 = [(q1 * s_cond.unsqueeze(-2)) @ q2.mT]
+    check("cond1e4_svd", lambda x: L.svd(x, full_matrices=False), cond1e4, err_svd, grad_fn=loss_svd)
+
+    u1 = torch.randn(BATCH, n, 1)
+    v1 = torch.randn(BATCH, 1, n)
+    rank1 = [u1 @ v1]
+    check("rank1_svd", lambda x: L.svd(x, full_matrices=False), rank1, err_svd)
+    check("rank1_pinv", lambda x: L.pinv(x, atol=1e-3, rtol=1e-3), rank1)
+    check("rank1_matrix_rank", lambda x: L.matrix_rank(x, atol=1e-3, rtol=1e-3), rank1)
+
+    rep_vals = torch.tensor([3.0, 3.0] + [1.0] * (n - 2))
+    rep = [torch.diag_embed(rep_vals.expand(BATCH, n))]
+    check("repeated_svdvals", lambda x: L.svdvals(x), rep, grad_fn=loss_sum)
+
+    with torch.no_grad():
+        check("svdvals_no_grad", lambda x: L.svdvals(x), [general(BATCH, n, torch.float32)])
+
+    # Declines (expected fallback, must run cleanly without error)
+    check("decline_pinv_hermitian", lambda x: L.pinv(x, hermitian=True), [spd(BATCH, n, torch.float32, "cpu")],
+          expect_fb=True)
+    check("decline_matrix_rank_hermitian", lambda x: L.matrix_rank(x, hermitian=True),
+          [spd(BATCH, n, torch.float32, "cpu")], expect_fb=True)
+    check("decline_lstsq_rank_deficient", lambda a, b: L.lstsq(a, b),
+          [rank1[0], torch.randn(BATCH, n, 3)], err_lstsq, expect_fb=True)
+
+    def svd_out_decline(x):
+        u = torch.zeros(BATCH, 4, 4, device=x.device, dtype=x.dtype)
+        s = torch.zeros(BATCH, 4, device=x.device, dtype=x.dtype)
+        vh = torch.zeros(BATCH, 4, 34, device=x.device, dtype=x.dtype)
+        L.svd(x, full_matrices=False, out=(u, s, vh))
+        return u, s, vh
+
+    check("decline_svd_out_big_n", svd_out_decline, [torch.randn(BATCH, 4, 34, dtype=torch.float32)], err_svd,
+          expect_fb=True)
+    return out_results
+
+
+def run_expm_hh_edges():
+    """Edge cases for Issue #13: matrix_exp s>0/zeros/n=1, householder rect/k<n/k=0/singular, and orthogonal layers."""
+    out_results = []
+
+    def check(label, fn, cpu_in, grad_fn=loss_sum, expect_fb=False):
+        row = {"op": f"expm_hh_edge.{label}", "n": SINGULAR_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY}
+        problems = []
+        try:
+            ref_in = [x.double() for x in cpu_in]
+            ref = as_tensors(fn(*ref_in))
+            with watch() as rec:
+                got = as_tensors(fn(*(x.to(HPU) for x in cpu_in)))
+                sync()
+            row["fwd_fallback"] = rec["fallback"]
+            e, notes = err_all(got, ref, ref_in)
+            e32, _ = err_all(as_tensors(fn(*cpu_in)), ref, ref_in)
+            row["max_rel_err"], row["err_cpu32"] = e, e32
+            problems += notes + over_bar("error", e, e32)
+            if not expect_fb:
+                problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+            if grad_fn is not None:
+                xs = [x.to(HPU).detach().requires_grad_() for x in cpu_in]
+                loss = grad_fn(as_tensors(fn(*xs)))
+                sync()
+                with watch() as brec:
+                    loss.backward()
+                    sync()
+                row["bwd_fallback"] = brec["fallback"]
+                ref_grads = reference_grads(
+                    Case(label, lambda *_: cpu_in, fn, loss=grad_fn), ref_in)
+                cpu_xs = [x.detach().clone().requires_grad_() for x in cpu_in]
+                grad_fn(as_tensors(fn(*cpu_xs))).backward()
+                ge = grad_error(xs, ref_grads)
+                ge32 = grad_error(cpu_xs, ref_grads)
+                row["grad_err"], row["grad_err_cpu32"] = ge, ge32
+                problems += over_bar("gradient error", ge, ge32)
+                if not expect_fb:
+                    problems += ["bwd fell back"] * bool(brec["fallback"]) + cpu_warnings(brec)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"exception {e!r}"[:300])
+        emit(**row, status="fail" if problems else "ok", problems=problems)
+        out_results.append(not problems)
+
+    # matrix_exp edge cases
+    check("expm_large_s_gt_0", lambda x: L.matrix_exp(x), [5.0 * torch.randn(BATCH, SINGULAR_N, SINGULAR_N)])
+    check("expm_zeros", lambda x: L.matrix_exp(x), [torch.zeros(BATCH, SINGULAR_N, SINGULAR_N)])
+    check("expm_n1", lambda x: L.matrix_exp(x), [torch.randn(BATCH, 1, 1)])
+    check("expm_torch_alias", lambda x: torch.matrix_exp(x), make_skew(BATCH, SINGULAR_N, torch.float32))
+
+    # householder_product edge cases (Issue #13 exact shapes)
+    a22 = torch.randn(BATCH, 22, 22).tril(-1)
+    t21 = 2.0 / (1.0 + (a22[..., :21] ** 2).sum(-2))
+    check("hh_22_22_k21", lambda a, t: L.householder_product(a, t), [a22, t21])
+
+    a10 = torch.randn(BATCH, 22, 10).tril(-1)
+    t10 = 2.0 / (1.0 + (a10 ** 2).sum(-2))
+    t6 = 2.0 / (1.0 + (a10[..., :6] ** 2).sum(-2))
+    check("hh_22_10_k10", lambda a, t: L.householder_product(a, t), [a10, t10])
+    check("hh_22_10_k6", lambda a, t: L.householder_product(a, t), [a10, t6])
+    check("hh_22_10_k0", lambda a, t: L.householder_product(a, t), [a10, torch.empty(BATCH, 0)], grad_fn=None)
+
+    a64_32 = torch.randn(BATCH, 64, 32).tril(-1)
+    t64_32 = 2.0 / (1.0 + (a64_32 ** 2).sum(-2))
+    check("hh_64_32_k32", lambda a, t: L.householder_product(a, t), [a64_32, t64_32])
+
+    # orthogonal parametrizations (matrix_exp & householder) on (22, 22) & (22, 10)
+    from torch.nn.utils.parametrizations import orthogonal
+
+    for omap in ("matrix_exp", "householder"):
+        for rows, cols in ((22, 22), (22, 10)):
+            row = {"op": f"orthogonal.{omap}_{rows}x{cols}", "n": rows, "batch": BATCH,
+                   "dtype": "float32", "lazy": LAZY}
+            problems = []
+            try:
+                torch.manual_seed(0)
+                layer_ref = orthogonal(torch.nn.Linear(cols, rows, bias=False).double(),
+                                       orthogonal_map=omap, use_trivialization=False)
+                layer_cpu32 = orthogonal(torch.nn.Linear(cols, rows, bias=False),
+                                         orthogonal_map=omap, use_trivialization=False)
+                layer_hpu = orthogonal(torch.nn.Linear(cols, rows, bias=False),
+                                         orthogonal_map=omap, use_trivialization=False)
+                with torch.no_grad():
+                    w0 = torch.randn(rows, cols)
+                    layer_ref.parametrizations.weight.original.copy_(w0.double())
+                    layer_cpu32.parametrizations.weight.original.copy_(w0)
+                    layer_hpu.parametrizations.weight.original.copy_(w0)
+                layer_hpu = layer_hpu.to(HPU)
+                x = torch.randn(BATCH, cols)
+                xh = x.to(HPU)
+                sync()
+                layer_ref(x.double()).sum().backward()
+                layer_cpu32(x).sum().backward()
+                with watch() as rec:
+                    out_h = layer_hpu(xh)
+                    out_h.sum().backward()
+                    sync()
+                row["fwd_fallback"] = rec["fallback"]
+                row["max_rel_err"] = rel_err(out_h, layer_ref(x.double()))
+                row["err_cpu32"] = rel_err(layer_cpu32(x), layer_ref(x.double()))
+                row["grad_err"] = rel_err(layer_hpu.parametrizations.weight.original.grad,
+                                          layer_ref.parametrizations.weight.original.grad)
+                row["grad_err_cpu32"] = rel_err(layer_cpu32.parametrizations.weight.original.grad,
+                                                layer_ref.parametrizations.weight.original.grad)
+                problems += over_bar("error", row["max_rel_err"], row["err_cpu32"])
+                problems += over_bar("gradient error", row["grad_err"], row["grad_err_cpu32"])
+                problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"exception {e!r}"[:300])
+            emit(**row, status="fail" if problems else "ok", problems=problems)
+            out_results.append(not problems)
+    return out_results
+
+
+def run_round3_edges():
+    """Review round 3 (REVISION.md): matrix_exp past the old scaling cap of 16, LU pivot ties against LAPACK's first
+    max, LU pivots past 2^126, a tiny SVD input, and the card against the float32 replicas of tests/kernel_replica.py.
+    In lazy mode the LU ops are not installed (measured slower): those rows then check Habana's ops."""
+    import numpy as np
+
+    import kernel_replica as R
+
+    out_results = []
+
+    def row(label, check, expect_fb=False):
+        r = {"op": f"round3.{label}", "dtype": "float32", "lazy": LAZY}
+        problems = []
+        try:
+            with watch() as rec:
+                problems += check(r)
+            r["fwd_fallback"] = rec["fallback"]
+            if not expect_fb:
+                problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"exception {e!r}"[:300])
+        emit(**r, status="fail" if problems else "ok", problems=problems)
+        out_results.append(not problems)
+
+    def skew(batch, n, norm, seed):
+        g = torch.Generator().manual_seed(seed)
+        x = torch.randn(batch, n, n, generator=g, dtype=torch.float64)
+        x = x - x.mT
+        return (x * (norm / L.matrix_norm(x, 1)[..., None, None])).float()
+
+    def expm_vs_truth(a):
+        def check(r):
+            got = L.matrix_exp(a.to(HPU))
+            sync()
+            truth = L.matrix_exp(a.double())
+            r["max_rel_err"], r["err_cpu32"] = rel_err(got, truth), rel_err(L.matrix_exp(a), truth)
+            return over_bar("error", r["max_rel_err"], r["err_cpu32"])
+        return check
+
+    for n in (6, 22):
+        row(f"expm_norm1e7_n{n}", expm_vs_truth(skew(BATCH, n, 1e7, n)))
+    norms = 10 ** (5.5 + 2.5 * torch.rand(BATCH, generator=torch.Generator().manual_seed(9), dtype=torch.float64))
+    mixed = skew(BATCH, 8, 1.0, 9) * norms[:, None, None].float()
+    row("expm_mixed_counts", expm_vs_truth(mixed))
+
+    def expm_vs_replica(a):
+        def check(r):
+            got = L.matrix_exp(a.to(HPU))
+            sync()
+            rep = torch.from_numpy(np.stack([R.matrix_exp(x.numpy()) for x in a]))
+            truth = L.matrix_exp(a.double())
+            r["card_vs_replica"], r["replica_err"] = rel_err(got, rep), rel_err(rep, truth)
+            r["max_rel_err"], r["err_cpu32"] = rel_err(got, truth), rel_err(L.matrix_exp(a), truth)
+            return over_bar("card vs replica", r["card_vs_replica"], r["err_cpu32"])
+        return check
+
+    for n, norm in ((6, 1.0), (22, 50.0), (22, 1e5)):
+        row(f"replica.matrix_exp_n{n}_norm{norm:g}", expm_vs_replica(skew(4, n, norm, 20 + n)))
+
+    def tied(n, seed, batch=8):
+        g = torch.Generator().manual_seed(seed)
+        lower = torch.tril(torch.randint(0, 2, (batch, n, n), generator=g).float() * 2 - 1, -1) + torch.eye(n)
+        upper = torch.triu(torch.randint(-2, 3, (batch, n, n), generator=g).float(), 1) + torch.diag_embed(
+            torch.randint(1, 3, (batch, n), generator=g).float())
+        return lower @ upper
+
+    lu_fb = LAZY and os.environ.get("HPU_OPS_LU_SLOW") != "1"
+
+    def lu_ties(n):
+        def check(r):
+            a = tied(n, n)
+            LU, piv = L.lu_factor(a.to(HPU))
+            sync()
+            LU_t, piv_t = L.lu_factor(a)
+            r["pivots_equal"] = bool(torch.equal(piv.cpu(), piv_t))
+            r["lu_abs_err"] = float((LU.cpu() - LU_t).abs().max())
+            return [] if r["pivots_equal"] and r["lu_abs_err"] == 0 else ["pivots or factors differ from LAPACK's"]
+        return check
+
+    for n in (22, 32):
+        row(f"lu_factor_tied_n{n}", lu_ties(n), expect_fb=lu_fb)
+
+    def lu_huge(r):
+        g = torch.Generator().manual_seed(1)
+        a = ((torch.eye(6, dtype=torch.float64) + 0.01 * torch.randn(4, 6, 6, generator=g, dtype=torch.float64))
+             * 2.0 ** 126.5).float()
+        b = (torch.randn(4, 6, 2, generator=g, dtype=torch.float64) * 2.0 ** 126).float()
+        LU, piv = L.lu_factor(a.to(HPU))
+        x = L.lu_solve(LU, piv, b.to(HPU))
+        sync()
+        LU_t, _ = L.lu_factor(a.double())
+        r["lu_rel_err"] = float(((LU.cpu().double() - LU_t).abs() / LU_t.abs().clamp_min(1e-30)).max())
+        r["solve_rel_err"] = rel_err(x, L.solve(a.double(), b.double()))
+        return [] if r["lu_rel_err"] < 1e-5 and r["solve_rel_err"] < 1e-5 else ["huge pivots lost"]
+
+    row("lu_huge_pivot_2^126.5", lu_huge, expect_fb=lu_fb)
+
+    def lu_vs_replica(r):
+        a = torch.randn(4, 22, 22, generator=torch.Generator().manual_seed(5))
+        LU, piv = L.lu_factor(a.to(HPU))
+        sync()
+        reps = [R.lu_factor(x.numpy()) for x in a]
+        r["pivots_equal"] = bool(torch.equal(piv.cpu(), torch.from_numpy(np.stack([p for _, p, _, _ in reps]))))
+        r["card_vs_replica"] = rel_err(LU, torch.from_numpy(np.stack([lu for lu, _, _, _ in reps])))
+        return [] if r["pivots_equal"] and r["card_vs_replica"] < 1e-5 else ["card differs from the replica"]
+
+    row("replica.lu_factor_n22", lu_vs_replica, expect_fb=lu_fb)
+
+    def svd_vs_replica(shape):
+        def check(r):
+            a = torch.randn(2, *shape, generator=torch.Generator().manual_seed(sum(shape)))
+            S = L.svdvals(a.to(HPU))
+            sync()
+            rep = torch.from_numpy(np.stack([R.jacobi_svd(x.numpy(), compute_uv=False)[1] for x in a]))
+            truth = L.svdvals(a.double())
+            r["card_vs_replica"], r["replica_err"] = rel_err(S, rep), rel_err(rep, truth)
+            r["err_cpu32"] = rel_err(L.svdvals(a), truth)
+            return over_bar("card vs replica", r["card_vs_replica"], r["err_cpu32"])
+        return check
+
+    for shape in ((22, 22), (8, 5)):
+        row(f"replica.svdvals_{shape[0]}x{shape[1]}", svd_vs_replica(shape))
+
+    def svd_tiny(r):
+        # entries 1.5e-37..3e-37, none flushed: before round 3 S was 0 (not scaled below 1e-36). Measured since: 1.35e-3
+        # relative at this scale, 2.6e-7 from 1e-35 up (the card's arithmetic on such entries; cause not isolated)
+        base = torch.randn(4, 5, 5, generator=torch.Generator().manual_seed(4))
+        a = torch.sign(base) * (0.5 + base.abs().clamp(max=1) * 0.5) * 3e-37
+        S = L.svdvals(a.to(HPU))
+        sync()
+        # truth of the input as the card holds it: entries below 2^-126 are flushed to zero on the way in (FTZ/DAZ)
+        flushed = torch.where(a.abs() < 2.0 ** -126, 0.0, a)
+        r["flushed_entries"] = int((flushed != a).sum())
+        r["max_rel_err"] = rel_err(S, L.svdvals(flushed.double()))
+        return [] if r["max_rel_err"] < 1e-2 else ["tiny matrix: singular values lost"]
+
+    row("svdvals_tiny_3e-37", svd_tiny)
+    return out_results
+
+
 def _lazy_check_row(name, n, batch, check_fn):
     row = {"op": name, "n": n, "batch": batch, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE}
     problems = []
@@ -1126,18 +1607,21 @@ def run_lazy_single_call_checks(tpc):
 
 
 def main():
-    global BASELINE, ops_linalg, ops_tpc, tpc_maxn, eigh_maxn
+    global BASELINE, ops_linalg, ops_tpc, tpc_maxn, eigh_maxn, small_maxn, large_maxn
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--baseline", action="store_true", help="skip hpu_ops.enable()")
     parser.add_argument("--with-eigh", action="store_true",
                         help="no-op: eigh is installed by hpu_ops.enable()")
+    parser.add_argument("--only", action="append", default=[], help="only run cases whose name contains this substring")
     args = parser.parse_args()
     BASELINE = args.baseline
     import hpu_ops
     from hpu_ops import linalg as ops_linalg
     from hpu_ops import tpc
     ops_tpc = tpc
-    tpc_maxn, eigh_maxn = tpc.MAXN, tpc.EIGH_MAXN
+    # past n = 64 the in-place kernel runs in eager mode only (tpc.large_pays); lazy mode expects main's route
+    tpc_maxn, eigh_maxn, small_maxn = tpc.MAXN, tpc.EIGH_MAXN, tpc.SMALL_MAXN
+    large_maxn = tpc.MAXN if LAZY else tpc.LARGE_MAXN
     if not BASELINE:
         hpu_ops.enable()
     complex_state = "skipped (baseline)"
@@ -1149,26 +1633,31 @@ def main():
         except ImportError:
             complex_state = "not found"
     print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), "hpu_complex", complex_state, "baseline",
-          BASELINE, "tpc_ready", None if BASELINE else tpc.ready(), "lazy", LAZY, flush=True)
-    results = [probe_argmax_ties(), probe_argsort_int64()]
-    if not BASELINE:
+          BASELINE, "tpc_ready", None if BASELINE else tpc.ready(), "lazy", LAZY, "bridge 1.21.4", flush=True)
+    results = [probe_argmax_ties(), probe_argsort_int64()] if not args.only else []
+    if not BASELINE and not args.only:
         results.append(check_tpc(tpc))
-    for case in CASES:
-        results += [run_case(case, n) for n in case.sizes or SIZES]
+    cases = [c for c in CASES if not args.only or any(s in c.name for s in args.only)]
+    for case in cases:
+        large = case.name.split(".")[:2] in [op.split(".") for op in LARGE_OPS]
+        results += [run_case(case, n) for n in case.sizes or (SIZES + LARGE_SIZES if large else SIZES)]
         if case.gate:
             results += [run_case(case, n, timed=False) for n in GATE_SIZES]
         if case.float64:
             results.append(run_float64(case))
-    if not BASELINE:
+    if not BASELINE and not args.only:
         results.append(run_double_backward())
         results += [run_eigh_adversarial(kind, n, seed) for kind in ("deg_rotated", "illcond_1e6", "scaled_1e30")
                     for n in (16, 22) for seed in range(3)]
         for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
-            results.append(run_singular(op, fn))
+            results += [run_singular(op, fn, n) for n in (SINGULAR_N, 220)]
         results += run_lazy_single_call_checks(tpc)
         for op, fn in (("solve_triangular", lambda T, B: L.solve_triangular(T, B, upper=False)),
                        ("cholesky_solve", lambda T, B: torch.cholesky_solve(B, T))):
             results.append(run_singular_triangle(op, fn, frozenset()))
+        results += run_svd_edges()
+        results += run_expm_hh_edges()
+        results += run_round3_edges()
         count_cpu_route()  # from here on, calls of hpu-ops' CPU route are counted (the Codex rows check them)
         results += [run_codex_case(*case) for case in codex_cases()]
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong

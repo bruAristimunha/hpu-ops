@@ -94,7 +94,9 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          composite.install_embedding, composite.install_roll, composite.install_unfold, indexing.install_index,
          indexing.install_mask_fill, im2col.install,
          linalg.install_solve_triangular, linalg.install_cholesky_solve,
-         linalg.install_solve, linalg.install_inv_det, eigh.install_eigh, quantile.install,
+         linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
+         linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
+         linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, quantile.install,
          serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "

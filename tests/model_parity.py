@@ -381,6 +381,8 @@ def main():
     parser.add_argument("--models", default="", help="comma-separated names (default: every model)")
     parser.add_argument("--steps", type=int, default=50, help="Adam steps of the train part")
     parser.add_argument("--parts", default=",".join(PARTS), help=f"subset of {','.join(PARTS)}")
+    parser.add_argument("--large-maxn", type=int, default=None,
+                        help="set hpu_ops.tpc.LARGE_MAXN before enable() (64: the parent branch's route past n = 64)")
     args = parser.parse_args()
     parts = [p for p in args.parts.split(",") if p]
     if not parts or not set(parts) <= set(PARTS):
@@ -391,6 +393,8 @@ def main():
     from spd_diag.models import MODELS
 
     import hpu_ops
+    if args.large_maxn is not None:
+        hpu_ops.tpc.LARGE_MAXN = args.large_maxn
     P._enable_device("hpu")  # hpu_ops.enable() and hpu_complex.enable()
     print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), hpu_ops.__file__, "hpu_complex",
           getattr(hpu_complex, "__version__", "?"), "tpc_ready",
