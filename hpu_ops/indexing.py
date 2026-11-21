@@ -205,19 +205,32 @@ def _expand_masks(indices):
     return out
 
 
+def _host_index_route(self, indices):
+    """Strict mode's one route per call of a device tensor indexed by CPU index tensors: checked, linearized,
+    masked or moved on the host (hpu_ops' choice: no device sync). A no-op when strict mode is off."""
+    if not _strict._ACTIVE["n"] or self.device.type == "cpu" or _tracing(self):
+        return contextlib.nullcontext()
+    host = [t for t in indices if t is not None and t.device.type == "cpu"]
+    if not host:
+        return contextlib.nullcontext()
+    return _strict.route(HOST_INDEX, *host,
+                         detail="CPU index tensors: checked, linearized or masked on the host, then copied to the card")
+
+
 def _index_kernel(device_type, fallback):
     op = aten.index.Tensor
 
     def kernel(self, indices):
-        plan = _plan(self, indices) if self.device.type == device_type else None
-        if plan is None:
-            return op._op_dk(fallback, self, indices)
-        count("index")
-        if plan == "move":
-            return op._op_dk(fallback, self, [t if t is None else t.to(self.device) for t in indices])
-        if plan == "mask":
-            return index_select_flat(self, _expand_masks(indices))
-        return index_select_flat(self, indices, checked=plan == "int")
+        with _host_index_route(self, indices):
+            plan = _plan(self, indices) if self.device.type == device_type else None
+            if plan is None:
+                return op._op_dk(fallback, self, indices)
+            count("index")
+            if plan == "move":
+                return op._op_dk(fallback, self, [t if t is None else t.to(self.device) for t in indices])
+            if plan == "mask":
+                return index_select_flat(self, _expand_masks(indices))
+            return index_select_flat(self, indices, checked=plan == "int")
 
     return kernel
 

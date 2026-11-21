@@ -359,11 +359,17 @@ def test_views_and_metadata_are_not_cpu_ops():
         torch.empty(3, 3)
 
 
-def test_higher_order_ops_run():
+def test_higher_order_ops_run_and_their_bodies_are_watched():
     x = torch.randn(3)
     with hpu_ops.strict("report", watch_cpu_ops=False):
         out = torch.cond(x.sum() > 0, lambda v: v + 1, lambda v: v - 1, (x,))
-    assert out.shape == x.shape
+    assert torch.equal(out, x + 1 if x.sum() > 0 else x - 1)
+    with hpu_ops.strict("report"):
+        torch.cond(x.sum() > 0, lambda v: v * 2, lambda v: v * 3, (x,))
+        n = torch._higher_order_ops.while_loop(lambda i: i < 3, lambda i: (i + 1,), (torch.tensor(0),))[0]
+    assert int(n) == 3
+    ops = {r[1] for r in hpu_ops.strict_report() if r[0] == "cpu op"}
+    assert "aten::mul.Tensor" in ops  # the branch's op, inside cond
 
 
 def test_fake_tensors_are_not_cpu_ops():
@@ -383,3 +389,155 @@ def test_per_op_env_is_case_insensitive(monkeypatch):
     finally:
         _strict._STATE.pop("env_config")
         _strict._STATE.pop("env_block").exit(False)
+
+
+def _counting_backend(stats):
+    def backend(gm, example_inputs):
+        stats["compiles"] += 1
+
+        def run(*args):
+            stats["runs"] += 1
+            return gm.forward(*args)
+
+        return run
+
+    return backend
+
+
+def test_a_block_runs_compiled_code_eagerly_on_its_own_thread_only():
+    """Round 3, N1: the force_eager stance is per thread. Another thread compiles while a block is open, and blocks
+    that exit out of order leave compilation on."""
+    import threading
+
+    stats = {"compiles": 0, "runs": 0}
+    fn = torch.compile(lambda x: torch.relu(x) * 2, backend=_counting_backend(stats))
+    entered, release = threading.Event(), threading.Event()
+
+    def holder():
+        with hpu_ops.strict("report", watch_cpu_ops=False):
+            entered.set()
+            release.wait()
+
+    torch._dynamo.reset()
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert entered.wait(30)
+    fn(torch.randn(4))  # this thread is in no block: compiled
+    assert stats == {"compiles": 1, "runs": 1}
+    with hpu_ops.strict("report", watch_cpu_ops=False):
+        fn(torch.randn(4))  # this one is: eager
+    assert stats["runs"] == 1
+    release.set()
+    thread.join()
+    fn(torch.randn(4))
+    assert stats["runs"] == 2
+
+
+def test_exit_removes_the_watch_not_a_mode_entered_in_the_block():
+    """Round 3, N2: a mode entered inside the block and left on stays; the watch goes."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Other(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    other = Other()
+    with hpu_ops.strict("report"):
+        other.__enter__()  # left on, as hpu_complex.enable(enter_mode=True) does
+    stack = _get_current_dispatch_mode_stack()
+    try:
+        assert stack == [other]
+        assert not _strict.active()
+    finally:
+        other.__exit__(None, None, None)
+    assert _get_current_dispatch_mode_stack() == []
+
+
+def test_exit_keeps_an_unreferenced_mode_alive():
+    """Round 3, N2: the stack's reference is the only one to a mode entered with ``Mode().__enter__()``; taking the
+    watch out from under it must not free it (a use-after-free crashed the process)."""
+    from torch.utils._python_dispatch import TorchDispatchMode, _pop_mode
+
+    class Other(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    with hpu_ops.strict("report", watch_cpu_ops=False):
+        Other().__enter__()
+    stack = _get_current_dispatch_mode_stack()
+    assert [type(m).__name__ for m in stack] == ["Other"]
+    torch.randn(3) + 1  # dispatches through it
+    _pop_mode()
+    del stack
+
+
+def test_the_watch_carries_the_innermost_settings():
+    """Round 3, N3: autograd's threads read the watch's settings, which follow the innermost block."""
+    with hpu_ops.strict("raise"):
+        outer = _strict._watch_on_stack().config
+        with hpu_ops.strict("report", allow=("host sync",)):
+            inner = _strict._watch_on_stack().config
+            assert inner.level == "report" and inner.allow == {"host sync"}
+        assert _strict._watch_on_stack().config is outer
+
+
+def test_dataloader_worker_loop_is_off(monkeypatch):
+    """Round 3, N5: a DataLoader worker (forked or spawned) computes on the CPU by design."""
+    import torch.utils.data._utils.worker as worker
+
+    with hpu_ops.strict():
+        monkeypatch.setattr(worker, "_worker_info", object())
+        torch.randn(5) * 2  # no cpu op raised in the worker loop
+        monkeypatch.setattr(worker, "_worker_info", None)
+        with pytest.raises(hpu_ops.CPUExecutionError):
+            torch.randn(5) * 2
+
+
+def test_fork_reset_removes_the_watch_under_another_mode():
+    """Round 3, N6: the watch goes from a forked child's stack even below another mode."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Other(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    with hpu_ops.strict():
+        with Other() as other:
+            _strict._reset_in_child()  # what os.register_at_fork runs in the child
+            assert _get_current_dispatch_mode_stack() == [other]
+            assert not _strict.active()
+            assert not getattr(_strict._TLS, "eager", 0)
+            torch.randn(5) * 2
+
+
+def test_copies_are_cpu_ops_allocations_and_inplace_views_are_not():
+    """Round 3, N7."""
+    x = torch.randn(4, 3)
+    with hpu_ops.strict("report"):
+        x.clone()
+        x.t().contiguous()
+    assert {r[1] for r in hpu_ops.strict_report()} >= {"aten::clone"}
+    with hpu_ops.strict():
+        torch.empty_like(x)
+        x.new_empty(3)
+        y = x.clone() if False else torch.empty(4, 3)
+        y.unsqueeze_(0)
+        y.t_() if y.dim() == 2 else None
+
+
+def test_off_routes_are_free():
+    """Round 3, N9: strict mode off, a route is the shared no-op context."""
+    assert _strict.route("x", torch.randn(2)) is _strict._NULL
+    assert _strict.quiet() is _strict._NULL
+
+
+def test_a_block_inside_compiled_code_runs_eagerly():
+    """Round 3, N10: no Dynamo internal error; the block's frame runs eagerly."""
+
+    @torch.compile(backend="eager")
+    def f(x):
+        with hpu_ops.strict("report", watch_cpu_ops=False):
+            return x + 1
+
+    torch._dynamo.reset()
+    assert torch.equal(f(torch.ones(3)), torch.full((3,), 2.0))

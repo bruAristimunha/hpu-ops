@@ -16,14 +16,16 @@ exit (``report()`` returns the rows). The sources:
 - ``cpu op``: an op computing CPU tensors of more than one element inside the step (the caller's or a library's);
   views, metadata ops and copies of CPU tensors to the card are not.
 
-Per-op attribution is a ``TorchDispatchMode`` (``per_op=True``, the default). A dispatch mode and torch.compile do
-not mix (Dynamo skips the frames for good, or, as an infra mode, recompiles at every call: its guards see the mode's
-dispatch keys), so inside a per-op block torch.compile'd code runs eagerly (``set_stance("force_eager")``, undone
-when the block ends): the check is of the eager program. ``per_op=False`` (``HPU_OPS_STRICT_PER_OP=0``) leaves
-compilation alone and reads the bridge's and hpu-complex's counters when the block ends (or at ``check()``), named
-by op, without a stack frame. ``HPU_OPS_STRICT_ALLOW`` (or ``allow=``) lists sources, comma-separated, that are not
-raised nor counted, e.g. ``host sync,cpu op``. Strict mode is per thread (autograd's threads follow the watch), off
-in DataLoader workers (forked or spawned) and while ``torch.save`` runs.
+Per-op attribution is a ``TorchDispatchMode`` (``per_op=True``, the default), pushed on the thread's mode stack
+without ``TorchDispatchMode.__enter__``'s process-wide flags. A dispatch mode and torch.compile do not mix (Dynamo
+skips the frames for good, or, as an infra mode, recompiles at every call: its guards see the mode's dispatch
+keys), so inside a per-op block torch.compile'd code runs eagerly on that thread (Dynamo's ``force_eager`` stance,
+per thread; process-wide on a torch without the hook, counted over the open blocks): the check is of the eager
+program. ``per_op=False`` (``HPU_OPS_STRICT_PER_OP=0``) leaves compilation alone and reads the bridge's and
+hpu-complex's counters when the block ends (or at ``check()``), named by op, without a stack frame.
+``HPU_OPS_STRICT_ALLOW`` (or ``allow=``) lists sources, comma-separated, that are not raised nor counted, e.g.
+``host sync,cpu op``. Strict mode is per thread (autograd's threads follow the innermost block's settings through the
+watch), off in DataLoader workers (forked or spawned: their worker loop) and while ``torch.save`` runs.
 """
 import atexit
 import collections
@@ -58,8 +60,19 @@ class _Config:
 
 # Counts and the counters' baseline are process-wide (the bridge's metric is); the settings are per thread.
 _STATE = {"counts": collections.Counter(), "where": {}, "baseline": None, "atexit": False,
-          "matmul_cpu_below": COMPLEX_MATMUL_CPU_BELOW}
+          "matmul_cpu_below": COMPLEX_MATMUL_CPU_BELOW, "generation": 0}  # generation: forks since import
 _TLS = threading.local()
+_LOCK = threading.Lock()
+_ACTIVE = {"n": 0}  # open strict blocks, every thread: off, the hooks in hpu-ops' CPU routes return at once
+_GLOBAL_EAGER = {"n": 0}  # the process-wide force_eager stance's blocks, on a torch without the per-thread hook
+_EAGER_HOOK = {}
+_HOPS = {"seen": -1}
+
+
+def _worker_info():
+    """The DataLoader worker this process runs, if any (its loop computes on the CPU by design)."""
+    worker = sys.modules.get("torch.utils.data._utils.worker")
+    return getattr(worker, "_worker_info", None) if worker is not None else None
 
 
 def _watch_on_stack():
@@ -71,7 +84,9 @@ def _watch_on_stack():
 
 def _config():
     """The settings in effect on this thread: its innermost block's, else (autograd's threads, the watch's own
-    handler) the watch's."""
+    handler) the watch's, which follows the innermost block of the thread that owns it. None in a DataLoader worker."""
+    if not _ACTIVE["n"] or _worker_info() is not None:
+        return None
     blocks = getattr(_TLS, "blocks", None)
     if blocks:
         return blocks[-1]
@@ -84,14 +99,42 @@ def active():
     return _config() is not None
 
 
-def _reset_in_child():
-    """A forked child (a DataLoader worker) computes on the CPU by design: strict mode off, the watch popped."""
-    _TLS.blocks = []
-    _TLS.watch = None
-    from torch.utils._python_dispatch import _pop_mode
+def _push_watch(watch):
+    from torch.utils._python_dispatch import _push_mode
 
-    while _get_current_dispatch_mode_stack() and isinstance(_get_current_dispatch_mode_stack()[-1], _Watch):
+    _push_mode(watch)
+
+
+def _remove_watch(watch):
+    """``watch`` off this thread's mode stack wherever it sits; the modes above it stay, in order (a mode entered in
+    the block and left on, as ``hpu_complex.enable(enter_mode=True)`` does). ``TorchDispatchMode.__exit__`` would pop
+    the top one instead."""
+    from torch.utils._python_dispatch import _pop_mode, _push_mode
+
+    stack = _get_current_dispatch_mode_stack()  # holds a reference to each mode: _pop_mode returns the stack's own,
+    at = next((i for i, m in enumerate(stack) if m is watch), None)  # freed with it when nothing else holds one
+    if at is None:
+        return
+    above = [m for m in stack[at + 1:] if getattr(m, "_mode_key", None) is None]  # infra modes have their own slots
+    for _ in range(len(above) + 1):
         _pop_mode()
+    for mode in above:
+        _push_mode(mode)
+
+
+def _reset_in_child():
+    """A forked child (a DataLoader worker) computes on the CPU by design: strict mode off, every watch off its mode
+    stack, Dynamo's stance back."""
+    for mode in list(_get_current_dispatch_mode_stack()):
+        if isinstance(mode, _Watch):
+            _remove_watch(mode)
+    _TLS.blocks, _TLS.watch, _TLS.eager, _TLS.depth = [], None, 0, 0
+    _ACTIVE["n"] = 0
+    _STATE["generation"] += 1  # the blocks open at the fork undo nothing when they exit in the child
+    _STATE.pop("env_config", None)
+    if _GLOBAL_EAGER["n"]:
+        _GLOBAL_EAGER["n"] = 0
+        _GLOBAL_EAGER.pop("cm").__exit__(None, None, None)
 
 
 if hasattr(os, "register_at_fork"):
@@ -203,8 +246,10 @@ def route(op, *tensors, detail="", source="hpu_ops route", leaves=None):
     """A named CPU route of hpu-ops around its body: recorded once; the copies, syncs and CPU ops inside are not
     recorded again. ``leaves``: a pytree whose tensors are the route's, flattened only when strict mode is on. A
     no-op context when strict mode is off."""
-    if _config() is None:
+    if not _ACTIVE["n"] or _config() is None:
         return _NULL
+    if getattr(_TLS, "depth", 0):  # inside another route: part of it, not recorded again
+        return _depth()
     if leaves is not None:
         import torch.utils._pytree as pytree
 
@@ -221,7 +266,7 @@ def host_read(op, tensor):
 
 def quiet():
     """CPU work inside is part of a route recorded elsewhere: not recorded."""
-    return _depth() if _config() is not None else _NULL
+    return _depth() if _ACTIVE["n"] and _config() is not None else _NULL
 
 
 @contextlib.contextmanager
@@ -331,8 +376,11 @@ _COPIES = {aten._to_copy.default, aten.copy_.default, aten.to.device, aten.to.dt
            aten.to.other}
 _MATMUL = {aten.mm.default, aten.bmm.default, aten.mm.out, aten.bmm.out}
 _METADATA = {aten.detach.default, aten.alias.default, aten.lift_fresh.default, aten.empty.memory_format,
-             aten.empty_strided.default, aten.resize_.default, aten.set_.source_Storage_storage_offset,
-             aten.set_.source_Storage, aten.set_.source_Tensor, aten.set_.default, aten.clone.default}
+             aten.empty_strided.default, aten.empty_like.default, aten.new_empty.default,
+             aten.new_empty_strided.default, aten._unsafe_view.default, aten.resize_.default,
+             aten.set_.source_Storage_storage_offset, aten.set_.source_Storage, aten.set_.source_Tensor,
+             aten.set_.default}  # allocations and metadata; copies (clone, contiguous) are CPU work
+_COMPLEX_DTYPES = (torch.complex32, torch.complex64, torch.complex128)
 _MAKES_COMPLEX = {}  # func -> whether it can make a complex tensor from real ones (hpu_complex's fallback then)
 
 
@@ -388,7 +436,7 @@ def _classify(func, args, tensors, outs):
         a, b = tensors[0], tensors[1]
         if a.numel() * b.shape[-1] < _STATE["matmul_cpu_below"]:
             return "hpu_complex", "complex64 mm/bmm below hpu_complex's CPU threshold (set_matmul_cpu_threshold(0))"
-    if func.is_view or func in _METADATA:
+    if func.is_view or func in _METADATA or torch.Tag.inplace_view in func.tags:
         return None
     if both and all(t.device.type == "cpu" for t in both) and any(t.numel() > 1 for t in both):
         return "cpu op", "an op on CPU tensors inside the step"
@@ -407,11 +455,16 @@ class _Watch(TorchDispatchMode):
         kwargs = kwargs or {}
         if func is aten._local_scalar_dense.default and not isinstance(args[0], torch.Tensor):
             return args[0]  # a wrapped number (z * 2j inside hpu_complex) reaches the mode as its Python value
+        if _worker_info() is not None:  # a DataLoader worker (spawned: its enable() ran the environment form)
+            return func(*args, **kwargs)
+        if len(torch._ops._higher_order_ops) != _HOPS["seen"]:
+            _passthrough_hops()
         tensors = _tensors(args, kwargs)
         config = _config() or self.config
         if getattr(_TLS, "allowed", 0) or _tracing(tensors):
             return func(*args, **kwargs)
-        complex_in = any(t.is_complex() for t in tensors) or _makes_complex(func)
+        complex_in = any(t.is_complex() for t in tensors) or _makes_complex(func) or any(
+            v in _COMPLEX_DTYPES for v in (*args, *kwargs.values()) if isinstance(v, torch.dtype))
         base = _STATE["baseline"] or ((0, {}), 0)
         (total0, ops0), calls0 = _bridge_stats(), (_complex_calls() if complex_in else base[1])
         if base[0][0] != total0 or base[1] != calls0:
@@ -440,14 +493,83 @@ class _Watch(TorchDispatchMode):
         return out
 
 
+def _cond_eager(pred, true_fn, false_fn, operands):
+    return true_fn(*operands) if pred else false_fn(*operands)  # cond_op_dense, which asserts that no mode is on
+
+
+def _while_loop_eager(cond_fn, body_fn, carried_inputs, additional_inputs):
+    carried = carried_inputs  # while_loop_dense, which runs below every mode
+    while cond_fn(*carried, *additional_inputs):
+        carried = body_fn(*carried, *additional_inputs)
+    return carried
+
+
+_HOP_EAGER = {"cond": _cond_eager, "while_loop": _while_loop_eager}
+
+
 def _passthrough_hops():
-    """Higher-order ops (``torch.cond``, ``while_loop``, ...) need a rule per mode: run them as without the watch."""
-    for hop in list(torch._ops._higher_order_ops.values()):
+    """Higher-order ops need a rule per mode. ``cond`` and ``while_loop`` run their eager semantics with the watch
+    pushed back (HOP dispatch pops it), so the ops of their bodies and the predicate's host read are watched; other
+    HOPs run as without the watch (their bodies unwatched). Looked up again when the registry grows (HOPs are
+    created on import)."""
+    registry = torch._ops._higher_order_ops
+    for name, hop in list(registry.items()):
         if _Watch not in hop.python_key_table:
-            def rule(mode, *args, _hop=hop, **kwargs):
-                return _hop(*args, **kwargs)
+            def rule(mode, *args, _hop=hop, _eager=_HOP_EAGER.get(name), **kwargs):
+                if _eager is None:
+                    return _hop(*args, **kwargs)
+                _push_watch(mode)
+                try:
+                    return _eager(*args, **kwargs)
+                finally:
+                    _remove_watch(mode)
 
             hop.py_impl(_Watch)(rule)
+    _HOPS["seen"] = len(registry)
+
+
+def _install_eager_hook():
+    """Dynamo's ``force_eager`` stance for the threads in a per-op block only: Dynamo reads its stance through
+    ``eval_frame._callback_from_stance`` at every call of compiled code; this wraps it with the thread's flag. False
+    when this torch has no such function (the process-wide stance is used then)."""
+    if "installed" not in _EAGER_HOOK:
+        try:
+            import torch._dynamo.eval_frame as eval_frame
+
+            original = eval_frame._callback_from_stance
+        except (ImportError, AttributeError):
+            _EAGER_HOOK["installed"] = False
+            return False
+
+        def _callback_from_stance(callback):
+            if getattr(_TLS, "eager", 0):
+                return None  # Dynamo's own "force_eager", for this thread
+            return original(callback)
+
+        _callback_from_stance._hpu_ops_strict = True
+        eval_frame._callback_from_stance = _callback_from_stance
+        _EAGER_HOOK.update(installed=True, original=original)
+    return _EAGER_HOOK["installed"]
+
+
+def _eager_on():
+    if _install_eager_hook():
+        _TLS.eager = getattr(_TLS, "eager", 0) + 1
+        return
+    with _LOCK:  # no hook: the process-wide stance, set by the first open block of any thread, undone by the last
+        if not _GLOBAL_EAGER["n"]:
+            _GLOBAL_EAGER["cm"] = torch.compiler.set_stance("force_eager")
+        _GLOBAL_EAGER["n"] += 1
+
+
+def _eager_off():
+    if _EAGER_HOOK.get("installed"):
+        _TLS.eager = max(0, getattr(_TLS, "eager", 0) - 1)
+        return
+    with _LOCK:
+        _GLOBAL_EAGER["n"] -= 1
+        if not _GLOBAL_EAGER["n"]:
+            _GLOBAL_EAGER.pop("cm").__exit__(None, None, None)
 
 
 class _Block:
@@ -456,19 +578,25 @@ class _Block:
 
     def __init__(self, config, per_op):
         self.config, self.per_op = config, per_op
-        self.watch = self.stance = None
+        self.watch = self.outer_watch = self.outer_config = None
+        self.generation = _STATE["generation"]
 
     def enter(self):
         _resolve_complex()
         check()  # an outer block's fallbacks so far are the outer block's
+        with _LOCK:
+            _ACTIVE["n"] += 1
         _TLS.blocks = getattr(_TLS, "blocks", []) + [self.config]
         _STATE["baseline"] = _snapshot()
-        if self.per_op and _watch_on_stack() is None:
+        outer = _watch_on_stack()
+        if outer is not None:  # an outer block's watch: autograd's threads read its settings, so it takes these
+            self.outer_watch, self.outer_config = outer, outer.config
+            outer.config = self.config
+        elif self.per_op:
             _passthrough_hops()
-            self.stance = torch.compiler.set_stance("force_eager")
-            self.stance.__enter__()
+            _eager_on()
             self.watch = _Watch(self.config)
-            self.watch.__enter__()
+            _push_watch(self.watch)
         return self
 
     def exit(self, failed):
@@ -476,11 +604,15 @@ class _Block:
             if not failed:
                 check(self.config)
         finally:
-            if self.watch is not None:
-                if any(m is self.watch for m in _get_current_dispatch_mode_stack()):  # not popped in a fork
-                    self.watch.__exit__(None, None, None)
-                self.stance.__exit__(None, None, None)
-            _TLS.blocks = _TLS.blocks[:-1]  # the baseline stays: an outer block does not count these again
+            _TLS.blocks = getattr(_TLS, "blocks", [])[:-1]  # the baseline stays: an outer block does not count again
+            if self.generation == _STATE["generation"]:  # else a fork reset strict mode in this (child) process
+                if self.watch is not None:
+                    _remove_watch(self.watch)
+                    _eager_off()
+                if self.outer_watch is not None:
+                    self.outer_watch.config = self.outer_config
+                with _LOCK:
+                    _ACTIVE["n"] = max(0, _ACTIVE["n"] - 1)
 
 
 @contextlib.contextmanager
@@ -489,18 +621,27 @@ def strict(level="raise", per_op=True, allow=(), watch_cpu_ops=True):
     ``per_op=False``: no dispatch mode (compiled code compiles), the bridge's and hpu-complex's fallbacks are checked
     when the block ends. ``allow``: sources neither raised nor counted. ``watch_cpu_ops=False`` drops the ``cpu op``
     source. Nested blocks share the outermost per-op block's watch; the innermost block's settings apply."""
+    if torch.compiler.is_compiling():  # Dynamo breaks the graph here and runs the block eagerly
+        raise RuntimeError("hpu_ops.strict() inside a torch.compile'd function: open the block around the call")
     if level not in ("raise", "report"):
         raise ValueError(f"strict level {level!r}: 'raise' or 'report'")
     unknown = set(allow) - set(SOURCES)
     if unknown:
         raise ValueError(f"unknown strict sources {sorted(unknown)}; known: {SOURCES}")
-    block = _Block(_Config(level, allow, watch_cpu_ops), per_op).enter()
+    block = _without_dynamo(_Block(_Config(level, allow, watch_cpu_ops), per_op).enter)
     failed = True
     try:
         yield
         failed = False
     finally:
-        block.exit(failed)
+        _without_dynamo(block.exit, failed)
+
+
+def _without_dynamo(fn, *args):
+    """``fn(*args)`` with Dynamo off for its frames: a block opened in code that torch.compile runs (eagerly, after
+    the graph break at ``strict()``) must not be traced. Without Dynamo loaded nothing traces them."""
+    dynamo = sys.modules.get("torch._dynamo")
+    return fn(*args) if dynamo is None else dynamo.disable(fn)(*args)
 
 
 def report():
@@ -540,21 +681,14 @@ def _at_exit():
     print(format_report(), file=sys.stderr, flush=True)
 
 
-def _in_worker():
-    """A multiprocessing child (a DataLoader worker, spawned or forked): computes on the CPU by design."""
-    import multiprocessing
-
-    return multiprocessing.parent_process() is not None
-
-
 def from_env():
     """``HPU_OPS_STRICT`` read by ``enable()``: ``1``/``raise`` raises, ``report`` counts and prints at exit, for the
-    main thread (autograd's threads follow its watch). Once per process; never in a multiprocessing child. Returns
-    the level or None."""
+    main thread (autograd's threads follow its watch). Once per process; a DataLoader worker runs its loop outside
+    it. Returns the level or None."""
     if "env_config" in _STATE:
         return _STATE["env_config"].level
     value = os.environ.get(ENV, "").strip().lower()
-    if value in OFF or _in_worker():
+    if value in OFF:
         return None
     level = "report" if value == "report" else "raise"
     allow = tuple(s.strip() for s in os.environ.get(ENV_ALLOW, "").split(",") if s.strip())
