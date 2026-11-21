@@ -1773,3 +1773,157 @@ def test_logsumexp_keeps_aten_gradient_with_every_fix_in_lazy_mode(monkeypatch, 
         (got,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
     assert not calls.get("logsumexp")
     torch.testing.assert_close(got, want, equal_nan=True)
+
+
+# ---- Tensor.unfold: as_strided with ATen's sizes and strides (lazy mode has no HPU kernel; the CPU stands in)
+
+
+@pytest.fixture
+def unfold_key_free(monkeypatch):
+    """The CPU key of ``aten::unfold`` counts as free, as the HPU key is in Habana's lazy mode, so ``register_kernels``
+    puts the rewrite there (over the CPU kernel, restored by the undo)."""
+    has = torch._C._dispatch_has_kernel_for_dispatch_key
+    monkeypatch.setattr(torch._C, "_dispatch_has_kernel_for_dispatch_key",
+                        lambda op, key: False if (op, key) == ("aten::unfold", "CPU") else has(op, key))
+
+
+def _unfold_cases():
+    base = torch.randn(4, 7, 13, dtype=torch.float64)
+    return [
+        ("contiguous", lambda: base.clone(), 2, 4, 3),
+        ("step > size", lambda: base.clone(), 2, 3, 5),
+        ("size == dim", lambda: base.clone(), 1, 7, 1),
+        ("size 1", lambda: base.clone(), 0, 1, 1),
+        ("negative dim", lambda: base.clone(), -1, 5, 2),
+        ("negative dim -3", lambda: base.clone(), -3, 2, 2),
+        ("non-contiguous", lambda: base.clone().transpose(0, 2), 1, 3, 2),
+        ("offset view", lambda: base.clone()[1:, 2:, 3:], 2, 4, 3),
+        ("strided slice", lambda: base.clone()[:, ::2, 1::3], 1, 2, 1),
+        ("broadcast stride 0", lambda: torch.randn(1, 5, dtype=torch.float64).expand(3, 5), 0, 2, 1),
+        ("1-d", lambda: torch.arange(11.0, dtype=torch.float64), 0, 4, 4),
+        ("0-d", lambda: torch.tensor(3.0, dtype=torch.float64), 0, 1, 1),
+        ("0-d dim -1", lambda: torch.tensor(3.0, dtype=torch.float64), -1, 0, 2),
+        ("empty dim", lambda: torch.randn(3, 0, 4, dtype=torch.float64), 2, 2, 1),
+        ("unfold twice", lambda: base.clone().unfold(1, 3, 2), 2, 4, 3),
+    ]
+
+
+@pytest.mark.parametrize("name,make,dim,size,step", _unfold_cases(), ids=[c[0] for c in _unfold_cases()])
+def test_unfold_is_the_same_view(unfold_key_free, name, make, dim, size, step):
+    """Sizes, strides, storage offset, values and aliasing equal ATen's; a write into the input shows in the view."""
+    x = make()
+    want = x.unfold(dim, size, step)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        got = x.unfold(dim, size, step)
+    assert calls["unfold"] == 1
+    assert (got.shape, got.stride(), got.storage_offset()) == (want.shape, want.stride(), want.storage_offset())
+    assert torch._C._is_alias_of(got, x) and got._base is (x._base if x._base is not None else x)
+    assert torch.equal(got, want)
+    if x.numel() and not (x.stride() and 0 in x.stride()):
+        x.add_(1)
+        assert torch.equal(got, x.unfold(dim, size, step))
+
+
+@pytest.mark.parametrize("dim,size,step,match", [
+    (3, 2, 1, "out of range"), (2, 14, 1, "maximum size for tensor at dimension 2 is 13 but size is 14"),
+    (2, 2, 0, "step is 0 but must be > 0"), (2, -1, 1, "size is -1 but must be >= 0"),
+])
+def test_unfold_raises_aten_errors(unfold_key_free, dim, size, step, match):
+    x = torch.randn(4, 7, 13)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        with pytest.raises((RuntimeError, IndexError), match=match):
+            x.unfold(dim, size, step)
+    assert calls["unfold"] == 1  # the error is ATen's, raised from the rewrite's meta call
+
+
+def _write_through(t, overlapping=True):
+    """Writes through a view of an unfold of ``t`` (scaled first, so the graph input is not written): a copy instead
+    of a view would leave ``c`` unchanged and the output and its gradient would differ from ATen's."""
+    c = t * 1
+    c.unfold(-1, 3, 3).select(-1, 0).mul_(3)
+    if overlapping:  # torch.compile's functionalization bans this write, with ATen's kernel too
+        c.unfold(-1, 3, 1)[..., 1].add_(c.detach()[..., :1])
+    return c.sin()
+
+
+def test_unfold_writes_through_the_view_in_training(unfold_key_free):
+    x = torch.randn(3, 4, 11, dtype=torch.float64)
+    want = train_step(_write_through, x)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        got = train_step(_write_through, x)
+    assert calls["unfold"] == 2
+    assert_same(got, want)
+    assert not torch.equal(want[0], x.sin())  # the writes changed the output
+
+
+def test_unfold_gradients_and_double_backward(unfold_key_free):
+    """Torch's autograd kernel stays above the rewrite: gradients (unfold_backward), second order, and gradcheck."""
+    x = torch.randn(3, 10, 9, dtype=torch.float64)
+    f = lambda t: t.unfold(1, 4, 3).unfold(2, 2, 1).sin()  # noqa: E731  (overlapping windows: a gradient sum)
+    want = train_step(f, x)
+    xg = x.clone().requires_grad_()
+    (g,) = torch.autograd.grad(f(xg).square().sum(), xg, create_graph=True)
+    (want_gg,) = torch.autograd.grad(g.square().sum(), xg)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        got = train_step(f, x)
+        xg = x.clone().requires_grad_()
+        (g,) = torch.autograd.grad(f(xg).square().sum(), xg, create_graph=True)
+        (got_gg,) = torch.autograd.grad(g.square().sum(), xg)
+        assert torch.autograd.gradcheck(lambda t: t.unfold(-1, 3, 2), (torch.randn(2, 7, dtype=torch.float64,
+                                                                                    requires_grad=True),))
+    assert calls["unfold"] > 0
+    assert_same(got, want)
+    assert_same([got_gg], [want_gg])
+
+
+def test_unfold_in_place_through_the_view_and_inference_mode(unfold_key_free):
+    x = torch.zeros(2, 12)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        x.unfold(1, 3, 3).select(-1, 0).fill_(1)  # non-overlapping windows: writes reach the input
+        with torch.inference_mode():
+            y = torch.arange(10.0)
+            u = y.unfold(0, 2, 2)
+        a = torch.randn(5, 6, requires_grad=True)
+        v = a.clone().unfold(1, 2, 2)
+        v.mul_(2)  # an in-place op on the view of a graph tensor: autograd rebases it, as for ATen's view
+        v.sum().backward()
+    assert calls["unfold"] == 3
+    assert torch.equal(x[:, ::3], torch.ones(2, 4)) and x.sum() == 8
+    assert torch.equal(u, torch.arange(10.0).reshape(5, 2)) and torch._C._is_alias_of(u, y)
+    assert torch.equal(a.grad, torch.full((5, 6), 2.0))
+
+
+def test_unfold_compiles(unfold_key_free):
+    """Under torch.compile the tracers see unfold's meta kernel; the CPU stand-in's aot graph then runs the rewrite.
+    The compiled results and gradients equal eager's, also with writes through the view."""
+    f = lambda t: (t.unfold(2, 4, 3) * 2).sum(-1)  # noqa: E731
+    x = torch.randn(2, 3, 17, dtype=torch.float64)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        got = train_step(compiled(f, [], fullgraph=True), x)
+        # 18 = 6 windows of 3: torch 2.6's functionalization replays a write through an unfold with unfold_backward,
+        # which zeroes the elements no window covers (with ATen's kernel too), so the compiled write needs full cover
+        x18 = torch.randn(2, 3, 18, dtype=torch.float64)
+        written = train_step(compiled(lambda t: _write_through(t, False), [], fullgraph=True), x18)
+    assert calls["unfold"] > 0  # the CPU aot graph runs aten ops, so the rewrite (in hpu_backend's place) runs
+    assert_same(got, train_step(f, x))
+    assert_same(written, train_step(lambda t: _write_through(t, False), x18))
+
+
+def test_one_channel_conv_weight_grad_takes_the_unfold_rewrite(unfold_key_free):
+    """TensorCSPNet's temporal block (Conv2d(1, c, (k, w * d^2), stride (1, d^2))): its weight gradient from hpu-ops'
+    contraction runs both of its unfolds through the rewrite, and equals the CPU's."""
+    conv2d = nn.Conv2d(1, 4, (3, 2 * 9), stride=(1, 9)).double()
+    x = torch.randn(5, 1, 3, 9 * 6, dtype=torch.float64)
+    (want,) = torch.autograd.grad(conv2d(x).square().sum(), conv2d.weight)
+    with cpu_as_hpu(lambda d: hpu_ops._dispatch.chain([conv.install_weight_grad(d), composite.install_unfold(d)])) \
+            as calls:
+        (got,) = torch.autograd.grad(conv2d(x).square().sum(), conv2d.weight)
+    assert calls["conv_weight_grad"] == 1 and calls["unfold"] == 2
+    assert_same([got], [want])
+
+
+def test_unfold_elsewhere_and_eager_hpu_keep_the_native_kernel():
+    """Where the backend key has a kernel (the CPU here, Habana's eager stack on Gaudi) nothing is registered."""
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        torch.randn(3, 8).unfold(1, 2, 2)
+    assert not calls.get("unfold")
