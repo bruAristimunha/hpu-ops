@@ -1127,8 +1127,8 @@ def test_svd_declined_past_maxn_and_without_kernel(monkeypatch, svd_hook):
     assert takes(A) is False
     monkeypatch.setattr(tpc, "ready", lambda: True)
     assert takes(A) is True
-    assert takes(torch.randn(tpc.SMALL_MAXN + 1, 4)) is True  # past the kernel: block Jacobi, on the card
-    assert takes(torch.randn(4, tpc.SMALL_MAXN + 1)) is True
+    assert takes(torch.randn(tpc.SMALL_MAXN + 1, 4)) is False  # past the kernel: main's route (SVD_GRAM_NOTE)
+    assert takes(torch.randn(4, tpc.SMALL_MAXN + 1)) is False
     assert takes(torch.randn(tpc.SMALL_MAXN, tpc.SMALL_MAXN)) is True
     assert takes(A, driver="gesvd") is False
 
@@ -1580,9 +1580,9 @@ def test_svd_u_backend_takes_and_decline_copy_back(monkeypatch, svd_hook):
     torch.testing.assert_close(S, want_S, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close((U * S.unsqueeze(-2)) @ Vh, A, rtol=1e-4, atol=1e-4)
 
-    # Decline path: float64 (driver != None is also declined by takes); past SMALL_MAXN the block Jacobi takes it
+    # Decline path: float64 and past SMALL_MAXN (driver != None is also declined by takes)
     assert not linalg._svd_takes("hpu")(A, driver="gesvd")
-    assert linalg._svd_takes("hpu")(torch.randn(2, 4, tpc.SMALL_MAXN + 1))
+    assert not linalg._svd_takes("hpu")(torch.randn(2, 4, tpc.SMALL_MAXN + 1))
     for mat, cuv in (
         (torch.randn(2, 4, 3, dtype=torch.float64), True),
     ):

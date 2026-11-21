@@ -54,9 +54,9 @@ def _tpc_takes(device_type):
 
 
 # Past tpc.EIGH_MAXN eigh runs on the card: the one-sided Jacobi kernel jacobi_big up to tpc.BIG_EIGH_MAXN (batch 32:
-# 11.6 / 21.9 / 29 ms at n = 55 / 110 / 128, hpu-ops' CPU route 9.6 / 26.2 / 34.7; tests/probe_eigh_big.py), the block
-# Jacobi past it (10x slower than the CPU route). ``HPU_OPS_LARGE_EIGH=cpu`` (read per call) asks for the CPU route
-# past tpc.EIGH_MAXN instead.
+# 11.6 / 21.9 / 29 ms at n = 55 / 110 / 128, hpu-ops' CPU route 9.6 / 26.2 / 34.7; tests/probe_eigh_big.py), past it
+# the block Jacobi of hpu_ops.jacobi on 128-wide pairs through jacobi_big, run to convergence (see jacobi.py).
+# ``HPU_OPS_LARGE_EIGH=cpu`` (read per call) asks for the CPU route past tpc.EIGH_MAXN instead.
 LARGE_EIGH = "HPU_OPS_LARGE_EIGH"
 
 

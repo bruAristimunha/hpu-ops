@@ -677,3 +677,78 @@ def householder_product(A, tau, legacy=False):
             e = np.where(lanes == i, F32(1), F32(0)).astype(F32)
             q[i] = add(e, ntv) if legacy or tau_i != 0 else e
     return np.stack([x[:m] for x in q], 1)
+
+
+# ---- jacobi_big_f32_gaudi2.c: one-sided Jacobi, 32 < n <= 128, rows in local memory -------------------------------
+
+
+def _rsqrt_lut_free(x):
+    """``rsqrt_lut_free``: the bit-level guess 0x5f3759df - (bits >> 1) and three Newton steps."""
+    y = _f32(0x5F3759DF - (_u32(x) >> 1))
+    hx = mul(F32(-0.5), x)
+    for _ in range(3):
+        y = mul(y, mac(hx, mul(y, y), F32(1.5)))
+    return y
+
+
+def _inv_sqrt_unit(c2):
+    p = np.full_like(c2, F32(1.1498469))
+    for coef in (-4.40869479, 6.8050256, -5.47635557, 2.9302518):
+        p = mac(c2, p, F32(coef))
+    half_c2 = mul(F32(-0.5), c2)
+    nr = mac(half_c2, mul(p, p), F32(1.5))
+    return mul(p, nr)
+
+
+def jacobi_big(S0, sweeps=8):
+    """``U`` of ``jacobi_big_f32_gaudi2.c`` for one ``S0[n, w]`` (w = 64 * VA): the kernel's round-robin order, its
+    lane-wise accumulation over the VA vectors of a row, the 64-lane butterfly, the LUT-free reciprocal square root and
+    the polynomial 1/sqrt, each op rounded as the kernel's (FTZ, one rounding per FMA)."""
+    u = _ftz(np.array(S0, dtype=F32))
+    n, w = u.shape
+    va = w // 64
+    M = n if n % 2 else n - 1
+
+    def rotate(p, q):
+        a = b = g = np.zeros(64, F32)
+        up, uq = u[p].reshape(va, 64), u[q].reshape(va, 64)
+        for v in range(va):
+            a, b, g = mac(up[v], up[v], a), mac(uq[v], uq[v], b), mac(up[v], uq[v], g)
+        alpha, beta, gamma = _reduce_add_64(a), _reduce_add_64(b), _reduce_add_64(g)
+        d = sub(beta, alpha)
+        g2 = add(gamma, gamma)
+        r2 = mac(g2, g2, mul(d, d))
+        sr2 = np.where(r2 == 0, F32(1), r2).astype(F32)
+        inv_r = _rsqrt_lut_free(sr2)
+        c2 = mul(F32(0.5), mac(np.abs(d), inv_r, F32(1)))
+        inv_c = _inv_sqrt_unit(c2)
+        c = mul(c2, inv_c)
+        s = mul(gamma, mul(inv_r, inv_c))
+        s = np.where(d < 0, sub(F32(0), s), s).astype(F32)
+        conv = sub(mul(F32(1e-14), mul(alpha, beta)), mul(gamma, gamma))
+        c = np.where(conv >= 0, F32(1), c).astype(F32)
+        s = np.where(conv >= 0, F32(0), s).astype(F32)
+        c = np.where(r2 == 0, F32(1), c).astype(F32)
+        s = np.where(r2 == 0, F32(0), s).astype(F32)
+        ns = sub(F32(0), s)
+        cv, sv, nsv = np.tile(c, va), np.tile(s, va), np.tile(ns, va)
+        u[p], u[q] = mac(u[q], nsv, mul(u[p], cv)), mac(u[p], sv, mul(u[q], cv))
+
+    for _ in range(sweeps):
+        for r in range(M):
+            if M < n:
+                rotate(r, M)
+            for k in range(1, (M + 1) // 2):
+                x, y = (r + k) % M, (r - k) % M
+                rotate(min(x, y), max(x, y))
+    return u
+
+
+def jacobi_big_op(refine=False):
+    """A stand-in for ``torch.ops.linalg_tpc.jacobi_big`` (``_refine``: 3 sweeps): the replica per batch element."""
+    import torch
+
+    def op(S0):
+        return torch.from_numpy(np.stack([jacobi_big(s.detach().cpu().numpy(), 3 if refine else 8) for s in S0]))
+
+    return op

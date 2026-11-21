@@ -1,22 +1,40 @@
-"""Block Jacobi on the card for the sizes past the Jacobi kernels' (``tpc.EIGH_MAXN``, ``tpc.SMALL_MAXN``): ``eigh``
-of a symmetric matrix (two-sided) and ``svd`` (one-sided, on the Gram matrix of column pairs), each pair of
-``BLOCK``-wide blocks diagonalized exactly by the ``2 * BLOCK = 32`` eigh kernel, all pairs of a round in one launch,
-the rotations applied as batched matmuls. Round-robin pairing (``eigh._schedule``) over the blocks, a fixed number of
-sweeps (``SWEEPS``), so nothing reads the device: no host sync, one shape per step.
+"""Block Jacobi ``eigh`` on the card past the eigh kernels' sizes: two-sided, each pair of ``b``-wide blocks
+diagonalized exactly by an eigh kernel (``tpc.eigh_big`` on 2b = 128 blocks on HPU), all pairs of a round in one
+launch, the rotations applied as batched matmuls; round-robin pairing (``eigh._schedule``) over the blocks.
 
-Padding to a whole number of block pairs uses a value no eigenvalue (singular value) of the input reaches, ``2
-||A||_F + 1``: the padded coordinates' subproblems are then block-diagonal with distinct eigenvalues, their rotations
-never mix them with the input's, and the padded eigenvalues sort last (first, for singular values) and are dropped.
+Sweeps run until the off-diagonal part is below ``TOL`` of the matrix (Frobenius, the worst matrix of the batch:
+one host read per sweep), at most ``max_sweeps(k)``; a traced call (no host reads) runs the cap. Measured (CPU
+float64-exact sub-solver, n = 512 and 1024): 16-wide blocks and 5 fixed sweeps left 1e-3 / 1e-2 eigenvalue error
+(code review of #51); 64-wide blocks reach CPU float32's error in 5 (n = 512) to 8 (n = 1024) sweeps.
+
+Padding to a whole number of block pairs uses a value no eigenvalue of the input reaches, ``2 ||A||_inf + 1`` (a
+row-sum bound: no squares, so no overflow for entries near 1e19): the padded coordinates' subproblems are then
+block-diagonal with distinct eigenvalues, their rotations never mix them with the input's, and the padded eigenvalues
+sort last and are dropped.
 """
 import torch
 
-BLOCK = 16  # 2 * BLOCK = tpc.EIGH_MAXN
+BLOCK = 64  # 2 * BLOCK = tpc.BIG_EIGH_MAXN
+TOL = 1e-6
 # Block-cyclic sweeps on the running S (off(S) / ||S|| reaches float32's rounding level by sweep 5, n <= 128), then
 # POLISH sweeps each from S = V^T A V recomputed with V re-orthogonalized (two Newton-Schulz steps), and a last
 # re-orthogonalization and Rayleigh-Ritz S = V^T A V. Without the polish the rotations' rounding left V orthogonal to
 # 5e-6 only and the eigenvalues 10-30x CPU float32's error (n = 64, 128, CPU float32 sub-solver); with it, 0.6-2x.
-SWEEPS = 5
+SWEEPS = 5  # traced calls; eager ones stop by TOL, at most max_sweeps(k)
 POLISH = 1
+
+
+def max_sweeps(k):
+    """The sweep cap for ``k`` blocks: cyclic Jacobi converges quadratically once close; 6 plus a few per doubling."""
+    return 6 + 2 * max(1, (k - 1).bit_length())
+
+
+def _off(S):
+    """The worst matrix's off-diagonal Frobenius norm relative to its own (scaled first: no overflow)."""
+    S = S / S.abs().amax((-2, -1), keepdim=True).clamp_min(torch.finfo(S.dtype).tiny)
+    total = torch.linalg.vector_norm(S, dim=(-2, -1))
+    diag = torch.linalg.vector_norm(torch.diagonal(S, dim1=-2, dim2=-1), dim=-1)
+    return ((total.square() - diag.square()).clamp_min(0).sqrt() / total.clamp_min(torch.finfo(S.dtype).tiny)).amax()
 
 
 def _pairs(k, device):
@@ -65,7 +83,7 @@ def _sweep(S, V, k, eigh, b):
     return S, V
 
 
-def block_eigh(A, eigh, compute_v=True, b=BLOCK, sweeps=SWEEPS, polish=POLISH):
+def block_eigh(A, eigh, compute_v=True, b=BLOCK, sweeps=None, polish=POLISH, tol=TOL):
     """``(w, V)`` of the symmetric ``A[..., n, n]`` (both triangles read): ``w`` ascending, the columns of ``V``
     orthonormal eigenvectors (None unless ``compute_v``). ``eigh`` takes ``[B, 2b, 2b]`` and returns ``(w, V)``."""
     batch, n = A.shape[:-2], A.shape[-1]
@@ -74,14 +92,23 @@ def block_eigh(A, eigh, compute_v=True, b=BLOCK, sweeps=SWEEPS, polish=POLISH):
     k = 2 * -(-n // (2 * b))
     m = k * b
     if m > n:  # pad with a value past the spectrum: the padded eigenvalues sort last
-        big = 2 * torch.linalg.vector_norm(S, dim=(-2, -1)) + 1
+        big = 2 * S.abs().sum(-1).amax(-1) + 1
         pad = torch.diag_embed(big[:, None].expand(B, m - n))
         S = torch.cat([torch.cat([S, S.new_zeros(B, n, m - n)], -1), torch.cat([S.new_zeros(B, m - n, n), pad], -1)], -2)
     A0 = S
     V = torch.eye(m, dtype=S.dtype, device=S.device).expand(B, m, m)  # also for eigenvalues alone: the polish needs it
-    for _ in range(sweeps):
+    from .linalg import _strict, _tracing
+
+    traced = _tracing(S)
+    cap = (SWEEPS if traced else max_sweeps(k)) if sweeps is None else sweeps
+    for _ in range(cap):
         S, V = _sweep(S, V, k, eigh, b)
         S = (S + S.mT) / 2
+        if sweeps is None and not traced:
+            off = _off(S)
+            with _strict.host_read("linalg_eigh: block Jacobi convergence", off):
+                if float(off) <= tol:
+                    break
     for _ in range(polish):
         V = _orthonormalize(V)
         S = V.mT @ (A0 @ V)
@@ -100,61 +127,3 @@ def block_eigh(A, eigh, compute_v=True, b=BLOCK, sweeps=SWEEPS, polish=POLISH):
         return w.reshape(*batch, n), None
     V = V.gather(-1, idx[..., None, :].expand(B, m, m))[..., :n, :n]
     return w.reshape(*batch, n), V.reshape(*batch, n, n)
-
-
-def block_svd(A, eigh, compute_uv=True, b=BLOCK, sweeps=SWEEPS, polish=POLISH):
-    """``(U, S, Vh)`` (thin) of ``A[..., m, n]``: one-sided block Jacobi on the columns (rows if m < n), each pair's
-    Gram matrix diagonalized by ``eigh`` and the pair rotated by its eigenvectors; ``S`` descending, the column norms
-    at the end, ``U = A V / S`` (a singular value below ``n eps S_max`` gives a zero column) re-orthogonalized. ``U``
-    and ``Vh`` are None unless ``compute_uv``."""
-    if A.shape[-2] < A.shape[-1]:
-        U, S, Vh = block_svd(A.mT, eigh, compute_uv, b, sweeps, polish)
-        return (None, S, None) if not compute_uv else (Vh.mT, S, U.mT)
-    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
-    X = A.reshape(-1, m, n)
-    B = X.shape[0]
-    k = 2 * -(-n // (2 * b))
-    p = k * b
-    if p > n:  # pad with [[A, 0], [0, c I]], c past every singular value: the padded ones sort first
-        c = 2 * torch.linalg.vector_norm(X, dim=(-2, -1)) + 1
-        pad = torch.diag_embed(c[:, None].expand(B, p - n))
-        X = torch.cat([torch.cat([X, X.new_zeros(B, m, p - n)], -1), torch.cat([X.new_zeros(B, p - n, n), pad], -1)], -2)
-    rows = X.shape[-2]
-    X0 = X
-    V = torch.eye(p, dtype=X.dtype, device=X.device).expand(B, p, p)
-    h, w = p // (2 * b), 2 * b
-    for sweep in range(sweeps + polish):
-        if sweep >= sweeps:  # polish: V re-orthogonalized, X = A V recomputed from the input
-            V = _orthonormalize(V)
-            X = X0 @ V
-        for order in _pairs(k, X.device):
-            perm = _block_perm(order, b)
-            Xp = X.index_select(-1, perm).view(B, rows, h, w)
-            G = torch.einsum("brix,briy->bixy", Xp, Xp).reshape(B * h, w, w)
-            _, J = eigh(((G + G.mT) / 2).contiguous())
-            J = J.reshape(B, h, w, w)
-            inv = perm.argsort()
-            X = torch.einsum("brix,bixy->briy", Xp, J).reshape(B, rows, p).index_select(-1, inv)
-            V = torch.einsum("brix,bixy->briy", V.index_select(-1, perm).view(B, p, h, w), J).reshape(B, p, p)
-            V = V.index_select(-1, inv)
-    V = _orthonormalize(V)
-    X = X0 @ V
-    norms = torch.linalg.vector_norm(X, dim=-2)
-    S, idx = norms.sort(-1, descending=True)
-    S = S[..., p - n:]
-    idx = idx[..., p - n:]
-    if not compute_uv:
-        return None, S.reshape(*batch, n), None
-    V = V.gather(-1, idx[..., None, :].expand(B, p, n))[..., :n, :]
-    U = X.gather(-1, idx[..., None, :].expand(B, rows, n))[..., :m, :]
-    # a singular value at rounding level (below n eps S_max) gives a zero column: dividing by it would blow the
-    # rounding up (the projector of _complete_orthogonal has exact zeros), and the Newton-Schulz steps keep zeros
-    tiny = S <= S[..., :1] * (n * torch.finfo(S.dtype).eps)
-    U = torch.where(tiny[..., None, :], 0.0, U / torch.where(tiny, 1.0, S)[..., None, :])
-    # A V / S loses orthogonality where S is small (7e-6 for a 134 x 128 Gaussian, 1e-4 for a square one): a
-    # first-order Cholesky-QR step U <- U (I - diag(E) / 2 - triu(E, 1)), E = U^T U - I, which, S sorted descending,
-    # corrects each column by the larger singular values' columns only (a symmetric Newton-Schulz step let the
-    # inaccurate columns rotate the accurate ones); a zero column stays zero
-    E = U.mT @ U - torch.eye(n, dtype=U.dtype, device=U.device)
-    U = U - U @ (torch.triu(E, 1) + torch.diag_embed(torch.diagonal(E, dim1=-2, dim2=-1)) / 2)
-    return U.reshape(*batch, m, n), S.reshape(*batch, n), V.mT.reshape(*batch, n, n)

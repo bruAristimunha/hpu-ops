@@ -1449,13 +1449,13 @@ BIG_EIGH_MAXN = 128  # jacobi_big: 32 < n <= BIG_EIGH_MAXN (VA = 1, 2); past it 
 BIG_SHIFT = 1.001  # S = A / ||A||_inf + BIG_SHIFT I: positive definite, eigenvalues in [0.001, 2.001]
 
 
-def _big_pass(X, sigma, refine):
+def _big_pass(X, sigma, refine, shift=None):
     """One kernel pass (``jacobi_big``, 8 sweeps; ``refine``: 3) on ``X[b, n, n]`` symmetric, shifted positive
     definite by its row-sum bound ``sigma[b]``: the rows of the eigenvector estimate ``[b, n, n]``."""
     b, n, _ = X.shape
     w = 64 * (-(-n // 64))
     eye = torch.eye(n, dtype=X.dtype, device=X.device)
-    S = X / sigma[:, None, None] + BIG_SHIFT * eye
+    S = X / sigma[:, None, None] + (BIG_SHIFT if shift is None else shift[:, None, None]) * eye
     U = _call(_big_op(refine), _fresh(torch.nn.functional.pad(S, (0, w - n)).contiguous()))[..., :n]
     # the rows of S V are lambda_j v_j at convergence (S positive definite): normalized, the eigenvectors
     return U * torch.rsqrt((U * U).sum(-1, keepdim=True))
@@ -1476,7 +1476,13 @@ def eigh_big(A):
     sigma = torch.where(sigma > 0, sigma, 1.0)
     V = _big_pass(X, sigma, False)  # rows
     T = V @ X @ V.mT
-    V = _big_pass((T + T.mT) / 2, sigma, True) @ V
+    T = (T + T.mT) / 2
+    # The refinement on T = V A V^T, nearly diagonal: unshifted where Gershgorin proves T positive definite (one-sided
+    # Jacobi on a definite matrix keeps its small eigenvalues' relative accuracy; the shift of 1.001 compressed them:
+    # 1e-6 came back as 1.41e-6 at n = 127, code review of #51), else shifted as the first pass
+    off = T.abs().sum(-1) - torch.diagonal(T, dim1=-2, dim2=-1).abs()
+    definite = (torch.diagonal(T, dim1=-2, dim2=-1) - off > 0).all(-1)
+    V = _big_pass(T, sigma, True, torch.where(definite, 0.0, BIG_SHIFT)) @ V
     eye = torch.eye(n, dtype=X.dtype, device=X.device)
     for _ in range(2):
         V = (1.5 * eye - 0.5 * (V @ V.mT)) @ V

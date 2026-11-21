@@ -107,6 +107,13 @@ def _float64_on_card(device_type, args, kwargs):
     return True
 
 
+def _mixed_floats(args, kwargs):
+    """Whether the floating tensor arguments mix dtypes (``solve(A float64, B float32)``): the opt-in then casts
+    nothing, so the call raises where torch raises (code review of #51)."""
+    dtypes = {x.dtype for x in pytree.tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor) and x.is_floating_point()}
+    return len(dtypes) > 1
+
+
 def _writes(op):
     """Whether ``op`` writes into an argument (an out= overload or an in-place op): those keep the default."""
     return any(a.alias_info is not None and a.alias_info.is_write for a in op._schema.arguments)
@@ -119,8 +126,8 @@ def _float64_kernel(device_type, op, kernel):
         return kernel
 
     def wrapped(*args, **kwargs):
-        if not _float64_on_card(device_type, args, kwargs):
-            return kernel(*args, **kwargs)
+        if not _float64_on_card(device_type, args, kwargs) or _mixed_floats(args, kwargs):
+            return kernel(*args, **kwargs)  # mixed float64 / float32 arguments: torch's own dtype error
         down = lambda x: x.to(torch.float32) if isinstance(x, torch.Tensor) and x.dtype == torch.float64 else x  # noqa: E731
         out = kernel(*pytree.tree_map(down, args), **pytree.tree_map(down, kwargs))
         up = lambda y: y.to(torch.float64) if isinstance(y, torch.Tensor) and y.dtype == torch.float32 else y  # noqa: E731
@@ -1094,7 +1101,8 @@ def _det_backward(A, det, grad, inverse):
 def _det_grad_singular(A, grad):
     """torch's ``linalg_det_backward`` for singular ``A`` in grad mode: with ``A = U S V^H``, ``det(U) det(V^H) U
     diag(g prod_{j != i} s_j) V^H``, the products without a division (exclusive cumulative products). The SVD is
-    the public op, so on HPU it is hpu-ops' own (``install_svd``: the Jacobi kernel, differentiable), on the card."""
+    the public op: on HPU hpu-ops' own (``install_svd``: the Jacobi kernel, differentiable, on the card) up to
+    ``tpc.SMALL_MAXN``, main's route past it (SVD_GRAM_NOTE)."""
     U, S, Vh = torch.linalg.svd(A)
     alpha = torch.linalg.det(U) * torch.linalg.det(Vh)
     ones = torch.ones_like(S[..., :1])
@@ -1255,8 +1263,8 @@ def _svd_takes(device_type, name="svd"):
             return False
         if A.dim() < 2:
             return False
-        if device_type != "hpu" and _BLOCK_EIGH is None and max(A.shape[-2:]) > tpc.SMALL_MAXN:
-            return False  # the CPU stand-in keeps torch's own past the kernel's sizes; on HPU the block Jacobi SVD
+        if max(A.shape[-2:]) > tpc.SMALL_MAXN:
+            return False  # main's route past the Jacobi SVD kernel (SVD_GRAM_NOTE)
         return device_type != "hpu" or tpc.ready()
 
     return takes
@@ -1270,8 +1278,8 @@ def _pinv_takes(device_type, name="pinv"):
             return False
         if A.dim() < 2:
             return False
-        if device_type != "hpu" and _BLOCK_EIGH is None and max(A.shape[-2:]) > tpc.SMALL_MAXN:
-            return False  # the CPU stand-in keeps torch's own past the kernel's sizes; on HPU the block Jacobi SVD
+        if max(A.shape[-2:]) > tpc.SMALL_MAXN:
+            return False  # main's route past the Jacobi SVD kernel (SVD_GRAM_NOTE)
         if device_type == "hpu" and not tpc.ready():
             return False
         for tol in (atol, rtol):
@@ -1296,8 +1304,8 @@ def _lstsq_takes(device_type, name="lstsq"):
             return False
         if A.dim() < 2:
             return False
-        if device_type != "hpu" and _BLOCK_EIGH is None and max(A.shape[-2:]) > tpc.SMALL_MAXN:
-            return False  # the CPU stand-in keeps torch's own past the kernel's sizes; on HPU the block Jacobi SVD
+        if max(A.shape[-2:]) > tpc.SMALL_MAXN:
+            return False  # main's route past the Jacobi SVD kernel (SVD_GRAM_NOTE)
         if device_type == "hpu" and not tpc.ready():
             return False
         if B.dim() == A.dim() - 1:
@@ -1313,27 +1321,23 @@ def _lstsq_takes(device_type, name="lstsq"):
     return takes
 
 
-# The block Jacobi hook for the CPU tests: ``(A[B, 32, 32]) -> (w, V)``, the eigh the block SVD and eigh call past the
-# kernels' sizes. None means ``tpc.eigh`` on HPU.
+# SVD_GRAM_NOTE: the SVD family (svd, svdvals, pinv, lstsq, matrix_norm 2 / -2 / nuc, matrix_rank) takes matrices of
+# both sides <= tpc.SMALL_MAXN only (the Jacobi SVD kernel); past it main's route. A block Jacobi on column pairs' Gram
+# matrices, tried on this branch, squares the condition number: svdvals of a 512 x 512 matrix of spectrum 1 to 1e-5 had
+# 6.9e-3 error (CPU float32 7.5e-7), lstsq 40 x 20 at condition 1e4 4.6e-2 (CPU 1.8e-4; code review of #51).
+
+# The block Jacobi hook for the CPU tests: ``(A[B, 2b, 2b]) -> (w, V)``, the eigh the block Jacobi eigh calls on its
+# pairs past tpc.BIG_EIGH_MAXN. None means ``tpc.eigh_big`` on HPU (2b = 128).
 _BLOCK_EIGH = None
 
 
 def _block_eigh_solver(device):
     if _BLOCK_EIGH is not None:
         return _BLOCK_EIGH
-    return lambda X: tpc.eigh(X, False)
+    return tpc.eigh_big
 
 
 def _run_svd(A, compute_uv, full_matrices=False, sort=True, flush=True):
-    big = A.shape[-2] > tpc.SMALL_MAXN or A.shape[-1] > tpc.SMALL_MAXN
-    if big and (_BLOCK_EIGH is not None or A.device.type == "hpu"):
-        # past the Jacobi SVD kernel: one-sided block Jacobi on the card (its column pairs' Gram matrices through
-        # the eigh kernel); thin, sorted; Svd.compute completes U or V for full_matrices
-        from . import jacobi
-
-        U, S, Vh = jacobi.block_svd(A.detach() if _BLOCK_EIGH is not None else A, _block_eigh_solver(A.device),
-                                    compute_uv)
-        return (U, S, Vh) if compute_uv else (A.new_empty(0), S, A.new_empty(0))
     if _SVD is not None:
         return _SVD(A.detach(), compute_uv)
     if A.device.type == "hpu":
@@ -1347,13 +1351,6 @@ def _complete_orthogonal(U, S):
     m, k = U.shape[-2], U.shape[-1]
     eye = torch.eye(m, dtype=U.dtype, device=U.device)
     P = eye - U @ U.mT
-    if m > tpc.SMALL_MAXN and (_BLOCK_EIGH is not None or U.device.type == "hpu"):
-        # past the SVD kernel: the eigenvectors of eigenvalue 1 of the projector (block Jacobi eigh, on the card),
-        # which its eigenvalues 0 and 1 separate cleanly; the block SVD's Gram sees its zeros as sqrt(eps)
-        from . import jacobi
-
-        _, Q = jacobi.block_eigh((P + P.mT) / 2, _block_eigh_solver(U.device))
-        return torch.cat([U, Q[..., k:]], -1)
     unull = _run_svd(P, True)[0]
     return torch.cat([U, unull[..., :m - k]], -1)
 
@@ -1502,8 +1499,7 @@ def install_svd(device_type):
             def ag(*args, **kwargs):
                 A, ord_, dim, keepdim, dtype = _bind(op_, args, kwargs)
                 dims = _norm_dims(A, dim) if dtype is None and pred_(ord_) else None
-                small = device_type == "hpu" or (dims is not None and
-                                                 max(A.shape[dims[0]], A.shape[dims[1]]) <= tpc.SMALL_MAXN)
+                small = dims is not None and max(A.shape[dims[0]], A.shape[dims[1]]) <= tpc.SMALL_MAXN
                 if dims is not None and not _transformed() and _takes_tensors(device_type, "svd", [A]) and \
                         small and (device_type != "hpu" or tpc.ready()):
                     return _norm_run(A, ord_, dims[0], dims[1], keepdim)

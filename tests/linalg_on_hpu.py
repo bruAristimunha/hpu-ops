@@ -67,6 +67,10 @@ large_maxn = 512  # hpu_ops.tpc.LARGE_MAXN (solve, inv, det, slogdet), set in ma
 LARGE_OPS = ("linalg.solve", "linalg.inv", "linalg.det", "linalg.slogdet")  # and their variants, not solve_triangular
 eigh_maxn = 32  # hpu_ops.tpc.EIGH_MAXN, set in main
 small_maxn = 32  # hpu_ops.tpc.SMALL_MAXN (SVD family, matrix_exp, LU ops), set in main
+# the SVD family: past small_maxn main's route (hpu_ops.linalg.SVD_GRAM_NOTE), recorded as "fallback", not failed
+SVD_OPS = ("linalg.svd", "linalg.svdvals", "linalg.pinv", "linalg.lstsq", "linalg.matrix_norm", "linalg.matrix_rank")
+# Codex rows whose SVD past small_maxn takes main's route by design (the singular det double backward's SVD at n = 33)
+SVD_ROUTE_ROWS = ("codex8.det_double_backward_singular",)
 SMALL_OPS = ("linalg.svd", "linalg.svdvals", "linalg.pinv", "linalg.lstsq", "linalg.matrix_norm", "linalg.matrix_rank",
              "linalg.matrix_exp", "linalg.lu", "lu_unpack")
 SINGULAR_N = 22
@@ -649,9 +653,10 @@ def run_case(case, n, timed=True):
             notes += note
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
-    # fallbacks recorded, not failed: baseline only (no size is exempt: past every kernel's n limit the call stays
-    # on the card too)
-    expected = BASELINE
+    # fallbacks recorded, not failed: baseline, and the SVD family past the Jacobi SVD kernel's sizes, which takes
+    # main's route by design (hpu_ops.linalg's SVD_GRAM_NOTE: the Gram route on the card squared the condition number);
+    # every other size stays on the card
+    expected = BASELINE or (case.name.startswith(SVD_OPS) and n > small_maxn)
     problems = hard + ([] if expected else soft)
     row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft, notes=notes)
     if problems and os.environ.get("LINALG_ON_HPU_DUMP"):  # the failing inputs, for a reproducer
@@ -1011,8 +1016,8 @@ def run_codex_case(name, fn, ins, expect):
             problems += [f"error {err:.3g} > 1e-6"] * (not err <= 1e-6)
         # hpu-ops' CPU route is judged below: allowed only where torch raises (it reproduces torch's error there)
         problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings({**rec, "cpu_route": 0})
-        problems += [f"took hpu-ops' CPU route {row['cpu_route']}x"] * bool(row["cpu_route"] and want_err is None
-                                                                            and expect != "raise")
+        routed = row["cpu_route"] and want_err is None and expect != "raise" and not name.startswith(SVD_ROUTE_ROWS)
+        problems += [f"took hpu-ops' CPU route {row['cpu_route']}x"] * bool(routed)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         problems.append(f"exception {e!r}"[:300])
     emit(**row, status="fail" if problems else "ok", problems=problems)
