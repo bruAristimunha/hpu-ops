@@ -79,6 +79,8 @@ One fix is outside the dispatcher: `torch.save` pickles HPU tensors through a te
 | In lazy mode the gradient of `X[..., rows, cols]` (spd_learn's `vech` and `vec_to_sym`) is wrong from batch 2 to 8 on: 0.45 to 1 relative error; every gradient before it was wrong in SPDResNet, GyroSPD, CorNet, SPNN, DeepGeoCCA, SPDNetAE, EEGSPDNet, MAtt and CorAtt (up to 1.19), eager right. Once that gradient is right, SPNN's lazy graph fails to launch (`Sections' validation failure`). | Gaudi's lazy accumulating `_index_put_impl_` (the backward of `index`) with a `None` before or between the index tensors (`repro/index_put_lazy.py`); and, in one lazy graph with index puts and reads, a boolean-mask put (`repro/lazy_section_validation.py`). Both without hpu-ops. | eager + compile, at `AutogradHPU` and `HPU`: an `index` of integer indices (int32 or int64, broadcast, negative) with an index tensor on the CPU, or that do not lead, is one `index_select` of the indexed span flattened (a slice between two indices joins the linear index as an `arange`, so the input is not copied), with the linear index (backward: `index_add`), built on the host for CPU index tensors and moved once; leading device indices keep Habana's kernel; one boolean mask after a slice goes through its `nonzero` into the same `index_select`; other masks with CPU index tensors are moved to the device; eager + compile: a boolean-mask put of one value, `m[..., mask] = c`, into a dense tensor is `copy_(where(mask, value, self))`. | Lazy: the 9 models within the parity bar (worst 3.1e-4), 20 of 20 lazy models ok, steps as fast or faster (SPDResNet 47.1 to 37.2 ms). Eager: the same gradients, and `aten::index.Tensor_out` no longer falls back to the CPU (SPNN 326 to 240 ms per step). |
 | Linear 1-D upsampling drifts with the length unless the factor is a power of two without `align_corners`, eager and compiled (NeuroPose's last resize, 9920 to 10000 samples: 34% off). | Gaudi's `upsample_linear1d` forward; its backward is also less exact than the CPU's at some sizes. | eager + compile: explicit source indices and weights, computed as ATen's CPU kernel computes them, differentiated by autograd. Powers of two keep the native op. | Output and input gradient as close to float64 as the CPU's float32 kernel; NeuroPose matches the CPU (1.2e-06). |
 | `torch.save` fails after an optimizer step, eager and compiled (`Number of dims in tensor don't match in permute`). | Synapse writes a conv weight updated in place in a permuted layout, and records the permutation on its storage. `torch.save` copies storages to the host as flat byte tensors, and Habana's device-to-host copy cannot undo a 4-D permutation on them (`habana_eager/ops/copy_from.cpp`). | eager + compile: HPU tensors are pickled through a tensor-level host copy, which undoes the permutation, the way torch pickles XLA tensors (and Habana its tensors in lazy mode). They load back on the HPU. | Checkpoints of conv nets save after eager and compiled steps, and load on the card with the values of the same step run on the CPU. |
+| Large-kernel convolutions fail graph compile (`gaudi2_agu_config::setAssociatedDimAndSize: size - 1 <= uint8 max`) in `STaRNet(64)` (`conv_spatial_fusion` `(351, 1)`) and `TensorCSPNet(22, dims=(22, 11, 11, 11))` (`temporal_block` `(4, 1089)`, stride `(1, 121)`, eager only). | Gaudi2's MME AGU rejects most `Conv` nodes with a spatial kernel dimension above 256. Not all: a card sweep of the native op (forward and backward against CPU float64, one case per process; [table below](#large-kernel-convolutions-which-run-natively)) finds one class that runs, one input channel with the kernel wide only in its last dim, and there the result depends on the mode: eager runs every even width from 258 to 6000 at strides >= 32 and fails every odd width tried (257, 351, 1089, 1091, 1501); lazy runs every width from 257 to 6000 at strides >= 8, and stops the card at stride 1 when the input is as wide as the kernel. In lazy mode a native conv1d (4, 8, 1000) x (16, 8, 256) fails as well, and kernels 129..255 give a wrong input gradient (relative error 1.3 to 1.5 at k = 144 over 260, 240 over 300, 255 over 257) when the input is longer than 256 but shorter than twice the kernel. | eager + compile + lazy: `aten.convolution.default` at `AutogradHPU` and `HPU` splits spatial kernel dims `> 256` (lazy mode: `> 128`) into chunks of at most that size with exact input slicing and `F.pad`, summing partial outputs (16-bit inputs: each chunk is convolved in 16-bit, the chunks are summed in `float32`, so the output is rounded twice). It leaves to the native op the measured class (`conv.NATIVE_WIDE`): 2-D float32, groups 1, one input channel, no padding or dilation, `kH <= 22`, only `kW` above the bound; eager: `kW` even and stride `>= 32`; lazy: `kW >= 257` and stride `>= 8`. TensorCSPNet's default `temporal_block` (`(4, 4356)`, stride `(1, 484)`) stays native in both modes, its `dims=(22, 11, 11, 11)` one in lazy mode. Compiled graphs (not measured) split as before. | Bridge 1.21.4, 20 synced steps after 3 warm-up, each run in its own process. Without the fix `STaRNet(64)` fails in eager, lazy and compile; with it 266.0 ms/step eager, 92.0 lazy, 136.4 compiled. `TensorCSPNet(22, k=11)` fails eager without it; with it 140.0 eager (split), 35.3 lazy (native), 57.9 compiled (split). First loss the same in every mode (`1.39551`, `1.47586`). Models whose convolutions run natively are within noise of main, eager and lazy (medians of alternating rounds, this fix on top of main against main): default-dims `TensorCSPNet(22)` 197.5 / 200.0 ms eager, 162.8 / 161.7 lazy (5 rounds), `STaRNet(22)` 100.3 / 122.5 eager, 54.4 / 50.7 lazy, `SPDNet` 34.2 / 44.8 eager (5 rounds), 17.1 / 16.5 lazy; per-process spread 10-30%. Before this change the default-dims TensorCSPNet split ran 405-485 ms/step lazy with 70 `unfold` fallbacks; now 2, as on main. |
+| `torch.quantile` / `torch.nanquantile` abort lazy mode (`FATAL ERROR :: MODULE:PT_BRIDGE ... Trying to resize tensor with non-existing TensorImpl`, from `resize_impl_hpu_`). Eager, a slice with a NaN gives a number (`quantile([3, nan, 1, 2], 0.5)`: 2.5, torch: nan; `nanquantile`: 2.5, torch: 2). | ATen's composite writes into an empty `out` tensor that it resizes; Habana's lazy resize of it fails in the accumulation thread. Gaudi's `sort` returns NaN as `+inf`, which the composite then reads as a value. | eager + compile + lazy: `quantile` / `nanquantile` (float and tensor `q`) at `AutogradHPU` and `HPU` as ATen's own steps (sort, ranks, the five interpolations, `gather`, `lerp`) into a fresh tensor; NaN slices found in the input. Arguments ATen rejects go to ATen. | Bridge 1.21.4, each case in its own process, against CPU float64. Lazy without the fix: FATAL for float `q`, tensor `q`, `dim` + `keepdim` + midpoint, and NaN inputs (the backward of a `requires_grad` input ran). With it, all run, error <= 1.1e-7, no CPU fallback, NaNs where torch has them. Eager: native 0.0106 off with a NaN, the rewrite 3.7e-9. Cost, `quantile(x, 0.9, dim=1)` of an 8x300 tensor, 30 synced calls: lazy 0.93 / 1.94 ms (native fails), eager 3.41 / 3.08 ms against native 0.81 / 1.86 ms (two processes). |
 | einsum graphs fail to compile (BIOT: `Can not compile graph`). | `pass_remove_unnecessary_bmm_view` removes views that are not pure batch merges. Unfixed in bridge 1.24.2. | `enable()` sets Habana's `PT_HPU_DISABLE_pass_remove_unnecessary_bmm_view`, Intel's own workaround (vllm-gaudi #1102). | BIOT compiles. |
 | LaBraM fails to compile (`used before defined`). | `batch_as_strided` puts a `getitem` before the node it reads. Fixed in bridge 1.22. | `enable()` sets `PT_HPU_DISABLE_pass_batch_as_strided_groups`. | LaBraM compiles. |
 | FBCNet and FBMSNet fail to compile (`create tensor invalid permutation 4 2`), EEGNet and Deep4Net at times. | `pass_weight_permutation` puts an `hpu.weight_permutation` before every 2-D and 3-D convolution weight. The backward of some graphs then fails to create a tensor. | `enable()` sets `PT_HPU_DISABLE_pass_weight_permutation`. | All four compile (EEGNet and Deep4Net: 8 of 8 times). CBraMod steps 2.2% faster, CodeBrain the same. |
@@ -90,6 +92,69 @@ One fix is outside the dispatcher: `torch.save` pickles HPU tensors through a te
 | `linalg.lu_factor`, `lu_factor_ex`, `lu_solve` and `lu_unpack` run on the CPU in eager mode (#10). | No HPU kernel. | TPC kernels, n <= 32: LU with partial pivoting (LAPACK's packed factors, pivots and info), pivots to permutation, and getrs (row swaps and two substitutions). Adjoint and right-side `lu_solve` rebuild A = P L U and use the Gauss-Jordan kernel. Installed in eager mode only: in lazy mode, and for `linalg.lu` in both modes, they were measured at parity or slower than the fallback, so Habana's ops stay. `HPU_OPS_LU_SLOW=1` installs them all anyway (no fallbacks, at that speed). The pivot is the first largest candidate, LAPACK's rule, also on exact ties; pivots of magnitude 2^64 and above are scaled by 2^-64 before the reciprocal, so 1/pivot is not flushed to zero past 2^126. Pivots are trusted: out-of-range pivots give finite garbage on the card, not torch's error. NaN input gives non-finite factors, as torch's; the pivots may then differ. | n = 22, batch 32, eager, same process (each includes the `lu_factor`): `lu_factor_ex` 0.27–0.46 ms against 0.69–2.65 (2.6x to 6.9x: the fallback's time varies between jobs); `lu_solve` 2.28 against 6.50; `lu_unpack` 2.87 against 4.54. Not installed by default: lazy `lu_factor_ex` 0.94–0.98x, lazy `lu_solve` 0.96x, lazy `lu_unpack` 0.91x, `linalg.lu` 0.87x eager and 0.77x lazy (medians). |
 
 The pass switches are read at every compile. A non-empty setting in your environment wins (`PT_HPU_DISABLE_<pass>=0` keeps a pass on).
+
+### Large-kernel convolutions: which run natively
+
+Native `F.conv2d` forward and backward (output and both gradients against CPU float64, relative error < 1e-3; "no x grad": weight gradient only) on Gaudi2, bridge 1.21.4, one case per process: `bash repro/sweep_conv_native.sh "B C H W O KH KW SH SW [XGRAD]"` (`PT_HPU_LAZY_MODE=0|1`), raw results in `repro/sweep_conv_native_results.jsonl`, this table from `python3 repro/sweep_conv_native_table.py repro/sweep_conv_native_results.jsonl`. Strides are along W unless written `sH,sW`. A failure is `setAssociatedDimAndSize` (eager) or a lazy graph compile failure; "died" is a device critical error that stopped the card. `conv.install_large_kernel` leaves to the native op only the cells this table backs (see `conv.NATIVE_WIDE`) and splits the rest.
+
+| x (B, C, H, W) | w (O, C, kH, kW) | eager runs | eager fails | lazy runs | lazy fails |
+|---|---|---|---|---|---|
+| 8, 1, 4, 257 | 16, 1, 4, 257 |  | 1, 8, 32, 121, 256, 257, 484 | 8, 32, 121 | 1 (died) |
+| 8, 1, 4, 514 | 16, 1, 4, 257 |  | 1, 8, 32, 121 | 1, 8, 32, 121 |  |
+| 8, 1, 4, 258 | 16, 1, 4, 258 | 32 |  | 32 |  |
+| 8, 1, 4, 300 | 16, 1, 4, 300 | 32 |  | 32 |  |
+| 8, 1, 4, 351 | 16, 1, 4, 351 |  | 1, 8, 32, 121, 256, 257, 484 | 8, 32, 121 | 1 (died) |
+| 8, 1, 4, 702 | 16, 1, 4, 351 |  | 1, 8, 32, 121 | 1, 8, 32, 121 |  |
+| 8, 1, 4, 384 | 16, 1, 4, 384 | 32 |  | 32 |  |
+| 8, 1, 4, 512 | 16, 1, 4, 512 | 8, 32, 121 | 1 | 8, 32, 121 | 1 (died) |
+| 8, 1, 4, 1024 | 16, 1, 4, 512 | 8, 32, 121 | 1 | 1, 8, 32, 121 |  |
+| 8, 1, 4, 600 | 16, 1, 4, 600 | 8, 32, 121, 600 | 1 | 8, 32, 121 | 1 (died) |
+| 8, 1, 4, 1200 | 16, 1, 4, 600 | 8, 32, 121 | 1 | 1, 8, 32, 121 |  |
+| 8, 1, 4, 800 | 16, 1, 4, 800 | 8, 32, 121 | 1 | 8, 32, 121 | 1 (died) |
+| 8, 1, 4, 1600 | 16, 1, 4, 800 | 8, 32, 121 | 1 | 1, 8, 32, 121 |  |
+| 8, 1, 4, 1024 | 16, 1, 4, 1024 | 8, 32, 121 | 1 | 8, 32, 121 | 1 (died) |
+| 8, 1, 4, 2048 | 16, 1, 4, 1024 | 8, 32, 121 | 1 | 1, 8, 32, 121 |  |
+| 8, 1, 4, 1088 | 16, 1, 4, 1088 | 32 |  | 32 |  |
+| 8, 1, 4, 1089 | 16, 1, 4, 1089 |  | 1, 8, 32, 64, 121, 256, 257, 484, 1089 | 8, 32, 64, 121, 484, 1089 | 1 (died) |
+| 8, 1, 22, 1089 | 16, 1, 22, 1089 |  | 121 | 121 |  |
+| 32, 1, 4, 1089 | 16, 1, 4, 1089 |  | 121 | 121 |  |
+| 8, 1, 4, 1089 (no x grad) | 16, 1, 4, 1089 |  | 121 | 121 |  |
+| 32, 1, 4, 1089 (no x grad) | 16, 1, 4, 1089 |  | 121 | 121 |  |
+| 8, 1, 4, 2178 | 16, 1, 4, 1089 |  | 1, 8, 32, 121 | 1, 8, 32, 121 |  |
+| 8, 1, 4, 1090 | 16, 1, 4, 1090 | 32 |  | 32 |  |
+| 8, 1, 4, 1091 | 16, 1, 4, 1091 |  | 32 | 32 |  |
+| 8, 1, 4, 1200 | 16, 1, 4, 1200 | 8, 32, 121 | 1 | 8, 32, 121 | 1 (died) |
+| 8, 1, 4, 2400 | 16, 1, 4, 1200 | 8, 32, 121 | 1 | 1, 8, 32, 121 |  |
+| 8, 1, 4, 1500 | 16, 1, 4, 1500 | 8, 32, 64, 121, 484, 1500 | 1 | 8, 32, 64, 121, 484, 1500 | 1 (died) |
+| 8, 1, 22, 1500 | 16, 1, 22, 1500 | 32 |  | 32 |  |
+| 32, 1, 4, 1500 | 16, 1, 4, 1500 | 32 |  | 32 |  |
+| 8, 1, 4, 1500 | 64, 1, 4, 1500 | 32 |  | 32 |  |
+| 8, 1, 4, 3000 | 16, 1, 4, 1500 | 8, 32, 121 | 1 | 1, 8, 32, 121 |  |
+| 8, 1, 4, 1501 | 16, 1, 4, 1501 |  | 32 | 32 |  |
+| 8, 1, 4, 2000 | 16, 1, 4, 2000 | 32, 64, 121, 484, 2000 |  | 32, 64, 121, 484, 2000 |  |
+| 8, 1, 4, 2048 | 16, 1, 4, 2048 | 32, 64, 121, 484, 2048 |  | 32, 64, 121, 484, 2048 |  |
+| 8, 1, 4, 4096 | 16, 1, 4, 2048 | 64, 484 |  | 64, 484 |  |
+| 8, 1, 4, 2500 | 16, 1, 4, 2500 | 32, 64, 121, 484, 2500 |  | 32, 64, 121, 484, 2500 |  |
+| 8, 1, 4, 3000 | 16, 1, 4, 3000 | 32, 64, 121, 484, 3000 |  | 32, 64, 121, 484, 3000 |  |
+| 8, 1, 4, 4095 | 16, 1, 4, 4095 | 4095 |  |  |  |
+| 8, 1, 4, 4096 | 16, 1, 4, 4096 | 4096 |  |  |  |
+| 8, 1, 4, 4097 | 16, 1, 4, 4097 | 4097 |  |  |  |
+| 8, 1, 4, 4356 | 16, 1, 4, 4356 | 32, 64, 120, 121, 256, 257, 484, 4356 | 1, 2, 8, 16 | 8, 16, 32, 64, 121, 484, 4356 |  |
+| 32, 1, 4, 4356 | 16, 1, 1, 4356 | 484 |  | 484 |  |
+| 8, 1, 22, 4356 | 16, 1, 22, 4356 | 484 |  | 484 |  |
+| 8, 1, 4, 4356 | 64, 1, 4, 4356 | 484 |  | 484 |  |
+| 32, 1, 4, 4356 | 16, 1, 4, 4356 | 484 |  | 484 |  |
+| 32, 1, 4, 4356 (no x grad) | 16, 1, 4, 4356 | 484 |  | 484 |  |
+| 8, 1, 4, 5000 | 16, 1, 4, 4356 | 484 |  |  |  |
+| 8, 1, 4, 8712 | 16, 1, 4, 4356 | 484 | 1 | 1 |  |
+| 8, 1, 4, 4358 | 16, 1, 4, 4358 | 32 |  | 32 |  |
+| 8, 1, 4, 6000 | 16, 1, 4, 6000 | 32, 64, 121, 484, 6000 |  | 32, 64, 121, 484, 6000 |  |
+| 8, 1, 4351, 2 | 8, 1, 4351, 1 |  | 4351,1 |  |  |
+| 8, 1, 351, 1000 | 8, 1, 351, 1 |  | 351,1 |  |  |
+| 32, 1, 351, 1000 | 8, 1, 351, 1 |  | 1 |  | 1 |
+| 32, 1, 351, 1000 (no x grad) | 8, 1, 351, 1 |  | 1 |  | 1 |
+| 8, 1, 4356, 4 | 16, 1, 4356, 4 |  | 484,1 |  | 484,1 |
+| 8, 4, 4, 4356 | 16, 4, 4, 4356 |  | 484 |  | 484 |
 
 ### Linalg kernels on the TPC
 
@@ -201,7 +266,9 @@ python tests/run_on_hpu.py           # on a Gaudi card, with the attention setti
 - that eager and compiled results match the native ops, with 16-bit and non-contiguous inputs too;
 - that symbolic shapes (a new batch size) and other devices keep torch's own path, and that undoing restores torch;
 - that the attention check reads the fused kernel's registration, and that symbolic linear upsampling warns while `dynamic=False` keeps the native op;
-- that a checkpoint after an optimizer step (state dicts, a `Parameter`, momentum) goes through the host copies and loads with `weights_only=True`, on its device or where `map_location` says; that hooks still warn and `skip_data` raises.
+- that a checkpoint after an optimizer step (state dicts, a `Parameter`, momentum) goes through the host copies and loads with `weights_only=True`, on its device or where `map_location` says; that hooks still warn and `skip_data` raises;
+- which large-kernel convolutions are split and which keep the native op, per mode (`tests/test_conv_routing.py`: the model shapes, the parity, stride, channel, orientation, padding, dilation, `kH`, dtype and conv1d bounds of `conv.NATIVE_WIDE`, and compiled graphs splitting as before);
+- that large-kernel convolutions (`> 256`) match native 1-D/2-D/3-D convolutions across eager, `torch.compile`, `inference_mode()`, `channels_last`, `bfloat16`/`autocast`, `groups`, `Conv1d`/`Conv3d`, dynamic batch shapes, and coexistence with `valid_conv` and `conv_weight_grad`, while invalid/transposed/symbolic-spatial inputs fall through to ATen;
 - that the autocast files hold the installed torch's CUDA lists, and that the installed package ships them.
 
 CI runs `test_cpu.py` on torch 2.6.0 (Gaudi's) and the latest CPU release.
@@ -224,6 +291,8 @@ It also checks:
 - that rolls of strided slices by a multiple of the size, and the input gradient of a stack of rolls by -1, 0, +1, match the CPU, eager and compiled;
 - that linear upsampling by other than a power of two is as close to float64 as the CPU's float32 kernel, output and input gradient, eager and compiled, and that powers of two keep the native op;
 - that `torch.save` works after an eager and after a compiled optimizer step, and loads, on the card, the values of the same step run on the CPU;
+- that a boolean-mask put of one value inside `autograd.Function.backward()` followed by `vech`'s `X[..., rows, cols]` (GBWAtt's lazy synStatus 30, #20) matches the CPU with zero CPU fallbacks;
+- that large-kernel convolutions (`(351, 1)` and `(4, 1089)` stride `(1, 121)`) match the CPU, eager, compiled, and in `inference_mode()`, via `split_conv`;
 - with `hpu_ops.autocast`'s lists exported, CUDA's output dtypes under bfloat16 autocast (without them, Habana's are printed);
 - that braindecode's FBCNet compiles (the weight-permutation switch), and that its output and parameter gradients match eager mode.
 
@@ -257,4 +326,6 @@ It also checks:
 - `F.fold` with overlapping windows sums through `index_add`; in float16 and bfloat16 that sum is exact where ATen's CPU kernel rounds per add. The gradient of a complex `index` holding `inf` gives `inf+nanj` through `index_select`'s backward, where ATen gives `inf+0j`.
 - `F.unfold` and `F.fold` whose spatial index would exceed 2^24 elements (`im2col.MAX_INDEX`, `kh * kw * oh * ow`) keep the native op (a CPU fallback on Gaudi).
 - Duplicate indices accumulate their gradients through `index_add`, which in bfloat16 sums in the order of the index; Gaudi's native accumulating put may round differently (not a defect of either).
+- The native class of wide kernels (`conv.NATIVE_WIDE`) is empirical: it holds for the shapes in the sweep table (bridge 1.21.4); a new bridge may move it, rerun `repro/sweep_conv_native.sh`. Eager odd widths above 256 with one input channel are split although 4095 and 4097 ran at stride = width.
+- Large-kernel convolution splitting requires static spatial, kernel, stride, padding, and dilation sizes (dynamic spatial sizes fall back to the native op); under `torch.compile` inside `torch.inference_mode()`, `AutogradHPU` is excluded and `ProxyTorchDispatchMode` sits above `HPU`, so compiled `inference_mode()` graphs keep the unsplit `aten.convolution.default`. Compiled, some split graphs still fail in Habana's graph compiler, as the native op does: conv1d k = 351 over 1000 (`Cannot add a node DEDW to bundle`, any chunking but 256 + 256, `repro/probe_compile_chunks.py`) and a (4, 1089) kernel over width 1500 (`setAssociatedDimAndSize`). In lazy mode a native conv2d (1, 1, 54, 54) x (1, 1, 44, 44), forward and backward, stops the card (`Synapse detected a device critical error ... Compute or dma timeout`; `repro/probe_conv2d_lazy.py 54 54 44 44`); the split of a (300, 300) kernel over 310 x 310 makes such a chunk and stops the card the same way.
 - Fully masked query rows (a sample with no real key) may differ from torch's zeros.

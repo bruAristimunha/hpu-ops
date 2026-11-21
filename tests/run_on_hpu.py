@@ -150,6 +150,37 @@ check('Conv1d padding="valid"', per_device(torch.nn.Conv1d(8, 16, 5, padding="va
       atol=1e-4)
 expect('compiled padding="valid" took full zero lists', calls["valid_conv"] > 0, f"{calls['valid_conv']} times")
 
+# ---- large-kernel convolutions (> 256; > 128 in lazy mode): STaRNet(64) conv_spatial_fusion & TensorCSPNet(22, k=11) temporal_block
+calls.clear()
+check("Conv2d kernel (351, 1) (STaRNet(64) conv_spatial_fusion)",
+      per_device(torch.nn.Conv2d(1, 8, (351, 1), bias=False)), (torch.randn(4, 1, 351, 200),), atol=1e-4)
+check("Conv2d kernel (4, 1089) stride (1, 121) (TensorCSPNet(22, k=11))",
+      per_device(torch.nn.Conv2d(1, 16, (4, 1089), stride=(1, 121))), (torch.randn(4, 1, 4, 1089),), atol=1e-4)
+check("Conv2d kernel (351, 1) inference_mode",
+      per_device(torch.nn.Conv2d(1, 8, (351, 1), bias=False)), (torch.randn(4, 1, 351, 200),),
+      atol=1e-4, modes=("eager",), context=torch.inference_mode)
+# lazy mode (bridge 1.21.4): 256-wide chunks failed graph compile over long inputs, and native kernels 129..255 give
+# wrong input gradients when the input is longer than 256 but shorter than twice the kernel (k=351 over 400).
+# Compiled, k=351 over 1000 still fails (graph compiler: "Cannot add a node DEDW to bundle", with any chunking but
+# 256+256; repro/probe_compile_chunks.py) and so does (4, 1089) over 1500 (setAssociatedDimAndSize with 256-wide
+# chunks), as the native op does: those two shapes are checked eager only (lazy: repro/sweep_conv_k.sh).
+check("Conv1d k=351 over 1000 (256-wide chunks failed in lazy)",
+      per_device(torch.nn.Conv1d(8, 16, 351)), (torch.randn(4, 8, 1000),), atol=1e-3, modes=("eager",))
+check("Conv1d k=351 over 400 (lazy input gradient of a 240-wide chunk was wrong)",
+      per_device(torch.nn.Conv1d(8, 16, 351)), (torch.randn(4, 8, 400),), atol=1e-3)
+check("Conv2d kernel (4, 1089) over width 1500",
+      per_device(torch.nn.Conv2d(4, 8, (4, 1089))), (torch.randn(2, 4, 4, 1500),), atol=1e-3, modes=("eager",))
+expect("large-kernel convolutions took split_conv", calls["large_conv"] > 0, f"{calls['large_conv']} times")
+
+# ---- quantile (#17): no resized out= tensor (lazy FATAL), NaN slices read from the input (Gaudi's sort gives +inf)
+calls.clear()
+x_q = torch.randn(8, 300)
+x_q[2, 5] = float("nan")
+check("torch.quantile q (0.1, 0.9) dim=1", lambda x: torch.quantile(x, torch.tensor([0.1, 0.9], device=x.device),
+                                                                    dim=1).nan_to_num(-7.0), (x_q,), atol=1e-5)
+check("torch.nanquantile 0.5 dim=1", lambda x: torch.nanquantile(x, 0.5, dim=1), (x_q,), atol=1e-5)
+expect("quantile took the rewrite", calls["quantile"] > 0 and calls["nanquantile"] > 0, dict(calls))
+
 # ---- glu (BrainModule: a convolution, then a gated linear unit over the channels)
 calls.clear()
 check("Conv1d > F.glu (BrainModule)", per_device(torch.nn.Conv1d(8, 640, 3, padding=1), lambda m, x: F.glu(m(x), 1)),
@@ -230,6 +261,48 @@ for mode in ("eager", "compiled"):
     err = (xh.grad.cpu() - xc.grad).abs().max().item()
     expect(f"input gradient of a stack of rolls by -1, 0, +1, {mode}", err <= 1e-6 and calls["roll_zero"] > 0,
            f"max|err| {err:.1e}")
+
+# ---- boolean-mask index_put_ and trailing 2-D index.Tensor (GBWAtt lazy synStatus 30, #20; main's indexing fixes)
+calls.clear()
+def mask_assign(t):
+    y = t * 2.0
+    y[y <= 0] = 0
+    return y
+check("boolean-mask index_put_ (scalar)", mask_assign, (torch.randn(8, 18),), atol=1e-5)
+expect("boolean-mask index_put_ took where (mask_fill)", calls["mask_fill"] > 0, f"{calls['mask_fill']} times")
+check("boolean-mask index_put_ (inference_mode, native op)", mask_assign, (torch.randn(8, 18),), atol=1e-5,
+      context=torch.inference_mode)
+
+class _MaskInBwd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x * 1.0
+
+    @staticmethod
+    def backward(ctx, g):
+        (x,) = ctx.saved_tensors
+        s = g.clone()
+        s[x <= 0.5] = 0
+        return s
+
+calls.clear()
+m_bwd = torch.eye(18, device=hpu, requires_grad=True)
+x_bwd = torch.randn(32, 3, 18, 18, device=hpu)
+ixs_cpu = torch.triu_indices(18, 18)
+def gbw_repro_step():
+    m_bwd.grad = None
+    root = _MaskInBwd.apply(m_bwd)
+    (root @ x_bwd @ root)[..., ixs_cpu[0], ixs_cpu[1]].sum().backward()
+fallbacks_gbw = cpu_fallbacks(gbw_repro_step)
+expect("GBWAtt mask-in-backward + Vech index on card (no fallback)",
+       not fallbacks_gbw and calls["mask_fill"] > 0 and calls["index"] > 0,
+       f"fallbacks={fallbacks_gbw}, calls={dict(calls)}")
+
+calls.clear()
+check("trailing 2-D index.Tensor (Vech triu_indices)", lambda t: t[..., ixs_cpu[0], ixs_cpu[1]],
+      (torch.randn(4, 3, 18, 18),), atol=1e-5)
+expect("trailing 2-D index.Tensor took index_select", calls["index"] > 0, f"{calls['index']} times")
 
 # ---- linear upsampling by other than a power of two: Gaudi's forward kernel drifts with the length (NeuroPose's
 # 9920 to 10000: 34% off), and its backward is less exact than the CPU's at some sizes. Output and input gradient as

@@ -13,6 +13,11 @@ at the tensor's pickling:
   convolution needs (ATCNet, EEGInceptionERP, EEGITNet).
 - The weight gradient of one-channel convolutions with a stride (``conv``): Gaudi's compiled
   ``convolution_backward`` returns about half of it plus an unrelated part (EEGDINO, CodeBrain, LaBraM).
+- Large-kernel convolutions that fail natively (``conv``): Gaudi2's MME AGU rejects most spatial kernel sizes
+  ``> 256`` (``setAssociatedDimAndSize`` in ``STaRNet(64)`` and ``TensorCSPNet(22, dims=(22, 11, 11, 11))``), and in
+  lazy mode a kernel of 256 over 1000 fails too while kernels 129..255 can get a wrong input gradient. Those are split
+  into ``<= 256`` slices (``<= 128`` in lazy mode); the one class measured to run natively (one input channel, wide
+  only in its last dim, e.g. TensorCSPNet's default ``(4, 4356)`` stride ``(1, 484)``) keeps the native op.
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's
@@ -56,6 +61,8 @@ at the tensor's pickling:
   Without the kernel, or past n = 32, the call is declined and runs through hpu-ops' own CPU route, not Habana's
   fallback: the parallel-Jacobi composite of ``eigh`` was measured slower than the fallback on Gaudi2, so it only
   serves the CPU stand-in.
+- ``quantile`` / ``nanquantile`` as sort, gather and lerp (``quantile``): ATen's composite resizes an empty ``out``
+  tensor, which aborts lazy mode ("Trying to resize tensor with non-existing TensorImpl").
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -76,19 +83,21 @@ import warnings
 
 import torch
 
-from . import composite, conv, eigh, im2col, indexing, linalg, serialization, tpc, upsample  # noqa: F401
+from . import composite, conv, eigh, im2col, indexing, linalg, quantile, serialization, tpc, upsample  # noqa: F401
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
-         conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
-         composite.install_roll, composite.install_unfold, indexing.install_index, indexing.install_mask_fill, im2col.install,
+         conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
+         composite.install_embedding, composite.install_roll, composite.install_unfold, indexing.install_index,
+         indexing.install_mask_fill, im2col.install,
          linalg.install_solve_triangular, linalg.install_cholesky_solve,
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
-         linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, serialization.install)
+         linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, quantile.install,
+         serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "

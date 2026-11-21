@@ -398,6 +398,279 @@ def test_same_padding_is_left_alone():
     assert not calls["valid_conv"]
 
 
+# ---- large-kernel convolutions (> MAX_KERNEL): spatial kernel splitting
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+@pytest.mark.parametrize("make, shape", [
+    (lambda: nn.Conv2d(1, 8, (351, 1), bias=False), (2, 1, 351, 40)),  # STaRNet(64) conv_spatial_fusion
+    (lambda: nn.Conv2d(1, 16, (4, 1089), stride=(1, 121)), (2, 1, 4, 1089)),  # TensorCSPNet(22, k=11) temporal_block
+])
+def test_large_kernel_real_shapes_match_native_conv(mode, make, shape):
+    torch.manual_seed(0)
+    layer, x = make().double(), torch.randn(*shape, dtype=torch.float64)
+    want, nodes = module_grads(layer, x), []
+    with cpu_as_hpu(conv.install_large_kernel) as calls:
+        got = module_grads(layer if mode == "eager" else compiled(layer, nodes), x)
+    assert_same(got, want)
+    assert calls["large_conv"] > 0
+    if mode == "compiled":
+        convs = [n for n in nodes if n.target in (torch.ops.aten.convolution.default,
+                                                 torch.ops.aten.convolution_backward.default)]
+        assert convs
+        for node in convs:
+            w_idx = 1 if node.target is torch.ops.aten.convolution.default else 2
+            assert all(k <= conv.MAX_KERNEL for k in node.args[w_idx].meta["val"].shape[2:])
+
+
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+@pytest.mark.parametrize("make, shape", [
+    (lambda: nn.Conv2d(2, 3, (9, 1)), (2, 2, 12, 5)),  # kH > M, L_out > 1
+    (lambda: nn.Conv2d(2, 3, (9, 1)), (2, 2, 9, 5)),  # L_out == 1
+    (lambda: nn.Conv2d(2, 3, (9, 7), padding=(2, 1)), (2, 2, 10, 8)),  # both kH > M and kW > M
+    (lambda: nn.Conv2d(2, 3, (3, 9), stride=(1, 3), padding=(1, 2)), (2, 2, 6, 15)),  # stride > 1
+    (lambda: nn.Conv2d(2, 3, (3, 6), dilation=(1, 2), padding=(0, 1)), (2, 2, 5, 14)),  # dilation > 1
+    (lambda: nn.Conv2d(4, 6, (3, 7), groups=2), (2, 4, 5, 11)),  # groups > 1
+    (lambda: nn.Conv2d(4, 4, (3, 7), groups=4, bias=False), (2, 4, 5, 11)),  # depthwise, no bias
+    (lambda: nn.Conv1d(2, 3, 9, stride=2, padding=3), (2, 2, 15)),  # 1D
+    (lambda: nn.Conv3d(2, 3, (3, 6, 5), padding=(1, 2, 1)), (2, 2, 4, 7, 6)),  # 3D
+    (lambda: nn.Conv2d(2, 3, (1, 7), padding="valid"), (2, 2, 4, 11)),  # padding="valid"
+    (lambda: nn.Conv2d(2, 3, (1, 7), padding="same"), (2, 2, 4, 11)),  # padding="same"
+    (lambda: nn.Conv2d(2, 3, (1, 7), padding=(0, 3), padding_mode="reflect"), (2, 2, 4, 11)),  # reflect pad
+    (lambda: nn.Conv2d(2, 3, (1, 7)), (0, 2, 4, 11)),  # batch == 0
+    (lambda: nn.Conv2d(2, 3, (1, 9), stride=(1, 20), padding=(0, 10)), (2, 2, 4, 6)),  # zero-overlap (acc is None)
+])
+def test_large_kernel_splitting_variants_match_native(monkeypatch, mode, make, shape):
+    monkeypatch.setattr(conv, "MAX_KERNEL", 4)
+    torch.manual_seed(0)
+    layer, x = make().double(), torch.randn(*shape, dtype=torch.float64)
+    want, nodes = module_grads(layer, x), []
+    with cpu_as_hpu(conv.install), cpu_as_hpu(conv.install_large_kernel) as calls:
+        got = module_grads(layer if mode == "eager" else compiled(layer, nodes), x)
+    assert_same(got, want)
+    assert calls["large_conv"] > 0
+    if mode == "compiled":
+        convs = [n for n in nodes if n.target in (torch.ops.aten.convolution.default,
+                                                 torch.ops.aten.convolution_backward.default)]
+        for node in convs:
+            w_idx = 1 if node.target is torch.ops.aten.convolution.default else 2
+            assert all(k <= 4 for k in node.args[w_idx].meta["val"].shape[2:])
+
+
+def test_large_kernel_one_element_lists_and_coexistence(monkeypatch):
+    monkeypatch.setattr(conv, "MAX_KERNEL", 4)
+    torch.manual_seed(0)
+    x = torch.randn(2, 1, 6, 15, dtype=torch.float64)
+    w = torch.randn(3, 1, 2, 7, dtype=torch.float64)
+    b = torch.randn(3, dtype=torch.float64)
+
+    def fn(xr, wr, br):
+        return F.conv2d(xr, wr, br, stride=(2,), padding=(1,), dilation=(1,))
+
+    want = train_step(fn, x, w, b)
+    nodes = []
+    with (cpu_as_hpu(conv.install) as c_valid, cpu_as_hpu(conv.install_weight_grad) as c_wg,
+          cpu_as_hpu(conv.install_large_kernel) as c_lk):
+        eager = train_step(fn, x, w, b)
+        assert c_lk["large_conv"] == 1 and c_wg["conv_weight_grad"] > 0
+        c_lk.clear()
+        c_wg.clear()
+        got = train_step(compiled(fn, nodes), x, w, b)
+        assert c_lk["large_conv"] > 0 and c_wg["conv_weight_grad"] > 0
+
+        # Also test valid padding + large kernel + one-channel strided weight grad together
+        layer = nn.Conv2d(1, 4, (1, 7), stride=(1, 2), padding="valid").double()
+        want_v = module_grads(layer, x)
+        nodes_v = []
+        c_valid.clear()
+        c_wg.clear()
+        c_lk.clear()
+        got_v = module_grads(compiled(layer, nodes_v), x)
+        assert c_valid["valid_conv"] > 0 and c_lk["large_conv"] > 0 and c_wg["conv_weight_grad"] > 0
+    assert_same(eager, want)
+    assert_same(got, want)
+    assert_same(got_v, want_v)
+
+
+def test_large_kernel_channels_last_non_contiguous_bf16_and_inference_mode(monkeypatch):
+    monkeypatch.setattr(conv, "MAX_KERNEL", 4)
+    torch.manual_seed(0)
+    x_cl = torch.randn(2, 3, 6, 12, dtype=torch.float64).to(memory_format=torch.channels_last)
+    w_cl = torch.randn(4, 3, 2, 7, dtype=torch.float64).to(memory_format=torch.channels_last)
+    b = torch.randn(4, dtype=torch.float64)
+    want_cl = train_step(lambda a, k: F.conv2d(a, k, b), x_cl, w_cl)
+
+    x_nc = torch.randn(2, 12, 6, 3, dtype=torch.float64).permute(0, 3, 2, 1)
+    w_nc = torch.randn(4, 7, 2, 3, dtype=torch.float64).permute(0, 3, 2, 1)
+    want_nc = train_step(lambda a, k: F.conv2d(a, k), x_nc, w_nc)
+
+    with cpu_as_hpu(conv.install_large_kernel) as calls:
+        got_cl = train_step(lambda a, k: F.conv2d(a, k, b), x_cl, w_cl)
+        assert got_cl[0].is_contiguous(memory_format=torch.channels_last)
+        got_nc = train_step(lambda a, k: F.conv2d(a, k), x_nc, w_nc)
+
+        # bfloat16 & autocast with float32 accumulation
+        x_f32, w_f32, b_f32 = x_cl.float(), w_cl.float(), b.float()
+        want_f64 = train_step(lambda a, k, bias: F.conv2d(a, k, bias), x_cl, w_cl, b)
+        got_bf16 = train_step(lambda a, k, bias: F.conv2d(a, k, bias),
+                              x_f32.bfloat16(), w_f32.bfloat16(), b_f32.bfloat16())
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            got_ac = train_step(lambda a, k, bias: F.conv2d(a, k, bias), x_f32, w_f32, b_f32)
+
+        # inference_mode (hits "{}" backend key)
+        calls.clear()
+        with torch.inference_mode():
+            got_inf = F.conv2d(x_cl, w_cl, b)
+            assert got_inf.is_contiguous(memory_format=torch.channels_last)
+        assert calls["large_conv"] == 1
+    assert_same(got_cl, want_cl)
+    assert_same(got_nc, want_nc)
+    assert_same([got_inf], [want_cl[0]])
+    assert got_bf16[0].dtype == torch.bfloat16
+    for a, r in zip(got_bf16, want_f64):
+        torch.testing.assert_close(a.double(), r, rtol=2e-2, atol=2e-2 * r.abs().max().item())
+    for a, r in zip(got_ac, want_f64):
+        torch.testing.assert_close(a.double(), r, rtol=2e-2, atol=2e-2 * r.abs().max().item())
+
+
+def test_large_kernel_dynamic_batch_vs_dynamic_spatial(monkeypatch):
+    monkeypatch.setattr(conv, "MAX_KERNEL", 4)
+    torch.manual_seed(0)
+    layer = nn.Conv2d(2, 3, (1, 7)).double()
+    inputs = [torch.randn(b, 2, 4, 11, dtype=torch.float64) for b in (2, 5, 3)]
+    wants = [module_grads(layer, x) for x in inputs]
+    nodes = []
+    with cpu_as_hpu(conv.install_large_kernel) as calls:
+        c = compiled(layer, nodes, fullgraph=True)
+        for x, want in zip(inputs, wants):
+            assert_same(module_grads(c, x), want)
+        assert calls["large_conv"] > 0
+        convs = [n for n in nodes if n.target is torch.ops.aten.convolution.default]
+        assert convs and all(n.args[1].meta["val"].shape[-1] <= 4 for n in convs)
+
+        # Dynamic spatial size falls back cleanly via static(...) during tracing
+        dyn_nodes = []
+        x_sp = torch.randn(2, 2, 4, 13, dtype=torch.float64)
+        c_sp = compiled(layer, dyn_nodes, dynamic=True, fullgraph=True)
+        want_sp = F.conv2d(x_sp.detach(), layer.weight.detach(), layer.bias.detach())
+        got_sp = c_sp(x_sp)
+        dyn_convs = [n for n in dyn_nodes if n.target is torch.ops.aten.convolution.default]
+        assert dyn_convs and any(n.args[1].meta["val"].shape[-1] == 7 for n in dyn_convs)
+    assert_same([got_sp], [want_sp])
+
+
+def test_large_kernel_skips_preregistered_backend_key_and_still_fixes_autograd(monkeypatch):
+    monkeypatch.setattr(conv, "MAX_KERNEL", 4)
+    op = torch.ops.aten.convolution.default
+    backend_calls = 0
+
+    def dummy_cpu_conv(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups):
+        nonlocal backend_calls
+        backend_calls += 1
+        return op._op_dk(torch._C.DispatchKey.CompositeExplicitAutograd, input, weight, bias, stride, padding,
+                         dilation, transposed, output_padding, groups)
+
+    lib = torch.library.Library("aten", "IMPL")
+    lib.impl(op, dummy_cpu_conv, "CPU")
+    op._dispatch_cache.clear()
+    try:
+        assert torch._C._dispatch_has_kernel_for_dispatch_key("aten::convolution", "CPU")
+        x = torch.randn(2, 2, 4, 10, dtype=torch.float64)
+        w = torch.randn(3, 2, 1, 7, dtype=torch.float64)
+        want = train_step(lambda a, k: F.conv2d(a, k), x, w)
+        nodes = []
+        with cpu_as_hpu(conv.install_large_kernel) as calls:
+            eager = train_step(lambda a, k: F.conv2d(a, k), x, w)
+            with torch.no_grad():
+                ng = F.conv2d(x, w)
+            comp = train_step(compiled(lambda a, k: F.conv2d(a, k), nodes), x, w)
+        assert calls["large_conv"] >= 3 and backend_calls >= 6
+        assert_same(eager, want)
+        assert_same(comp, want)
+        assert_same([ng], [want[0]])
+    finally:
+        lib._destroy()
+        op._dispatch_cache.clear()
+
+
+def test_large_kernel_invalid_and_passthrough_fall_through_to_aten(monkeypatch):
+    monkeypatch.setattr(conv, "MAX_KERNEL", 4)
+    op = torch.ops.aten.convolution.default
+    invalid_calls = [
+        lambda: F.conv2d(torch.randn(2, 2, 4, 4), torch.randn(3, 2, 1, 6)),  # k > L_in + 2p
+        lambda: F.conv2d(torch.randn(2, 2, 0, 10), torch.randn(3, 2, 1, 6), padding=(1, 0)),  # L_in == 0
+        lambda: F.conv2d(torch.randn(2, 2, 4, 10), torch.randn(0, 2, 1, 6)),  # C_out == 0
+        lambda: F.conv2d(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 0, 6)),  # k == 0
+        lambda: op(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 6), None, [1, 1], [0, 0], [1, 1], False, [0, 0], 0),
+        lambda: F.conv2d(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 6), torch.randn(4)),  # bad bias
+        lambda: F.conv2d(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 6), stride=(1, 0)),  # stride == 0
+        lambda: op(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 6), None, [1, 1], [0, -1], [1, 1], False, [0, 0], 1),
+        lambda: F.conv2d(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 6), dilation=(1, 0)),  # dilation == 0
+        lambda: F.conv2d(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 6).double()),  # dtype mismatch
+        lambda: op(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 6), None, [1, 1], [0, 0], [1, 1], False, [0, 0, 0], 1),
+        lambda: op(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 6), None, [1, 1], [0, 0], [1, 1], False, [-1, 0], 1),
+        lambda: op(torch.randn(2, 2, 4, 10, requires_grad=True), torch.randn(3, 2, 1, 6, requires_grad=True),
+                   None, [1, 1], [0, 0], [1, 1], False, [1, 0], 1).sum().backward(),
+        lambda: op(torch.randn(2, 2, 4, 10, requires_grad=True), torch.randn(3, 2, 1, 6, requires_grad=True),
+                   None, [1, 1], [0, 0], [1, 1], False, [1], 1).sum().backward(),
+    ]
+    for call in invalid_calls:
+        with pytest.raises(Exception) as want:
+            call()
+        with cpu_as_hpu(conv.install_large_kernel) as calls, pytest.raises(type(want.value)):
+            call()
+        assert not calls["large_conv"]
+
+    # Non-split / transposed / non-float / C_in=0 / non-zero output_padding pass through cleanly
+    with cpu_as_hpu(conv.install_large_kernel) as calls:
+        F.conv2d(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 4))
+        F.conv_transpose2d(torch.randn(2, 2, 4, 10), torch.randn(2, 3, 1, 6))
+        F.conv2d(torch.randint(0, 5, (2, 2, 4, 10)), torch.randint(0, 5, (3, 2, 1, 6)))
+        y_c0 = F.conv2d(torch.randn(2, 0, 4, 10), torch.randn(3, 0, 1, 6))
+        assert y_c0.shape == (2, 0, 4, 5)
+        y_op = op(torch.randn(2, 2, 4, 10), torch.randn(3, 2, 1, 6), None, [1, 1], [0, 0], [1, 1], False, [1, 0], 1)
+        assert y_op.shape == (2, 3, 4, 5)
+    assert not calls["large_conv"]
+
+
+def test_large_kernel_zero_overlap_with_inf_input_matches_native(monkeypatch):
+    monkeypatch.setattr(conv, "MAX_KERNEL", 4)
+    x = torch.tensor([[[[float("inf"), 1.0, 2.0, 3.0]]]], dtype=torch.float64)
+    w = torch.ones(1, 1, 1, 9, dtype=torch.float64)
+    b = torch.tensor([1.5], dtype=torch.float64)
+
+    def f(a, k, bias=None):
+        return F.conv2d(a, k, bias, stride=(1, 20), padding=(0, 10))
+
+    want = train_step(f, x, w)
+    want_b = train_step(f, x, w, b)
+    x_cl = x.expand(2, 3, 2, 4).clone().to(memory_format=torch.channels_last)
+    w_cl = torch.ones(2, 3, 1, 9, dtype=torch.float64).to(memory_format=torch.channels_last)
+    want_cl = train_step(f, x_cl, w_cl)
+    want_bf16 = train_step(f, x_cl.bfloat16(), w_cl.bfloat16(), torch.ones(2, dtype=torch.bfloat16))
+    x_b0 = torch.empty(0, 3, 2, 4, dtype=torch.float64)
+    want_b0 = train_step(f, x_b0, w_cl)
+
+    nodes = []
+    with cpu_as_hpu(conv.install_large_kernel) as calls:
+        got = train_step(f, x, w)
+        got_c = train_step(compiled(f, nodes), x, w)
+        got_b = train_step(f, x, w, b)
+        got_cl = train_step(f, x_cl, w_cl)
+        got_bf16 = train_step(f, x_cl.bfloat16(), w_cl.bfloat16(), torch.ones(2, dtype=torch.bfloat16))
+        got_b0 = train_step(f, x_b0, w_cl)
+    assert calls["large_conv"] >= 6
+    assert got[0].item() == 0.0 and not torch.isnan(got[0]).any()
+    assert torch.equal(got[1], torch.zeros_like(x)) and torch.equal(got[2], torch.zeros_like(w))
+    assert got_cl[0].is_contiguous(memory_format=torch.channels_last)
+    assert_same(got, want)
+    assert_same(got_c, want)
+    assert_same(got_b, want_b)
+    assert_same(got_cl, want_cl)
+    assert_same(got_bf16, want_bf16)
+    assert_same(got_b0, want_b0)
+
+
 # ---- glu as a * sigmoid(b)
 
 
@@ -758,7 +1031,7 @@ def test_roll_of_a_stack_by_zero(mode):
     assert calls["roll_zero"] > 0
 
 
-# ---- torch.save: tensor-level host copies
+# ---- boolean-mask index_put_ / index_put and trailing 2-D index.Tensor (GBWAtt)
 
 
 def test_save_reduces_device_tensors_through_a_host_copy(tmp_path):
@@ -1433,10 +1706,12 @@ def test_undo_restores_torch():
     assert [dict(op.py_kernels) for op in touched] == before
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
-                 "aten::embedding_dense_backward", "aten::convolution_backward", "aten::roll",
+                 "aten::embedding_dense_backward", "aten::convolution", "aten::convolution_backward", "aten::roll",
                  "aten::upsample_linear1d", "aten::index.Tensor", "aten::index_put_", "aten::im2col",
                  "aten::col2im"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
+    for name in ("aten::index_put_", "aten::index_put", "aten::convolution"):
+        assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "CPU")
 
 
 def test_no_two_fixes_register_the_same_op_and_key(monkeypatch):
