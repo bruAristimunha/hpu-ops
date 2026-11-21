@@ -2757,3 +2757,45 @@ def test_lu_ops_installed_only_where_measured_faster(monkeypatch, lazy, knob, in
     monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
     monkeypatch.delenv(linalg.LU_SLOW, raising=False)
     assert all(linalg._lu_wanted("cpu", name) for name in ("lu", "lu_factor"))  # the CPU stand-in always installs
+
+
+def _graded_singular_values(dtype=torch.float32):
+    """S = (1, 1, 1, 1e-3, 1e-14) with random orthogonal factors, built in float64."""
+    g = torch.Generator().manual_seed(11)
+    Q1, _ = torch.linalg.qr(torch.randn(5, 5, generator=g, dtype=torch.float64))
+    Q2, _ = torch.linalg.qr(torch.randn(5, 5, generator=g, dtype=torch.float64))
+    S = torch.tensor([1.0, 1.0, 1.0, 1e-3, 1e-14], dtype=torch.float64)
+    return ((Q1 * S) @ Q2.mT).to(dtype)
+
+
+def test_matrix_rank_and_pinv_positive_atol_drops_the_default_rtol(svd_hook):
+    """atol > 0 with rtol unset: torch's rtol becomes 0, so the tolerance is atol alone (1e-16 here) and the smallest
+    singular value (1e-14, float32 rounding noise ~1e-7 on the card's input) is kept: rank 5 and its inverse in pinv.
+    The default rtol (eps * 5 = 6e-7) would have dropped it."""
+    A = _graded_singular_values()
+    want_rank = torch.linalg.matrix_rank(A, atol=1e-16)
+    want_pinv = torch.linalg.pinv(A, atol=1e-16)
+    assert int(want_rank) == 5 and int(torch.linalg.matrix_rank(A)) == 4
+    with cpu_as_hpu(linalg.install_matrix_rank) as calls:
+        got_rank = torch.linalg.matrix_rank(A, atol=1e-16)
+        assert calls["svd"] >= 1
+    assert torch.equal(got_rank, want_rank)
+    with cpu_as_hpu(linalg.install_pinv) as calls:
+        got_pinv = torch.linalg.pinv(A, atol=1e-16)
+        got_default = torch.linalg.pinv(A)
+        assert calls["pinv"] >= 2
+    assert got_pinv.abs().max() > 1e5 and want_pinv.abs().max() > 1e5  # 1/S_min is in both
+    torch.testing.assert_close(got_default, torch.linalg.pinv(A), rtol=1e-3, atol=1e-3)
+
+
+def test_lstsq_rank_is_a_fresh_tensor(svd_hook):
+    """The rank of a batched lstsq was ``new_full((), k).expand(batch)``: stride 0, so an in-place update of it
+    raised and its elements aliased one value. torch returns an ordinary tensor."""
+    A = torch.randn(3, 5, 4, dtype=torch.float32, generator=torch.Generator().manual_seed(0))
+    B = torch.randn(3, 5, 2, dtype=torch.float32, generator=torch.Generator().manual_seed(1))
+    with cpu_as_hpu(linalg.install_lstsq) as calls:
+        rank = torch.linalg.lstsq(A, B, driver="gelsd").rank
+        assert calls["lstsq"] >= 1
+    assert rank.shape == (3,) and 0 not in rank.stride() and rank._base is None
+    rank[0] += 1  # writable without touching the other entries
+    assert rank.tolist() == [5, 4, 4]

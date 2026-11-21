@@ -1256,6 +1256,140 @@ def run_expm_hh_edges():
     return out_results
 
 
+def run_round3_edges():
+    """Review round 3 (REVISION.md): matrix_exp past the old scaling cap of 16, LU pivot ties against LAPACK's first
+    max, LU pivots past 2^126, a tiny SVD input, and the card against the float32 replicas of tests/kernel_replica.py.
+    In lazy mode the LU ops are not installed (measured slower): those rows then check Habana's ops."""
+    import numpy as np
+
+    import kernel_replica as R
+
+    out_results = []
+
+    def row(label, check, expect_fb=False):
+        r = {"op": f"round3.{label}", "dtype": "float32", "lazy": LAZY}
+        problems = []
+        try:
+            with watch() as rec:
+                problems += check(r)
+            r["fwd_fallback"] = rec["fallback"]
+            if not expect_fb:
+                problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"exception {e!r}"[:300])
+        emit(**r, status="fail" if problems else "ok", problems=problems)
+        out_results.append(not problems)
+
+    def skew(batch, n, norm, seed):
+        g = torch.Generator().manual_seed(seed)
+        x = torch.randn(batch, n, n, generator=g, dtype=torch.float64)
+        x = x - x.mT
+        return (x * (norm / L.matrix_norm(x, 1)[..., None, None])).float()
+
+    def expm_vs_truth(a):
+        def check(r):
+            got = L.matrix_exp(a.to(HPU))
+            sync()
+            truth = L.matrix_exp(a.double())
+            r["max_rel_err"], r["err_cpu32"] = rel_err(got, truth), rel_err(L.matrix_exp(a), truth)
+            return over_bar("error", r["max_rel_err"], r["err_cpu32"])
+        return check
+
+    for n in (6, 22):
+        row(f"expm_norm1e7_n{n}", expm_vs_truth(skew(BATCH, n, 1e7, n)))
+    norms = 10 ** (5.5 + 2.5 * torch.rand(BATCH, generator=torch.Generator().manual_seed(9), dtype=torch.float64))
+    mixed = skew(BATCH, 8, 1.0, 9) * norms[:, None, None].float()
+    row("expm_mixed_counts", expm_vs_truth(mixed))
+
+    def expm_vs_replica(a):
+        def check(r):
+            got = L.matrix_exp(a.to(HPU))
+            sync()
+            rep = torch.from_numpy(np.stack([R.matrix_exp(x.numpy()) for x in a]))
+            truth = L.matrix_exp(a.double())
+            r["card_vs_replica"], r["replica_err"] = rel_err(got, rep), rel_err(rep, truth)
+            r["max_rel_err"], r["err_cpu32"] = rel_err(got, truth), rel_err(L.matrix_exp(a), truth)
+            return over_bar("card vs replica", r["card_vs_replica"], r["err_cpu32"])
+        return check
+
+    for n, norm in ((6, 1.0), (22, 50.0), (22, 1e5)):
+        row(f"replica.matrix_exp_n{n}_norm{norm:g}", expm_vs_replica(skew(4, n, norm, 20 + n)))
+
+    def tied(n, seed, batch=8):
+        g = torch.Generator().manual_seed(seed)
+        lower = torch.tril(torch.randint(0, 2, (batch, n, n), generator=g).float() * 2 - 1, -1) + torch.eye(n)
+        upper = torch.triu(torch.randint(-2, 3, (batch, n, n), generator=g).float(), 1) + torch.diag_embed(
+            torch.randint(1, 3, (batch, n), generator=g).float())
+        return lower @ upper
+
+    lu_fb = LAZY and os.environ.get("HPU_OPS_LU_SLOW") != "1"
+
+    def lu_ties(n):
+        def check(r):
+            a = tied(n, n)
+            LU, piv = L.lu_factor(a.to(HPU))
+            sync()
+            LU_t, piv_t = L.lu_factor(a)
+            r["pivots_equal"] = bool(torch.equal(piv.cpu(), piv_t))
+            r["lu_abs_err"] = float((LU.cpu() - LU_t).abs().max())
+            return [] if r["pivots_equal"] and r["lu_abs_err"] == 0 else ["pivots or factors differ from LAPACK's"]
+        return check
+
+    for n in (22, 32):
+        row(f"lu_factor_tied_n{n}", lu_ties(n), expect_fb=lu_fb)
+
+    def lu_huge(r):
+        g = torch.Generator().manual_seed(1)
+        a = ((torch.eye(6, dtype=torch.float64) + 0.01 * torch.randn(4, 6, 6, generator=g, dtype=torch.float64))
+             * 2.0 ** 126.5).float()
+        b = (torch.randn(4, 6, 2, generator=g, dtype=torch.float64) * 2.0 ** 126).float()
+        LU, piv = L.lu_factor(a.to(HPU))
+        x = L.lu_solve(LU, piv, b.to(HPU))
+        sync()
+        LU_t, _ = L.lu_factor(a.double())
+        r["lu_rel_err"] = float(((LU.cpu().double() - LU_t).abs() / LU_t.abs().clamp_min(1e-30)).max())
+        r["solve_rel_err"] = rel_err(x, L.solve(a.double(), b.double()))
+        return [] if r["lu_rel_err"] < 1e-5 and r["solve_rel_err"] < 1e-5 else ["huge pivots lost"]
+
+    row("lu_huge_pivot_2^126.5", lu_huge, expect_fb=lu_fb)
+
+    def lu_vs_replica(r):
+        a = torch.randn(4, 22, 22, generator=torch.Generator().manual_seed(5))
+        LU, piv = L.lu_factor(a.to(HPU))
+        sync()
+        reps = [R.lu_factor(x.numpy()) for x in a]
+        r["pivots_equal"] = bool(torch.equal(piv.cpu(), torch.from_numpy(np.stack([p for _, p, _, _ in reps]))))
+        r["card_vs_replica"] = rel_err(LU, torch.from_numpy(np.stack([lu for lu, _, _, _ in reps])))
+        return [] if r["pivots_equal"] and r["card_vs_replica"] < 1e-5 else ["card differs from the replica"]
+
+    row("replica.lu_factor_n22", lu_vs_replica, expect_fb=lu_fb)
+
+    def svd_vs_replica(shape):
+        def check(r):
+            a = torch.randn(2, *shape, generator=torch.Generator().manual_seed(sum(shape)))
+            S = L.svdvals(a.to(HPU))
+            sync()
+            rep = torch.from_numpy(np.stack([R.jacobi_svd(x.numpy(), compute_uv=False)[1] for x in a]))
+            truth = L.svdvals(a.double())
+            r["card_vs_replica"], r["replica_err"] = rel_err(S, rep), rel_err(rep, truth)
+            r["err_cpu32"] = rel_err(L.svdvals(a), truth)
+            return over_bar("card vs replica", r["card_vs_replica"], r["err_cpu32"])
+        return check
+
+    for shape in ((22, 22), (8, 5)):
+        row(f"replica.svdvals_{shape[0]}x{shape[1]}", svd_vs_replica(shape))
+
+    def svd_tiny(r):
+        a = torch.randn(4, 5, 5, generator=torch.Generator().manual_seed(4)) * 1e-37
+        S = L.svdvals(a.to(HPU))
+        sync()
+        r["max_rel_err"] = rel_err(S, L.svdvals(a.double()))
+        return [] if r["max_rel_err"] < 1e-5 else ["tiny matrix: singular values lost"]
+
+    row("svdvals_tiny_1e-37", svd_tiny)
+    return out_results
+
+
 def _lazy_check_row(name, n, batch, check_fn):
     row = {"op": name, "n": n, "batch": batch, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE}
     problems = []
@@ -1468,6 +1602,7 @@ def main():
             results.append(run_singular_triangle(op, fn, frozenset()))
         results += run_svd_edges()
         results += run_expm_hh_edges()
+        results += run_round3_edges()
         count_cpu_route()  # from here on, calls of hpu-ops' CPU route are counted (the Codex rows check them)
         results += [run_codex_case(*case) for case in codex_cases()]
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
