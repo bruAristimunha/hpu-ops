@@ -1,6 +1,6 @@
 """Which conv1d kernel sizes compile on Gaudi2 (bridge 1.21.4) forward AND backward, for (B, C, L) x (O, C, k).
 One case per process (a failed lazy graph poisons the rest):
-PT_HPU_LAZY_MODE=0|1 python3 repro/probe_conv_k_bwd.py K L [enable] [B C O]"""
+PT_HPU_LAZY_MODE=0|1 [STRIDE=s] python3 repro/probe_conv_k_bwd.py K L [en|-] [B C O]"""
 import json
 import os
 import sys
@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 k, length = int(sys.argv[1]), int(sys.argv[2])
+stride = int(os.environ.get("STRIDE", "1"))
 enable = len(sys.argv) > 3 and sys.argv[3] == "en"
 b, c, o = (int(v) for v in sys.argv[4:7]) if len(sys.argv) > 6 else (4, 8, 16)
 if enable:
@@ -19,16 +20,16 @@ lazy = os.environ.get("PT_HPU_LAZY_MODE", "0") != "0"
 torch.manual_seed(0)
 x, w = torch.randn(b, c, length), torch.randn(o, c, k) / k ** 0.5
 xd, wd = x.double().requires_grad_(), w.double().requires_grad_()
-F.conv1d(xd, wd).pow(2).sum().backward()
-info = {"k": k, "L": length, "bco": [b, c, o], "lazy": lazy, "enable": enable}
+F.conv1d(xd, wd, stride=stride).pow(2).sum().backward()
+info = {"k": k, "L": length, "stride": stride, "bco": [b, c, o], "lazy": lazy, "enable": enable}
 try:
     xh, wh = x.to("hpu").requires_grad_(), w.to("hpu").requires_grad_()
-    y = F.conv1d(xh, wh)
+    y = F.conv1d(xh, wh, stride=stride)
     y.pow(2).sum().backward()
     if lazy:
         htcore.mark_step()
     y, gx, gw = y.cpu(), xh.grad.cpu(), wh.grad.cpu()
-    ref = F.conv1d(x.double(), w.double())
+    ref = F.conv1d(x.double(), w.double(), stride=stride)
     rel = lambda a, r: float((a.double() - r).abs().max() / r.abs().max())  # noqa: E731
     info.update(ok=True, out_rel=rel(y, ref), gx_rel=rel(gx, xd.grad), gw_rel=rel(gw, wd.grad))
     if enable:
