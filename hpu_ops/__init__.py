@@ -69,8 +69,9 @@ at the tensor's pickling:
   (``amax([nan, 1, 2])`` is ``-inf``). Each runs Gaudi's kernel and puts NaN where torch has it, with torch's
   indices (the first NaN) and gradients; in 16-bit dtypes ``argmax`` / ``max(dim)`` of a row of ``-inf`` no longer
   return the out-of-range index ``n``. ``softmax``, ``log_softmax``, ``logsumexp``, ``cummax`` and the sums were
-  right and stay native. Not fixed: ``sort`` / ``topk`` / ``kthvalue`` / ``argsort`` with NaN (and float ``sort``
-  of 1000+ elements with infs, even without NaN, returns out-of-range indices).
+  right and stay native. ``sort`` / ``argsort`` / ``topk`` / ``kthvalue`` with NaN (and Gaudi's float ``sort`` of
+  1000+ elements with infs, which returns out-of-range indices even without NaN) only with ``HPU_OPS_EXACT_SORT=1``:
+  hpu-ops' own eigh and SVD sort their eigenvalues, and the exact sort made eager SPD steps up to 22% slower.
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
