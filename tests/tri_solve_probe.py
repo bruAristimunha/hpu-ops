@@ -4,7 +4,8 @@ Habana's own path (its CPU fallback), in the same process.
 Per op, variant and n (batch 32, float32): the relative error ``max|x - ref| / max|ref|`` against float64 on the CPU,
 next to the same error of CPU float32 (the bar), well- and ill-conditioned (diagonal logspace(-3, 0): condition about
 1e3 per factor, so 1e6 for cholesky_solve), the bridge ``cpu_fallback`` delta and "runs on the CPU" warnings, and
-the mean ms of ``--iters`` synced calls with the outputs kept alive. The kernel runs first (``hpu_ops.enable()``),
+the mean ms of ``--iters`` back-to-back calls, synced once at the end (``ms``: throughput), and the median ms of
+``--iters`` calls each synced on its own (``ms_isolated``: latency), the outputs kept alive. The kernel runs first (``hpu_ops.enable()``),
 then the fixes are undone and the same calls time Habana's fallback. One ``RESULT {json}`` line per row; the last line
 counts the failed rows (kernel error above 10x the CPU float32 bar, or any fallback/CPU warning on the kernel path)."""
 import argparse
@@ -81,7 +82,7 @@ def variants(n, gen):
 
 
 def run(fn, h_in, iters):
-    """First call (checked) and the mean ms of ``iters`` synced calls, outputs kept alive."""
+    """First call (checked), ``(mean ms of iters back-to-back calls, median ms of iters isolated synced calls)``."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         f0 = fb_ops()
@@ -94,10 +95,17 @@ def run(fn, h_in, iters):
             keep.append(fn(*h_in))
         sync()
         ms = (time.perf_counter() - t) * 1e3 / iters
+        # isolated-call latency: each call synced on its own (the mean above is of back-to-back submissions)
+        laps = []
+        for _ in range(iters):
+            t = time.perf_counter()
+            keep.append(fn(*h_in))
+            sync()
+            laps.append((time.perf_counter() - t) * 1e3)
         f1 = fb_ops()
     fb = {k: f1[k] - f0.get(k, 0) for k in f1 if f1[k] - f0.get(k, 0)}
     cpu = [str(w.message)[:120] for w in caught if "runs on the CPU" in str(w.message)]
-    return first, ms, fb, cpu
+    return first, (ms, sorted(laps)[len(laps) // 2]), fb, cpu
 
 
 def main():
@@ -119,11 +127,11 @@ def main():
             h_in = [x.to(HPU) for x in cpu_in]
             sync()
             try:
-                first, ms, fb, cpu = run(fn, h_in, args.iters)
+                first, (ms, ms_iso), fb, cpu = run(fn, h_in, args.iters)
                 err = rel_err(first, ref)
             except Exception as e:  # noqa: BLE001  (a failing case is a row)
-                ms, fb, cpu, err = None, {}, [f"exception {e!r}"[:300]], math.inf
-            rows.setdefault((n, name), {})[phase] = dict(err=err, ms=ms, fb=fb, cpu=cpu, bar=bar)
+                ms, ms_iso, fb, cpu, err = None, None, {}, [f"exception {e!r}"[:300]], math.inf
+            rows.setdefault((n, name), {})[phase] = dict(err=err, ms=ms, ms_iso=ms_iso, fb=fb, cpu=cpu, bar=bar)
     failed = 0
     for (n, name), r in rows.items():
         k, h = r["kernel"], r["habana"]
@@ -136,6 +144,7 @@ def main():
         print("RESULT " + json.dumps(dict(op=name, n=n, batch=BATCH, lazy=LAZY, bridge="1.21.4",
                                           err=k["err"], err_cpu32=k["bar"], err_habana=h["err"],
                                           ms_kernel=k["ms"], ms_habana=h["ms"], speedup=speed,
+                                          ms_isolated_kernel=k["ms_iso"], ms_isolated_habana=h["ms_iso"],
                                           fb_kernel=k["fb"], fb_habana=h["fb"], status="fail" if problems else "ok",
                                           problems=problems)), flush=True)
     print(f"SUMMARY {len(rows)} rows, {failed} failed", flush=True)

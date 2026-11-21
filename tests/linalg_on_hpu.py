@@ -59,6 +59,7 @@ F64_TEXT = "hpu-ops#16"
 BASELINE = False
 EIGH_FALLBACKS = []  # baseline: the fallback deltas seen for eigh (the positive control)
 ops_linalg = None  # hpu_ops.linalg, imported in main
+ops_tpc = None  # hpu_ops.tpc, imported in main
 tpc_maxn = 64  # hpu_ops.tpc.MAXN, set in main
 eigh_maxn = 32  # hpu_ops.tpc.EIGH_MAXN, set in main
 SINGULAR_N = 22
@@ -657,6 +658,209 @@ def run_double_backward(tol=1e-2):
     return not problems
 
 
+# ---- the Codex review of PR #25 (REVISION.md): its inputs, each against torch on the CPU ----
+S64, T64, BIG = 2.0 ** 64, 2.0 ** -64, 2.0 ** 127
+CPU_ROUTE = []  # calls of hpu-ops' own CPU route (hpu_ops.linalg._on_cpu / _out_on_cpu), counted in main
+
+
+def embed(block, n):
+    """``eye(n)`` with ``block`` in its upper-left corner."""
+    A = torch.eye(n)
+    block = torch.tensor(block, dtype=torch.float32)
+    A[:block.shape[0], :block.shape[1]] = block
+    return A
+
+
+def unit_rhs(n, rows, value=1.0):
+    B = torch.zeros(n, 1)
+    B[rows] = value
+    return B
+
+
+def _det_grad_create_graph(A):
+    A = A.detach().requires_grad_()
+    return torch.autograd.grad(L.det(A).sum(), A, create_graph=True)[0]
+
+
+def _cloned_coefficient_grad(A, B):
+    B = B.detach().requires_grad_()
+    torch.triangular_solve(B, A, upper=False).cloned_coefficient.sum().backward()
+    return B.grad
+
+
+def _slogdet_sign_backward(A):
+    A = A.detach().requires_grad_()
+    sign, _ = L.slogdet(A)
+    sign.backward()
+    return torch.tensor(float(A.grad is None))
+
+
+def _out_int(A, B):
+    return L.solve_triangular(A, B, upper=False, out=torch.empty(B.shape, dtype=torch.long, device=B.device))
+
+
+def _out_nonleaf(A, B):
+    leaf = torch.ones(B.shape, device=B.device, requires_grad=True)
+    return L.solve_triangular(A, B, upper=False, out=leaf * 2)
+
+
+def _out_layout(A, B):
+    out = torch.empty(0, device=B.device)
+    L.solve_triangular(A, B, upper=False, out=out)
+    return out, torch.tensor(out.stride(), dtype=torch.float32)
+
+
+def _legacy_out(A, B):
+    X, M = torch.empty(0, device=B.device), torch.empty(0, device=B.device)
+    torch.triangular_solve(B, A, upper=False, out=(X, M))
+    return X, M, torch.tensor(X.stride() + M.stride(), dtype=torch.float32)
+
+
+def _inference_offset_view(n):
+    def f(big, B):
+        # inv and solve_triangular: their backend kernels take inference mode (solve's is Habana's, by design)
+        with torch.inference_mode():
+            big = big * 1  # an inference tensor: its slices have ``_base`` None
+            view = big[1:2]
+            return (L.inv(view), L.inv(view), L.solve_triangular(view, B, upper=False),
+                    L.solve_triangular(view, B, upper=True))  # two calls in a row each: lazy
+    return f
+
+
+def _tri_upper_unit_overflow(n):
+    A, B = torch.eye(n), torch.zeros(n, 1)
+    A[n - 3, n - 2:] = 1
+    B[n - 3:] = BIG
+    return A, B
+
+
+def _tri_lower_unit_overflow(n):
+    A, B = torch.eye(n), torch.zeros(n, 1)
+    A[2, :2] = 1
+    B[:3] = BIG
+    return A, B
+
+
+def codex_cases():
+    """``(name, fn, inputs, expect)``: ``expect`` "torch" compares with CPU torch on the same inputs (both raise, or
+    the outputs match to 1e-6 relative with the same NaN/Inf pattern); "float64" the same against CPU torch in
+    float64, rounded to float32 (the 2^127 triangles: CPU float32's own trsm overflows on the pod's BLAS, measured
+    -inf, while it is finite on Apple's); "raise" expects an error on the card."""
+    for n in (2, 33):  # 2: the n <= 32 range of main's kernel too
+        dup = embed([[3, 4], [3, 4]], n)
+        yield f"codex1.solve_duplicate_rows.n{n}", L.solve, (dup, unit_rhs(n, 1)), "torch"
+        yield f"codex1.solve_ex_info_duplicate_rows.n{n}", lambda a, b: L.solve_ex(a, b).info.float(), \
+            (dup, unit_rhs(n, 1)), "torch"
+        yield f"codex1.det_duplicate_rows.n{n}", L.det, (dup,), "torch"
+        yield f"codex1.inv_duplicate_rows.n{n}", L.inv, (dup,), "torch"
+        colmajor = embed([[0.5, 0.5], [0.5, -0.5]], n).mT.contiguous().mT
+        yield f"codex3.solve_rhs_2^127.n{n}", L.solve, (colmajor, unit_rhs(n, 0, BIG)), "torch"
+        scaled = embed([[S64, T64], [S64, 2 * T64]], n)
+        yield f"codex4.det_pivot_2^64.n{n}", L.det, (scaled,), "torch"
+        yield f"codex4.slogdet_pivot_2^64.n{n}", L.slogdet, (scaled,), "torch"
+        yield f"codex4.solve_pivot_2^64.n{n}", L.solve, (scaled, unit_rhs(n, 1)), "torch"
+        rank1 = embed([[2.0 ** 30, 2.0 ** 127], [2.0 ** -97, 1.0]], n)  # row 2 = 2^-127 x row 1
+        yield f"rereview.solve_ex_info_tiny_multiplier.n{n}", lambda a, b: L.solve_ex(a, b).info.float(), \
+            (rank1, torch.ones(n, 1)), "torch"
+        yield f"rereview.det_tiny_multiplier.n{n}", L.det, (rank1,), "torch"
+        det1016 = embed([[1024.0, 2.0 ** 120], [2.0 ** -117, 1.0]], n)  # det 1016
+        yield f"rereview.det_1016.n{n}", L.det, (det1016,), "float64"
+        yield f"rereview.solve_det_1016.n{n}", L.solve, (det1016, torch.ones(n, 1)), "float64"
+    yield "codex2.tri_lower_unit_2^127.n33", lambda a, b: L.solve_triangular(a, b, upper=False, unitriangular=True), \
+        _tri_lower_unit_overflow(33), "float64"
+    yield "codex2.tri_upper_unit_2^127.n33", lambda a, b: L.solve_triangular(a, b, upper=True, unitriangular=True), \
+        _tri_upper_unit_overflow(33), "float64"
+    tri = torch.tril(torch.randn(2, 22, 22)) / 22 + 2 * torch.eye(22)
+    rhs = torch.randn(2, 22, 3)
+    yield "codex5.solve_triangular_out_int", _out_int, (tri, rhs), "torch"
+    yield "codex5.solve_triangular_out_nonleaf_grad", _out_nonleaf, (tri, rhs), "torch"
+    yield "codex6.cloned_coefficient_B_grad", _cloned_coefficient_grad, (tri, rhs), "torch"
+    big = torch.tril(torch.randn(65, 65)) / 65 + 2 * torch.eye(65)
+    yield "codex7.legacy_mixed_devices_n65", lambda a, b: torch.triangular_solve(b.cpu(), a), \
+        (big, torch.ones(65, 1)), "raise"
+    yield "codex7.legacy_mixed_devices_n33", lambda a, b: torch.triangular_solve(b.cpu(), a), \
+        (big[:33, :33], torch.ones(33, 1)), "raise"
+    singular = torch.eye(33)
+    singular[-1, -1] = 0
+    yield "codex8.det_double_backward_singular.n33", _det_grad_create_graph, \
+        (torch.stack([singular, 2 * torch.eye(33)]),), "torch"
+    yield "codex10.inference_offset_view.n33", _inference_offset_view(33), \
+        (torch.stack([torch.eye(33), 2 * torch.eye(33)]), torch.ones(1, 33, 2)), "torch"
+    yield "codex.minor.legacy_out_X", _legacy_out, (tri, rhs), "torch"
+    yield "codex.minor.out_layout", _out_layout, (tri, rhs), "torch"
+    yield "codex.minor.slogdet_sign_backward.n33", _slogdet_sign_backward, (torch.eye(33) * 2,), "torch"
+    yield "codex.minor.tpc_tri_solve_float64", lambda a, b: ops_tpc.tri_solve(a.double(), b.double()), \
+        (tri, rhs), "raise"
+    yield "codex.minor.raw_tri_solve_4d", lambda a, b: ops_tpc._tri_op(False, False)(
+        a.reshape(1, 2, 22, 22).expand(2, 2, 22, 22).contiguous(), b.reshape(1, 2, 22, 3).expand(2, 2, 22, 3)
+        .contiguous()), (tri, rhs), "raise"
+
+
+def run_codex_case(name, fn, ins, expect):
+    row = {"op": name, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE, "expect": expect}
+    problems = []
+    try:
+        want, want_err = None, None
+        if expect in ("torch", "float64"):
+            cast = (lambda x: x.double()) if expect == "float64" else (lambda x: x.clone())  # noqa: E731
+            try:
+                want = [t.detach().cpu().float() if expect == "float64" else t.detach().cpu()
+                        for t in as_tensors(fn(*[cast(x) for x in ins]))]
+            except Exception as e:  # noqa: BLE001
+                want_err = type(e).__name__
+        routed0 = len(CPU_ROUTE)
+        with watch() as rec:
+            try:
+                got = [t.detach().cpu() for t in as_tensors(fn(*[x.to(HPU) for x in ins]))]
+                sync()
+                got_err = None
+            except Exception as e:  # noqa: BLE001
+                got, got_err = None, f"{type(e).__name__}: {str(e)[:160]}"
+                with contextlib.suppress(Exception):
+                    sync()
+        row.update(fwd_fallback=rec["fallback"], raised=got_err, want_raised=want_err,
+                   cpu_route=len(CPU_ROUTE) - routed0)
+        if expect == "raise":
+            problems += ["did not raise"] * (got_err is None)
+        elif want_err:
+            problems += [f"torch raised {want_err}, the card did not"] * (got_err is None)
+        elif got_err:
+            problems.append(f"raised {got_err}")
+        else:
+            if len(got) != len(want):
+                problems.append(f"{len(got)} outputs, torch {len(want)}")
+            errs = []
+            for g, w in zip(got, want):
+                g, w = g.double(), w.double()
+                if g.shape != w.shape:
+                    problems.append(f"shape {tuple(g.shape)} vs {tuple(w.shape)}")
+                    continue
+                if not torch.equal(torch.isnan(g), torch.isnan(w)) or not torch.equal(torch.isinf(g), torch.isinf(w)):
+                    problems.append("NaN/Inf pattern differs from torch's")
+                errs.append(rel_err(g, w))
+            err = max(errs, default=0.0)
+            row["max_rel_err"] = err
+            problems += [f"error {err:.3g} > 1e-6"] * (not err <= 1e-6)
+        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+        problems += [f"took hpu-ops' CPU route {row['cpu_route']}x"] * bool(row["cpu_route"] and want_err is None
+                                                                            and expect != "raise")
+    except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
+        problems.append(f"exception {e!r}"[:300])
+    emit(**row, status="fail" if problems else "ok", problems=problems)
+    return not problems
+
+
+def count_cpu_route():
+    for name in ("_on_cpu", "_out_on_cpu"):
+        inner = getattr(ops_linalg, name)
+
+        def counted(*args, _inner=inner, _name=name, **kwargs):
+            CPU_ROUTE.append(_name)
+            return _inner(*args, **kwargs)
+
+        setattr(ops_linalg, name, counted)
+
+
 def rotated(b, n, diagonal, seed):
     """``Q diag(d) Q^T`` for a random orthogonal Q per batch element (QR of a normal matrix), float32."""
     g = torch.Generator().manual_seed(seed)
@@ -922,7 +1126,7 @@ def run_lazy_single_call_checks(tpc):
 
 
 def main():
-    global BASELINE, ops_linalg, tpc_maxn, eigh_maxn
+    global BASELINE, ops_linalg, ops_tpc, tpc_maxn, eigh_maxn
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--baseline", action="store_true", help="skip hpu_ops.enable()")
     parser.add_argument("--with-eigh", action="store_true",
@@ -932,6 +1136,7 @@ def main():
     import hpu_ops
     from hpu_ops import linalg as ops_linalg
     from hpu_ops import tpc
+    ops_tpc = tpc
     tpc_maxn, eigh_maxn = tpc.MAXN, tpc.EIGH_MAXN
     if not BASELINE:
         hpu_ops.enable()
@@ -964,6 +1169,8 @@ def main():
         for op, fn in (("solve_triangular", lambda T, B: L.solve_triangular(T, B, upper=False)),
                        ("cholesky_solve", lambda T, B: torch.cholesky_solve(B, T))):
             results.append(run_singular_triangle(op, fn, frozenset()))
+        count_cpu_route()  # from here on, calls of hpu-ops' CPU route are counted (the Codex rows check them)
+        results += [run_codex_case(*case) for case in codex_cases()]
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
         ok = bool(EIGH_FALLBACKS)
         emit(op="metric_check", lazy=LAZY, baseline=True, status="ok" if ok else "error",
