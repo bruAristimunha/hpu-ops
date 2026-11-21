@@ -148,6 +148,25 @@ static habana::PartialOutputMetaDataVector large_meta(const at::Stack& inputs) {
           habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
           habana::PartialOutputMetaData{a.scalar_type(), {batch, 2}}};
 }
+static habana::PartialOutputMetaDataVector csolve_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor(), b = inputs[1].toTensor();
+  auto batch = a.size(0), n = a.size(2);
+  return {habana::PartialOutputMetaData{b.scalar_type(), b.sizes().vec()},
+          habana::PartialOutputMetaData{b.scalar_type(), {batch, 3, n}},
+          habana::PartialOutputMetaData{b.scalar_type(), {batch, 4}}};
+}
+static habana::PartialOutputMetaDataVector cinv_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto batch = a.size(0), n = a.size(2);
+  return {habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, 3, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, 4}}};
+}
+static bool registered_complex = [] {
+  habana::custom_op::registerUserCustomOp("linalg_tpc::cgj_solve", "cgj_solve_f32_gaudi2", csolve_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::cgj_inv", "cgj_inv_f32_gaudi2", cinv_meta, nullptr);
+  return true;
+}();
 static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_large", "gj_large_f32_gaudi2", large_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", eigh_meta, nullptr);
@@ -183,6 +202,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_solve(at::Tensor a, at::Tensor
 std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::gj_inv");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+std::tuple<at::Tensor, at::Tensor, at::Tensor> cgj_solve(at::Tensor a, at::Tensor b) {
+  std::vector<c10::IValue> inputs{a, b};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::cgj_solve");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+std::tuple<at::Tensor, at::Tensor, at::Tensor> cgj_inv(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::cgj_inv");
   auto out = desc.execute(inputs);
   return {out[0], out[1], out[2]};
 }
@@ -273,6 +304,8 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_large(Tensor a) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("cgj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
+  m.def("cgj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svdvals(Tensor a) -> Tensor");
@@ -293,6 +326,8 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_large", gj_large);
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
+  m.impl("cgj_solve", cgj_solve);
+  m.impl("cgj_inv", cgj_inv);
   m.impl("jacobi_svd", jacobi_svd);
   m.impl("jacobi_svd_full", jacobi_svd_full);
   m.impl("jacobi_svdvals", jacobi_svdvals);
@@ -321,6 +356,12 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   });
   m.impl("gj_inv", [](at::Tensor a) {
     return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), a.size(1)}), a.new_empty({a.size(0), 2}));
+  });
+  m.impl("cgj_solve", [](at::Tensor a, at::Tensor b) {
+    return std::make_tuple(b.new_empty(b.sizes()), b.new_empty({a.size(0), 3, a.size(2)}), b.new_empty({a.size(0), 4}));
+  });
+  m.impl("cgj_inv", [](at::Tensor a) {
+    return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), 3, a.size(2)}), a.new_empty({a.size(0), 4}));
   });
   m.impl("jacobi_svd", [](at::Tensor a) {
     auto b = a.size(0), n = a.size(1), m = a.size(2);
@@ -405,6 +446,25 @@ static bool registered_large = [] {
                                                  {3, c10::ScalarType::Float, dshape},
                                                  {4, c10::ScalarType::Float, sshape}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_large", "gj_large_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static auto cdshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  return std::vector<int64_t>{a.size(0), 3, a.size(2)};
+};
+static auto csshape = [](const at::Stack& s) { return std::vector<int64_t>{s[0].toTensor().size(0), 4}; };
+static bool registered_complex = [] {
+  std::vector<habana::custom_op::InputDesc> in2{{habana::custom_op::input_type::TENSOR, 0},
+                                                {habana::custom_op::input_type::TENSOR, 1}};
+  std::vector<habana::custom_op::OutputDesc> out2{{0, c10::ScalarType::Float, xshape_b},
+                                                  {1, c10::ScalarType::Float, cdshape},
+                                                  {2, c10::ScalarType::Float, csshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::cgj_solve", "cgj_solve_f32_gaudi2", in2, out2, nullptr);
+  std::vector<habana::custom_op::InputDesc> in1{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out1{{0, c10::ScalarType::Float, xshape_a},
+                                                  {1, c10::ScalarType::Float, cdshape},
+                                                  {2, c10::ScalarType::Float, csshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::cgj_inv", "cgj_inv_f32_gaudi2", in1, out1, nullptr);
   return true;
 }();
 static bool registered_inv = [] {
@@ -527,6 +587,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto out = op.execute(inputs);
   return {out[0], out[1], out[2]};
 }
+std::tuple<at::Tensor, at::Tensor, at::Tensor> cgj_solve(at::Tensor a, at::Tensor b) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::cgj_solve");
+  std::vector<c10::IValue> inputs{a, b};
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+std::tuple<at::Tensor, at::Tensor, at::Tensor> cgj_inv(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::cgj_inv");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
 using Large = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
 Large gj_large(at::Tensor a) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_large");
@@ -613,6 +685,8 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_large(Tensor a) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("cgj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
+  m.def("cgj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svdvals(Tensor a) -> Tensor");
@@ -633,6 +707,8 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_large", gj_large);
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
+  m.impl("cgj_solve", cgj_solve);
+  m.impl("cgj_inv", cgj_inv);
   m.impl("jacobi_svd", jacobi_svd);
   m.impl("jacobi_svd_full", jacobi_svd_full);
   m.impl("jacobi_svdvals", jacobi_svdvals);
@@ -1489,3 +1565,7 @@ def lu_solve(LU, pivots, B):
     else:
         X = torch.cat([_call(op, lu_f, piv_f, _fresh(chunk.contiguous())) for chunk in B_f.split(SMALL_MAXN, -1)], -1)
     return X.reshape(*batch, n, m)
+
+
+# complex64 kernels (for hpu-complex): ``hpu_ops.tpc.complex_linalg``; imported last, it reads this module's helpers
+from . import complex_linalg  # noqa: E402

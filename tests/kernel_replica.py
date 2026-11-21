@@ -607,3 +607,139 @@ def householder_product(A, tau, legacy=False):
             e = np.where(lanes == i, F32(1), F32(0)).astype(F32)
             q[i] = add(e, ntv) if legacy or tau_i != 0 else e
     return np.stack([x[:m] for x in q], 1)
+
+
+# ---- complex64 kernels (planar re/im rows): cgj_solve / cgj_inv ----------------------------------------------------
+# LUT-free throughout (lut_free_recip, a bit-guess + 3 Newton rsqrt, power-of-two scaling), so these replays are
+# meant to be bit-identical to the card.
+
+
+def _nonfinite(*xs):
+    return any(bool(np.any((_u32(np.asarray(x, F32)) & 0x7F800000) == 0x7F800000)) for x in xs)
+
+
+def _pow2_scale(m):
+    """``pow2_scale``: 2^(127 - e) for the biased exponent e of m (1 for m = 0)."""
+    e = (_u32(m) >> 23) & 0xFF
+    return np.where(e == 0, F32(1), _f32(((254 - e) & 0xFFFFFFFF) << 23)).astype(F32)
+
+
+def _pow2_unscale(m):
+    e = _u32(m) & 0x7F800000
+    return np.where(e == 0, F32(1), _f32(e)).astype(F32)
+
+
+def _big_scale(m):
+    return np.where((_u32(m) & 0x7FFFFFFF) >= 0x5F800000, F32(2.0 ** -64), F32(1)).astype(F32)
+
+
+def lut_free_rsqrt(x):
+    """``lut_free_rsqrt``: 0 -> 1, then the guess 0x5F375A86 - bits / 2 and three Newton steps y (1.5 - x/2 y^2)."""
+    x = np.where(np.asarray(x, F32) == 0, F32(1), np.asarray(x, F32)).astype(F32)
+    y = _f32((0x5F375A86 - (_u32(x) >> 1)) & 0xFFFFFFFF)
+    hx = mul(x, F32(-0.5))
+    for _ in range(3):
+        y = mul(y, mac(hx, mul(y, y), F32(1.5)))
+    return y
+
+
+def _cneg_recip_parts(pr, pi, pm):
+    """The kernel's -1/p, with the 2^-64 prescale: (scale, psr, psi, ninvr, ninvi)."""
+    scale = _big_scale(pm)
+    psr, psi = mul(pr, scale), mul(pi, scale)
+    t = _pow2_scale(mul(pm, scale))
+    tr, ti = mul(psr, t), mul(psi, t)
+    rt = mul(recip(mac(ti, ti, mul(tr, tr)), zero_to_inf=False), t)
+    return scale, psr, psi, mul(sub(F32(0), tr), rt), mul(ti, rt)
+
+
+def cgj_solve(A, B=None):
+    with np.errstate(all="ignore"):
+        return _cgj_solve(A, B)
+
+
+def _cgj_solve(A, B=None):
+    """``(X, D, S)`` of cgj_solve_f32_gaudi2.c (cgj_inv with ``B=None``) for one planar ``A[2n, n]`` (rows 0..n-1
+    real parts, n..2n-1 imaginary parts) and ``B[2n, m]``; ``X[2n, m]``, ``D[3, n]`` (pivot re, im, abs), ``S[4]``
+    (phase re, im, info, (-1)^swaps)."""
+    A = np.array(A, dtype=F32)
+    n = A.shape[1]
+    ar, ai = _ftz(A[:n].copy()), _ftz(A[n:].copy())
+    if B is None:
+        br, bi = np.eye(n, dtype=F32), np.zeros((n, n), F32)
+    else:
+        B = np.array(B, dtype=F32)
+        br, bi = _ftz(B[:n].copy()), _ftz(B[n:].copy())
+    m = br.shape[1]
+    if _nonfinite(A) or (B is not None and _nonfinite(B)):
+        return np.full((2 * n, m), np.nan, F32), np.full((3, n), np.nan, F32), np.full(4, np.nan, F32)
+    dvr, dvi = np.zeros(n, F32), np.zeros(n, F32)
+    sv, info = F32(1), F32(0)
+    for k in range(n):
+        colr, coli = ar[:, k].copy(), ai[:, k].copy()
+        cand = add(np.abs(colr), np.abs(coli))
+        cand[:k] = -1
+        top = max(F32(0), np.max(cand))
+        hits = np.nonzero(cand == top)[0]
+        p = int(hits[0]) if hits.size else k
+        if p != k:
+            for x in (ar, ai, br, bi):
+                x[[k, p]] = x[[p, k]]
+            colr[[k, p]], coli[[k, p]] = colr[[p, k]], coli[[p, k]]
+            sv = -sv
+        pr, pi = ar[k, k], ai[k, k]
+        dvr[k], dvi[k] = pr, pi
+        pm = max(abs(pr), abs(pi))
+        if pm == 0 and info == 0:
+            info = F32(k + 1)
+        scale, psr, psi, ninvr, ninvi = _cneg_recip_parts(pr, pi, pm)
+        csr, csi = mul(colr, scale), mul(coli, scale)
+        qr = mac(sub(F32(0), csi), ninvi, mul(csr, ninvr))
+        qi = mac(csi, ninvr, mul(csr, ninvi))
+        rr = mac(sub(F32(0), qi), psi, mac(qr, psr, csr))
+        ri = mac(qi, psr, mac(qr, psi, csi))
+        qr = mac(sub(F32(0), ri), ninvi, mac(rr, ninvr, qr))
+        qi = mac(ri, ninvr, mac(rr, ninvi, qi))
+        nqi = sub(F32(0), qi)
+        apr, api, bpr, bpi = ar[k].copy(), ai[k].copy(), br[k].copy(), bi[k].copy()
+        for i in range(n):
+            if i != k:
+                ar[i] = mac(api, nqi[i], mac(apr, qr[i], ar[i]))
+                ai[i] = mac(apr, qi[i], mac(api, qr[i], ai[i]))
+                br[i] = mac(bpi, nqi[i], mac(bpr, qr[i], br[i]))
+                bi[i] = mac(bpr, qi[i], mac(bpi, qr[i], bi[i]))
+    dm = np.maximum(np.abs(dvr), np.abs(dvi)).astype(F32)
+    dscale = _big_scale(dm)
+    dms = mul(dm, dscale)
+    t, inv_t = _pow2_scale(dms), _pow2_unscale(dms)
+    tr, ti = mul(mul(dvr, dscale), t), mul(mul(dvi, dscale), t)
+    den = mac(ti, ti, mul(tr, tr))
+    rt = mul(recip(den, zero_to_inf=False), t)
+    invr, invi = mul(tr, rt), mul(sub(F32(0), ti), rt)
+    rs = lut_free_rsqrt(den)
+    absd = mul(mul(mul(den, rs), inv_t), np.where(dscale == 1, F32(1), F32(2.0 ** 64)).astype(F32))
+    ur, ui = mul(tr, rs), mul(ti, rs)
+    X = np.zeros((2 * n, m), F32)
+    for i in range(n):
+        bsr, bsi = mul(br[i], dscale[i]), mul(bi[i], dscale[i])
+        X[i] = mac(sub(F32(0), bsi), invi[i], mul(bsr, invr[i]))
+        X[n + i] = mac(bsi, invr[i], mul(bsr, invi[i]))
+    phr, phi = F32(sv), F32(0)
+    for k in range(n):
+        phr, phi = mac(sub(F32(0), phi), ui[k], mul(phr, ur[k])), mac(phi, ur[k], mul(phr, ui[k]))
+    pn = lut_free_rsqrt(mac(phi, phi, mul(phr, phr)))
+    phr, phi = mul(phr, pn), mul(phi, pn)
+    return X, np.stack([dvr, dvi, absd]), np.array([phr, phi, info, sv], F32)
+
+
+def cgj_op(identity=False):
+    """A stand-in for ``torch.ops.linalg_tpc.cgj_solve`` (``cgj_inv`` with ``identity``): the replica per batch
+    element on the planar tensors, torch tensors out."""
+    import torch
+
+    def op(A, B=None):
+        outs = [cgj_solve(a.detach().cpu().numpy(), None if identity else b.detach().cpu().numpy())
+                for a, b in zip(A, A if identity else B)]
+        return tuple(torch.from_numpy(np.stack([o[j] for o in outs])) for j in range(3))
+
+    return (lambda A: op(A)) if identity else op

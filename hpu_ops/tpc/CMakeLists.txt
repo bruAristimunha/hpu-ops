@@ -7,7 +7,8 @@ set(TPC_INCLUDE_DIR "/usr/lib/habanatools/include" CACHE STRING "TPC includes")
 add_library(linalg_tpc SHARED glue.cpp)
 target_include_directories(linalg_tpc PRIVATE ${TPC_INCLUDE_DIR})
 
-# gj_solve (A, B) and gj_inv (A alone, B = identity, -DIDENTITY_B) share one source;
+# gj_solve (A, B) and gj_inv (A alone, B = identity, -DIDENTITY_B) share one source, and so do their complex64
+# versions cgj_solve and cgj_inv (planar re/im rows);
 # jacobi_eigh and jacobi_eigh_refine (Pass 2 adaptive-shift refinement, -DREFINE_PASS) share one source;
 # gj_large{2..8} (in-place inverse, 64 < n <= 512, -DVA = ceil(n / 64)) share gj_large_f32_gaudi2.c;
 # the 4 tri_solve variants share tri_solve_f32_gaudi2.c (-DUPPER, -DUNIT_DIAG).
@@ -16,11 +17,15 @@ foreach(KERNEL
         tri_solve_lower_f32_gaudi2 tri_solve_upper_f32_gaudi2
         tri_solve_lower_unit_f32_gaudi2 tri_solve_upper_unit_f32_gaudi2
         gj_large2_f32_gaudi2 gj_large3_f32_gaudi2 gj_large4_f32_gaudi2 gj_large5_f32_gaudi2
-        gj_large6_f32_gaudi2 gj_large7_f32_gaudi2 gj_large8_f32_gaudi2)
+        gj_large6_f32_gaudi2 gj_large7_f32_gaudi2 gj_large8_f32_gaudi2
+        cgj_solve_f32_gaudi2 cgj_inv_f32_gaudi2)
     set(SOURCE ${KERNEL})
     set(DEFINES "")
     if(KERNEL STREQUAL "gj_inv_f32_gaudi2")
         set(SOURCE gj_solve_f32_gaudi2)
+        set(DEFINES -DIDENTITY_B)
+    elseif(KERNEL STREQUAL "cgj_inv_f32_gaudi2")
+        set(SOURCE cgj_solve_f32_gaudi2)
         set(DEFINES -DIDENTITY_B)
     elseif(KERNEL MATCHES "^gj_large([0-9])_")
         set(SOURCE gj_large_f32_gaudi2)
