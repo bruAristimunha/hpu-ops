@@ -119,8 +119,11 @@ def quantile_of(self, q, dim=None, keepdim=False, interpolation="linear", ignore
 def _ranks_in_float64():
     """Whether the installed torch computes a float32 input's ranks ``q * (n - 1)`` and linear weights in float64
     (torch 2.15.0; 2.6 to 2.8 compute them in float32). Read from torch's own CPU quantile once: float32 0.7 * 5 is
-    3.4999998 in float64, so nearest picks index 3, and 3.5 in float32, which rounds half to even to 4."""
-    probe = aten.quantile.scalar._op_dk(DispatchKey.CompositeImplicitAutograd, torch.arange(6.0), 0.7, None, False,
+    3.4999998 in float64, so nearest picks index 3, and 3.5 in float32, which rounds half to even to 4. The probe is
+    an explicit float32 CPU tensor: it runs at import, where the default dtype (bf16 / fp16: quantile rejects them) or
+    device (meta: no value; hpu: the device would initialise before ``enable()`` sets the kernel path) is the user's."""
+    probe = aten.quantile.scalar._op_dk(DispatchKey.CompositeImplicitAutograd,
+                                        torch.arange(6.0, dtype=torch.float32, device="cpu"), 0.7, None, False,
                                         interpolation="nearest")  # ATen's own composite: never a rewrite
     return probe.item() == 3.0
 
@@ -130,7 +133,8 @@ def _length_limited():
     """Whether the installed torch rejects a slice longer than 2**24 (2.6 to 2.8; 2.15.0 does not). Read from ATen's
     composite on a meta tensor, which checks the size without computing."""
     try:
-        aten.quantile.scalar._op_dk(DispatchKey.CompositeImplicitAutograd, torch.empty(MAX_LENGTH + 1, device="meta"),
+        aten.quantile.scalar._op_dk(DispatchKey.CompositeImplicitAutograd,
+                                    torch.empty(MAX_LENGTH + 1, dtype=torch.float32, device="meta"),
                                     0.5, None, False, interpolation="linear")
     except RuntimeError:
         return True
