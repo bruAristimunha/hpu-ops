@@ -1,5 +1,5 @@
 """Convolutions on HPU: ``padding="valid"`` under ``torch.compile``, the weight gradient of one-channel
-convolutions with a stride, and spatial splitting of large-kernel convolutions (``> 128``).
+convolutions with a stride, and spatial splitting of the large-kernel convolutions that fail natively.
 
 Weight gradient: for a convolution with one input channel and a stride above 1, Gaudi's compiled
 ``convolution_backward`` returns about half the true weight gradient plus an unrelated part (the first convolutions of
@@ -25,7 +25,10 @@ compile the same way, and for 129 <= k <= 255 the input gradient is wrong (relat
 256 < L < 2k (k = 144 over 260, 240 over 300, 255 over 257). Eager, kernels up to 256 were right at every length tried
 (those and k = 255, 256 over 1000). So a kernel dimension above ``MAX_KERNEL = 256`` (eager ops, compiled graphs) or
 ``LAZY_MAX_KERNEL = 128`` (lazy mode) is split into slices of at most that size, with exact input slicing and
-``F.pad``; a 128-wide chunk whose input is longer than 256 is then longer than twice its kernel.
+``F.pad``; a 128-wide chunk whose input is longer than 256 is then longer than twice its kernel. One class of wider
+kernels runs natively and is left to the native op, which is faster (see ``NATIVE_WIDE`` below and the README's
+sweep table): one input channel, wide only in the last dim, an even width at stride >= 32 in eager mode, any width
+>= 257 at stride >= 8 in lazy mode. TensorCSPNet's default ``(4, 4356)`` stride ``(1, 484)`` is in it.
 
 Not fixed, compiled (``torch.compile(backend="hpu_backend")``): the graph compiler rejects some split graphs whatever the
 chunk width. With 256-wide chunks (used): conv1d k = 351 over 1000 fails in a bundling pass (``Cannot add a node DEDW to
@@ -144,14 +147,47 @@ def _lazy():
 _MODE = {}
 
 
-def _max_kernel(input):
-    """The largest kernel a single Synapse ``Conv`` node gets: ``LAZY_MAX_KERNEL`` (128) for HPU ops in lazy mode,
-    else ``MAX_KERNEL`` (256: eager ops and traced ``torch.compile`` graphs, where 128-wide chunks failed more shapes
-    than 256-wide ones; see the module docstring). Off HPU (the CPU tests) ``MAX_KERNEL``, which the tests patch."""
-    traced = is_fake(input) or torch._guards.detect_fake_mode() is not None
-    if input.device.type == "hpu" and not traced and _lazy():
-        return min(MAX_KERNEL, LAZY_MAX_KERNEL)
-    return MAX_KERNEL
+def _mode(input):
+    """How this convolution runs: ``"compile"`` (a traced ``torch.compile`` graph), ``"lazy"`` (an HPU op in lazy
+    mode) or ``"eager"`` (an HPU op in eager mode, and the CPU stand-in of the CPU tests, which patch this)."""
+    if is_fake(input) or torch._guards.detect_fake_mode() is not None:
+        return "compile"
+    return "lazy" if input.device.type == "hpu" and _lazy() else "eager"
+
+
+def _max_kernel(mode):
+    """The largest kernel a single Synapse ``Conv`` node gets: ``LAZY_MAX_KERNEL`` (128) in lazy mode, else
+    ``MAX_KERNEL`` (256: eager ops and traced ``torch.compile`` graphs, where 128-wide chunks failed more shapes than
+    256-wide ones; see the module docstring). The CPU tests patch ``MAX_KERNEL``."""
+    return min(MAX_KERNEL, LAZY_MAX_KERNEL) if mode == "lazy" else MAX_KERNEL
+
+
+# The one class of wide kernels Gaudi2's native convolution runs, forward and backward, with the right numbers (bridge
+# 1.21.4, measured by ``repro/sweep_conv_native.sh``, table in the README): a 2-D float32 convolution with one input
+# channel and groups 1, no padding or dilation, whose kernel is wider than the bound only in its last dim, with
+# ``kH <= 22`` and
+#   eager: an even ``kW`` and a stride ``>= 32`` along it (every even ``kW`` from 258 to 6000 ran at strides 32 to kW;
+#          every odd one tried, 257, 351, 1089, 1091 and 1501, fails ``setAssociatedDimAndSize``; (4, 4356) fails at
+#          strides 1 to 16);
+#   lazy:  any ``kW`` and a stride ``>= 8`` (every ``kW`` from 257 to 6000 ran at strides 8 to kW; at stride 1 with
+#          the input as wide as the kernel the card stops with a device critical error).
+# TensorCSPNet's default ``temporal_block`` ((4, 4356), stride (1, 484)) is in it in both modes, and its
+# ``dims=(22, 11, 11, 11)`` one ((4, 1089), stride (1, 121)) in lazy mode, so they keep the native op. Everything
+# else above the bound is split: 4 input channels, the wide dim first ((4356, 4) or STaRNet's (351, 1)), conv1d and
+# 3-D convolutions, other dtypes, and traced graphs (not measured) included.
+NATIVE_WIDE = {"eager": {"min_k": 258, "stride": 32, "even": True}, "lazy": {"min_k": 257, "stride": 8, "even": False}}
+NATIVE_WIDE_MAX_KH = 22
+
+
+def _native_wide(mode, input, weight, groups, strd, pad, dil):
+    """Whether this convolution is in the measured native class above."""
+    rule = NATIVE_WIDE.get(mode)
+    if rule is None or input.dim() != 4 or input.dtype != torch.float32:
+        return False
+    k_h, k_w = weight.shape[2:]
+    return (groups == 1 and weight.shape[1] == 1 and k_h <= min(NATIVE_WIDE_MAX_KH, _max_kernel(mode))
+            and k_w >= rule["min_k"] and (k_w % 2 == 0 or not rule["even"]) and strd[1] >= rule["stride"]
+            and all(p == 0 for p in pad) and all(d == 1 for d in dil))
 
 
 def _large_kernel_takes(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups):
@@ -177,7 +213,11 @@ def _large_kernel_takes(input, weight, bias, stride, padding, dilation, transpos
     if (any(s <= 0 for s in strd) or any(p < 0 for p in pad) or any(d <= 0 for d in dil)
             or any(p != 0 for p in output_padding)):
         return False
-    if not any(k > _max_kernel(input) for k in weight.shape[2:]):
+    mode = _mode(input)
+    if not any(k > _max_kernel(mode) for k in weight.shape[2:]):
+        return False
+    if _native_wide(mode, input, weight, groups, strd, pad, dil):
+        count("large_conv_native")
         return False
     return all(l_in + 2 * p >= d * (k - 1) + 1
                for l_in, k, p, d in zip(input.shape[2:], weight.shape[2:], pad, dil))
@@ -192,7 +232,7 @@ def _split_conv(op, fallback, input, weight, bias, stride, padding, dilation, gr
     another order than native's: where the reduction already overflows (float32 inputs near 3e38), a split output
     can be NaN (+inf + -inf) where native gives inf; both are non-finite in the same places."""
     n = input.dim() - 2
-    max_k = _max_kernel(input)
+    max_k = _max_kernel(_mode(input))
     strd, pad, dil = _expand(stride, n), _expand(padding, n), _expand(dilation, n)
     out_sizes = [(l_in + 2 * p - d * (k - 1) - 1) // s + 1
                  for l_in, k, s, p, d in zip(input.shape[2:], weight.shape[2:], strd, pad, dil)]
