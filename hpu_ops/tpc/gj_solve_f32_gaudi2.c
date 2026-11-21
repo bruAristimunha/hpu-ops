@@ -4,7 +4,13 @@
  *   A [n, n, batch]  f32     B [m, n, batch]  f32     X [m, n, batch]  f32
  *   D [n, batch]  f32: the pivot at each step (U's diagonal of P A = L U)
  *   S [2, batch]  f32: lane 0 = (-1)^swaps, lane 1 = info (1 + first zero pivot, kernel's order)
- * D and S give det = S0 * prod(D) and slogdet. A zero pivot zeroes the pivot row, so later pivots stay finite.
+ * D and S give det = S0 * prod(D) and slogdet. Elimination is LU-style (row -= (a_ik / pivot) * pivot row, the
+ * pivot row unnormalized; X = B / diag at the end): equal rows cancel exactly, so a rank-deficient matrix gets an exactly
+ * zero pivot when its rows are exact duplicates (or a power-of-two multiple), where LAPACK's rounded multipliers can
+ * leave a residue and report info 0; other rank-deficient matrices (e.g. integer ones) are not detected, as in torch.
+ * B is never scaled by 1/pivot before the cancellation (no intermediate overflow). A multiplier below 2^-126 is
+ * carried as q * 2^64 against the pivot row * 2^-64, so it is not flushed when its product is normal. A zero pivot
+ * leaves the elimination a no-op and its row of X zero, so later pivots stay finite.
  * With -DIDENTITY_B the kernel takes A alone and solves against the identity (inv): m = n, no B tensor.
  * Row i of A and of B is one 64-lane vector in local memory (lane j = column j), so n, m <= MAXN.
  * All operations (lane broadcast, argmax, reciprocal) are LUT-free so VLM stays in 80 KB mode (a[64]+b[64] = 32 KB).
@@ -129,12 +135,23 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
         float64 infov = 0.0f;
         for (int k = 0; k < n; k++)
         {
-            // column k as a vector over rows: lane i = A[i][k]
-            float64 col = 0.0f;
-            for (int i = k; i < n; i++)
+            // column k as a vector over rows: lane i = A[i][k], every row (the multipliers need the rows above k too)
+            // four independent select chains (rows i mod 4), so the n dependent selects do not serialize; lanes are
+            // disjoint, so the sum of the four is exact
+            float64 c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+            int i4 = 0;
+            for (; i4 + 3 < n; i4 += 4)
             {
-                col = v_f32_sel_eq_u32_b(lane, (unsigned)i, lane_bcast(a[i], k), col);
+                c0 = v_f32_sel_eq_u32_b(lane, (unsigned)i4, lane_bcast(a[i4], k), c0);
+                c1 = v_f32_sel_eq_u32_b(lane, (unsigned)(i4 + 1), lane_bcast(a[i4 + 1], k), c1);
+                c2 = v_f32_sel_eq_u32_b(lane, (unsigned)(i4 + 2), lane_bcast(a[i4 + 2], k), c2);
+                c3 = v_f32_sel_eq_u32_b(lane, (unsigned)(i4 + 3), lane_bcast(a[i4 + 3], k), c3);
             }
+            for (; i4 < n; i4++)
+            {
+                c0 = v_f32_sel_eq_u32_b(lane, (unsigned)i4, lane_bcast(a[i4], k), c0);
+            }
+            float64 col = v_f32_add_b(v_f32_add_b(c0, c1), v_f32_add_b(c2, c3));
             float64 cand = v_f32_abs_b(col);
             cand = v_f32_sel_less_u32_b(lane, (unsigned)k, -1.0f, cand);
             cand = v_f32_sel_geq_u32_b(lane, (unsigned)n, -1.0f, cand);
@@ -152,30 +169,60 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
                 a[i] = v_f32_sel_eq_u32_b(p, (unsigned)i, ak, a[i]);
                 b[i] = v_f32_sel_eq_u32_b(p, (unsigned)i, bk, b[i]);
             }
+            a[k] = ap;
+            b[k] = bp;
             float64 pk = lane_bcast(ap, k);
+            // the column after the swap: lane p gets the old A[k][k], lane k the pivot
+            col = v_f32_sel_eq_u32_b(lane, p, lane_bcast(col, k), col);
+            col = v_f32_sel_eq_u32_b(lane, (unsigned)k, pk, col);
             dv = v_f32_sel_eq_u32_b(lane, (unsigned)k, pk, dv);
             sv = v_f32_sel_eq_u32_b(p, (unsigned)k, sv, v_f32_sub_b(0.0f, sv));
             infov = v_f32_sel_eq_f32_b(pk, 0.0f, v_f32_sel_eq_f32_b(infov, 0.0f, (float)(k + 1), infov), infov);
-            // a zero pivot gives a zero pivot row: its elimination is a no-op, as in LAPACK
-            // |pivot| >= 2^64: scale the pivot row by 2^-64 (exact) so recip(pivot) is never subnormal, which the
-            // card flushes to zero; a row entry underflows only when its quotient is subnormal itself
+            // LU-style elimination: row i -= (A[i][k] / pivot) * pivot row, the pivot row left unnormalized, so equal
+            // rows cancel exactly and B is never scaled by 1/pivot before the cancellation. The quotients of all rows
+            // at once, one vector: q = -col / pivot, then one FMA residual correction (Markstein), so q is the
+            // rounded quotient (-1 exactly for an equal row). |pivot| >= 2^64: col and pivot scaled by 2^-64 (exact)
+            // so recip(pivot) is never subnormal, which the card flushes to zero. A zero pivot gives recip 0, so
+            // q = 0 and the elimination is a no-op, as in LAPACK.
             float64 scale = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(pk), 0x7FFFFFFFu), 0x5F800000u,
                                                 0x1p-64f, 1.0f);
-            float64 inv = lut_free_recip(v_f32_mul_b(pk, scale));
-            ak = v_f32_mul_b(v_f32_mul_b(ap, scale), inv);
-            bk = v_f32_mul_b(v_f32_mul_b(bp, scale), inv);
-            a[k] = ak;
-            b[k] = bk;
+            float64 pks = v_f32_mul_b(pk, scale);
+            float64 ninv = v_f32_sub_b(0.0f, lut_free_recip(pks));
+            float64 cs = v_f32_mul_b(col, scale);
+            float64 q = v_f32_mul_b(cs, ninv);
+            float64 r = v_f32_mac_b(q, pks, cs);  // cs + q * pivot, exact in one FMA
+            // no correction when 1/pivot is 0 (an infinite or zero pivot): 0 * inf in r would make every q NaN
+            q = v_f32_sel_eq_f32_b(ninv, 0.0f, q, v_f32_mac_b(r, ninv, q));
+            // |a_ik / pivot| < 2^-126 flushes q to zero although q * (pivot row) can be normal: those rows also take
+            // qs = q * 2^64 (from col * 2^64, |col| < 2^-126 |pivot| <= 4 so it does not overflow) against the pivot
+            // row * 2^-64; any other row gets qs = 0. Entries of the scaled row that flush, or are not finite, are 0:
+            // their true products are subnormal (|q| < 2^-126, |entry| < 2^-62), or q * inf is already NaN in the
+            // first FMA, and a 0 * inf there would turn the normal rows' inf into NaN.
+            float64 qs = v_f32_mul_b(v_f32_mul_b(col, v_f32_sel_eq_f32_b(scale, 1.0f, 0x1p64f, 1.0f)), ninv);
+            qs = v_f32_sel_eq_f32_b(q, 0.0f, qs, 0.0f);
+            float64 aps = v_f32_sel_less_u32_b(v_u32_and_b(as_uint64(ap), 0x7FFFFFFFu), 0x7F800000u,
+                                               v_f32_mul_b(ap, 0x1p-64f), 0.0f);
+            float64 bps = v_f32_sel_less_u32_b(v_u32_and_b(as_uint64(bp), 0x7FFFFFFFu), 0x7F800000u,
+                                               v_f32_mul_b(bp, 0x1p-64f), 0.0f);
             for (int i = 0; i < n; i++)
             {
                 if (i == k)
                 {
                     continue;
                 }
-                float64 nf = v_f32_sub_b(0.0f, lane_bcast(a[i], k));
-                a[i] = v_f32_mac_b(ak, nf, a[i]);
-                b[i] = v_f32_mac_b(bk, nf, b[i]);
+                float64 l = lane_bcast(q, i);
+                float64 ls = lane_bcast(qs, i);
+                a[i] = v_f32_mac_b(aps, ls, v_f32_mac_b(ap, l, a[i]));
+                b[i] = v_f32_mac_b(bps, ls, v_f32_mac_b(bp, l, b[i]));
             }
+        }
+        // A is now diagonal (the pivots dv, up to the unread residues left of each diagonal): X row i = B row i / d_i,
+        // with the same 2^-64 scaling of huge pivots; a zero pivot gives a zero row
+        float64 dscale = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(dv), 0x7FFFFFFFu), 0x5F800000u, 0x1p-64f, 1.0f);
+        float64 dinv = lut_free_recip(v_f32_mul_b(dv, dscale));
+        for (int i = 0; i < n; i++)
+        {
+            b[i] = v_f32_mul_b(v_f32_mul_b(b[i], lane_bcast(dscale, i)), lane_bcast(dinv, i));
         }
         for (int i = 0; i < n; i++)
         {

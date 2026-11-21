@@ -2,9 +2,10 @@
     PT_HPU_LAZY_MODE=0|1 python3 tests/probe_adversarial_f.py [--only REGEX] [--habana]
 Per case: the HPU call, torch on the CPU in float64 (reference, on the float32-rounded inputs) and in float32 (the
 error bar and the finiteness pattern). A row fails when its error exceeds max(1e-6, 10x CPU float32's), its NaN/Inf
-pattern differs from CPU float32's, it raises where the CPU does not, the bridge cpu_fallback metric moved, or a
-warning says "runs on the CPU". ``--habana`` reruns every case after ``undo()`` (Habana's own path, origin/main-like
-baseline) in the same process. One RESULT {json} line per row, then SUMMARY. Bridge 1.21.4."""
+pattern differs from CPU float32's, it raises where the CPU does not, a gradient the CPU has is missing on the HPU (or
+the other way round), the bridge cpu_fallback metric moved, a warning says "runs on the CPU", or the call took
+hpu-ops' own CPU route (``hpu_ops.linalg._on_cpu`` / ``_out_on_cpu``, which neither of the former sees).
+``--habana`` reruns every case after ``undo()`` (Habana's own path, origin/main-like baseline) in the same process. One RESULT {json} line per row, then SUMMARY. Bridge 1.21.4."""
 import argparse
 import json
 import math
@@ -27,6 +28,25 @@ HPU = torch.device("hpu")
 L = torch.linalg
 G = torch.Generator().manual_seed(11)
 PHASE = "kernel"
+ON_CPU = []  # one entry per call of hpu-ops' own CPU route (counted by wrapping hpu_ops.linalg._on_cpu)
+
+
+def _count_cpu_route():
+    from hpu_ops import linalg as ops_linalg
+
+    for name in ("_on_cpu", "_out_on_cpu"):
+        inner = getattr(ops_linalg, name, None)
+        if inner is None:
+            continue
+
+        def counted(*args, _inner=inner, _name=name, **kwargs):
+            ON_CPU.append(_name)
+            return _inner(*args, **kwargs)
+
+        setattr(ops_linalg, name, counted)
+
+
+_count_cpu_route()
 
 
 def sync():
@@ -158,8 +178,9 @@ def cases():
     yield "tri_n2", st(upper=True), (tri(7, 2, 2, upper=True), rn(7, 2, 1)), {}
     yield "solve_n1_b37", L.solve, (spd(37, 1, 1), rn(37, 1, 2)), {}
     yield "inv_n1", L.inv, (spd(1, 1),), {}
-    yield "tri_batch_empty", st(), (tri(0, 22, 22), rn(0, 22, 3)), {}
-    yield "tri_m0", st(), (tri(2, 22, 22), rn(2, 22, 0)), {}
+    # empty inputs are declined (``_takes`` needs numel > 0) and take hpu-ops' CPU route: a copy of nothing
+    yield "tri_batch_empty", st(), (tri(0, 22, 22), rn(0, 22, 3)), {"route": "declined"}
+    yield "tri_m0", st(), (tri(2, 22, 22), rn(2, 22, 0)), {"route": "declined"}
     yield "tri_batch_1000_n64", st(), (tri(1000, 64, 64), rn(1000, 64, 5)), {}
     yield "solve_batch_997_n40", L.solve, (spd(997, 40, 40), rn(997, 40, 1)), {}
     yield "tri_expand_A", lambda a, b: L.solve_triangular(a.expand(16, 40, 40), b, upper=False), \
@@ -226,6 +247,7 @@ def run(name, fn, ins, opt, compiled=False):
             warnings.simplefilter("always")
             sync()
             f0 = fb_ops()
+            routed0 = len(ON_CPU)
             try:
                 if opt.get("inference"):
                     with torch.inference_mode():
@@ -240,11 +262,12 @@ def run(name, fn, ins, opt, compiled=False):
                 hpu_raised = repr(e)[:200]
             sync()
             f1 = fb_ops()
+            on_cpu = len(ON_CPU) - routed0
         fb = {k: f1[k] - f0.get(k, 0) for k in f1 if f1[k] - f0.get(k, 0)}
         allow = opt.get("allow_fb")
         fb_bad = {k: v for k, v in fb.items() if not (allow and allow in k)}
         cpu_w = [str(w.message)[:140] for w in caught if "runs on the CPU" in str(w.message)]
-        row.update(fallback=fb, cpu_warnings=cpu_w, cpu_raised=cpu_raised, hpu_raised=hpu_raised)
+        row.update(fallback=fb, cpu_warnings=cpu_w, cpu_raised=cpu_raised, hpu_raised=hpu_raised, on_cpu=on_cpu)
         if cpu_raised and hpu_raised:
             pass
         elif hpu_raised:
@@ -253,6 +276,11 @@ def run(name, fn, ins, opt, compiled=False):
             problems.append(f"cpu raised {cpu_raised} but hpu returned")
         else:
             errs, bars = [], []
+            if len(hg) != len(rg):
+                problems.append(f"{len(hg)} HPU gradients, {len(rg)} CPU")
+            for k, (h, r) in enumerate(zip(hg, rg)):
+                if (h is None) != (r is None):
+                    problems.append(f"gradient {k} {'missing' if h is None else 'extra'} on the HPU")
             for h, r, c in zip(out + hg, ref + rg, c32 + cg):
                 if r is None or h is None:
                     continue
@@ -269,6 +297,8 @@ def run(name, fn, ins, opt, compiled=False):
                 problems.append(f"err {err:.3g} > {limit:.3g}")
         if opt.get("route") != "any":
             problems += [f"fell back {fb_bad}"] * bool(fb_bad) + cpu_w
+        if opt.get("route") not in ("any", "declined"):
+            problems += [f"took hpu-ops' CPU route {on_cpu}x"] * bool(on_cpu)
     except Exception as e:  # noqa: BLE001
         problems.append(f"probe exception {e!r}"[:300])
     print("RESULT " + json.dumps({**row, "status": "fail" if problems else "ok", "problems": problems},

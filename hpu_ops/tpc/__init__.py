@@ -6,8 +6,13 @@
   n <= 64 (B columns chunked by 64). One matrix per index-space member, rows in local memory, no LUT-based special
   function (so the 80 KB of local memory are available). ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign
   (-1)^swaps of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can
-  differ from LAPACK's, and is nonzero exactly when a pivot is exactly zero. The kernel zeroes the pivot row of a zero
-  pivot so later pivots stay finite.
+  differ from LAPACK's, and is nonzero exactly when a pivot is exactly zero. The elimination is LU-style (a row minus
+  ``a_ik / pivot`` times the unnormalized pivot row, the quotient rounded with one FMA correction; X = B / diag(D) at
+  the end), so rows that are exact duplicates (or power-of-two multiples) cancel exactly and give a zero pivot,
+  where LAPACK's rounded multipliers can leave a residue and report info 0 (other rank-deficient matrices, e.g.
+  integer ones, are not detected, as in torch); B is never scaled by 1/pivot before the cancellation, and a
+  multiplier below 2^-126 is carried scaled by 2^64 so it is not flushed when its product is normal. A zero pivot makes its elimination step a no-op and its row of X
+  zero, so later pivots stay finite.
 - ``torch.ops.linalg_tpc.gj_large(A[b, n, n]) -> (R, P, Q, D, S)`` for 64 < n <= ``LARGE_MAXN`` (512): the in-place
   Gauss-Jordan inverse with partial pivoting (implicit: no row moves), one matrix per index-space member, the first
   rows in local memory and the others re-read from global memory on each step (one ASO per step). ``A^-1 = R[P, :][:,
@@ -16,8 +21,9 @@
   parity of ``P``.
 - ``torch.ops.linalg_tpc.tri_solve_{lower,upper}[_unit](A[b, n, n], B[b, n, m]) -> X[b, n, m]``: forward or back
   substitution without pivoting for float32, n <= 64 (B columns chunked by 64; ``left=False`` through ``.mT`` and the
-  flipped triangle). The other triangle (and the diagonal for ``_unit``) is never read. Substitution is backward
-  stable, so it keeps CPU float32's accuracy on ill-conditioned triangles, which pivoted Gauss-Jordan does not.
+  flipped triangle). The other triangle (and the diagonal for ``_unit``) is never read. Each ``X[i]`` is ``B[i]``
+  minus the products one at a time in LAPACK's order (never a separate sum, which can overflow where the solution
+  does not). Substitution is backward stable, so it keeps CPU float32's accuracy on ill-conditioned triangles, which pivoted Gauss-Jordan does not.
 
 Both work in the normal float32 range: the card flushes subnormal inputs and results to zero (a subnormal entry
 counts as zero, so an all-subnormal matrix is singular on the card), while a pivot or diagonal up to the float32
@@ -530,8 +536,16 @@ def _call(op, *args):
 
 
 def _fresh(t):
-    """Detaches view storage so even size-1 ``.mT`` / slice views never alias graph inputs in lazy mode."""
-    return t.clone() if t._base is not None else t
+    """``t``, or a copy of it when it may alias other storage: a view (``_base``), an offset into its storage, or a
+    storage larger than ``t`` (inference-mode views have ``_base`` None), so the kernel never reads a view of a graph
+    input, which breaks lazy mode."""
+    if t._base is not None or t.storage_offset() != 0:
+        return t.clone()
+    try:
+        whole = t.untyped_storage().nbytes() == t.numel() * t.element_size()
+    except (RuntimeError, NotImplementedError):  # a tensor without accessible storage: copy, to be safe
+        whole = False
+    return t if whole else t.clone()
 
 
 def _flat(x, batch, *shape):
@@ -562,9 +576,12 @@ def _tri_chunked(op, A, B):
     return torch.cat([_call(op, A, _fresh(chunk.contiguous())) for chunk in B.split(MAXN, -1)], -1)
 
 
-def _check(A, n, limit=MAXN):
+def _check(A, n, *others, limit=MAXN):
     if A.dim() < 2 or n > limit or A.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc takes square A with n <= {limit}, got {tuple(A.shape)}")
+    if any(t.dtype != torch.float32 for t in (A, *others)):
+        # the kernels compute in float32: a float64 input would be downcast silently
+        raise ValueError(f"hpu_ops.tpc takes float32 tensors, got {[str(t.dtype) for t in (A, *others)]}")
 
 
 def large_pays(n, batch):
@@ -616,7 +633,7 @@ def gj_solve(A, B):
     zero pivot in the kernel's elimination order, else 0; it can differ from LAPACK's);
     shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
     n, m = A.shape[-1], B.shape[-1]
-    _check(A, n, LARGE_MAXN)
+    _check(A, n, B, limit=LARGE_MAXN)
     if B.dim() < 2 or B.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.gj_solve takes B with n rows, got {tuple(A.shape)} and {tuple(B.shape)}")
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
@@ -628,7 +645,7 @@ def gj_solve(A, B):
 def gj_inv(A):
     """``(A^-1, D, S)`` for ``A[..., n, n]``: ``gj_solve`` against the identity, which the kernel builds itself."""
     n = A.shape[-1]
-    _check(A, n, LARGE_MAXN)
+    _check(A, n, limit=LARGE_MAXN)
     batch = A.shape[:-2]
     A = _flat(A, batch, n, n)
     X, D, S = _call(_inv_op(), A) if n <= MAXN else _large(A)
@@ -638,7 +655,7 @@ def gj_inv(A):
 def tri_solve(A, B, upper=False, left=True, unitriangular=False):
     """Solve ``A X = B`` (``X A = B`` if not ``left``) for triangular ``A[..., n, n]`` (n <= ``MAXN``)."""
     n = A.shape[-1]
-    _check(A, n)
+    _check(A, n, B)
     if B.dim() < 2 or B.shape[-2 if left else -1] != n:
         raise ValueError(f"hpu_ops.tpc.tri_solve takes compatible B for left={left}, "
                          f"got {tuple(A.shape)} and {tuple(B.shape)}")
@@ -665,7 +682,7 @@ def tri_solve_reference(A, B, upper=False, left=True, unitriangular=False):
     rows = [None] * n
     for i in (range(n - 1, -1, -1) if upper else range(n)):
         rhs = B[..., i, :]
-        for j in (range(i + 1, n) if upper else range(i)):
+        for j in (range(n - 1, i, -1) if upper else range(i)):  # the kernel's (and LAPACK's) order
             rhs = rhs - A[..., i, j:j + 1] * rows[j]
         if not unitriangular:
             rhs = rhs / A[..., i, i:i + 1]
@@ -733,8 +750,8 @@ def gj_large_reference(A):
 
 def gj_solve_reference(A, B):
     """``gj_solve`` in plain torch, the contract of the kernel: ``lu`` and ``lu_solve`` of ``hpu_ops.linalg``, ``D``
-    the diagonal of U (a zero pivot leaves later pivots finite; the kernel also zeroes the pivot's row, which this
-    reference does not), ``S[..., 0]`` the parity of the pivots and ``S[..., 1]`` the info. For the CPU tests."""
+    the diagonal of U (a zero pivot leaves later pivots finite; the kernel's row of X for it is zero, this
+    reference's is not finite), ``S[..., 0]`` the parity of the pivots and ``S[..., 1]`` the info. For the CPU tests."""
     from .. import linalg
 
     LU, pivots = linalg.lu(A)
