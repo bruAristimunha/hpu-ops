@@ -13,6 +13,7 @@ import torch
 from habana_frameworks.torch.hpu.metrics import metric_global
 
 import hpu_ops
+from hpu_ops import composite
 
 hpu_ops.enable()
 LAZY = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
@@ -111,28 +112,47 @@ def write_case(name, write, card_want=None):
     return row
 
 
-OP_CASES = [  # aten.unfold_backward called directly: dtypes autograd never passes, buffers > 5-D, both skews
-    (dtype, shape, dim, size, step, transposed)
+OP_CASES = [  # aten.unfold_backward called directly: dtypes autograd never passes, buffers > 5-D, both skews, layouts
+    (dtype, shape, dim, size, step, layout)
     for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.bool)
-    for shape, dim, size, step, transposed in [
-        ((16, 52, 64), 1, 8, 1, False), ((16, 64), -1, 4, 4, False), ((4, 12), -1, 3, 5, False),
-        ((2, 40, 3), 1, 30, 1, False), ((2, 3, 10, 2, 3, 2), 2, 3, 3, False), ((2, 3, 9, 2, 3, 2), -4, 5, 2, True)]
-    if dtype in (torch.float32, torch.int32, torch.bool) or shape == (16, 52, 64)
-]
+    for shape, dim, size, step, layout in [
+        ((16, 52, 64), 1, 8, 1, ""), ((16, 64), -1, 4, 4, ""), ((4, 12), -1, 3, 5, ""),
+        ((2, 40, 3), 1, 30, 1, ""), ((2, 3, 10, 2, 3, 2), 2, 3, 3, ""), ((2, 3, 9, 2, 3, 2), -4, 5, 2, "transposed"),
+        ((4, 5), -1, 1, 10**7, ""), ((3, 100, 2), 1, 99, 10**6, ""), ((1, 9), 1, 9, 20, ""),  # a step past the end
+        ((16, 52, 64), 1, 8, 1, "offset"), ((16, 52, 64), 1, 8, 1, "expanded")]
+    if dtype in (torch.float32, torch.int32, torch.bool) or (shape == (16, 52, 64) and not layout)
+] + [(torch.uint8, (2, 12), 1, 3, 1, "overflow"), (torch.int8, (2, 12), 1, 3, 1, "overflow")]  # wraps as ATen's
 
 
-def op_case(dtype, shape, dim, size, step, transposed):
+def _layout(g, layout):
+    """``g`` as a transposed copy, a slice of a larger tensor at a storage offset, or a stride-0 expand."""
+    if layout == "transposed":
+        return g.mT.contiguous().mT
+    if layout == "offset":
+        big = torch.zeros([s + 1 for s in g.shape], dtype=g.dtype, device=g.device)
+        big[(slice(1, None),) * g.dim()] = g
+        return big[(slice(1, None),) * g.dim()]
+    if layout == "expanded":
+        return g.flatten()[:1].reshape([1] * g.dim()).expand(g.shape)
+    return g
+
+
+def op_case(dtype, shape, dim, size, step, layout):
     """``aten.unfold_backward`` on the card against the CPU's (float64 for floats: 16-bit within 2e-2), fallbacks."""
     f0 = fb()
     row = {}
+    ERRORS.clear()
     torch.manual_seed(3)
     windows = torch.empty(shape).unfold(dim, size, step).shape
     g = torch.randn(windows, dtype=torch.float64)
-    g = g > 0 if dtype == torch.bool else (g * 5).round().to(dtype) if dtype == torch.int32 else g.to(dtype)
+    if dtype == torch.bool:
+        g = g > 0
+    elif layout == "overflow":
+        g = torch.full(windows, 100, dtype=dtype)  # 3 overlapping windows: 300 wraps
+    else:
+        g = (g * 5).round().to(dtype) if dtype == torch.int32 else g.to(dtype)
     try:
-        gh = g.to("hpu")
-        if transposed:
-            g, gh = g.mT.contiguous().mT, gh.mT.contiguous().mT
+        g, gh = _layout(g, layout), _layout(g.to("hpu"), layout)
         want = torch.ops.aten.unfold_backward(g.double() if g.is_floating_point() else g, list(shape), dim, size, step)
         got = torch.ops.aten.unfold_backward(gh, list(shape), dim, size, step)
         mark()
@@ -146,10 +166,18 @@ def op_case(dtype, shape, dim, size, step, transposed):
     mark()
     d = fb()
     row["fallbacks"] = {k: d[k] - f0.get(k, 0) for k in d if d[k] - f0.get(k, 0)}
-    print("CASE op", str(dtype)[6:], shape, dim, size, step, "transposed" * transposed, row, "rel_err",
-          dict(ERRORS), flush=True)
+    print("CASE op", str(dtype)[6:], shape, dim, size, step, layout, row, "rel_err", dict(ERRORS), flush=True)
     ERRORS.clear()
     return row
+
+
+def pad_layout_case():
+    """The layout Gaudi's ``constant_pad_nd`` gives the skew's transposed input (the CPU's keeps it channels-last, so
+    the next reshape copies): informational, never a failure."""
+    g = torch.randn(16, 45, 64, 8, device="hpu").reshape(16, 45, 64, 8).transpose(2, 3)
+    out = composite._pad_dims(g.reshape(16, 45, 8, 1, 64).transpose(1, 2), {2: 8})
+    mark()
+    print("CASE info pad layout", tuple(out.shape), out.stride(), "contiguous", out.is_contiguous(), flush=True)
 
 
 def make_on_hpu(x, name):
@@ -192,6 +220,7 @@ def main():
     ]
     rows = [case(*c) for c in cases]
     rows += [op_case(*c) for c in OP_CASES]
+    pad_layout_case()
 
     # writes THROUGH the view (and a view of it): base and view against the CPU's
     writes = [

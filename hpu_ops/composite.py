@@ -96,7 +96,9 @@ def unfold(input, dimension, size, step):
 
 
 def _pad_dims(t, pads):
-    """``t`` with ``pads[d]`` zeros after its end along each dim ``d`` (one ``constant_pad_nd``: a contiguous copy)."""
+    """``t`` with ``pads[d]`` zeros after its end along each dim ``d`` (one ``constant_pad_nd``). The copy keeps a
+    permuted input's layout (CPU and Gaudi alike), so a reshape after it may copy again; building it from zeros instead
+    was within noise on Gaudi2 (eager and lazy, #43's shapes)."""
     first = min(pads)
     pad = []
     for d in range(t.dim() - 1, first - 1, -1):
@@ -137,6 +139,7 @@ def unfold_backward(grad, input_sizes, dim, size, step):
     g = grad.reshape(outer, n, inner, size).transpose(2, 3)  # (outer, n, size, inner), a view of a contiguous grad
     blocks = max(-(-length // step) - (n + k - 1), 0)  # e: zero blocks up to the input's end
     if k == 1:
+        step = min(step, length)  # step > length: one window (n == 1), padded to the input's end only
         if blocks or step > size:
             g = _pad_dims(g, {1: blocks, 2: step - size})
         else:  # step == size and no tail: only a copy, never a view of ``grad``
