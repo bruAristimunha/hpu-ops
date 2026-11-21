@@ -33,6 +33,7 @@ import torch
 from torch._C import DispatchKey
 from torch._subclasses.fake_tensor import is_fake
 
+from . import _strict
 from ._dispatch import chain, count, register_kernels, replace_py_kernels
 from .extrema import internal_sort
 
@@ -156,7 +157,8 @@ def _takes(self, q, dim=None, keepdim=False, interpolation="linear"):
             return False
         if not _concrete(q):  # traced: checked at run time by the graph (_check_traced_range)
             return True
-        return q.numel() == 0 or bool(((q >= 0) & (q <= 1)).all())
+        with _strict.host_read("quantile: q range check", q) if q.device.type != "cpu" else _strict.quiet():
+            return q.numel() == 0 or bool(((q >= 0) & (q <= 1)).all())
     return 0.0 <= float(q) <= 1.0
 
 
