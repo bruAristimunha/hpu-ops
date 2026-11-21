@@ -76,23 +76,24 @@ def _takes(device_type, name, matrix_at=0):
     return takes
 
 
-def _tpc_takes(device_type, takes, matrix_at=0):
-    """``takes``, and on ``hpu`` also: n <= ``tpc.MAXN`` and the TPC kernel ready (path installed, Gaudi2, extension
-    built). Otherwise the call is declined and takes hpu-ops' own CPU route (``_on_cpu``), which beats the composites
-    on Gaudi2."""
+def _tpc_takes(device_type, takes, matrix_at=0, limit=None):
+    """``takes``, and on ``hpu`` also: n <= ``limit`` (default ``tpc.MAXN``) and the TPC kernel ready (path installed,
+    Gaudi2, extension built). Otherwise the call is declined and takes hpu-ops' own CPU route (``_on_cpu``), which
+    beats the composites on Gaudi2."""
 
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
             return False
-        return device_type != "hpu" or (args[matrix_at].shape[-1] <= tpc.MAXN and tpc.ready())
+        return device_type != "hpu" or (args[matrix_at].shape[-1] <= (limit or tpc.MAXN) and tpc.ready())
 
     return tpc_takes
 
 
 def _use_tpc(A):
-    """Whether ``A`` goes through the Gauss-Jordan kernel: n <= ``tpc.MAXN`` and, on HPU, float32 with the kernel
-    ready; or, with the ``_GJ`` hook set (CPU tests), any dtype."""
-    if A.shape[-1] > tpc.MAXN:
+    """Whether ``A`` goes through the Gauss-Jordan kernels: n <= ``tpc.LARGE_MAXN`` (n <= ``tpc.MAXN``: rows in local
+    memory; past it the in-place inverse kernel, ``tpc.gj_solve`` multiplying by it) and, on HPU, float32 with the
+    kernel ready; or, with the ``_GJ`` hook set (CPU tests), any dtype."""
+    if A.shape[-1] > tpc.LARGE_MAXN:
         return False
     return _GJ is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
 
@@ -456,19 +457,53 @@ def _is_vector_rhs(A, B):
     return B.dim() == 1 or (B.dim() == A.dim() - 1 and B.shape == A.shape[:-1])
 
 
+class _InvSolve(torch.autograd.Function):
+    """``A^-1 B`` (``B A^-1`` if not ``left``) as a matmul with ``Ainv``, the inverse of ``A`` the forward already
+    computed (n > ``tpc.MAXN``: the in-place kernel's), so the backward of a large solve launches no kernel. ``Ainv``
+    is a constant here; the derivative in ``A`` is torch's solve formula, so double backward works."""
+
+    @staticmethod
+    def forward(ctx, A, B, Ainv, left):
+        X = Ainv @ B if left else B @ Ainv
+        ctx.save_for_backward(A, X, Ainv)
+        ctx.left = left
+        ctx.B_shape = B.shape
+        return X
+
+    @staticmethod
+    def backward(ctx, grad):
+        A, X, Ainv = ctx.saved_tensors
+        gB = _InvSolve.apply(A.mH, grad, Ainv.mH, ctx.left)
+        gA = None
+        if ctx.needs_input_grad[0]:
+            gA = (-(gB @ X.mH) if ctx.left else -(X.mH @ gB)).sum_to_size(A.shape)
+        return gA, gB.sum_to_size(ctx.B_shape), None, None
+
+
 class SolveEx(torch.autograd.Function):
     """``aten._linalg_solve_ex`` from the masked LU, with torch's backward (``linalg_solve_backward``) over the
     composite. ``LU``, ``pivots`` and ``info`` are not differentiable. ``LU`` and ``pivots`` are those of A (native's
     CPU kernel returns those of A^T); only torch's own derivative reads them, and this kernel replaces it. Through
     the TPC kernel ``LU`` and ``pivots`` are not computed: ``LU`` is a zero placeholder and ``pivots`` the
-    identity permutation."""
+    identity permutation. Past ``tpc.MAXN`` the kernel computes ``A^-1`` (in place, partial pivoting) and the solve
+    is a matmul with it; the inverse is kept for the backward, which is then matmuls only."""
 
     @staticmethod
     def compute(A, B, left, check_errors):
+        return SolveEx.compute_with_inverse(A, B, left, check_errors)[:4]
+
+    @staticmethod
+    def compute_with_inverse(A, B, left, check_errors):
+        """``compute``'s outputs and ``A^-1`` (None unless n > ``tpc.MAXN`` on the kernel path)."""
         vector = _is_vector_rhs(A, B)
         rhs = B.unsqueeze(-1) if vector else B
+        Ainv = None
         if _use_tpc(A):
-            result, _, S = _gj_solve(A, rhs, left)
+            if A.shape[-1] > tpc.MAXN:
+                Ainv, _, S = _gj_inv(A)
+                result = Ainv @ rhs if left else rhs @ Ainv
+            else:
+                result, _, S = _gj_solve(A, rhs, left)
             LU, pivots = _unused_factors(A)
             info = _gj_info(S, A.shape[:-2])
             if check_errors:
@@ -479,12 +514,12 @@ class SolveEx(torch.autograd.Function):
             if check_errors:
                 torch.ops.aten._linalg_check_errors(info, "torch.linalg.solve_ex", is_matrix=A.dim() == 2)
             result = lu_solve(LU, pivots, rhs, left)
-        return (result.squeeze(-1) if vector else result), LU, pivots, info
+        return (result.squeeze(-1) if vector else result), LU, pivots, info, Ainv
 
     @staticmethod
     def forward(ctx, A, B, left, check_errors):
-        X, LU, pivots, info = SolveEx.compute(A, B, left, check_errors)
-        ctx.save_for_backward(A, X)
+        X, LU, pivots, info, Ainv = SolveEx.compute_with_inverse(A, B, left, check_errors)
+        ctx.save_for_backward(A, X, Ainv)
         ctx.left = left
         ctx.vector = _is_vector_rhs(A, B)
         ctx.B_shape = B.shape
@@ -493,8 +528,13 @@ class SolveEx(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad, *_):
-        A, X = ctx.saved_tensors
-        gB = SolveEx.apply(A.mH, grad, ctx.left, False)[0]
+        A, X, Ainv = ctx.saved_tensors
+        if Ainv is None:
+            gB = SolveEx.apply(A.mH, grad, ctx.left, False)[0]
+        else:
+            g = grad.unsqueeze(-1) if ctx.vector else grad
+            gB = _InvSolve.apply(A.mH, g, Ainv.mH, ctx.left)
+            gB = gB.squeeze(-1) if ctx.vector else gB
         gA = None
         if ctx.needs_input_grad[0]:
             g, x = (gB.unsqueeze(-1), X.unsqueeze(-1)) if ctx.vector else (gB, X)
@@ -515,7 +555,7 @@ def install_solve(device_type):
             return left and B.shape[-1] == A.shape[-1]
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
-    takes = _tpc_takes(device_type, shapes_ok)
+    takes = _tpc_takes(device_type, shapes_ok, limit=tpc.LARGE_MAXN)
     return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes, backend=False)])
 
 
@@ -627,6 +667,6 @@ def install_inv_det(device_type):
     groups = []
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
-        takes = _tpc_takes(device_type, _takes(device_type, name))
+        takes = _tpc_takes(device_type, _takes(device_type, name), limit=tpc.LARGE_MAXN)
         groups.append(_kernels(device_type, op, name, function, takes, backend=name == "inv"))
     return register_paired(device_type, groups)

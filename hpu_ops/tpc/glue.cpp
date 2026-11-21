@@ -21,6 +21,20 @@ extern const char _binary___tri_solve_upper_unit_f32_gaudi2_o_start[];
 extern const char _binary___tri_solve_upper_unit_f32_gaudi2_o_end[];
 extern const char _binary___jacobi_eigh_refine_f32_gaudi2_o_start[];
 extern const char _binary___jacobi_eigh_refine_f32_gaudi2_o_end[];
+extern const char _binary___gj_large2_f32_gaudi2_o_start[];
+extern const char _binary___gj_large2_f32_gaudi2_o_end[];
+extern const char _binary___gj_large3_f32_gaudi2_o_start[];
+extern const char _binary___gj_large3_f32_gaudi2_o_end[];
+extern const char _binary___gj_large4_f32_gaudi2_o_start[];
+extern const char _binary___gj_large4_f32_gaudi2_o_end[];
+extern const char _binary___gj_large5_f32_gaudi2_o_start[];
+extern const char _binary___gj_large5_f32_gaudi2_o_end[];
+extern const char _binary___gj_large6_f32_gaudi2_o_start[];
+extern const char _binary___gj_large6_f32_gaudi2_o_end[];
+extern const char _binary___gj_large7_f32_gaudi2_o_start[];
+extern const char _binary___gj_large7_f32_gaudi2_o_end[];
+extern const char _binary___gj_large8_f32_gaudi2_o_start[];
+extern const char _binary___gj_large8_f32_gaudi2_o_end[];
 }
 
 namespace {
@@ -33,6 +47,8 @@ const char* kTriLower = "tri_solve_lower_f32_gaudi2";
 const char* kTriUpper = "tri_solve_upper_f32_gaudi2";
 const char* kTriLowerUnit = "tri_solve_lower_unit_f32_gaudi2";
 const char* kTriUpperUnit = "tri_solve_upper_unit_f32_gaudi2";
+const char* kLarge = "gj_large_f32_gaudi2";
+constexpr uint64_t kMaxLargeN = 512;  // NMAX of gj_large
 constexpr uint64_t kMaxN = 64;      // MAXN of gj_solve and tri_solve
 constexpr uint64_t kMaxEighN = 32;  // MAXN of jacobi_eigh
 
@@ -269,6 +285,73 @@ tpc_lib_api::GlueCodeReturn tri_solve_defs(tpc_lib_api::HabanaKernelParams* in,
                            _binary___tri_solve_lower_f32_gaudi2_o_end);
 }
 
+// gj_large: input A (n, n, batch); outputs R (64 * ceil(n / 64), n, batch), the in-place inverse, and P, Q, D
+// (n, batch), S (2, batch). One index-space member per matrix.
+tpc_lib_api::GlueCodeReturn large_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out)
+{
+    if (in->inputTensorNr != 1)
+    {
+        in->inputTensorNr = 1;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
+    }
+    if (in->outputTensorNr != 5)
+    {
+        in->outputTensorNr = 5;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    }
+    if (in->inputTensors[0].geometry.dataType != tpc_lib_api::DATA_F32)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+    }
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    const uint64_t w = 64 * ((n + 63) / 64);
+    if (n <= 64 || n > kMaxLargeN || in->inputTensors[0].geometry.maxSizes[1] != n)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    if (in->outputTensors[0].geometry.maxSizes[0] != w || in->outputTensors[0].geometry.maxSizes[1] != n)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+
+    auto& pa = out->inputTensorAccessPattern[0];
+    base_pattern(pa);
+    full_dim(pa, 0, n);
+    full_dim(pa, 1, n);
+    batch_dim(pa, 2);
+    auto& pr = out->outputTensorAccessPattern[0];
+    base_pattern(pr);
+    full_dim(pr, 0, w);
+    full_dim(pr, 1, n);
+    batch_dim(pr, 2);
+    for (int t = 1; t < 4; t++)
+    {
+        auto& pv = out->outputTensorAccessPattern[t];
+        base_pattern(pv);
+        full_dim(pv, 0, n);
+        batch_dim(pv, 1);
+    }
+    auto& ps = out->outputTensorAccessPattern[4];
+    base_pattern(ps);
+    full_dim(ps, 0, 2);
+    batch_dim(ps, 1);
+    // one ELF per row width in vectors (-DVA), so the kernel's loops over a row unroll
+    switch ((n + 63) / 64)
+    {
+        case 2: return copy_elf(out, _binary___gj_large2_f32_gaudi2_o_start, _binary___gj_large2_f32_gaudi2_o_end);
+        case 3: return copy_elf(out, _binary___gj_large3_f32_gaudi2_o_start, _binary___gj_large3_f32_gaudi2_o_end);
+        case 4: return copy_elf(out, _binary___gj_large4_f32_gaudi2_o_start, _binary___gj_large4_f32_gaudi2_o_end);
+        case 5: return copy_elf(out, _binary___gj_large5_f32_gaudi2_o_start, _binary___gj_large5_f32_gaudi2_o_end);
+        case 6: return copy_elf(out, _binary___gj_large6_f32_gaudi2_o_start, _binary___gj_large6_f32_gaudi2_o_end);
+        case 7: return copy_elf(out, _binary___gj_large7_f32_gaudi2_o_start, _binary___gj_large7_f32_gaudi2_o_end);
+        default: return copy_elf(out, _binary___gj_large8_f32_gaudi2_o_start, _binary___gj_large8_f32_gaudi2_o_end);
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -276,7 +359,7 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 8 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 9 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
@@ -287,6 +370,7 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint3
         strcpy(guids[5].name, kTriUpper);
         strcpy(guids[6].name, kTriLowerUnit);
         strcpy(guids[7].name, kTriUpperUnit);
+        strcpy(guids[8].name, kLarge);
     }
     if (kernelCount != nullptr)
     {
@@ -329,6 +413,10 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (strcmp(params->guid.name, kTriUpperUnit) == 0)
     {
         return tri_solve_defs(params, instance, true, true);
+    }
+    if (strcmp(params->guid.name, kLarge) == 0)
+    {
+        return large_defs(params, instance);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }

@@ -39,6 +39,7 @@ import warnings
 import torch
 
 MAXN = 64
+LARGE_MAXN = 512  # NMAX of gj_large_f32_gaudi2.c: gj_solve and gj_inv take 64 < n <= LARGE_MAXN through it
 EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
@@ -85,7 +86,17 @@ static habana::PartialOutputMetaDataVector tri_solve_meta(const at::Stack& input
   auto b = inputs[1].toTensor();
   return {habana::PartialOutputMetaData{b.scalar_type(), b.sizes().vec()}};
 }
+static habana::PartialOutputMetaDataVector large_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto batch = a.size(0), n = a.size(1);
+  return {habana::PartialOutputMetaData{a.scalar_type(), {batch, n, 64 * ((n + 63) / 64)}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, 2}}};
+}
 static bool registered = [] {
+  habana::custom_op::registerUserCustomOp("linalg_tpc::gj_large", "gj_large_f32_gaudi2", large_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", eigh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh_refine", "jacobi_eigh_refine_f32_gaudi2",
                                           eigh_meta, nullptr);
@@ -110,6 +121,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto out = desc.execute(inputs);
   return {out[0], out[1], out[2]};
 }
+using Large = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
+Large gj_large(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::gj_large");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2], out[3], out[4]};
+}
 std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_eigh");
@@ -133,6 +151,7 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v
   return {out[0], out[1]};
 }
 TORCH_LIBRARY(linalg_tpc, m) {
+  m.def("gj_large(Tensor a) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
@@ -143,6 +162,7 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
+  m.impl("gj_large", gj_large);
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
   m.impl("jacobi_eigh", jacobi_eigh);
@@ -153,6 +173,12 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
+  m.impl("gj_large", [](at::Tensor a) {
+    auto bt = a.size(0), n = a.size(1);
+    auto v = a.new_empty({bt, n});
+    return std::make_tuple(a.new_empty({bt, n, 64 * ((n + 63) / 64)}), v, a.new_empty({bt, n}), a.new_empty({bt, n}),
+                           a.new_empty({bt, 2}));
+  });
   m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
     return std::make_tuple(b.new_empty(b.sizes()), b.new_empty({a.size(0), a.size(1)}), b.new_empty({a.size(0), 2}));
   });
@@ -190,6 +216,21 @@ static bool registered_solve = [] {
                                                  {1, c10::ScalarType::Float, dshape},
                                                  {2, c10::ScalarType::Float, sshape}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static auto rshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  auto n = a.size(1);
+  return std::vector<int64_t>{a.size(0), n, 64 * ((n + 63) / 64)};
+};
+static bool registered_large = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, rshape},
+                                                 {1, c10::ScalarType::Float, dshape},
+                                                 {2, c10::ScalarType::Float, dshape},
+                                                 {3, c10::ScalarType::Float, dshape},
+                                                 {4, c10::ScalarType::Float, sshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_large", "gj_large_f32_gaudi2", in, out, nullptr);
   return true;
 }();
 static bool registered_inv = [] {
@@ -243,6 +284,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto out = op.execute(inputs);
   return {out[0], out[1], out[2]};
 }
+using Large = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
+Large gj_large(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_large");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2], out[3], out[4]};
+}
 std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_eigh");
   std::vector<c10::IValue> inputs{a};
@@ -265,6 +313,7 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v
   return {out[0], out[1]};
 }
 TORCH_LIBRARY(linalg_tpc, m) {
+  m.def("gj_large(Tensor a) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
@@ -275,6 +324,7 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
+  m.impl("gj_large", gj_large);
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
   m.impl("jacobi_eigh", jacobi_eigh);
@@ -410,6 +460,12 @@ def _inv_op():
     return torch.ops.linalg_tpc.gj_inv
 
 
+def _large_op():
+    """``torch.ops.linalg_tpc.gj_large``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.gj_large
+
+
 def _eigh_op():
     """``torch.ops.linalg_tpc.jacobi_eigh``, built on first use."""
     _load()
@@ -495,9 +551,36 @@ def _tri_chunked(op, A, B):
     return torch.cat([_call(op, A, _fresh(chunk.contiguous())) for chunk in B.split(MAXN, -1)], -1)
 
 
-def _check(A, n):
-    if A.dim() < 2 or n > MAXN or A.shape[-2] != n:
-        raise ValueError(f"hpu_ops.tpc takes square A with n <= {MAXN}, got {tuple(A.shape)}")
+def _check(A, n, limit=MAXN):
+    if A.dim() < 2 or n > limit or A.shape[-2] != n:
+        raise ValueError(f"hpu_ops.tpc takes square A with n <= {limit}, got {tuple(A.shape)}")
+
+
+def _parity(P):
+    """``(-1)^inversions`` of the permutations ``P[b, n]`` (float, exact integers): the sign of the row order."""
+    n = P.shape[-1]
+    later = torch.ones(n, n, dtype=torch.bool, device=P.device).triu(1)
+    inversions = ((P[..., :, None] > P[..., None, :]) & later).sum((-2, -1))
+    return (1 - 2 * (inversions % 2)).to(P.dtype)
+
+
+def _rows(X, index):
+    """``X[..., index, :]`` for a float index ``[b, n]`` (exact integers): a gather of float data."""
+    return X.gather(-2, index.long()[..., None].expand(*index.shape, X.shape[-1]))
+
+
+def _large(A, B=None):
+    """``(X, D, S)`` of the in-place Gauss-Jordan kernel for ``A[b, n, n]`` (64 < n <= ``LARGE_MAXN``): ``X =
+    A^-1`` (``B`` None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel leaves ``R`` with ``A^-1 =
+    R[P, :][:, Q]``, so ``A^-1 B = (R @ B[Q^-1 order])[P]``: with ``Q = P^-1``, ``R[:, Q] @ B = R @ B[P]``."""
+    n = A.shape[-1]
+    R, P, Q, D, S = _call(_large_op(), A)
+    R = R[..., :n]
+    if B is None:
+        X = _rows(R, P).gather(-1, Q.long()[..., None, :].expand(*Q.shape[:-1], n, n))
+    else:
+        X = _rows(R @ _rows(B, P), P)
+    return X, D, torch.stack([_parity(P), S[..., 1]], -1)
 
 
 def gj_solve(A, B):
@@ -506,20 +589,22 @@ def gj_solve(A, B):
     zero pivot in the kernel's elimination order, else 0; it can differ from LAPACK's);
     shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
     n, m = A.shape[-1], B.shape[-1]
-    _check(A, n)
+    _check(A, n, LARGE_MAXN)
     if B.dim() < 2 or B.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.gj_solve takes B with n rows, got {tuple(A.shape)} and {tuple(B.shape)}")
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
-    X, D, S = _chunked(_flat(A, batch, n, n), _flat(B, batch, n, m))
+    solve = _chunked if n <= MAXN else _large
+    X, D, S = solve(_flat(A, batch, n, n), _flat(B, batch, n, m))
     return _unflatten(X, batch, n, m), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
 def gj_inv(A):
     """``(A^-1, D, S)`` for ``A[..., n, n]``: ``gj_solve`` against the identity, which the kernel builds itself."""
     n = A.shape[-1]
-    _check(A, n)
+    _check(A, n, LARGE_MAXN)
     batch = A.shape[:-2]
-    X, D, S = _call(_inv_op(), _flat(A, batch, n, n))
+    A = _flat(A, batch, n, n)
+    X, D, S = _call(_inv_op(), A) if n <= MAXN else _large(A)
     return _unflatten(X, batch, n, n), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
@@ -589,6 +674,34 @@ def eigh_reference(A, upper):
 
     w, V = np.linalg.eigh(A.detach().cpu().numpy(), UPLO="U" if upper else "L")
     return torch.from_numpy(w).to(A.device), torch.from_numpy(V).to(A.device)
+
+
+def gj_large_reference(A):
+    """``torch.ops.linalg_tpc.gj_large`` in plain torch, the contract of the in-place kernel, for ``A[b, n, n]``:
+    ``(R, P, Q, D, S)`` with ``R`` padded to whole 64-lane vectors and ``A^-1 = R[P, :][:, Q]``. Implicit partial
+    pivoting (the first unused row of largest |column k|), a zero pivot zeroes its row. For the CPU tests."""
+    A = A.detach()
+    b, n = A.shape[0], A.shape[-1]
+    rows = torch.arange(b)
+    R = A.clone()
+    used = torch.zeros(b, n, dtype=torch.bool)
+    P, D, info = A.new_zeros(b, n), A.new_zeros(b, n), A.new_zeros(b)
+    for k in range(n):
+        p = R[:, :, k].abs().masked_fill(used, -1.0).argmax(-1)
+        pivot = R[rows, p, k]
+        P[:, k], D[:, k] = p.to(A.dtype), pivot
+        info = torch.where((pivot == 0) & (info == 0), float(k + 1), info)
+        used[rows, p] = True
+        prow = R[rows, p].clone()
+        prow[:, k] = 1.0
+        prow = prow * torch.where(pivot == 0, 0.0, 1.0 / torch.where(pivot == 0, 1.0, pivot))[:, None]
+        f = R[:, :, k].clone()
+        R[:, :, k] = 0.0
+        R = R - f[:, :, None] * prow[:, None, :]
+        R[rows, p] = prow
+    Q = P.argsort(-1).to(A.dtype)
+    R = torch.nn.functional.pad(R, (0, 64 * ((n + 63) // 64) - n))
+    return R, P, Q, D, torch.stack([torch.zeros_like(info), info], -1)
 
 
 def gj_solve_reference(A, B):
