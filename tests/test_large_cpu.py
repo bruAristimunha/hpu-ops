@@ -189,26 +189,36 @@ def test_solve_backward_launches_no_kernel(large_on_cpu):
     assert len(large_on_cpu) == before
 
 
-def test_batch_threshold_counts_the_broadcast_batch(monkeypatch):
-    """Review finding 7: past LARGE_ANY_BATCH_N, A's batch of 1 broadcast against B's batch of 8 takes the kernel."""
-    monkeypatch.setattr(tpc, "ready", lambda: True)
-    takes = linalg._tpc_takes("hpu", lambda *a, **k: True, large=True)
-    n = tpc.LARGE_ANY_BATCH_N + 1
-    A = torch.empty(1, n, n)
-    assert takes(A, torch.empty(tpc.LARGE_MIN_BATCH, n, 3)) is True
-    assert takes(A, torch.empty(1, n, 3)) is False
-    assert takes(A[0], torch.empty(tpc.LARGE_MIN_BATCH, n, 1)) is True  # 2-D A
-
-
-
-@pytest.mark.parametrize("lazy, want", [("0", True), ("1", False)])
-def test_large_route_is_eager_only(lazy, want, monkeypatch):
-    """Coordinator's ruling: past tpc.MAXN the in-place kernel in eager mode only; lazy mode keeps main's route."""
+@pytest.mark.parametrize("lazy", ["0", "1"])
+def test_large_route_takes_every_size_batch_and_mode(lazy, monkeypatch):
+    """Nothing on the CPU: past tpc.MAXN the in-place kernels take every n (past LARGE_MAXN the blocked route), every
+    batch (a small one: the blocked route, ``tpc._square_pays``) and both modes."""
     monkeypatch.setenv("PT_HPU_LAZY_MODE", lazy)
     monkeypatch.setattr(tpc, "ready", lambda: True)
     takes = linalg._tpc_takes("hpu", lambda *a, **k: True, large=True)
-    assert takes(torch.empty(1, 220, 220), torch.empty(1, 220, 220)) is want
-    assert takes(torch.empty(1, 64, 64), torch.empty(1, 64, 3)) is True  # n <= 64: the kernel in both modes
+    for n, b in ((220, 1), (300, 1), (512, 2), (600, 1), (1500, 1)):
+        assert takes(torch.empty(b, n, n), torch.empty(b, n, 3)) is True
+    assert takes(torch.empty(1, 64, 64), torch.empty(1, 64, 3)) is True
+
+
+def test_square_pays_by_batch_and_mode(monkeypatch):
+    """The cost model: one square call for a full card of matrices, the blocked route for one large matrix (measured:
+    n = 512 batch 1, square 28.2 ms against blocked 9.1 lazy) and never past LARGE_MAXN."""
+    for lazy in (False, True):
+        monkeypatch.setattr(tpc, "_lazy", lambda _l=lazy: _l)
+        assert tpc._square_pays(220, 1) is True
+        assert tpc._square_pays(130, 32) is True
+        assert tpc._square_pays(512, 1) is False
+    monkeypatch.setattr(tpc, "_lazy", lambda: True)
+    assert tpc._square_pays(384, 1) is False
+    assert tpc._square_pays_for(torch.empty(48, 600, 600)) is False
+
+
+def test_panel_widths():
+    for n in range(65, 1400, 7):
+        widths = tpc._panel_widths(n)
+        assert sum(widths) == n and all(tpc.MAXN < c <= tpc.LARGE_MAXN for c in widths)
+        assert max(widths) - min(widths) <= 1 and (len(widths) == 1 or max(widths) <= tpc.PANEL + 1)
 
 
 def test_large_route_declines_under_compile(monkeypatch):
@@ -404,3 +414,186 @@ def test_review_direct_wrappers_reject_complex(call):
     its imaginary part: exp([[1 + 1j]]) gave 2.71828). The check runs before any kernel is touched."""
     with pytest.raises(ValueError, match="real floating"):
         call()
+
+
+# ---- the blocked route (past LARGE_MAXN, or a batch too small to fill the card): gj_tall panels, matmul updates
+
+
+@pytest.fixture
+def blocked(monkeypatch, replica):
+    monkeypatch.setattr(tpc, "_square_pays", lambda n, b: False)
+    return replica
+
+
+@pytest.mark.parametrize("r, c", [(130, 65), (300, 70), (200, 128)])
+def test_replica_tall_panel_contract(r, c):
+    """A tall panel W[r, c]: R[P] = W[P]^-1, the rows never taken hold -W[o] W[P]^-1 and Q orders them after."""
+    W = torch.randn(r, c, generator=torch.Generator().manual_seed(r))
+    R, P, Q, D, S = (torch.from_numpy(x) for x in kr.gj_large(W.numpy()))
+    P = P.long()
+    o = torch.tensor([i for i in range(r) if i not in set(P.tolist())])
+    X = torch.linalg.inv(W[P].double())
+    assert rel(R[P, :c], X) < 1e-4 and rel(R[o, :c], -W[o].double() @ X) < 1e-4
+    assert torch.equal(Q.argsort()[:c], P) and torch.equal(Q.argsort()[c:], o)
+    torch.testing.assert_close(D.double().prod(), torch.linalg.det(W[P].double()), rtol=1e-3, atol=0)
+
+
+@pytest.mark.parametrize("n, b", [(130, 2), (200, 1), (300, 2)])
+def test_blocked_inverse_det_and_solve(n, b, blocked):
+    A = torch.randn(b, n, n, generator=torch.Generator().manual_seed(n))
+    X, D, S = tpc.gj_inv(A)
+    ref = torch.linalg.inv(A.double())
+    assert rel(X, ref) <= max(1e-5, 10 * rel(torch.linalg.inv(A), ref))
+    sign, logabsdet = torch.linalg.slogdet(A.double())
+    assert torch.equal(S[..., 0] * D.sign().prod(-1), sign) and torch.equal(S[..., 1], torch.zeros(b))
+    torch.testing.assert_close(D.double().abs().log().sum(-1), logabsdet, rtol=0, atol=1e-3)
+    D2, S2 = tpc.large_factors(A)
+    torch.testing.assert_close(D2.double().abs().log().sum(-1), logabsdet, rtol=0, atol=1e-3)
+    assert torch.equal(S2[..., 0] * D2.sign().prod(-1), sign)
+    B = torch.randn(b, n, 3)
+    Y, _, _ = tpc.gj_solve(A, B)
+    want = torch.linalg.solve(A.double(), B.double())
+    assert rel(Y, want) <= max(1e-5, 10 * rel(torch.linalg.solve(A, B), want))
+    assert len(blocked) == 3 * len(tpc._panel_widths(n))  # inverse, factors, solve: one launch per panel each
+
+
+def test_blocked_singular_and_nan(blocked):
+    A = torch.randn(3, 140, 140, generator=torch.Generator().manual_seed(3))
+    A[1, 7] = 0
+    A[2, 3, 4] = float("nan")
+    X, D, S = tpc.gj_inv(A)
+    assert S[0, 1] == 0 and S[1, 1] > 0
+    assert X[2].isnan().all() and D[2].isnan().all() and X[0].isfinite().all() and X[1].isfinite().all()
+
+
+def test_blocked_tournament(blocked, monkeypatch):
+    """Past TALL_MAXM rows a panel's pivots come from a tournament (CALU): each chunk nominates its pivot rows."""
+    monkeypatch.setattr(tpc, "TALL_MAXM", 200)
+    A = torch.randn(2, 300, 300, generator=torch.Generator().manual_seed(7))
+    X, D, S = tpc.gj_inv(A)
+    ref = torch.linalg.inv(A.double())
+    assert rel(X, ref) <= max(1e-5, 10 * rel(torch.linalg.inv(A), ref))
+    assert torch.equal(S[..., 0] * D.sign().prod(-1), torch.linalg.slogdet(A.double()).sign)
+    assert max(rows for _, rows, _ in blocked) <= 200
+
+
+@pytest.mark.parametrize("name", list(OPS))
+def test_functions_through_the_blocked_route(name, large_on_cpu, monkeypatch):
+    """SolveEx / InvEx / Det / Slogdet on the blocked route (n = 140: two panels), forward and gradients."""
+    monkeypatch.setattr(tpc, "_square_pays", lambda n, b: False)
+    install, f, _ = OPS[name]
+    A, B = permuted(2, 140, seed=5), torch.randn(2, 140, 3)
+    xs = [A.clone().requires_grad_(), B.clone().requires_grad_()]
+    refs = [A.double().requires_grad_(), B.double().requires_grad_()]
+    with cpu_as_hpu(install) as calls:
+        out = f(*xs)
+        out.sum().backward()
+    want = f(*refs)
+    want.sum().backward()
+    assert sum(calls.values()) >= 1 and all(shape[-1] == 70 for shape in large_on_cpu)
+    assert rel(out.detach(), want.detach()) < 1e-4
+    for x, r in zip(xs, refs):
+        assert rel(x.grad, r.grad) < 1e-4, name
+
+
+@pytest.mark.parametrize("name", ["det", "slogdet"])
+def test_det_backward_reuses_the_forward_inverse(name, large_on_cpu):
+    """det / slogdet with grad: the forward's kernel call yields the inverse, the backward launches no kernel."""
+    install, f, _ = OPS[name]
+    A = permuted(2, 70, seed=6).requires_grad_()
+    with cpu_as_hpu(install):
+        out = f(A, torch.ones(2, 70, 1))
+        before = len(large_on_cpu)
+        out.sum().backward()
+    assert before == 1 and len(large_on_cpu) == 1
+
+
+# ---- blocked substitution past tpc.MAXN (solve_triangular, cholesky_solve)
+
+
+@pytest.fixture
+def tri_replica(monkeypatch):
+    """``tpc._tri_op`` -> the substitution kernel's replica; the list collects the diagonal blocks' shapes."""
+    calls = []
+
+    def make(upper, unitriangular):
+        def op(A, B):
+            calls.append(tuple(A.shape))
+            out = [kr.tri_solve(a.numpy(), b.numpy(), upper, unitriangular) for a, b in zip(A, B)]
+            return torch.from_numpy(np.stack(out))
+        return op
+
+    monkeypatch.setattr(tpc, "_tri_op", make)
+    return calls
+
+
+@pytest.mark.parametrize("n", [65, 130, 200])
+@pytest.mark.parametrize("upper, left, unit", [(False, True, False), (True, True, False), (False, False, True),
+                                               (True, False, True)])
+def test_blocked_substitution(n, upper, left, unit, tri_replica):
+    g = torch.Generator().manual_seed(n)
+    T = torch.randn(2, n, n, generator=g) / n ** 0.5 + 2 * torch.eye(n)
+    T = T.triu() if upper else T.tril()
+    poisoned = T + (torch.full((n, n), float("nan")).tril(-1) if upper else torch.full((n, n), float("nan")).triu(1))
+    if unit:
+        poisoned = poisoned + torch.diag(torch.full((n,), float("nan")))
+    B = torch.randn(2, n, 3, generator=g) if left else torch.randn(2, 3, n, generator=g)
+    X = tpc.tri_solve(poisoned, B, upper, left, unit)
+    want = torch.linalg.solve_triangular(T.double(), B.double(), upper=upper, left=left, unitriangular=unit)
+    got32 = torch.linalg.solve_triangular(T, B, upper=upper, left=left, unitriangular=unit)
+    assert rel(X, want) <= max(1e-6, 10 * rel(got32, want))
+    assert all(shape[-1] <= tpc.MAXN for shape in tri_replica) and len(tri_replica) == -(-n // tpc.MAXN)
+
+
+def test_large_triangular_ops_take_the_card(monkeypatch):
+    """Past tpc.MAXN solve_triangular and cholesky_solve stay on the card (the blocked substitution)."""
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    takes = linalg._tpc_takes("hpu", lambda *a, **k: True, maxn=float("inf"))
+    assert takes(torch.empty(1, 300, 300), torch.empty(1, 300, 2)) is True
+    assert linalg._use_tri(torch.empty(300, 300)) is False  # CPU tensors keep the composite
+
+
+def test_cholesky_solve_past_maxn(tri_replica, monkeypatch):
+    monkeypatch.setattr(linalg, "_use_tri", lambda A: True)
+    g = torch.Generator().manual_seed(1)
+    M = torch.randn(2, 100, 100, generator=g)
+    Lc = torch.linalg.cholesky(M @ M.mT / 100 + torch.eye(100))
+    B = torch.randn(2, 100, 4, generator=g)
+    for upper, F in ((False, Lc), (True, Lc.mT.contiguous())):
+        got = linalg.CholeskySolve.compute(B, F, upper)
+        want = torch.cholesky_solve(B.double(), F.double(), upper=upper)
+        assert rel(got, want) < 1e-5
+
+
+# ---- HPU_OPS_FLOAT64=card: float64 linalg on the card in float32 precision, opt-in
+
+
+def test_float64_opt_in_casts_and_warns_once(monkeypatch):
+    seen = []
+
+    def kernel(A, check_errors=False):
+        seen.append(A.dtype)
+        return torch.linalg.inv_ex(A)
+
+    wrapped = linalg._float64_kernel("hpu", torch.ops.aten.linalg_inv_ex.default, kernel)
+    A = torch.randn(3, 5, 5, dtype=torch.float64) + 5 * torch.eye(5, dtype=torch.float64)
+    monkeypatch.delenv(linalg.FLOAT64_ENV, raising=False)
+    assert wrapped(A)[0].dtype == torch.float64 and seen == [torch.float64]  # default: untouched (declined later)
+    monkeypatch.setenv(linalg.FLOAT64_ENV, "card")
+    linalg._WARNED.discard("float64-card")
+    with pytest.warns(UserWarning, match="float32 precision"):
+        X, info = wrapped(A.requires_grad_())
+    assert seen[-1] == torch.float32 and X.dtype == torch.float64 and info.dtype == torch.int32
+    X.sum().backward()
+    assert A.grad.dtype == torch.float64
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        wrapped(A.detach())  # once per process
+
+
+def test_float64_opt_in_skips_out_overloads():
+    k = object()
+    assert linalg._float64_kernel("hpu", torch.ops.aten.linalg_solve_triangular.out, k) is k
+    assert linalg._float64_kernel("cpu", torch.ops.aten.linalg_inv_ex.default, k) is not k  # wrapped, inert on cpu

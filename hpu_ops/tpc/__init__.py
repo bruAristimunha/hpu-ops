@@ -13,7 +13,8 @@
   integer ones, are not detected, as in torch); B is never scaled by 1/pivot before the cancellation, and a
   multiplier below 2^-126 is carried scaled by 2^64 so it is not flushed when its product is normal. A zero pivot makes its elimination step a no-op and its row of X
   zero, so later pivots stay finite.
-- ``torch.ops.linalg_tpc.gj_large(A[b, n, n]) -> (R, P, Q, D, S)`` for 64 < n <= ``LARGE_MAXN`` (512): the in-place
+- ``torch.ops.linalg_tpc.gj_large(A[b, m, n]) -> (R, P, Q, D, S)`` for 64 < n <= ``LARGE_MAXN`` (512), m = n or, a
+  tall panel, n < m <= ``TALL_MAXM`` (the blocked route's panels: the pivot rows chosen over all m rows): the in-place
   Gauss-Jordan inverse with partial pivoting (implicit: no row moves), one matrix per index-space member, the first
   rows in local memory and the others re-read from global memory on each step (one ASO per step). ``A^-1 = R[P, :][:,
   Q]``, ``D`` the pivots, ``S[:, 1]`` the info; one ELF per ``ceil(n / 64)``. ``gj_solve`` and ``gj_inv`` route n >
@@ -53,12 +54,7 @@ import torch
 MAXN = 64  # MAXN of gj_solve and tri_solve (main)
 SMALL_MAXN = 32  # MAXN of jacobi_svd, matrix_exp, lu_factor, lu_perm and lu_solve
 MAXHH = 64
-LARGE_MAXN = 512  # NMAX of gj_large_f32_gaudi2.c: gj_solve and gj_inv take 64 < n <= LARGE_MAXN through it
-# The in-place kernel runs one matrix per TPC (24 on Gaudi2), so a small batch leaves the card idle: measured on
-# Gaudi2 (bridge 1.21.4, eager, mean of synced calls), batch 1 n = 384 and batch 1 to 4 n = 512 were slower than
-# Habana's CPU fallback, batch 1 n <= 300 and batch 32 n <= 256 not (see ``large_pays``).
-LARGE_ANY_BATCH_N = 256  # up to here the kernel takes any batch
-LARGE_MIN_BATCH = 8  # past it, at least this many matrices
+LARGE_MAXN = 512  # NMAX of gj_large_f32_gaudi2.c: the square in-place kernel; past it the blocked route (any n)
 EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
@@ -139,10 +135,10 @@ static habana::PartialOutputMetaDataVector tri_solve_meta(const at::Stack& input
 }
 static habana::PartialOutputMetaDataVector large_meta(const at::Stack& inputs) {
   auto a = inputs[0].toTensor();
-  auto batch = a.size(0), n = a.size(1);
-  return {habana::PartialOutputMetaData{a.scalar_type(), {batch, n, 64 * ((n + 63) / 64)}},
+  auto batch = a.size(0), m = a.size(1), n = a.size(2);  // m rows: n, or more for a tall panel
+  return {habana::PartialOutputMetaData{a.scalar_type(), {batch, m, 64 * ((n + 63) / 64)}},
           habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
-          habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, m}},
           habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
           habana::PartialOutputMetaData{a.scalar_type(), {batch, 2}}};
 }
@@ -309,10 +305,9 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("gj_large", [](at::Tensor a) {
-    auto bt = a.size(0), n = a.size(1);
-    auto v = a.new_empty({bt, n});
-    return std::make_tuple(a.new_empty({bt, n, 64 * ((n + 63) / 64)}), v, a.new_empty({bt, n}), a.new_empty({bt, n}),
-                           a.new_empty({bt, 2}));
+    auto bt = a.size(0), m = a.size(1), n = a.size(2);
+    return std::make_tuple(a.new_empty({bt, m, 64 * ((n + 63) / 64)}), a.new_empty({bt, n}), a.new_empty({bt, m}),
+                           a.new_empty({bt, n}), a.new_empty({bt, 2}));
   });
   m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
     return std::make_tuple(b.new_empty(b.sizes()), b.new_empty({a.size(0), a.size(1)}), b.new_empty({a.size(0), 2}));
@@ -392,15 +387,19 @@ static bool registered_solve = [] {
 }();
 static auto rshape = [](const at::Stack& s) {
   auto a = s[0].toTensor();
-  auto n = a.size(1);
-  return std::vector<int64_t>{a.size(0), n, 64 * ((n + 63) / 64)};
+  auto n = a.size(2);
+  return std::vector<int64_t>{a.size(0), a.size(1), 64 * ((n + 63) / 64)};
+};
+static auto cshape = [](const at::Stack& s) {  // one per column of a (tall) panel
+  auto a = s[0].toTensor();
+  return std::vector<int64_t>{a.size(0), a.size(2)};
 };
 static bool registered_large = [] {
   std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
   std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, rshape},
-                                                 {1, c10::ScalarType::Float, dshape},
+                                                 {1, c10::ScalarType::Float, cshape},
                                                  {2, c10::ScalarType::Float, dshape},
-                                                 {3, c10::ScalarType::Float, dshape},
+                                                 {3, c10::ScalarType::Float, cshape},
                                                  {4, c10::ScalarType::Float, sshape}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_large", "gj_large_f32_gaudi2", in, out, nullptr);
   return true;
@@ -946,7 +945,7 @@ def _tri_chunked(op, A, B):
 
 
 def _check(A, n, *others, limit=MAXN):
-    if A.dim() < 2 or n > limit or A.shape[-2] != n:
+    if A.dim() < 2 or (limit is not None and n > limit) or A.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc takes square A with n <= {limit}, got {tuple(A.shape)}")
     if any(t.dtype != torch.float32 for t in (A, *others)):
         # the kernels compute in float32: a float64 input would be downcast silently
@@ -954,16 +953,47 @@ def _check(A, n, *others, limit=MAXN):
 
 
 def large_pays(n, batch):
-    """Whether the routing sends ``batch`` matrices of order ``n`` (``MAXN`` < n <= ``LARGE_MAXN``) to the in-place
-    kernel: eager mode, not tracing under ``torch.compile``, and n <= ``LARGE_ANY_BATCH_N`` or at least
-    ``LARGE_MIN_BATCH`` matrices. In lazy mode (and compiled) the call keeps main's route (Habana's fallback):
-    measured on Gaudi2, bridge 1.21.4, EEGSPDNet's lazy step was 73.2 against 63.0 ms median with the kernel (its graph
-    boundary, gathers and checks), and the compiled path was not measured faster."""
-    # lazy_mode(), the one reading of the mode every route uses (the variable unset is eager on bridge 1.21.4,
-    # measured in the pod; reading the variable here with another default declined default eager calls). Tracing
-    # (make_fx, AOT autograd, where is_compiling() is False) is declined by the caller, which sees the tensors.
-    eager = not lazy_mode() and not torch.compiler.is_compiling()
-    return eager and n <= LARGE_MAXN and (n <= LARGE_ANY_BATCH_N or batch >= LARGE_MIN_BATCH)
+    """Whether the routing sends ``batch`` matrices of order ``n > MAXN`` to the in-place kernels: every size and
+    batch, eager and lazy, but not while tracing under ``torch.compile`` (main's route there; the compiled path was not
+    measured). Tracing (make_fx, AOT autograd, where is_compiling() is False) is declined by the caller, which sees the
+    tensors. Past ``LARGE_MAXN``, and for small batches below it (``_square_pays``), the blocked route runs."""
+    return not torch.compiler.is_compiling()
+
+
+# The blocked route (n > LARGE_MAXN, or a batch too small to fill the card's 24 TPCs with whole matrices): block
+# Gauss-Jordan over panels of about PANEL columns, each panel's pivots chosen by partial pivoting over the whole
+# remaining height (``gj_tall``, the in-place kernel on a tall panel: the same pivot rows as unblocked GEPP), the
+# trailing updates two matmuls per panel. Measured on Gaudi2 (bridge 1.21.4, batch 1, eager): the square kernel takes
+# 2.3 / 9.1 / 24.9 ms at n = 220 / 384 / 512 (one matrix per TPC, n^2 ceil(n / 64) vector-row steps); a panel of width
+# c over r rows costs r c ceil(c / 64), so the panels' sum is about n^2 PANEL / 128.
+PANEL = 128
+TALL_MAXM = 2048  # rows of a gj_tall panel (VR = 32 in gj_large_f32_gaudi2.c); taller panels take a tournament
+TPCS = 24  # Gaudi2: one matrix per TPC
+# What one panel of the blocked route costs on top of its kernel steps (its launches or graph boundary, the reorder,
+# gathers and matmuls), in the kernel's vector-row steps (about 13 ns each): fitted to the same measurements, n = 512
+# batch 1 inverse forward and backward, square 28.2 ms against blocked 9.1 (lazy) and 29.5 against 27.4 (eager).
+PANEL_OVERHEAD = {"lazy": 90000, "eager": 400000}
+
+
+def _panel_widths(n):
+    """Near-equal panel widths summing to ``n``, each of at most about ``PANEL`` and more than ``MAXN`` columns (the
+    kernel's lower limit)."""
+    p = max(1, min(-(-n // PANEL), n // (MAXN + 1)))
+    q, r = divmod(n, p)
+    return [q + 1] * r + [q] * (p - r)
+
+
+def _square_pays(n, batch):
+    """Whether one square in-place kernel call beats the blocked route for ``batch`` matrices of order ``n`` (<=
+    ``LARGE_MAXN``), by the cost model above (kernel steps per wave of ``TPCS`` matrices, plus each panel's overhead)."""
+    waves = -(-batch // TPCS)
+    square = waves * n * n * (-(-n // 64))
+    overhead = PANEL_OVERHEAD["lazy" if _lazy() else "eager"]
+    widths, rows, blocked = _panel_widths(n), n, 0
+    for c in widths:
+        blocked += waves * rows * c * (-(-c // 64)) + overhead
+        rows -= c
+    return square <= blocked
 
 
 def _parity(P):
@@ -975,55 +1005,136 @@ def _parity(P):
 
 
 def _rows(X, index):
-    """``X[..., index, :]`` for a float index ``[b, n]`` (exact integers): a gather of float data."""
+    """``X[..., index, :]`` for an index ``[b, n]`` (int64, or float holding exact integers): a gather of float data."""
     return X.gather(-2, index.long()[..., None].expand(*index.shape, X.shape[-1]))
 
 
-def _large_raw(A, sign=True):
-    """The kernel's ``(R, P, Q, D, S)`` for ``A[b, n, n]`` run on ``A^T`` (``R[P, :][:, Q] = A^-T``), ``S[:, 0]`` set
-    to the sign of the pivot order (0 when not ``sign``: solve and inv do not read it, and its [b, n, n] comparison
-    costs eager launches) and a matrix with a NaN given NaN pivots (LAPACK's results are NaN there; the kernel's need
-    not be). ``A^T``, as torch: its CPU solve, inv and det factor the row-major A as LAPACK's column-major A^T, so
-    the pivot order is LAPACK's on the matrix torch hands it. On ``A`` the kernel took the other order, and partial
-    pivoting's 2^(n-1) growth on Wilkinson's matrix (``W = I - tril(1, -1)``, last column 1; condition 58 at n =
-    130) overflowed where torch's factors stay bounded (Codex review #1); torch overflows on ``W^T``, and so do we."""
-    R, P, Q, D, S = _call(_large_op(), A.mT.contiguous())
-    nan = A.isnan().any(-1).any(-1)
-    D = D.masked_fill(nan[..., None], float("nan"))
+def _arange(n, like, batch):
+    return torch.arange(n, dtype=torch.float32, device=like.device).expand(batch, n)
+
+
+def _panel(W):
+    """Partial pivoting over the whole height of the panel ``W[b, r, c]`` (MAXN < c <= LARGE_MAXN, c <= r):
+    ``(rows, X, D, info, key)`` with ``rows[b, c]`` the pivot row of each step (float, exact integers), ``X[b, c, c] =
+    W[rows]^-1``, ``D[b, c]`` the pivots (``det W[rows] = prod D``), ``info[b]`` 1 + the first zero pivot (else 0) and
+    ``key[b, r]`` whose ascending order puts the pivot rows first, in order, then the others in theirs. One
+    ``gj_tall`` launch up to ``TALL_MAXM`` rows; past it a tournament (CALU): each chunk of rows nominates its own
+    pivot rows, and the panel of the nominees picks the final ones."""
+    b, r, c = W.shape
+    if r > TALL_MAXM:
+        assert 2 * c <= TALL_MAXM, "a tournament round must halve the candidates"
+        k = -(-r // TALL_MAXM)
+        q, extra = divmod(r, k)
+        starts = [i * q + min(i, extra) for i in range(k + 1)]
+        nominees = torch.cat([_panel(_fresh(W[:, a:e].contiguous()))[0] + a for a, e in zip(starts, starts[1:])], -1)
+        rows_c, X, D, info, _ = _panel(_rows(W, nominees))
+        rows = nominees.gather(-1, rows_c.long())
+        key = (_arange(r, W, b) + c).scatter(-1, rows.long(), _arange(c, W, b))
+        return rows, X, D, info, key
+    R, P, Q, D, S = _call(_large_op(), W)
+    return P, _rows(R[..., :c], P), D, S[..., 1], Q
+
+
+def _cat(parts, dim):
+    """``torch.cat`` of the non-empty ``parts``: on Gaudi2 (bridge 1.21.4, eager) a cat along the rows with an empty
+    slice of a gather's output among its inputs failed its launch (synStatus 30, "Sections' validation failure";
+    ``tests/probe_blocked_ops.py``)."""
+    kept = [p for p in parts if p.shape[dim] > 0] or parts[:1]
+    return kept[0] if len(kept) == 1 else torch.cat(kept, dim)
+
+
+def _blocked(A, inverse=True, sign=True):
+    """Block Gauss-Jordan with partial pivoting over the whole height for ``A[b, n, n]`` (float32, contiguous):
+    ``(X, D, S)`` with ``X = A^-1`` (None unless ``inverse``), ``D`` the pivots and ``S[:, 0]`` the sign of the row
+    order (0 unless ``sign``), ``S[:, 1]`` the info. Panel by panel: the panel's pivot rows (``_panel``) are moved
+    before the rows not yet taken, the pivot block inverted by the kernel, the other rows updated by one matmul (with
+    ``inverse``, the rows already taken too: the in-place inverse of ``A[perm]``, whose columns are then put back in
+    ``A``'s row order; without it only the trailing Schur complement, LU-style, for det and slogdet)."""
+    b, n, _ = A.shape
+    perm = _arange(n, A, b)
+    M = A  # with ``inverse`` the whole matrix, else the trailing block of the rows and columns not yet taken
+    Ds, s = [], 0
+    for c in _panel_widths(n):
+        e = s + c
+        W = M[:, s:, s:e] if inverse else M[..., :c]
+        rows, X, D, _, key = _panel(_fresh(W.contiguous()))
+        order = key.argsort(-1)
+        perm = _cat([perm[:, :s], perm[:, s:].gather(-1, order)], -1)
+        Ds.append(D)
+        if inverse:
+            tail = _rows(M[:, s:], order)
+            G = X @ tail[:, :c]  # the pivot rows, normalized: X at their own columns
+            G = _cat([G[..., :s], X, G[..., e:]], -1)
+            rest = _cat([M[:, :s], tail[:, c:]], 1)
+            C = rest[..., s:e]
+            rest = _cat([rest[..., :s], torch.zeros_like(C), rest[..., e:]], -1) - C @ G
+            M = _cat([rest[:, :s], G, rest[:, s:]], 1)
+        elif e < n:
+            T = _rows(M, order)
+            M = T[:, c:, c:] - T[:, c:, :c] @ (X @ T[:, :c, c:])
+        s = e
+    D = _cat(Ds, -1)
+    # info: 1 + the first zero pivot (the kernel's own info, per panel, is the same test on its D)
+    zero = torch.where(D == 0, _arange(n, A, b) + 1, float(n + 1)).amin(-1)
+    info = torch.where(zero > n, 0.0, zero)
+    S = torch.stack([_parity(perm) if sign else torch.zeros_like(info), info], -1)
+    if not inverse:
+        return None, D, S
+    # M is the inverse of A[perm]: A^-1 = M with its columns put back in A's row order
+    return M.gather(-1, perm.argsort(-1)[:, None, :].expand(b, n, n)), D, S
+
+
+def _square(A, sign=True):
+    """The square in-place kernel's ``(R, P, Q, D, S)`` for ``A[b, n, n]`` (MAXN < n <= LARGE_MAXN), ``S[:, 0]`` the
+    sign of the pivot order (0 when not ``sign``: solve and inv do not read it, and its [b, n, n] comparison costs
+    launches). The kernel makes R and D NaN for a matrix with a NaN (LAPACK's results are NaN there)."""
+    R, P, Q, D, S = _call(_large_op(), A)
     if sign:
         S = torch.stack([_parity(P), S[..., 1]], -1)
-    return R, P, Q, D, S, nan
+    return R, P, Q, D, S
+
+
+def _square_pays_for(A):
+    n = A.shape[-1]
+    return n <= LARGE_MAXN and _square_pays(n, A.shape[0])
 
 
 def large_factors(A):
-    """``(D, S)`` of the in-place kernel for ``A[..., n, n]`` (64 < n <= ``LARGE_MAXN``), for ``det`` and
-    ``slogdet``: the pivots and (sign, info), without forming the inverse."""
+    """``(D, S)`` of the in-place kernels for ``A[..., n, n]`` (n > ``MAXN``), for ``det`` and ``slogdet``: the pivots
+    and (sign, info), without forming the inverse. Run on ``A^T`` (see ``_large``)."""
     n = A.shape[-1]
-    _check(A, n, limit=LARGE_MAXN)
+    _check(A, n, limit=None)
     batch = A.shape[:-2]
-    _, _, _, D, S, _ = _large_raw(_flat(A, batch, n, n))
+    At = _flat(A, batch, n, n).mT.contiguous()
+    if _square_pays_for(At):
+        _, _, _, D, S = _square(At)
+    else:
+        _, D, S = _blocked(At, inverse=False)
     return _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
 def _large(A, B=None, sign=True):
-    """``(X, D, S)`` of the in-place Gauss-Jordan kernel for ``A[b, n, n]`` (64 < n <= ``LARGE_MAXN``): ``X =
-    A^-1`` (``B`` None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel runs on ``A^T`` (see
-    ``_large_raw``) and divides each row by its pivot at the end: ``A^-T = R[P, :][:, Q]``, so ``A^-1 = R^T[Q, :][:,
-    P]`` and ``A^-1 B = (R^T @ B[Q])[Q]`` (with ``Q = P^-1``); a zero pivot gives a zero column (info is set)."""
+    """``(X, D, S)`` of the in-place Gauss-Jordan kernels for ``A[b, n, n]`` (n > ``MAXN``): ``X = A^-1`` (``B``
+    None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. Run on ``A^T``, as torch: its CPU solve, inv and det
+    factor the row-major A as LAPACK's column-major A^T, so the pivot order is LAPACK's on the matrix torch hands it.
+    On ``A`` the kernel took the other order, and partial pivoting's 2^(n-1) growth on Wilkinson's matrix (``W = I -
+    tril(1, -1)``, last column 1; condition 58 at n = 130) overflowed where torch's factors stay bounded (Codex review
+    #1); torch overflows on ``W^T``, and so do we. One square kernel call (``A^-T = R[P, :][:, Q]``, so ``A^-1 =
+    R^T[Q, :][:, P]`` and ``A^-1 B = (R^T @ B[Q])[Q]``) when it pays, else the blocked route (``_blocked``)."""
     n = A.shape[-1]
-    R, P, Q, D, S, nan = _large_raw(A, sign)
+    At = A.mT.contiguous()
+    if not _square_pays_for(At):
+        Xt, D, S = _blocked(At, sign=sign)
+        return (Xt.mT if B is None else Xt.mT @ B), D, S
+    R, P, Q, D, S = _square(At, sign)
     Rt = R[..., :n].mT
     # the kernel divides each row by its pivot itself (a torch division by a pivot of 1e38 zeroed the row in lazy mode:
     # the card's division multiplies by a reciprocal, subnormal hence flushed, and a 2^-64 prescale was folded away)
-    Y = _rows(Rt, Q) if B is None else _rows(Rt @ _rows(B, Q), Q)
     if B is None:
         # no Newton step: on the kernel's float32 replica it gained little at condition <= 1e4 and lost past 1e6
         # (n = 220, condition 1e7: 6.8e-2 against 4.5e-2 without, LAPACK 4.7e-2)
-        X = Y.gather(-1, P.long()[..., None, :].expand(*P.shape[:-1], n, n))
-    else:
-        X = Y
-    X = X.masked_fill(nan[..., None, None], float("nan"))
-    return X, D, S
+        return _rows(Rt, Q).gather(-1, P.long()[..., None, :].expand(*P.shape[:-1], n, n)), D, S
+    return _rows(Rt @ _rows(B, Q), Q), D, S
 
 
 def gj_solve(A, B):
@@ -1032,7 +1143,7 @@ def gj_solve(A, B):
     zero pivot in the kernel's elimination order, else 0; it can differ from LAPACK's);
     shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
     n, m = A.shape[-1], B.shape[-1]
-    _check(A, n, B, limit=LARGE_MAXN)
+    _check(A, n, B, limit=None)
     if B.dim() < 2 or B.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.gj_solve takes B with n rows, got {tuple(A.shape)} and {tuple(B.shape)}")
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
@@ -1045,17 +1156,41 @@ def gj_inv(A, sign=True):
     """``(A^-1, D, S)`` for ``A[..., n, n]``: ``gj_solve`` against the identity, which the kernel builds itself.
     Past ``MAXN``, ``sign=False`` leaves ``S[..., 0]`` 0 (not computed)."""
     n = A.shape[-1]
-    _check(A, n, limit=LARGE_MAXN)
+    _check(A, n, limit=None)
     batch = A.shape[:-2]
     A = _flat(A, batch, n, n)
     X, D, S = _call(_inv_op(), A) if n <= MAXN else _large(A, sign=sign)
     return _unflatten(X, batch, n, n), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
-def tri_solve(A, B, upper=False, left=True, unitriangular=False):
-    """Solve ``A X = B`` (``X A = B`` if not ``left``) for triangular ``A[..., n, n]`` (n <= ``MAXN``)."""
+def _tri_blocked(op, A, B, upper):
+    """Blocked substitution for ``A[b, n, n]`` (n > ``MAXN``), ``B[b, n, m]``: diagonal blocks of at most ``MAXN``
+    through the substitution kernel ``op``, each block's right-hand side first updated by one matmul with the blocks
+    already solved (forward for lower, backward for upper). The other triangle is never read: the off-diagonal blocks
+    used lie in ``A``'s own triangle."""
     n = A.shape[-1]
-    _check(A, n, B)
+    p = -(-n // MAXN)
+    q, r = divmod(n, p)
+    bounds = [0]
+    for i in range(p):
+        bounds.append(bounds[-1] + q + (i < r))
+    X = [None] * p
+    for i in (range(p - 1, -1, -1) if upper else range(p)):
+        a, e = bounds[i], bounds[i + 1]
+        rhs = B[:, a:e]
+        done = range(i + 1, p) if upper else range(i)
+        if done:
+            lo, hi = (e, n) if upper else (0, a)
+            rhs = rhs - A[:, a:e, lo:hi] @ torch.cat([X[j] for j in done], 1)
+        X[i] = _tri_chunked(op, _fresh(A[:, a:e, a:e].contiguous()), _fresh(rhs.contiguous()))
+    return torch.cat(X, 1)
+
+
+def tri_solve(A, B, upper=False, left=True, unitriangular=False):
+    """Solve ``A X = B`` (``X A = B`` if not ``left``) for triangular ``A[..., n, n]``: n <= ``MAXN`` one substitution
+    kernel call per chunk of 64 columns of ``B``, past it the blocked substitution (``_tri_blocked``)."""
+    n = A.shape[-1]
+    _check(A, n, B, limit=None)
     if B.dim() < 2 or B.shape[-2 if left else -1] != n:
         raise ValueError(f"hpu_ops.tpc.tri_solve takes compatible B for left={left}, "
                          f"got {tuple(A.shape)} and {tuple(B.shape)}")
@@ -1064,7 +1199,8 @@ def tri_solve(A, B, upper=False, left=True, unitriangular=False):
     upper_eff = upper if left else not upper
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
     m = B_eff.shape[-1]
-    X = _tri_chunked(_tri_op(upper_eff, unitriangular), _flat(A_eff, batch, n, n), _flat(B_eff, batch, n, m))
+    solve = _tri_chunked if n <= MAXN else functools.partial(_tri_blocked, upper=upper_eff)
+    X = solve(_tri_op(upper_eff, unitriangular), _flat(A_eff, batch, n, n), _flat(B_eff, batch, n, m))
     X = _unflatten(X, batch, n, m)
     return X if left else X.mT
 

@@ -17,8 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from . import tpc
-from ._dispatch import register_paired
-from .linalg import _kernels, _takes
+from .linalg import _kernels, _takes, register_paired
 
 aten = torch.ops.aten
 JACOBI_SWEEPS = 10

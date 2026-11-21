@@ -174,21 +174,24 @@ def gj_large(A, legacy=False, legacy_growth=False):
     first unused row of largest |new column k + 1|, a NaN candidate counting as 0). ``legacy=True`` replays the kernel
     before the review: the pivot row normalized by 1/pivot before the elimination (tiny quotients flushed) and NaN
     candidates never taken. ``legacy_growth=True``: the kernel before the stored pivot row was normalized by a power of
-    two (Codex review #17: the quotients of used rows overflowed)."""
+    two (Codex review #17: the quotients of used rows overflowed). ``A`` may be a tall panel ``[m, n]`` (m >= n, the
+    ``-DTALL`` build): n steps over m rows, ``Q[i] = n + i`` for a row never taken, which is not divided. A NaN in
+    ``A`` makes every entry of ``R`` and ``D`` NaN (not in ``legacy`` mode, the kernel before that)."""
     a = np.array(A, dtype=F32)  # tensor loads are not flushed; every op is
-    n = a.shape[0]
+    m, n = a.shape
     w = 64 * ((n + 63) // 64)
-    R = np.zeros((n, w), F32)
+    R = np.zeros((m, w), F32)
     R[:, :n] = a
-    used = np.zeros(n, bool)
-    P, Q, D = np.zeros(n, F32), np.zeros(n, F32), np.zeros(n, F32)
-    drv = np.zeros(n, F32)  # row i's pivot, times the 2^-e that normalized the row as stored
+    used = np.zeros(m, bool)
+    P, D = np.zeros(n, F32), np.zeros(n, F32)
+    Q = (n + np.arange(m)).astype(F32)
+    drv = np.ones(m, F32)  # row i's pivot, times the 2^-e that normalized the row as stored (1 while not taken)
     info = F32(0)
     lanes = np.arange(w)
 
     def pick(cand):
         best, idx = F32(-1), 0
-        for i in range(n):
+        for i in range(m):
             c = cand[i] if legacy or cand[i] == cand[i] else F32(0)
             if c > best:
                 best, idx = c, i
@@ -242,6 +245,8 @@ def gj_large(A, legacy=False, legacy_growth=False):
         dr = drv
         ds = _scale(dr)
         R = mul(mul(R, ds[:, None]), recip(mul(dr, ds), zero_to_inf=False)[:, None])
+        if np.isnan(a).any():
+            R, D = np.full_like(R, np.nan), np.full_like(D, np.nan)
     return R, P, Q, D, np.array([0, info], F32)
 
 
