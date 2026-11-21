@@ -23,7 +23,7 @@ def rows(n=8, seed=0):
     x[3, 0], x[3, -1] = INF, NAN
     x[4, -1], x[4, 0] = -INF, NAN
     x[5] = NAN
-    x[6, 0], x[6, 1] = NAN, NAN
+    x[6, 0], x[6, 1], x[6, 3] = NAN, NAN, INF  # two NaNs and a real +inf (sort: NaN after it)
     x[7] = -INF
     x[8] = 1.5
     x[9, 0], x[9, 1] = -0.0, 0.0
@@ -44,15 +44,23 @@ CASES = {
     "pool2d_ceil": lambda x: F.max_pool2d(x.reshape(1, 5, 2, 8), (2, 3), ceil_mode=True),
     "pool3d": lambda x: F.max_pool3d(x.reshape(1, 5, 2, 2, 4), 2),
     "maxpool_module": lambda x: torch.nn.MaxPool2d((1, 3), (1, 2))(x.reshape(1, 1, 10, 8)),
+    "sort": lambda x: x.sort(-1).values, "sort_desc_dim0": lambda x: x.sort(0, descending=True).values,
+    "topk3": lambda x: x.topk(3, -1).values, "topk3_small": lambda x: x.topk(3, -1, largest=False).values,
+    "kthvalue2": lambda x: x.kthvalue(2, -1).values, "msort": lambda x: x.msort(),
 }
 INDEX = {"argmax": lambda x: x.argmax(-1), "argmin_dim0": lambda x: x.argmin(0), "argmax_all": lambda x: x.argmax(),
          "max_dim_idx": lambda x: x.max(-1).indices, "median_dim_idx": lambda x: x.median(-1).indices,
-         "aminmax": lambda x: torch.stack(torch.aminmax(x, dim=-1))}
+         "aminmax": lambda x: torch.stack(torch.aminmax(x, dim=-1)),
+         "argsort_stable": lambda x: x.argsort(dim=-1, stable=True),
+         "sort_stable_desc_idx": lambda x: x.sort(dim=-1, stable=True, descending=True).indices,
+         "topk3_idx": lambda x: x.topk(3, -1).indices, "kthvalue2_idx": lambda x: x.kthvalue(2, -1).indices}
 
 
 # Gaudi breaks ties its own way (measured without hpu_ops too): median's index among equal values, and a padded
-# max_pool window of all -inf sends its gradient to the padding. Those cases get tie-free rows 7 and 8.
-TIES_NATIVE = {"median_dim", "median_dim_idx", "pool1d_k3s1p1"}
+# max_pool window of all -inf sends its gradient to the padding; topk / kthvalue indices among ties are not fixed by
+# torch either. Those cases get tie-free rows 7 and 8.
+TIES_NATIVE = {"median_dim", "median_dim_idx", "pool1d_k3s1p1", "topk3", "topk3_small", "kthvalue2", "topk3_idx",
+               "kthvalue2_idx"}
 
 
 def untied(x):

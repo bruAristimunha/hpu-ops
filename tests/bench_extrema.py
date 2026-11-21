@@ -50,6 +50,10 @@ CASES = {  # name: (function of the inputs, inputs, differentiable)
     "max_pool2d 2 32x64x56x56": (lambda x: F.max_pool2d(x, 2), (torch.randn(32, 64, 56, 56),), True),
     "max_pool2d 2 bf16 32x64x56x56": (lambda x: F.max_pool2d(x, 2), (torch.randn(32, 64, 56, 56).bfloat16(),), True),
     "max_pool1d 3,2 32x22x1000": (lambda x: F.max_pool1d(x, 3, 2), (EEG,), True),
+    "sort(-1) 32x22x1000": (lambda x: x.sort(-1).values, (EEG,), True),
+    "sort(-1) 64x64": (lambda x: x.sort(-1).values, (torch.randn(64, 64),), True),
+    "topk(8, -1) 32x22x1000": (lambda x: x.topk(8, -1).values, (EEG,), True),
+    "argsort(-1) 32x22x1000": (lambda x: x.argsort(-1), (EEG,), False),
 }
 
 
