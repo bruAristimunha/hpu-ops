@@ -84,9 +84,10 @@ def _scale(v):
     return np.where((_u32(v) & 0x7FFFFFFF) >= 0x5F800000, F32(2.0 ** -64), F32(1)).astype(F32)
 
 
-def gj_solve(A, B=None, legacy=False):
+def gj_solve(A, B=None, legacy=False, legacy_tiny=False):
     """``(X, D, S)`` of ``gj_solve_f32_gaudi2.c`` (``gj_inv`` with ``B=None``) for one matrix ``A[n, n]`` and
-    ``B[n, m]`` (numpy or torch, any float dtype; converted to float32)."""
+    ``B[n, m]`` (numpy or torch, any float dtype; converted to float32). ``legacy_tiny=True``: the LU-style kernel
+    before multipliers below 2^-126 were carried scaled (commit 090da6b)."""
     a = _ftz(np.array(A, dtype=F32))
     n = a.shape[0]
     b = np.eye(n, dtype=F32) if B is None else _ftz(np.array(B, dtype=F32))
@@ -123,10 +124,19 @@ def gj_solve(A, B=None, legacy=False):
         q = mul(cs, ninv)
         r = mac(q, pks, cs)
         q = q if ninv == 0 else mac(r, ninv, q)
+        if legacy_tiny:
+            qs, aps, bps = np.zeros_like(q), np.zeros_like(a[k]), np.zeros_like(b[k])
+        else:  # multipliers below 2^-126: q * 2^64 against the pivot row * 2^-64
+            with np.errstate(invalid="ignore", over="ignore"):
+                qs = mul(mul(col, F32(2.0 ** 64) if s == 1 else F32(1)), ninv)
+            qs = np.where(q == 0, qs, F32(0)).astype(F32)
+            with np.errstate(invalid="ignore"):
+                aps = np.where(np.abs(a[k]) < np.inf, mul(a[k], F32(2.0 ** -64)), F32(0)).astype(F32)
+                bps = np.where(np.abs(b[k]) < np.inf, mul(b[k], F32(2.0 ** -64)), F32(0)).astype(F32)
         for i in range(n):
             if i != k:
-                a[i] = mac(a[k], q[i], a[i])
-                b[i] = mac(b[k], q[i], b[i])
+                a[i] = mac(aps, qs[i], mac(a[k], q[i], a[i]))
+                b[i] = mac(bps, qs[i], mac(b[k], q[i], b[i]))
     if not legacy:
         ds = _scale(dv)
         dinv = recip(mul(dv, ds), zero_to_inf=False)

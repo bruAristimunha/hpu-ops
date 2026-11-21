@@ -211,6 +211,56 @@ def test_replica_infinite_pivot_stays_finite():
     np.testing.assert_allclose(got, want.numpy(), rtol=1e-4, atol=1e-5)
 
 
+# ---- re-review: a multiplier below 2^-126 flushed although its product with the pivot row is normal ----
+
+TINY_MULTIPLIER = {
+    # rank 1 (row 2 = 2^-127 x row 1): torch info 2, det 0
+    "rank1_2^-127": ([[2.0 ** 30, 2.0 ** 127], [2.0 ** -97, 1.0]], 2),
+    # regular, det 1024 - 2^120 * 2^-117 = 1016: the flushed multiplier gave 1024 and X off by 0.8%
+    "det_1016": ([[1024.0, 2.0 ** 120], [2.0 ** -117, 1.0]], 0),
+}
+
+
+@pytest.mark.parametrize("case", list(TINY_MULTIPLIER))
+@pytest.mark.parametrize("n", [2, 33])
+def test_replica_tiny_multiplier(case, n):
+    block, info = TINY_MULTIPLIER[case]
+    A, B = embed(block, n), torch.ones(n, 1)
+    want_det = float(torch.linalg.det(A.double()))
+    X, D, S = replica_gj(A, B, legacy_tiny=True)  # the reviewer's values: the replica is faithful
+    assert S[0] * np.prod(D.astype(np.float64)) == (2.0 ** 30 if info else 1024)
+    X, D, S = replica_gj(A, B)
+    assert S[1] == info == torch.linalg.solve_ex(A, B).info
+    assert S[0] * np.prod(D.astype(np.float64)) == want_det
+    if info == 0:
+        np.testing.assert_allclose(X, torch.linalg.solve(A.double(), B.double()).float().numpy(), rtol=1e-6)
+
+
+@pytest.mark.parametrize("case", list(TINY_MULTIPLIER))
+def test_tiny_multiplier_through_the_kernel_arithmetic(replica_gj_hook, case):
+    block, info = TINY_MULTIPLIER[case]
+    A, B = embed(block, 33), torch.ones(33, 1)
+    with cpu_as_hpu(linalg.install_inv_det):
+        assert torch.linalg.det(A) == torch.linalg.det(A.double()).float()
+    with cpu_as_hpu(linalg.install_solve):
+        if info:
+            with pytest.raises(torch.linalg.LinAlgError):
+                torch.linalg.solve(A, B)
+        else:
+            torch.testing.assert_close(torch.linalg.solve(A, B), torch.linalg.solve(A.double(), B.double()).float())
+
+
+def test_duplicate_rows_info_differs_from_torch():
+    """Documented in the README: exact duplicate rows of general values cancel exactly on the kernel (info != 0, so
+    solve and inv raise) while torch's LAPACK leaves a rounding residue (info 0)."""
+    torch.manual_seed(0)
+    for n in (2, 3, 5, 17, 63):
+        A = torch.randn(n, n)
+        A[1] = A[0]
+        B = torch.ones(n, 1)
+        assert torch.linalg.solve_ex(A, B).info == 0 and replica_gj(A, B)[2][1] != 0
+
+
 # ---- 5. solve_triangular(out=): int destination and a destination that requires grad raise as in torch ----
 
 def _tri(n=6):

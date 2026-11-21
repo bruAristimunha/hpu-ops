@@ -8,8 +8,10 @@
   (-1)^swaps of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can
   differ from LAPACK's, and is nonzero exactly when a pivot is exactly zero. The elimination is LU-style (a row minus
   ``a_ik / pivot`` times the unnormalized pivot row, the quotient rounded with one FMA correction; X = B / diag(D) at
-  the end), so equal rows cancel exactly (a rank-deficient matrix gets an exactly zero pivot, as in LAPACK) and B is
-  never scaled by 1/pivot before the cancellation. A zero pivot makes its elimination step a no-op and its row of X
+  the end), so rows that are exact duplicates (or power-of-two multiples) cancel exactly and give a zero pivot,
+  where LAPACK's rounded multipliers can leave a residue and report info 0 (other rank-deficient matrices, e.g.
+  integer ones, are not detected, as in torch); B is never scaled by 1/pivot before the cancellation, and a
+  multiplier below 2^-126 is carried scaled by 2^64 so it is not flushed when its product is normal. A zero pivot makes its elimination step a no-op and its row of X
   zero, so later pivots stay finite.
 - ``torch.ops.linalg_tpc.tri_solve_{lower,upper}[_unit](A[b, n, n], B[b, n, m]) -> X[b, n, m]``: forward or back
   substitution without pivoting for float32, n <= 64 (B columns chunked by 64; ``left=False`` through ``.mT`` and the

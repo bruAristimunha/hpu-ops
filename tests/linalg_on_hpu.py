@@ -759,6 +759,13 @@ def codex_cases():
         yield f"codex4.det_pivot_2^64.n{n}", L.det, (scaled,), "torch"
         yield f"codex4.slogdet_pivot_2^64.n{n}", L.slogdet, (scaled,), "torch"
         yield f"codex4.solve_pivot_2^64.n{n}", L.solve, (scaled, unit_rhs(n, 1)), "torch"
+        rank1 = embed([[2.0 ** 30, 2.0 ** 127], [2.0 ** -97, 1.0]], n)  # row 2 = 2^-127 x row 1
+        yield f"rereview.solve_ex_info_tiny_multiplier.n{n}", lambda a, b: L.solve_ex(a, b).info.float(), \
+            (rank1, torch.ones(n, 1)), "torch"
+        yield f"rereview.det_tiny_multiplier.n{n}", L.det, (rank1,), "torch"
+        det1016 = embed([[1024.0, 2.0 ** 120], [2.0 ** -117, 1.0]], n)  # det 1016
+        yield f"rereview.det_1016.n{n}", L.det, (det1016,), "float64"
+        yield f"rereview.solve_det_1016.n{n}", L.solve, (det1016, torch.ones(n, 1)), "float64"
     yield "codex2.tri_lower_unit_2^127.n33", lambda a, b: L.solve_triangular(a, b, upper=False, unitriangular=True), \
         _tri_lower_unit_overflow(33), "float64"
     yield "codex2.tri_upper_unit_2^127.n33", lambda a, b: L.solve_triangular(a, b, upper=True, unitriangular=True), \
@@ -1162,7 +1169,7 @@ def main():
         for op, fn in (("solve_triangular", lambda T, B: L.solve_triangular(T, B, upper=False)),
                        ("cholesky_solve", lambda T, B: torch.cholesky_solve(B, T))):
             results.append(run_singular_triangle(op, fn, frozenset()))
-        count_cpu_route()  # last: the raw 4-D kernel call is refused by the glue
+        count_cpu_route()  # from here on, calls of hpu-ops' CPU route are counted (the Codex rows check them)
         results += [run_codex_case(*case) for case in codex_cases()]
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
         ok = bool(EIGH_FALLBACKS)
