@@ -4,16 +4,24 @@ Per op and n in 16, 22, 64, 128 (batch 32, float32): forward, and backward where
 (solve, inv, det, slogdet, solve_triangular, cholesky_solve, eigh, eigvalsh) also run at the kernel's edges, n in
 1, 3, 21, 31, 32, for correctness and fallback only (no timing loop), and eigh and eigvalsh on an indefinite
 (G + G^T) / 2 at n = 3, 22, 32. A case fails when
-the bridge ``cpu_fallback`` delta is not empty, when a warning says "runs on the CPU" (hpu_complex's boxed fallback
-does not move the bridge metric, so both are read), when an error or its CPU float32 bar is not finite, or when the
-relative error ``max|x - ref| / max|ref|``, in forward or backward, exceeds max(1e-6, 10 * the error of the same op in
-float32 on the CPU): no worse than 10x CPU float32. One float64 case per op: every output (eigh: w and V) matches the
-native CPU float64 result to 1e-12, and hpu-ops#16's warning comes once. Two probes of Gaudi behavior: argmax returns
+the bridge ``cpu_fallback`` delta holds an op the case does not expect (see below), when a warning says "runs on the
+CPU" (hpu_complex's boxed fallback does not move the bridge metric, so both are read), when an error or its CPU
+float32 bar is not finite, or when the relative error ``max|x - ref| / max|ref|``, in forward or backward, exceeds
+max(1e-6, 10 * the error of the same op in float32 on the CPU): no worse than 10x CPU float32. One float64 case per
+op: every output (eigh: w and V) matches the native CPU float64 result to 1e-12, and hpu-ops#16's warning comes once
+(not for solve_triangular and cholesky_solve, which are not installed). Two probes of Gaudi behavior: argmax returns
 the first index among ties, and int64 argsort stays on the card.
 One ``RESULT {json}`` line per case; the last line counts them; exits 1 if any case failed.
 eigh and eigvalsh go through the TPC Jacobi kernel for n <= hpu_ops.tpc.EIGH_MAXN and are checked strictly there; past
 it (n = 64, 128) hpu-ops' CPU route is expected and recorded. ``--with-eigh`` is accepted and ignored (eigh is in
 hpu_ops.FIXES).
+Expected fallbacks (the defaults of hpu_ops.FIXES): ``linalg.solve_triangular`` and ``cholesky_solve`` are not
+installed, so they run through Habana's CPU fallback (``aten::linalg_solve_triangular``,
+``aten::_cholesky_solve_helper``), and so do the backward of ``linalg.cholesky`` and ``linalg.qr``. float64 ``solve``,
+``det`` and ``slogdet`` have no backend kernel and their autograd kernel declines float64 (one hpu-ops#16 warning), so
+Habana's fallback runs them. Each Case names these ops in ``fallback`` (float32) and ``fallback64`` (float64); a
+fallback op outside the set fails the case, an expected op that did not fall back is a note (the kernel may have come
+back). The accuracy bars still apply.
 ``--baseline`` skips ``hpu_ops.enable()`` to time the stock stack: fallbacks are then recorded (status "fallback")
 and do not fail a case, and the float64 cases are skipped (no warning to expect)."""
 from __future__ import annotations
@@ -54,6 +62,11 @@ tpc_maxn = 32  # hpu_ops.tpc.MAXN, set in main
 eigh_maxn = 32  # hpu_ops.tpc.EIGH_MAXN, set in main
 SINGULAR_N = 22
 L = torch.linalg
+TRI_FB = frozenset({"aten::linalg_solve_triangular"})  # bridge names of ops that run through Habana's fallback
+CHOL_FB = frozenset({"aten::_cholesky_solve_helper"})
+SOLVE_FB = frozenset({"aten::_linalg_solve_ex.result"})  # float64: no backend kernel, so Habana's fallback runs the op
+DET_FB = frozenset({"aten::_linalg_det.result"})
+SLOGDET_FB = frozenset({"aten::_linalg_slogdet.sign"})
 
 
 def sync():
@@ -241,17 +254,28 @@ class Case(NamedTuple):
     # routed through a TPC kernel (n <= hpu_ops.tpc.MAXN, EIGH_MAXN for eigh); past it hpu-ops' CPU route is expected
     tpc: bool = False
     gate: bool = False  # also run at GATE_SIZES, without timing
+    fallback: frozenset = frozenset()  # bridge ops expected in the float32 forward and backward fallback delta
+    fallback64: frozenset = frozenset()  # the same for the float64 case
+    warn64: bool = True  # the float64 case expects hpu-ops#16's warning once (else none: the op is not installed)
+
+
+def fallback_problems(got, expected, what):
+    """``(problems, notes)`` of a fallback delta ``got`` against the ops a case ``expected``: an op outside the set is
+    a problem, an expected op that did not fall back a note (the kernel may have come back)."""
+    extra, missing = sorted(set(got) - expected), sorted(expected - set(got))
+    return [f"{what} fell back on {extra}"] * bool(extra), [f"{what}: expected {k} did not fall back" for k in missing]
 
 
 CASES = (
     Case("linalg.solve_triangular", make_triangular, lambda a, b: L.solve_triangular(a, b, upper=False),
-         tpc=True, gate=True),
-    Case("cholesky_solve", make_cholesky_solve, lambda b, c: torch.cholesky_solve(b, c), tpc=True,
-         gate=True),
-    Case("linalg.solve", make_solve, lambda a, b: L.solve(a, b), tpc=True, gate=True),
+         gate=True, fallback=TRI_FB, fallback64=TRI_FB, warn64=False),
+    Case("cholesky_solve", make_cholesky_solve, lambda b, c: torch.cholesky_solve(b, c),
+         gate=True, fallback=CHOL_FB, fallback64=CHOL_FB, warn64=False),
+    Case("linalg.solve", make_solve, lambda a, b: L.solve(a, b), tpc=True, gate=True, fallback64=SOLVE_FB),
     Case("linalg.inv", make_pivoting, lambda x: L.inv(x), tpc=True, gate=True),
-    Case("linalg.det", make_pivoting, lambda x: L.det(x), tpc=True, gate=True),
-    Case("linalg.slogdet", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, tpc=True, gate=True),
+    Case("linalg.det", make_pivoting, lambda x: L.det(x), tpc=True, gate=True, fallback64=DET_FB),
+    Case("linalg.slogdet", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, tpc=True, gate=True,
+         fallback64=SLOGDET_FB),
     Case("linalg.eigh", make_spd, lambda x: L.eigh(x), err_eigh, loss_eigh, tpc=True, gate=True),
     Case("linalg.eigvalsh", make_spd, lambda x: L.eigvalsh(x), tpc=True, gate=True),
     Case("linalg.eigh.indefinite", make_indefinite, lambda x: L.eigh(x), err_eigh, loss_eigh, float64=False, tpc=True,
@@ -272,12 +296,15 @@ CASES = (
          float64=False, tpc=True, sizes=(22,)),
     Case("linalg.inv.of_batch_item", make_pivoting, lambda big: L.inv(big[3]), float64=False, tpc=True, sizes=(22,)),
     Case("linalg.solve_triangular.upper_unit", make_triangular_upper_unit,
-         lambda a, b: L.solve_triangular(a, b, upper=True, unitriangular=True), float64=False, tpc=True, sizes=(22,)),
+         lambda a, b: L.solve_triangular(a, b, upper=True, unitriangular=True), float64=False, sizes=(22,),
+         fallback=TRI_FB),
     Case("cholesky_solve.upper", make_cholesky_solve_upper, lambda b, c: torch.cholesky_solve(b, c, upper=True),
-         float64=False, tpc=True, sizes=(22,)),
-    Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False),
+         float64=False, sizes=(22,), fallback=CHOL_FB),
+    # the backward of cholesky and qr runs solve_triangular, which is not installed
+    Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False, fallback=TRI_FB),
     # factor 20: the forward is Habana's native qr, not an hpu_ops kernel (measured 10.2x at n=16)
-    Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20),
+    Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20,
+         fallback=TRI_FB),
 )
 
 
@@ -351,7 +378,7 @@ def over_bar(what, err, err_cpu32, factor=CPU32_FACTOR):
 def run_case(case, n, timed=True):
     row = {"op": case.name, "n": n, "batch": BATCH, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE,
            "timed": timed}
-    hard, soft = [], []  # wrong results or errors; CPU fallbacks
+    hard, soft, notes = [], [], []  # wrong results or errors; unexpected fallbacks; expected ones that did not occur
     try:
         cpu_in = case.make(BATCH, n, torch.float32)
         ref_in = [x.double() for x in cpu_in]
@@ -360,36 +387,42 @@ def run_case(case, n, timed=True):
         row["fwd_fallback"] = rec["fallback"]
         if BASELINE and case.name == "linalg.eigh" and rec["fallback"]:
             EIGH_FALLBACKS.append(rec["fallback"])
-        row["max_rel_err"], notes = case.err(out, ref, ref_in)
+        row["max_rel_err"], wrong = case.err(out, ref, ref_in)
         row["err_cpu32"], _ = case.err(as_tensors(case.fn(*cpu_in)), ref, ref_in)
-        hard += notes
+        hard += wrong
         if case.scope == "all":  # a "bwd" case's forward is Habana's native op, not ours: recorded, not gated
             hard += over_bar("error", row["max_rel_err"], row["err_cpu32"], case.factor)
-        if case.scope == "all":
-            soft += ["forward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+            bad, note = fallback_problems(rec["fallback"], case.fallback, "forward")
+            soft += bad + cpu_warnings(rec)
+            notes += note
         if case.loss:
             row["grad_err"], row["grad_err_cpu32"], rec = backward(case, cpu_in, ref_in)
             row["bwd_fallback"] = rec["fallback"]
             hard += over_bar("gradient error", row["grad_err"], row["grad_err_cpu32"], case.factor)
-            soft += ["backward fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+            bad, note = fallback_problems(rec["fallback"], case.fallback, "backward")
+            soft += bad + cpu_warnings(rec)
+            notes += note
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
     # fallbacks recorded, not failed: baseline, and the TPC ops past the kernel's n limit
     limit = eigh_maxn if case.name in ("linalg.eigh", "linalg.eigvalsh") else tpc_maxn
     expected = BASELINE or (case.tpc and n > limit)
     problems = hard + ([] if expected else soft)
-    row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft)
+    row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft, notes=notes)
     emit(**row)
     return not problems
 
 
 def run_float64(case):
-    """float64 on the card: declined, run on the CPU, with one warning naming hpu-ops#16 on the first call."""
+    """float64 on the card: declined, with one warning naming hpu-ops#16 on the first call. eigh, eigvalsh and inv run
+    on hpu-ops' CPU route. solve, det and slogdet warn too (the autograd kernel's check), then Habana's fallback runs
+    them; solve_triangular and cholesky_solve are not installed: no warning, Habana's fallback. The case's
+    ``fallback64`` is the expected delta, and an op outside it fails."""
     row = {"op": case.name, "n": F64_N, "batch": BATCH, "dtype": "float64", "lazy": LAZY, "baseline": BASELINE}
     if BASELINE:
         emit(**row, status="skipped", problems=["baseline: no hpu_ops install, no warning to check"])
         return True
-    problems = []
+    problems, notes = [], []
     try:
         ops_linalg._WARNED.clear()  # the warning comes once per op name and process
         cpu_in = case.make(BATCH, F64_N, torch.float64)
@@ -409,13 +442,17 @@ def run_float64(case):
         again = [m for _, m in second["caught"] if F64_TEXT in m]
         row.update(fwd_fallback=first["fallback"], warned=len(said), warned_again=len(again))
         problems += [f"error {row['max_rel_err']:.3g} > {TOL64}"] * (not row["max_rel_err"] <= TOL64)
-        problems += [f"{len(said)} warnings naming {F64_TEXT} on the first call, expected 1"] * (len(said) != 1)
+        want = int(case.warn64)
+        problems += [f"{len(said)} warnings naming {F64_TEXT} on the first call, expected {want}"] * (len(said) != want)
         problems += ["the warning came again"] * bool(again)
-        problems += ["forward fell back"] * bool(first["fallback"] or second["fallback"])
+        for rec in (first, second):
+            bad, note = fallback_problems(rec["fallback"], case.fallback64, "forward")
+            problems += bad
+            notes += note
         problems += cpu_warnings(first, F64_TEXT) + cpu_warnings(second, F64_TEXT)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         problems.append(f"exception {e!r}"[:300])
-    emit(**row, status="fail" if problems else "ok", problems=problems)
+    emit(**row, status="fail" if problems else "ok", problems=problems, notes=sorted(set(notes)))
     return not problems
 
 
@@ -437,12 +474,13 @@ def singular_triangle(op):
     return T
 
 
-def run_singular_triangle(op, fn):
+def run_singular_triangle(op, fn, expected):
     """``solve_triangular`` and ``cholesky_solve`` of a triangle with a zero diagonal entry: non-finite for that
-    element, finite for the others, as torch's; no fallback, no CPU warning."""
+    element, finite for the others, as torch's; through Habana's fallback (``expected``, not installed), no other
+    fallback, no CPU warning."""
     row = {"op": f"singular.{op}", "n": SINGULAR_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY,
            "baseline": BASELINE}
-    problems = []
+    problems, notes = [], []
     try:
         T, B = singular_triangle(op), torch.randn(BATCH, SINGULAR_N, 3)
         with watch() as rec:
@@ -451,10 +489,11 @@ def run_singular_triangle(op, fn):
         row["fwd_fallback"] = rec["fallback"]
         problems += ["the singular element is finite"] * bool(torch.isfinite(got[1]).all())
         problems += ["a regular element is not finite"] * (not bool(torch.isfinite(got[2:]).all()))
-        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+        bad, notes = fallback_problems(rec["fallback"], expected, "forward")
+        problems += bad + cpu_warnings(rec)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         problems.append(f"exception {e!r}"[:300])
-    emit(**row, status="fail" if problems else "ok", problems=problems)
+    emit(**row, status="fail" if problems else "ok", problems=problems, notes=notes)
     return not problems
 
 
@@ -673,9 +712,9 @@ def main():
                     for n in (16, 22) for seed in range(3)]
         for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
             results.append(run_singular(op, fn))
-        for op, fn in (("solve_triangular", lambda T, B: L.solve_triangular(T, B, upper=False)),
-                       ("cholesky_solve", lambda T, B: torch.cholesky_solve(B, T))):
-            results.append(run_singular_triangle(op, fn))
+        for op, fn, expected in (("solve_triangular", lambda T, B: L.solve_triangular(T, B, upper=False), TRI_FB),
+                                 ("cholesky_solve", lambda T, B: torch.cholesky_solve(B, T), CHOL_FB)):
+            results.append(run_singular_triangle(op, fn, expected))
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
         ok = bool(EIGH_FALLBACKS)
         emit(op="metric_check", lazy=LAZY, baseline=True, status="ok" if ok else "error",
