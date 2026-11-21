@@ -121,7 +121,8 @@ def _function(cls):
         outs = out if isinstance(out, tuple) else (out,)
         owned = tuple(own(t) for t in outs)
         swapped = {id(t): o for t, o in zip(outs, owned) if o is not t}
-        made = {k: o for k, o in swapped.items() if not any(k == id(a) for a in inputs)}
+        input_ids = {id(a) for a in inputs}  # a set, not a generator over k: Dynamo 2.7-2.8 fails on the latter
+        made = {k: o for k, o in swapped.items() if k not in input_ids}
         # mark_non_differentiable and save_for_backward match outputs by identity: an output saved for backward must
         # be the returned tensor, or double backward loses its dependence on the inputs; a saved input stays the input
         for attr, mapping in (("non_differentiable", swapped), ("to_save", made)):
