@@ -88,6 +88,10 @@ at the tensor's pickling:
     ("create tensor invalid permutation 4 2": FBCNet, FBMSNet, at times EEGNet and Deep4Net). Off, CBraMod steps
     2% faster and CodeBrain the same.
 
+Strict mode (``_strict``): ``HPU_OPS_STRICT=1`` or ``with hpu_ops.strict():`` raises ``CPUExecutionError`` on every CPU
+execution an HPU step reaches that hpu-ops can see (Habana's CPU fallback per op, hpu-ops' own CPU routes, hpu-complex's
+CPU and host-memory compute, host syncs and copies); ``HPU_OPS_STRICT=report`` counts them and prints a table at exit.
+
 Masked attention needs a Habana setting that is read when its library loads, so it must be exported before Python
 starts. The setting is per bridge version, listed in the README; ``enable()`` warns when it did not take effect.
 """
@@ -98,8 +102,12 @@ import torch
 
 from . import composite, conv, eigh, extrema, im2col, indexing, linalg, quantile, serialization, small, tpc, upsample  # noqa: F401
 from ._dispatch import _STATE, chain
+from ._strict import CPUExecutionError, strict  # noqa: F401
+from ._strict import check as strict_check, format_report as strict_format_report  # noqa: F401
+from ._strict import report as strict_report, reset as strict_reset  # noqa: F401
 
-__all__ = ["enable"]
+__all__ = ["enable", "strict", "CPUExecutionError", "strict_check", "strict_report", "strict_reset",
+           "strict_format_report"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
@@ -132,8 +140,17 @@ def _attention_fused(device_type="hpu"):
                for op in ("scaled_dot_product_attention", "_scaled_dot_product_fused_attention_overrideable"))
 
 
+def _strict_from_env():
+    from . import _strict
+
+    if _strict.from_env() == "report":
+        warnings.warn("hpu_ops: HPU_OPS_STRICT=report counts every CPU execution and prints a table at exit",
+                      stacklevel=3)
+
+
 def enable():
-    """Install the rewrites and turn off the broken passes. Idempotent; a no-op off a Gaudi stack."""
+    """Install the rewrites and turn off the broken passes. Idempotent; a no-op off a Gaudi stack. With
+    ``HPU_OPS_STRICT=1`` (or ``report``) in the environment, strict mode for the whole process (``hpu_ops._strict``)."""
     if _STATE.get("undo"):
         return
     try:
@@ -152,5 +169,6 @@ def enable():
             undo()
 
     _STATE["undo"] = undo_once
+    _strict_from_env()
     if not _attention_fused():  # last: under -W error the fixes are already in
         warnings.warn(ATTENTION_HINT, stacklevel=2)

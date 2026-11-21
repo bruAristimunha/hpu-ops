@@ -63,6 +63,57 @@ Output dtypes from float32 inputs under bfloat16 autocast, on Gaudi2 (bridge 1.2
 
 Compiled production steps (bfloat16 autocast, one card) take 2.2% longer for EEGPT (0.629 to 0.642 s) and 0.9% longer for LaBraM (1.813 to 1.829 s), each the mean of two interleaved runs.
 
+### Strict mode: every CPU execution, raised or counted
+
+To check that a training or inference step runs entirely on the card:
+
+```python
+with hpu_ops.strict():            # raises hpu_ops.CPUExecutionError at the first CPU execution
+    step()
+with hpu_ops.strict("report"):    # counts instead
+    step()
+print(hpu_ops.strict_format_report())
+```
+
+or, for the whole process, `export HPU_OPS_STRICT=1` (raise) or `HPU_OPS_STRICT=report` (a table on stderr at
+exit), read by `enable()`. The error names the op, the shapes, dtypes and devices of its tensors, and the first
+Python frame outside torch, Habana, hpu-ops and hpu-complex, e.g.
+
+```
+hpu_ops strict: aten::_cummin_helper runs on the CPU [bridge fallback] ((8, 4, 4) float32 hpu): under aten::cummin
+  called from train.py:92 in step
+```
+
+What it sees (source column of the report):
+
+| source | what |
+|---|---|
+| `bridge fallback` | Habana's CPU fallback: the bridge's `cpu_fallback` metric, read around every op |
+| `hpu_ops route` | hpu-ops' own CPU routes: declined linalg calls (`_on_cpu`, float64, n past the kernels, `out=` dtype errors), the singular `det` double backward's SVD, declined `im2col`/`col2im`, index tensors built on the host |
+| `hpu_complex` | hpu-complex's CPU fallback, complex128 (and host-backed float64) computed on the CPU in host memory, complex64 `mm`/`bmm` below its CPU threshold |
+| `host sync` | a device value read on the host: `.item()`, `bool(t)`, `int(t)`, and hpu-ops' own reads (`lstsq`'s rank check, `matrix_exp`'s scaling counts, `bincount`'s range, `quantile`'s q check, `det`'s singular check in double backward) |
+| `host copy` | a device tensor copied to the CPU (`.cpu()`, `.to("cpu")`, `.tolist()`) |
+| `cpu op` | an op on CPU tensors of more than one element inside the block (a library building indices on the CPU, say) |
+
+`allow=("host sync", "cpu op")` (or `HPU_OPS_STRICT_ALLOW="host sync,cpu op"`) leaves sources out. `torch.save`'s
+host copy is never counted.
+
+The per-op attribution is a `TorchDispatchMode`, declared an infra mode so that torch.compile still compiles under
+it (under an ordinary mode Dynamo skips the frame, and keeps skipping it after the block). It costs about 40-60 us
+per op (bridge 1.21.4, eager and lazy, `tests/strict_probe.py`), so time steps outside it. What it cannot see:
+
+- ops inside a compiled graph's Habana recipes, and inside C++ kernels (hpu-complex's own copies, Habana's): their
+  fallbacks come from the counters, named by op without a frame, at the next op or when the block ends
+  (`hpu_ops.strict_check()` reads them on demand). hpu-ops' own routes inside a compiled graph are seen once, when
+  the graph is traced (marked so in the error).
+- ops under hpu-complex's `complex_mode()` (it disables the modes below it), and host syncs inside an op's
+  kernel (`nonzero`, `torch.equal`).
+
+`strict(per_op=False)` (`HPU_OPS_STRICT_PER_OP=0`) drops the mode and reads the counters only when the block ends
+(at exit for the environment form). Strict mode is off in forked DataLoader workers and while `torch.save` runs. The
+inventory of the 21 SPD models and the braindecode zoo under strict mode is in `INVENTORY.md`
+(`tests/strict_sweep.py`, `tests/strict_inventory.py`).
+
 ## What it fixes
 
 Only HPU tensors are rewritten; other devices run the original ops. The rewrites sit in PyTorch's dispatcher, in one of two ways:

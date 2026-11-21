@@ -30,7 +30,7 @@ import torch.nn.functional as F
 import torch.utils._pytree as pytree
 from torch._C import DispatchKey
 
-from . import tpc
+from . import _strict, tpc
 from ._dispatch import count, register_kernels, register_paired, static
 
 aten = torch.ops.aten
@@ -240,8 +240,9 @@ def _on_cpu(op, args, kwargs):
     error)."""
     device = _device(args, kwargs)
     to_cpu = lambda x: x.cpu() if isinstance(x, torch.Tensor) else x  # noqa: E731
-    out = op(*pytree.tree_map(to_cpu, args), **pytree.tree_map(to_cpu, kwargs))
-    return pytree.tree_map(lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, out)
+    with _strict.route(op, leaves=(args, kwargs), detail="hpu_ops' own CPU route (_on_cpu)"):
+        out = op(*pytree.tree_map(to_cpu, args), **pytree.tree_map(to_cpu, kwargs))
+        return pytree.tree_map(lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, out)
 
 
 def _out_on_cpu(op, args, kwargs, outs):
@@ -249,6 +250,11 @@ def _out_on_cpu(op, args, kwargs, outs):
     ``outs`` (a dict of the out= arguments), so torch's own checks run (dtype, resize warning, layout); each result is
     then written into its destination with the layout torch gave it. Returns the destinations (one, or a tuple)."""
     _device(args, {**kwargs, **outs})
+    with _strict.route(op, leaves=(args, kwargs), detail="hpu_ops' own CPU route (_out_on_cpu)"):
+        return _out_on_cpu_body(op, args, kwargs, outs)
+
+
+def _out_on_cpu_body(op, args, kwargs, outs):
     to_cpu = lambda x: x.cpu() if isinstance(x, torch.Tensor) else x  # noqa: E731
     cpu_outs = {k: torch.empty_strided(v.shape, v.stride(), dtype=v.dtype) for k, v in outs.items()}
     op(*pytree.tree_map(to_cpu, args), **pytree.tree_map(to_cpu, kwargs), **cpu_outs)
@@ -832,7 +838,9 @@ def _det_backward(A, det, grad, inverse):
             safe = torch.where(mask, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device), A)
             cofactor = (grad * det)[..., None, None] * inverse(safe).mH
             return torch.where(mask, _det_grad_singular(A, grad), cofactor)
-        if bool(singular.any()):
+        with _strict.host_read("linalg_det double backward: singular check", singular):
+            any_singular = bool(singular.any())
+        if any_singular:
             return torch.where(singular[..., None, None], _det_grad_singular(A, grad), cofactor)
     return cofactor
 
@@ -843,7 +851,8 @@ def _det_grad_singular(A, grad):
     SVD kernel, so on HPU the SVD runs on a CPU copy (differentiable ``.cpu()``/``.to()``): a host round trip, only
     for a singular matrix differentiated with ``create_graph``."""
     if A.device.type == "hpu":
-        U, S, Vh = (t.to(A.device) for t in torch.linalg.svd(A.cpu()))
+        with _strict.route("linalg_det double backward: SVD of a singular matrix", A):
+            U, S, Vh = (t.to(A.device) for t in torch.linalg.svd(A.cpu()))
     else:
         U, S, Vh = torch.linalg.svd(A)
     alpha = torch.linalg.det(U) * torch.linalg.det(Vh)
@@ -1330,7 +1339,10 @@ def _lstsq_eval(A, B, rcond, driver):
     rank_out = A.new_empty(0, dtype=torch.int64) if driver == "gels" else A.new_full(
         A.shape[:-2], k, dtype=torch.int64)
     sv_out = S if driver in ("gelsd", "gelss") else A.new_empty(0)
-    if bad is not None and bool(bad):
+    if bad is not None:
+        with _strict.host_read("linalg_lstsq: rank check", bad):
+            bad = bool(bad)
+    if bad:
         return None
     return sol, U, S, Vh, residuals, rank_out, sv_out, rtol_val, vector
 
@@ -1548,7 +1560,8 @@ def _expm_counts(A):
     """The kernels' scaling count of each matrix of ``A`` (from its 1-norm, ``_expm_scaling``), on the host (one sync)
     and, unless all are equal, as a tensor ``[..., 1, 1]`` with the matching scales ``2^-s``: each matrix is scaled
     and squared by its own count, so one matrix's norm never changes another's result (codex review #9)."""
-    counts = [_expm_scaling(x) for x in A.detach().abs().sum(-2).amax(-1).reshape(-1).tolist()]
+    with _strict.host_read("linalg_matrix_exp: scaling counts", A):
+        counts = [_expm_scaling(x) for x in A.detach().abs().sum(-2).amax(-1).reshape(-1).tolist()]
     if len(set(counts)) <= 1:
         return (counts[0] if counts else 0), None, None
     shape = (*A.shape[:-2], 1, 1)

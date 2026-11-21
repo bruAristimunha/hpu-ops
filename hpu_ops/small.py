@@ -27,6 +27,7 @@ Registered at ``AutogradHPU``; calls it does not take (weights, other dtypes and
 import torch
 from torch._C import DispatchKey
 
+from . import _strict
 from ._dispatch import count, register_kernels, static
 from .linalg import _is_fake, _transformed
 
@@ -46,7 +47,7 @@ def _concrete(x):
     (``is_compiling()`` is false inside AOT dispatch)."""
     if _transformed() or torch._C._functorch.get_dynamic_layer_stack_depth() > 0 or _is_fake(x):
         return False
-    if torch._C._len_torch_dispatch_stack() > 0 or torch._guards.detect_fake_mode() is not None:
+    if _strict.foreign_modes() or torch._guards.detect_fake_mode() is not None:  # strict mode's watch is not one
         return False
     return not torch._is_functional_tensor(x) and not torch._C._functorch.is_functorch_wrapped_tensor(x)
 
@@ -76,7 +77,8 @@ def install_bincount(device_type):
 
     def kernel(x, weights=None, minlength=0):
         if _takes(x, weights, minlength):
-            lo, hi = (int(v) for v in torch.stack(torch.aminmax(x)).tolist())
+            with _strict.host_read("bincount: value range", x):
+                lo, hi = (int(v) for v in torch.stack(torch.aminmax(x)).tolist())
             if lo < 0:  # ATen's error; Habana's kernel counts negative values instead
                 raise RuntimeError("bincount only supports 1-d non-negative integral inputs.")
             bins = max(hi + 1, minlength)
