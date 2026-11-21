@@ -24,7 +24,8 @@ an ``inference_mode()`` graph (autograd keys are excluded there and the tracer s
 rejects (empty input, a ``q`` outside ``[0, 1]``, non-float dtypes, a ``q`` of another dtype or with more than one
 dim, an ``out`` of another dtype) are not taken: ATen's composite runs and raises its own error. A slice longer than
 2**24 raises ATen's error here. In a traced graph the values of a tensor ``q`` cannot be read on the host, so the
-graph checks the range at run time (``aten._assert_async``), with ATen's message.
+graph checks the range at run time: with ATen's message (``aten._assert_async``) where the device runs that op, and
+on Gaudi, which has no kernel for it, by returning NaN for an out-of-range ``q``.
 """
 import functools
 
@@ -75,11 +76,11 @@ def _sorted_positions(x):
     by_kind = torch.sort(torch.where(posinf, j - n, torch.where(nan, j, inf)), dim=-1).indices.to(code)
     n_valid = (~nan).sum(-1, keepdim=True)
     n_finite = n_valid - posinf.sum(-1, keepdim=True)
+    pos = torch.arange(n, device=key.device).expand(key.shape)
+    order = torch.where(pos < n_finite, by_value, by_kind.gather(-1, (pos - n_finite).clamp(min=0)))
 
-    def at(pos):
-        first = by_value.gather(-1, pos)
-        rest = by_kind.gather(-1, (pos - n_finite).clamp(min=0))
-        return torch.where(pos < n_finite, first, rest).long()
+    def at(p):  # float data, int64 index: Gaudi's gather does not compile on int64 data
+        return order.gather(-1, p).long()
 
     return at, n_valid
 
@@ -138,10 +139,21 @@ def _length(self, dim):
 def _compute(name, ignore_nan, self, q, dim, keepdim, interpolation):
     if _length(self, dim) > MAX_LENGTH:
         raise RuntimeError("quantile() input tensor is too large")
-    if isinstance(q, torch.Tensor) and q.numel() and not _concrete(q):
+    check = isinstance(q, torch.Tensor) and q.numel() and not _concrete(q)
+    if check and _asserts_on(self.device.type):
         torch._assert_async(((q >= 0) & (q <= 1)).all(), RANGE_ERROR)
     count(name)
-    return quantile_of(self, q, dim, keepdim, interpolation, ignore_nan)
+    values = quantile_of(self, q, dim, keepdim, interpolation, ignore_nan)
+    if check and not _asserts_on(self.device.type):  # no device assert: an out-of-range q gives NaN, not a number
+        bad = ~((q >= 0) & (q <= 1)).all()
+        values = torch.where(bad, torch.full_like(values, float("nan")), values)
+    return values
+
+
+def _asserts_on(device_type):
+    """Whether ``aten._assert_async`` runs on the device. Gaudi has no kernel for it (bridge 1.21.4: one CPU fallback
+    per compiled call, 1.0 ms against 0.12 without the check), so there a traced out-of-range ``q`` gives NaN."""
+    return torch._C._dispatch_has_kernel_for_dispatch_key("aten::_assert_async.msg", device_type.upper())
 
 
 def _kernel(op, name, ignore_nan, fallback):

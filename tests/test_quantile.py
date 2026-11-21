@@ -266,3 +266,16 @@ def test_vector_q_result_has_atens_layout():
         got = torch.quantile(x, q, dim=1)
     assert got.stride() == want.stride()
     torch.testing.assert_close(got.movedim(0, -1).view(-1), want.movedim(0, -1).view(-1), rtol=0, atol=0)
+
+
+def test_traced_q_outside_the_range_is_nan_where_the_device_has_no_assert(monkeypatch):
+    """Gaudi has no _assert_async kernel (one CPU fallback per call): there an out-of-range traced q gives NaN."""
+    monkeypatch.setattr(quantile, "_asserts_on", lambda device_type: False)
+    f = lambda x, q: torch.quantile(x, q, interpolation="nearest")  # noqa: E731
+    x = torch.tensor([2.0, 6.0])
+    nodes = []
+    with cpu_as_hpu(quantile.install):
+        c = compiled(f, nodes, fullgraph=True)
+        assert c(x, torch.tensor(0.25)).item() == 2.0
+        assert torch.isnan(c(x, torch.tensor(1.1))).all()
+    assert "aten._assert_async.msg" not in ops(nodes)

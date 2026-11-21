@@ -123,9 +123,9 @@ def run_case():
                               fullgraph=True)
             x = torch.tensor([2.0, 6.0], device=HPU)
             ok_val = f(x, torch.tensor(0.25, device=HPU)).cpu().item()
-            try:
+            try:  # Gaudi has no _assert_async kernel: hpu_ops gives NaN there (raising needs a CPU fallback per call)
                 bad = f(x, torch.tensor(1.1, device=HPU)).cpu().item()
-                info.update(ok=False, in_range=ok_val, out_of_range=bad)
+                info.update(ok=ok_val == 2.0 and bad != bad, in_range=ok_val, out_of_range=bad)
             except RuntimeError as e:
                 info.update(ok=ok_val == 2.0 and "range" in str(e), in_range=ok_val, raised=str(e)[:120])
         elif case == "compiled_perf":  # the cost of the run-time q range check (_assert_async falls back to the CPU)
