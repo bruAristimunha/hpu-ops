@@ -316,3 +316,74 @@ def test_review_nonfinite_info_as_torch(block, info, replica):
     assert int(S[0, 1]) == info == int(torch.linalg.inv_ex(A).info)
     assert int(kr.gj_large(A.numpy())[4][1]) != info  # main's route, the kernel on A
 
+
+
+# ---- (B) extreme-range findings: the kernels' arithmetic on their replicas
+
+# ---- Codex review #8 / #10: matrix_exp_f32_gaudi2.c's reciprocal and finiteness test, on its replica
+
+
+def test_review_expm_constant_component():
+    """#8: exp(diag(-1e8, 0))[1, 1] is 1: the reciprocal of 1 is now exactly 1 (was 0.99999994, squared 25 times)."""
+    A = np.diag([-1e8, 0.0]).astype(np.float32)
+    assert kr.rcp_newton(np.float32(1))[0] == 1 and kr.rcp_newton(np.float32(1), legacy=True)[0] < 1
+    assert kr.matrix_exp(A)[1, 1] == 1 and kr.matrix_exp(A)[0, 0] == 0
+    assert abs(kr.matrix_exp(A, legacy_rcp=True)[1, 1] - 0.13530262) < 1e-6  # the review's value, reproduced
+    x = np.float32(2.0) ** np.arange(-60, 60, 7, dtype=np.float32)
+    assert np.array_equal(kr.rcp_newton(x), (1 / x.astype(np.float64)).astype(np.float32))  # powers of two exact
+
+
+def test_review_expm_finite_norm_at_float_max():
+    """#10: the 1x1 matrix [[-FLT_MAX]]: a finite norm, 126 halvings, exp = 0 as torch (0 halvings and NaN before)."""
+    big = np.float32(-np.finfo(np.float32).max)
+    assert kr.expm_scaling(np.array([[big]])) == 126 and not (np.abs(big) <= np.float32(3.4e38))
+    assert kr.matrix_exp(np.array([[big]]))[0, 0] == 0
+    assert torch.linalg.matrix_exp(torch.tensor([[big]]))[0, 0] == 0
+
+
+# ---- Codex review #16: a zero Householder coefficient next to an overflowing dot product
+
+
+def zero_tau_input(m=4):
+    A = torch.zeros(m, 2)
+    A[2:4, 0] = 3e38
+    A[2:4, 1] = 1
+    return A, torch.tensor([0.0, 2 / 3])
+
+
+def test_review_householder_zero_tau_replica():
+    """#16 on the kernel's replica: Q's second column is torch's [0, 1/3, -2/3, -2/3] (four NaNs before)."""
+    A, tau = zero_tau_input()
+    want = torch.linalg.householder_product(A.double(), tau.double())
+    Q = torch.from_numpy(kr.householder_product(A.numpy(), tau.numpy()))
+    torch.testing.assert_close(Q.double(), want, rtol=1e-6, atol=1e-6)
+    assert torch.from_numpy(kr.householder_product(A.numpy(), tau.numpy(), legacy=True))[:, 1].isnan().all()
+    g = torch.Generator().manual_seed(3)  # ordinary inputs: the replica agrees with torch
+    B, t = torch.randn(22, 8, generator=g), torch.rand(8, generator=g) + 0.5
+    torch.testing.assert_close(torch.from_numpy(kr.householder_product(B.numpy(), t.numpy())).double(),
+                               torch.linalg.householder_product(B.double(), t.double()), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("m", [4, 65])
+def test_review_householder_zero_tau_route(m, monkeypatch):
+    """#16 through the route: m <= 64 on the replica (``_HOUSEHOLDER``), m = 65 through the compact-WY composite."""
+    A, tau = zero_tau_input(m)
+    rep = lambda a, t: torch.stack([torch.from_numpy(kr.householder_product(x.numpy(), y.numpy()))  # noqa: E731
+                                    for x, y in zip(a.reshape(-1, *a.shape[-2:]), t.reshape(-1, t.shape[-1]))])
+    monkeypatch.setattr(linalg, "_HOUSEHOLDER", lambda a, t: rep(a, t).reshape(a.shape))
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        Q = torch.linalg.householder_product(A, tau)
+        assert sum(calls.values()) == 1
+    want = torch.linalg.householder_product(A.double(), tau.double())
+    torch.testing.assert_close(Q.double(), want, rtol=1e-6, atol=1e-6)
+
+
+def test_review_lu_factor_flushed_multiplier():
+    """Codex #5: ``[[2^100, 2^100], [2^-30, 2^-30]]`` is singular: U[1, 1] = 0 and info 2 as torch (the multiplier
+    2^-130 flushes, so L keeps 0, but its scaled copy still cancels the row). Before: U[1, 1] = 2^-30, info 0."""
+    A = torch.tensor([[2.0 ** 100, 2.0 ** 100], [2.0 ** -30, 2.0 ** -30]])
+    LU, piv, _, info = kr.lu_factor(A.numpy())
+    LU_t, piv_t, info_t = torch.linalg.lu_factor_ex(A)
+    assert LU[1, 1] == LU_t[1, 1] == 0 and info == int(info_t) == 2 and (piv == piv_t.numpy()).all()
+    LU0, _, _, info0 = kr.lu_factor(A.numpy(), legacy_tiny=True)
+    assert LU0[1, 1] == 2.0 ** -30 and info0 == 0

@@ -291,13 +291,16 @@ def matmul(P, Q):
     return R
 
 
-def rcp_newton(x):
-    """``rcp_newton`` of matrix_exp_f32_gaudi2.c: a bit-level guess and four Newton steps; 0 -> 0."""
+def rcp_newton(x, legacy=False):
+    """``rcp_newton`` of matrix_exp_f32_gaudi2.c: a bit-level guess, four Newton steps and one in FMA error form (not
+    with ``legacy``, the kernel before Codex review #8); 0 -> 0."""
     x = np.atleast_1d(_ftz(np.asarray(x, F32)))
     ax = np.abs(x)
     y = _f32((0x7EF311C3 - _u32(ax)) & 0xFFFFFFFF)
     for _ in range(4):
         y = mul(y, sub(F32(2), mul(ax, y)))
+    if not legacy:  # one step in FMA error form (Codex review #8)
+        y = mac(y, mac(sub(F32(0), ax), y, F32(1)), y)
     y = np.where(x < 0, sub(F32(0), y), y)
     return np.where(x == 0, F32(0), y).astype(F32)
 
@@ -311,7 +314,7 @@ def expm_scaling(A, legacy=False, transpose=False):
     for i in range(a.shape[0]):
         col = add(col, np.abs(a[i]))
     norm = F32(np.max(col))
-    if not norm <= F32(3.4e38):
+    if not np.isfinite(norm):  # the kernel's bit test (Codex review #10: the literal 3.4e38 was below FLT_MAX)
         return 0
     s = 0
     while norm > THETA_13 and s < (EXPM_S_LEGACY if legacy else EXPM_S_MAX):
@@ -320,7 +323,7 @@ def expm_scaling(A, legacy=False, transpose=False):
     return s
 
 
-def _gj_expm(M, B):
+def _gj_expm(M, B, legacy_rcp=False):
     """``gj_solve_inplace`` of matrix_exp_f32_gaudi2.c: first largest pivot, ``rcp_newton``, pivot row normalized."""
     M, B = M.copy(), B.copy()
     n = M.shape[0]
@@ -328,7 +331,7 @@ def _gj_expm(M, B):
         cand = np.abs(M[k:, k])
         p = k + int(np.flatnonzero(cand == cand.max())[0]) if np.isfinite(cand).all() else k
         M[[k, p]], B[[k, p]] = M[[p, k]], B[[p, k]]
-        inv = rcp_newton(M[k, k])[0]
+        inv = rcp_newton(M[k, k], legacy_rcp)[0]
         M[k], B[k] = mul(M[k], inv), mul(B[k], inv)
         for i in range(n):
             if i != k:
@@ -337,9 +340,10 @@ def _gj_expm(M, B):
     return B
 
 
-def matrix_exp(A, legacy=False):
+def matrix_exp(A, legacy=False, legacy_rcp=False):
     """``exp(A)`` of matrix_exp_f32_gaudi2.c for one matrix ``A[n, n]``: scaling by 2^-s, Padé-13 in the kernel's
-    order, the Gauss-Jordan solve, s squarings. ``legacy``: the scaling capped at 16, as before review round 3."""
+    order, the Gauss-Jordan solve, s squarings. ``legacy``: the scaling capped at 16, as before review round 3;
+    ``legacy_rcp``: the reciprocal before Codex review #8 (four plain Newton steps)."""
     a = _ftz(np.array(A, dtype=F32))
     n = a.shape[0]
     s = expm_scaling(a, legacy)
@@ -357,7 +361,7 @@ def matrix_exp(A, legacy=False):
     v = mac(c[12], x6, mac(c[10], x4, mul(c[8], x2)))
     vi = add(matmul(x6, v), mac(c[6], x6, mac(c[4], x4, mac(c[2], x2, eye))))
     with np.errstate(over="ignore", invalid="ignore"):
-        r = _gj_expm(sub(vi, u), add(vi, u))
+        r = _gj_expm(sub(vi, u), add(vi, u), legacy_rcp)
         for _ in range(s):
             r = matmul(r, r)
     return r
@@ -373,10 +377,11 @@ def _last_max(cand):
     return int(hits[-1]) if hits.size else 0
 
 
-def lu_factor(A, argmax="first", legacy_recip=False):
+def lu_factor(A, argmax="first", legacy_recip=False, legacy_tiny=False):
     """``(LU, pivots, perm, info)`` of lu_factor_f32_gaudi2.c for one matrix ``A[n, n]``: pivots 1-based, perm the
     row permutation. ``argmax="last"`` breaks pivot ties by the last row (a tie order other than LAPACK's);
-    ``legacy_recip``: 1/pivot without the 2^-64 scaling, flushed to zero past |pivot| = 2^126 (before round 3)."""
+    ``legacy_recip``: 1/pivot without the 2^-64 scaling, flushed to zero past |pivot| = 2^126 (before round 3);
+    ``legacy_tiny``: a multiplier below 2^-126 flushed with its product (before Codex review #5)."""
     a = _ftz(np.array(A, dtype=F32))
     n = a.shape[0]
     piv, perm, info = np.zeros(n, np.int32), np.arange(n), 0
@@ -391,9 +396,14 @@ def lu_factor(A, argmax="first", legacy_recip=False):
             info = k + 1
         sc = F32(1) if (legacy_recip or abs(pk) < F32(2.0 ** 64)) else F32(2.0 ** -64)
         inv = F32(0) if pk == 0 else hw_recip(mul(pk, sc))
+        up = F32(2.0 ** 64) if sc == 1 else F32(1)
+        with np.errstate(invalid="ignore", over="ignore"):
+            aps = np.where(np.abs(a[k]) < np.inf, mul(a[k], F32(2.0 ** -64)), F32(0)).astype(F32)
         for i in range(k + 1, n):
             l_ik = mul(mul(a[i, k], sc), inv)
-            upd = mac(a[k], sub(F32(0), l_ik), a[i])
+            with np.errstate(invalid="ignore", over="ignore"):
+                ls = F32(0) if (legacy_tiny or legacy_recip or l_ik != 0) else mul(mul(a[i, k], up), inv)
+            upd = mac(aps, sub(F32(0), ls), mac(a[k], sub(F32(0), l_ik), a[i]))
             upd[:k + 1] = a[i, :k + 1]
             upd[k] = l_ik
             a[i] = upd
@@ -560,3 +570,40 @@ def jacobi_svd(A, compute_uv=True, full_matrices=False, contiguous=True, legacy_
     full_order = np.concatenate([order, np.arange(k, big)]) if full else order
     u_ord, v_ord = ((order, full_order) if swap else (full_order, order)) if full else (order, order)
     return U[:, u_ord], S[order], Vh[v_ord, :]
+
+
+# ---- householder_product_f32_gaudi2.c ------------------------------------------------------------------------------
+
+
+def _reduce_add_64(x):
+    """``reduce_add_64``: butterfly over the 64 lanes (dual groups 16, 32, then lane distance 8, 4, 2, 1)."""
+    lanes = np.arange(64)
+    for d in (16, 32, 8, 4, 2, 1):
+        x = add(x, x[lanes ^ d])
+    return x
+
+
+def householder_product(A, tau, legacy=False):
+    """``Q`` of householder_product_f32_gaudi2.c for one ``A[m, n]`` (m <= 64) and ``tau[k]``: the reflectors applied
+    from the last, each column a dot product (``_reduce_add_64``) and one FMA. ``legacy``: before Codex review #16 (a
+    zero tau multiplied its reflector's dot product, NaN where that overflowed)."""
+    a = np.array(A, dtype=F32)
+    t = np.array(tau, dtype=F32)
+    m, n = a.shape
+    k = t.shape[0]
+    lanes = np.arange(64)
+    q = [np.where(lanes < m, np.pad(a[:, j], (0, 64 - m)), F32(0)).astype(F32) for j in range(k)]
+    q += [np.where(lanes == j, F32(1), F32(0)).astype(F32) for j in range(k, n)]
+    for i in range(k - 1, -1, -1):
+        tau_i = t[i]
+        vi = np.where(lanes < i, F32(0), q[i])
+        vi = np.where(lanes == i, F32(1), vi).astype(F32)
+        with np.errstate(invalid="ignore", over="ignore"):
+            ntv = mul(sub(F32(0), tau_i), vi)
+            for j in range(i + 1, n):
+                d = _reduce_add_64(mul(vi, q[j]))
+                upd = mac(ntv, d, q[j])
+                q[j] = upd if legacy or tau_i != 0 else q[j]
+            e = np.where(lanes == i, F32(1), F32(0)).astype(F32)
+            q[i] = add(e, ntv) if legacy or tau_i != 0 else e
+    return np.stack([x[:m] for x in q], 1)

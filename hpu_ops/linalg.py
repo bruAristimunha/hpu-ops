@@ -1663,7 +1663,10 @@ def _compact_wy_factors(A, tau):
     m, k = A.shape[-2], tau.shape[-1]
     Y = torch.tril(A[..., :k], -1) + torch.eye(m, k, dtype=A.dtype, device=A.device)
     S = torch.triu(Y.mH @ Y, 1)
-    U = torch.eye(k, dtype=A.dtype, device=A.device) + tau.unsqueeze(-1) * S
+    # a zero tau is the identity reflector: its row of tau S is 0 even where S overflowed (0 * Inf was NaN; codex #16).
+    # Only there: elsewhere tau S keeps its derivative in tau (double backward at tau = 0)
+    tS = tau.unsqueeze(-1) * S
+    U = torch.eye(k, dtype=A.dtype, device=A.device) + torch.where((tau.unsqueeze(-1) == 0) & S.isinf(), 0.0, tS)
     return Y, S, U
 
 
