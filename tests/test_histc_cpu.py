@@ -367,3 +367,57 @@ def test_review16_edge_cache_stays_bounded():
             torch.histc(torch.rand(10), 2, 0.0, 1.0 + k)
         assert len(small._EDGE_CACHE) == small.EDGE_CACHE_SIZE
     assert not small._EDGE_CACHE
+
+
+# ---- scoped re-review (PR #40, round 2) ---------------------------------------------------------------------------
+
+def test_rereview1_float16_product_overflow_takes_the_float64_position():
+    """float16, [0, 1000], 100 bins: ATen's (x - L) * bins passes 65504 from x = 655.5 on, its position is infinite
+    and its write undefined (one thread: the value is dropped). The route bins such values by the float64 position;
+    values whose ATen position is finite keep ATen's bins."""
+    with cpu_as_hpu(small.install_histc):
+        out = torch.histc(torch.tensor([700.0], dtype=torch.float16), 100, 0.0, 1000.0)
+    assert out.nonzero().reshape(-1).tolist() == [70] and float(out.sum()) == 1
+    defined = (torch.rand(2000, generator=torch.Generator().manual_seed(3)) * 655).to(torch.float16)
+    _check(defined, 100, 0.0, 1000.0)
+    edges = small.histc_edges(0.0, 1000.0, 100, torch.float16)[0][1:-1].float()
+    assert bool((edges[1:] >= edges[:-1]).all()) and edges[-1] < 1000  # monotone, no pile-up of edges at 655.5
+
+
+@pytest.mark.parametrize("dtype,lo,hi", [(torch.float16, -40000.0, 40000.0), (torch.float32, -3e38, 3e38),
+                                         (torch.bfloat16, -3e38, 3e38)])
+def test_rereview2_width_past_the_dtype_range_counts_nothing(dtype, lo, hi):
+    x = torch.tensor([0.0, 5.0, -100.0, -40000.0, 40000.0], dtype=dtype)
+    _check(x, 4, lo, hi)
+
+
+def test_rereview_compiled_equal_bounds_on_an_empty_input():
+    torch._dynamo.reset()
+    with cpu_as_hpu(small.install_histc):
+        out = torch.compile(lambda t: torch.histc(t + 0, 8, 0.0, 0.0), backend="aot_eager", fullgraph=True)(
+            torch.empty(0))
+    torch._dynamo.reset()
+    same(out, torch.zeros(8), exact=True)
+
+
+def test_rereview_edge_cache_bounded_by_bytes_and_thread_safe(monkeypatch):
+    import threading
+
+    monkeypatch.setattr(small, "EDGE_CACHE_BYTES", 3 * 1001 * 4)
+    small._EDGE_CACHE.clear()
+    errors = []
+
+    def work(seed):
+        try:
+            for k in range(20):
+                torch.histc(torch.rand(50), 1000, 0.0, 1.0 + seed + k / 100)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    with cpu_as_hpu(small.install_histc):
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors and small._cache_bytes() <= small.EDGE_CACHE_BYTES and len(small._EDGE_CACHE) <= 3

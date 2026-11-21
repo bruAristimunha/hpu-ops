@@ -79,7 +79,13 @@ def check_int64_source(src):
         return
     _SCAN.active = True
     try:
-        lo, hi = (int(v) for v in torch.aminmax(src))
+        if src.is_floating_point():  # cast to int64 on the way: truncated toward zero; NaN / inf are not checked
+            values = src[torch.isfinite(src)]
+            if values.numel() == 0:
+                return
+            lo, hi = (int(v) for v in torch.aminmax(values.double().trunc()))
+        else:
+            lo, hi = (int(v) for v in torch.aminmax(src))
     finally:
         _SCAN.active = False
     _report(lo, hi, setting)
@@ -97,8 +103,8 @@ def copy_checks(self, src, device_type):
         return
     if self.dtype == torch.int64 and (
             (isinstance(src, int) and not isinstance(src, bool))
-            or (isinstance(src, torch.Tensor) and src.dtype == torch.int64 and src.device.type == "cpu"
-                and _plain(src))):
+            or (isinstance(src, torch.Tensor) and (src.dtype == torch.int64 or src.is_floating_point())
+                and src.device.type == "cpu" and _plain(src))):
         check_int64_source(src)
     if self.dtype == torch.float64:
         _warn_once("float64", FLOAT64_WARNING)

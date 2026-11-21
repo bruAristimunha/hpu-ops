@@ -62,9 +62,10 @@ def reference(held, bins, lo, hi):
     if held.dtype in (torch.bfloat16, torch.float16) and lo < hi:
         L, R = torch.tensor(lo, dtype=held.dtype), torch.tensor(hi, dtype=held.dtype)
         inside = held[(held >= L) & (held <= R)]
-        pos = ((inside - L) * torch.tensor(bins, dtype=held.dtype) / (R - L)).trunc().long()
-        if bool((pos > bins).any()):
-            return small._cap(torch.bincount(pos.clamp(max=bins - 1), minlength=bins).float(), held.dtype)
+        q = ((inside - L) * torch.tensor(bins, dtype=held.dtype) / (R - L)).trunc()
+        if torch.isfinite(R - L) and bool((~torch.isfinite(q)).any() | (q > bins).any()):  # ATen undefined
+            pos = small._positions(L, R, bins, held.dtype)(inside).long().clamp(max=bins - 1)
+            return small._cap(torch.bincount(pos, minlength=bins).float(), held.dtype)
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
@@ -167,7 +168,10 @@ def review_inputs(mode, compiled):
              ("bf16 4096 x 0.25", torch.full((4096,), 0.25, dtype=torch.bfloat16), (4, 0.0, 1.0)),
              ("fp16 4096 x 0.25", torch.full((4096,), 0.25, dtype=torch.float16), (4, 0.0, 1.0)),
              ("fp16 65504 equal bounds", torch.tensor([65504.0], dtype=torch.float16), (4, 0.0, 0.0)),
-             ("empty, 1e300 bound", torch.empty(0), (4, 0.0, 1e300))]
+             ("empty, 1e300 bound", torch.empty(0), (4, 0.0, 1e300)),
+             ("fp16 700 over [0, 1000]", torch.tensor([700.0, 10.0, 650.0], dtype=torch.float16), (100, 0.0, 1000.0)),
+             ("fp16 width overflow", torch.tensor([0.0, 5.0, -100.0], dtype=torch.float16), (4, -40000.0, 40000.0)),
+             ("fp32 width overflow", torch.tensor([0.0, 5.0, -100.0]), (4, -3e38, 3e38))]
     for name, x, args in cases:
         if compiled and args[1] == args[2]:
             continue  # equal bounds under compile: the card's arithmetic (documented)

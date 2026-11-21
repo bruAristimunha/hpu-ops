@@ -159,3 +159,12 @@ def test_review14_an_empty_float64_copy_does_not_use_up_the_warning():
         torch.empty(0, dtype=torch.float64).copy_(torch.empty(0))
         with pytest.warns(UserWarning, match="twice the offset"):
             _copy(torch.arange(3.0), torch.float64)
+
+
+def test_rereview_float_sources_copied_into_int64_are_scanned(monkeypatch):
+    monkeypatch.setenv("HPU_OPS_INT64_CHECK", "raise")
+    with cpu_as_hpu(wide.install_copy_checks):
+        with pytest.raises(RuntimeError, match="outside the int32 range"):
+            torch.empty(2, dtype=torch.long).copy_(torch.tensor([1.5, 3e9]))
+        out = torch.empty(3, dtype=torch.long).copy_(torch.tensor([1.9, -2.9, float("nan")]))
+    assert out[:2].tolist() == [1, -2]

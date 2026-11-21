@@ -26,6 +26,7 @@ Registered at ``AutogradHPU``; calls it does not take (weights, other dtypes and
 4096, traced graphs) and inference mode go to Habana's kernel.
 """
 import math
+import threading
 
 import torch
 from torch._C import DispatchKey
@@ -124,6 +125,8 @@ _C_NAMES = {torch.float32: "float", torch.float64: "double", torch.float16: "at:
             torch.bfloat16: "at::BFloat16"}
 SIGNIFICAND_BITS = {torch.float32: 24, torch.float64: 53, torch.bfloat16: 8, torch.float16: 11}
 EDGE_CACHE_SIZE = 64
+EDGE_CACHE_BYTES = 64 << 20
+_EDGE_LOCK = threading.Lock()
 _EDGE_CACHE = {}  # (lo, hi, bins, dtype, device) -> (edges on the device, low, high)
 
 
@@ -160,6 +163,36 @@ def _float32(t, toward):
     return torch.where(off, torch.nextafter(near, torch.full_like(near, toward)), near)
 
 
+def _positions(L, R, bins, dtype):
+    """ATen's position of values of ``dtype`` in ``[L, R]``: ``trunc((x - L) * bins / (R - L))``, every step rounded
+    to ``dtype`` (measured to match ATen's CPU kernel bin for bin in float16 and bfloat16). Where a step overflows
+    (float16: ``(x - L) * bins`` past 65504) ATen's position is infinite and its kernel's write undefined; there the
+    position is the float64 one, raised to the last finite position so that positions stay monotone in x."""
+    scale = torch.tensor(bins, dtype=dtype)
+
+    def exact(v):
+        return ((v - L) * scale / (R - L)).trunc().to(torch.float64)
+
+    if torch.isfinite(exact(R.reshape(1))).all():
+        return exact
+    top, finite = int(_ordered(R.reshape(1))[0]), int(_ordered(L.reshape(1))[0])
+    hi_key = top  # bisection: the largest key whose position is finite
+    while finite < hi_key:
+        mid = (finite + hi_key + 1) // 2
+        if bool(torch.isfinite(exact(_unordered(torch.tensor([mid]), dtype)))):
+            finite = mid
+        else:
+            hi_key = mid - 1
+    last = float(exact(_unordered(torch.tensor([finite]), dtype)))
+
+    def extended(v):
+        q = exact(v)
+        wide = ((v.double() - L.double()) * bins / (R.double() - L.double())).floor().clamp(min=last)
+        return torch.where(torch.isfinite(q), q, wide)
+
+    return extended
+
+
 def histc_edges(lo, hi, bins, dtype):
     """Host tensors ``(edges, low, high)`` for ATen's CPU histc over ``[lo, hi]`` (finite, ``lo < hi``) in ``dtype``:
     ``edges[k]`` (k = 1 .. bins - 1) is the smallest value of ``dtype`` whose position is ``k`` or more (``inf`` when
@@ -167,17 +200,19 @@ def histc_edges(lo, hi, bins, dtype):
     float64, everything rounded to the float32 values the card holds. Independent of the default dtype."""
     L, R = _to_dtype(lo, dtype), _to_dtype(hi, dtype)
     width = R - L
+    store = torch.float32 if dtype == torch.float64 else dtype
+    if torch.isinf(width):  # a width past the dtype's range: ATen counts nothing (its edges are not finite)
+        return _framed(torch.full((bins - 1,), math.inf, dtype=store)), math.inf, -math.inf
     if width == 0:  # distinct bounds that round to one value: ATen's position is trunc(0 / 0), measured bin 0
-        edges = torch.full((bins - 1,), math.inf, dtype=torch.float32 if dtype == torch.float64 else dtype)
-        return _framed(edges), float(L), float(R)
-    scale = torch.tensor(bins, dtype=dtype)
+        return _framed(torch.full((bins - 1,), math.inf, dtype=store)), float(L), float(R)
+    position = _positions(L, R, bins, dtype)
     k = torch.arange(1, bins, dtype=torch.float64)
     top = int(_ordered(R.reshape(1))[0])
     below = torch.full((bins - 1,), int(_ordered(L.reshape(1))[0]), dtype=torch.int64)
     above = torch.full((bins - 1,), top + 1, dtype=torch.int64)  # top + 1: no value in [L, R] reaches k
     while bool((below < above).any()):
         mid = (below >> 1) + (above >> 1) + (below & above & 1)  # the floor of the mean, without int64 overflow
-        reached = ((_unordered(mid.clamp(max=top), dtype) - L) * scale / width).trunc().to(torch.float64) >= k
+        reached = position(_unordered(mid.clamp(max=top), dtype)) >= k
         above = torch.where(reached, mid, above)
         below = torch.where(reached, below, mid + 1)
     edges = torch.where(below > top, torch.tensor(math.inf, dtype=dtype), _unordered(below.clamp(max=top), dtype))
@@ -199,17 +234,25 @@ def _host_edges(lo, hi, bins, dtype):
         return histc_edges(lo, hi, bins, dtype)
 
 
+def _cache_bytes():
+    return sum(entry[0].numel() * entry[0].element_size() for entry in _EDGE_CACHE.values())
+
+
 def _edges_on(lo, hi, bins, dtype, device, traced):
     if traced:  # a fresh constant of the graph
         edges, low, high = _host_edges(lo, hi, bins, dtype)
         return torch.tensor(edges.tolist(), dtype=edges.dtype, device=device), low, high
     key = (lo, hi, bins, dtype, str(device))
-    if key not in _EDGE_CACHE:
+    with _EDGE_LOCK:
+        entry = _EDGE_CACHE.get(key)
+    if entry is None:
         edges, low, high = _host_edges(lo, hi, bins, dtype)
-        _EDGE_CACHE[key] = (edges.to(device), low, high)
-        while len(_EDGE_CACHE) > EDGE_CACHE_SIZE:
-            _EDGE_CACHE.pop(next(iter(_EDGE_CACHE)))
-    return _EDGE_CACHE[key]
+        entry = (edges.to(device), low, high)
+        with _EDGE_LOCK:  # the newest entry always stays; the oldest go past 64 entries or EDGE_CACHE_BYTES
+            _EDGE_CACHE[key] = entry
+            while len(_EDGE_CACHE) > 1 and (len(_EDGE_CACHE) > EDGE_CACHE_SIZE or _cache_bytes() > EDGE_CACHE_BYTES):
+                _EDGE_CACHE.pop(next(iter(_EDGE_CACHE)))
+    return entry
 
 
 def _card_values(x, traced):
@@ -270,6 +313,8 @@ def histc_by_edges(x, bins, lo, hi, traced=False, flat=None):
 def histc_traced_range(x, bins):
     """Equal bounds under a tracer: the data's range is read on the card, so the bins come from the card's own
     arithmetic (as Gaudi's kernel bins them: not ATen's at the edges), and NaN / inf give counts where ATen raises."""
+    if x.numel() == 0:  # ATen: no data, bounds widened by 1, nothing counted
+        return torch.zeros(bins, dtype=x.dtype, device=x.device)
     flat = _card_values(x, traced=True)
     lo, hi = flat.amin(), flat.amax()
     same = lo == hi
@@ -336,6 +381,7 @@ def install_histc(device_type):
 
     def undo():
         chain(undos)()
-        _EDGE_CACHE.clear()
+        with _EDGE_LOCK:
+            _EDGE_CACHE.clear()
 
     return undo
