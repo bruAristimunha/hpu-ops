@@ -66,6 +66,10 @@ def test_quantile_gradient_matches_aten(fn, interp):
     with cpu_as_hpu(quantile.install) as calls:
         got = grads()
     assert calls[fn.__name__] == 1
+    # which NaN of the all-NaN row 3 gets its gradient follows torch's unstable CPU sort, which differs by platform
+    # (Linux CI and macOS give different NaNs); the rewrite gives it to the NaNs in input order: compare the row's sum
+    torch.testing.assert_close(got[1][3].sum(), want[1][3].sum(), rtol=0, atol=0)
+    got[1][3], want[1][3] = 0, 0
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol=0, atol=0, equal_nan=True)
 
