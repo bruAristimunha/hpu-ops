@@ -49,7 +49,7 @@ def test_expm_past_the_old_scaling_cap_is_finite():
     and the result was NaN (measured on the card too). With the cap at 126 it is as accurate as CPU float32."""
     a = skew(6, 1e7)
     assert R.expm_scaling(a.numpy()) == 21 and R.expm_scaling(a.numpy(), legacy=True) == 16
-    assert not np.isfinite(R.matrix_exp(a.numpy(), legacy=True)).all()
+    assert not np.isfinite(R.matrix_exp(a.numpy(), legacy=True, legacy_rcp=True)).all()  # the kernel of then
     truth = torch.linalg.matrix_exp(a.double()).numpy()
     bar = rel(torch.linalg.matrix_exp(a).numpy(), truth)
     for got in (R.matrix_exp(a.numpy()), tpc.matrix_exp_reference(a).numpy()):

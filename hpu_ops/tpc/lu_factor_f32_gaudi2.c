@@ -152,10 +152,18 @@ void main(tensor A, tensor LU, tensor PV)
             infov = v_f32_sel_eq_f32_b(pk, 0.0f, v_f32_sel_eq_f32_b(infov, 0.0f, (float)(k + 1), infov), infov);
             float64 sc = v_f32_sel_less_f32_b(v_f32_abs_b(pk), TWO_64, 1.0f, TWO_M64);
             float64 inv = v_f32_sel_eq_f32_b(pk, 0.0f, 0.0f, v_reciprocal_f32(v_f32_mul_b(pk, sc)));
+            // a multiplier below 2^-126 flushes (L keeps 0, as the card holds no subnormal), but its product with the
+            // pivot row can be normal: those rows also take ls = l * 2^64 against the pivot row * 2^-64, so equal
+            // rows still cancel (Codex review #5: [[2^100, 2^100], [2^-30, 2^-30]] kept U[1, 1] = 2^-30, info 0)
+            float64 up = v_f32_sel_eq_f32_b(sc, 1.0f, TWO_64, 1.0f);
+            float64 aps = v_f32_sel_less_u32_b(v_u32_and_b(as_uint64(ap), 0x7FFFFFFFu), 0x7F800000u,
+                                               v_f32_mul_b(ap, TWO_M64), 0.0f);
             for (int i = k + 1; i < n; i++)
             {
-                float64 l = v_f32_mul_b(v_f32_mul_b(lane_bcast(a[i], lane, k), sc), inv);
-                float64 upd = v_f32_mac_b(ap, v_f32_sub_b(0.0f, l), a[i]);
+                float64 aik = lane_bcast(a[i], lane, k);
+                float64 l = v_f32_mul_b(v_f32_mul_b(aik, sc), inv);
+                float64 ls = v_f32_sel_eq_f32_b(l, 0.0f, v_f32_mul_b(v_f32_mul_b(aik, up), inv), 0.0f);
+                float64 upd = v_f32_mac_b(aps, v_f32_sub_b(0.0f, ls), v_f32_mac_b(ap, v_f32_sub_b(0.0f, l), a[i]));
                 float64 row = v_f32_sel_less_u32_b(lane, (unsigned)(k + 1), a[i], upd);  // lanes <= k keep L
                 a[i] = v_f32_sel_eq_u32_b(lane, (unsigned)k, l, row);
             }
