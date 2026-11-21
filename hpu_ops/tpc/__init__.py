@@ -597,6 +597,11 @@ def _large(A, B=None):
         X = _rows(R, P).gather(-1, Q.long()[..., None, :].expand(*Q.shape[:-1], n, n))
     else:
         X = _rows(R @ _rows(B, P), P)
+    # A NaN in A: LAPACK's results are NaN; the kernel's are not always (measured on Gaudi2: a NaN at (0, 0) of a
+    # 70 x 70 matrix left R finite), so a matrix with a NaN gets NaN outputs here
+    nan = A.isnan().any(-1).any(-1)
+    X = X.masked_fill(nan[..., None, None], float("nan"))
+    D = D.masked_fill(nan[..., None], float("nan"))
     return X, D, torch.stack([_parity(P), S[..., 1]], -1)
 
 

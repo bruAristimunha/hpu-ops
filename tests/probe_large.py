@@ -90,8 +90,15 @@ def cases():
     S1 = permuted(3, 220)
     S1[2, :, 17] = 0
     yield "det_singular_column", L.det, (S1,), {}
-    yield "solve_ex_info", lambda a, b: L.solve_ex(a, b).info.float(), (S1, rn(3, 220, 3)), {}
-    yield "inv_ex_info", lambda a: L.inv_ex(a).info.float(), (S1,), {}
+    # info: nonzero exactly where singular (its index follows the kernel's elimination order; torch's CPU solve_ex
+    # reports that of A^T's LU: 220 here, the kernel 18)
+    yield "solve_ex_info", lambda a, b: (L.solve_ex(a, b).info != 0).float(), (S1, rn(3, 220, 3)), {}
+    yield "inv_ex_info", lambda a: (L.inv_ex(a).info != 0).float(), (S1,), {}
+    nan0 = permuted(2, 70)
+    nan0[1, 0, 0] = float("nan")
+    yield "solve_nan_at_00", L.solve, (nan0, rn(2, 70, 3)), {}
+    yield "inv_nan_at_00", L.inv, (nan0,), {}
+    yield "det_nan_at_00", L.det, (nan0,), {}
     yield "solve_grad_n128", L.solve, (permuted(4, 128), rn(4, 128, 3)), {"grad": True}
     yield "inv_grad_n128", L.inv, (permuted(4, 128),), {"grad": True}
     yield "det_grad_n96", L.det, (permuted(4, 96),), {"grad": True}

@@ -1698,3 +1698,13 @@ def test_large_solve_backward_reuses_the_inverse(case, monkeypatch, gj_hook):
         X.sum().backward()
         assert len(gj_hook) == before, "the backward of a large solve called the kernel"
         assert torch.autograd.gradgradcheck(f, inputs, atol=1e-5, rtol=1e-4)
+
+
+def test_large_nan_in_A_gives_nan(large_reference):
+    A = permuted(3, 70)
+    A[1, 0, 0] = float("nan")
+    X, D, _ = tpc.gj_inv(A)
+    assert X[1].isnan().all() and D[1].isnan().all()
+    assert torch.isfinite(X[[0, 2]]).all() and torch.isfinite(D[[0, 2]]).all()
+    Y, _, _ = tpc.gj_solve(A, torch.randn(3, 70, 2))
+    assert Y[1].isnan().all() and torch.isfinite(Y[[0, 2]]).all()
