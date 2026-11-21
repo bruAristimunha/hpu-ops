@@ -17,5 +17,8 @@ cmake -S "$here" -B "$build" \
     -DTPC_COMPILER_PATH="${TPC_COMPILER_PATH:-/usr/bin/tpc-clang}" \
     -DTPC_INCLUDE_DIR="${TPC_INCLUDE_DIR:-/usr/lib/habanatools/include}"
 cmake --build "$build" -j"$(nproc)"
-cp "$build/liblinalg_tpc.so" "$here/liblinalg_tpc.so"
+# a new file renamed over the old one, never written in place: a running job has the old library mapped, and
+# overwriting its pages (cp) crashed it with SIGBUS or SIGSEGV; the rename leaves the old inode to it (code review)
+cp "$build/liblinalg_tpc.so" "$here/.liblinalg_tpc.so.new.$$"
+mv -f "$here/.liblinalg_tpc.so.new.$$" "$here/liblinalg_tpc.so"
 sha256sum "$here/liblinalg_tpc.so"

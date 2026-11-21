@@ -1,7 +1,11 @@
 /* Batched matrix exponential exp(A) and Frechet derivative L_exp(A^T, G) on Gaudi2 TPC for n <= 32.
  *
- * Uses Higham Padé-13 scaling-and-squaring with normalized coefficients c_k = b_k / b_0 <= 1.0,
- * THETA_13 = 5.371920351148152, and Gauss-Jordan with partial pivoting.
+ * Uses Higham Padé-13 scaling-and-squaring with normalized coefficients c_k = b_k / b_0 <= 1.0, the scaled
+ * 1-norm at most THETA = 2 (not Higham's double-precision theta_13 = 5.37), and Gauss-Jordan with partial pivoting.
+ * At 5.37 the denominator q = V - U cancels for a dominant positive eigenvalue (V / (V - U) = 75 at x = 5), and
+ * float32 lost 66-75x against torch's float32 (diag(5, .5, -1): 5.4e-6 against 8.2e-8; gradients 20-170x, code
+ * review #8). At 2 the cancellation is about 3x; the truncation error of Padé-13 stays far below float32's unit
+ * roundoff, and the cost is up to 2 more squarings (none for ||A||_1 <= 2).
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, n, n] row-major):
  *   A [n, n, batch]  f32
@@ -11,23 +15,27 @@
  * 100% LUT-free (no v_f32_reduce_*, v_reciprocal_f32, sqrt, rsqrt) -> 80 KB VLM.
  * Forward uses 6 x 8 KB = 48 KB; -DFRECHET uses 8 x 8 KB = 64 KB.
  *
- * Scaling: s = the number of halvings of ||A||_1 (of A^T under -DFRECHET) until it is <= THETA_13, at most S_MAX
- * (0 when the norm is not finite; the result is then non-finite, from the inputs). S_MAX = 126 covers float32:
- * ||A||_1 <= 3.4e38 = THETA_13 * 2^125.9, and 2^-126 is still a normal float. s lives in a vector (all lanes equal);
- * the squarings are masked by it. S_FIXED masked squarings always run (cheap; ||A||_1 <= 3.5e5 needs no more). For
+ * Scaling: s = the number of halvings of ||A||_1 (of A^T under -DFRECHET) until it is <= THETA, at most S_MAX
+ * (0 when the norm is not finite; the result is then non-finite, from the inputs). S_MAX = 126, as 2^-126 is the
+ * smallest normal float: up to ||A||_1 = THETA * 2^126 = 1.7e38 the scaled norm is <= THETA, past it (to FLT_MAX)
+ * <= 4. s lives in a vector (all lanes equal);
+ * the squarings are masked by it. S_FIXED masked squarings always run (cheap; ||A||_1 <= 1.3e5 needs no more). For
  * s > S_FIXED the scalar loop needs s as a scalar: it is stored to Y (overwritten at the end) and read back by one
- * scalar load after the Pade solve. A read that is not a number in (S_FIXED, S_MAX] is ignored, so the kernel
+ * scalar load after the Pade solve, behind an ASO barrier: Habana's TPC coherency table does not keep a vector
+ * st_tnsr and a later scalar ld_g of the same address coherent in hardware (code review #11). A read that is not a number in (S_FIXED, S_MAX] is ignored, so the kernel
  * can never run fewer than S_FIXED squarings, nor more than S_MAX.
  */
 #define MAXN 32
-#define THETA_13 5.371920351148152f
+#define THETA 2.0f
 #define S_MAX 126
 #define S_FIXED 16
 
-// The squaring count for the scalar loop: s read back from Y (see above), else S_FIXED.
+// The squaring count for the scalar loop: s read back from Y (see above), else S_FIXED. The ASO orders the read
+// after the vector store of s (st_tnsr -> scalar ld_g is not coherent in hardware), as gj_large_f32_gaudi2.c does.
 static int squaring_trips(tensor Y_out, int bt)
 {
     int5 c0 = {0, 0, bt, 0, 0};
+    aso(SW_VPU);
     float sv = s_f32_ld_g((__global__ float*)gen_addr(c0, Y_out));
     return (sv > (float)S_FIXED && sv <= (float)S_MAX) ? (int)sv : S_FIXED;
 }
@@ -310,7 +318,7 @@ void main(tensor A_in, tensor Y_out)
         float64 s_vec = 0.0f;
         for (int k = 0; k < S_MAX; k++)
         {
-            float64 need = v_f32_sel_grt_f32_b(cur_norm, THETA_13, 1.0f, 0.0f);
+            float64 need = v_f32_sel_grt_f32_b(cur_norm, THETA, 1.0f, 0.0f);
             scale = v_f32_sel_eq_f32_b(need, 1.0f, v_f32_mul_b(scale, 0.5f), scale);
             cur_norm = v_f32_sel_eq_f32_b(need, 1.0f, v_f32_mul_b(cur_norm, 0.5f), cur_norm);
             s_vec = v_f32_sel_eq_f32_b(need, 1.0f, v_f32_add_b(s_vec, 1.0f), s_vec);
