@@ -1634,7 +1634,10 @@ def install_matrix_rank(device_type):
 # ---- matrix_exp & householder_product (#13)
 
 
-_PADE13_THETA = 5.371920351148152
+# The kernels' bound on the scaled 1-norm (THETA of matrix_exp_f32_gaudi2.c): 2, not Higham's double-precision
+# theta_13 = 5.37, at which the Padé denominator V - U cancels for a dominant positive eigenvalue and float32 lost
+# 66-75x against torch's float32 (code review #8; see the kernel's header).
+_PADE13_THETA = 2.0
 # The scaling cap of the matrix_exp kernels (S_MAX of matrix_exp_f32_gaudi2.c): ||A||_1 <= 3.4e38 needs <= 126 halvings
 _EXPM_S_MAX = 126
 
