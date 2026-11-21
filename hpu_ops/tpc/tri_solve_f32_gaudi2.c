@@ -3,6 +3,7 @@
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
  *   A [n, n, batch]  f32     B [m, n, batch]  f32     X [m, n, batch]  f32
+ * Each X[i] is B[i] minus the products A[i][k] X[k] one at a time, as LAPACK's trsm.
  * Build variants via -DUPPER (back substitution, else forward) and -DUNIT_DIAG (assume diag = 1, skip recip).
  * Row i of X is one 64-lane vector in local memory (lane j = column j), so n, m <= MAXN.
  * Opposite triangle (and diagonal under -DUNIT_DIAG) is never read; all ops are LUT-free (80 KB VLM, x[64] = 16 KB).
@@ -82,17 +83,18 @@ void main(tensor A, tensor B, tensor X)
             int5 c = {0, i, bt, 0, 0};
             float64 row_a = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, v_f32_ld_tnsr_b(c, A));
             float64 row_b = v_f32_sel_geq_u32_b(lane, (unsigned)m, 0.0f, v_f32_ld_tnsr_b(c, B));
-            float64 sum = 0.0f;
+            // B[i] minus each product in turn, in LAPACK's order (forward: k = 0 .. i-1, back: k = n-1 .. i+1), never
+            // a separate sum, which can overflow where the solution does not; the row is negated once for the FMA
+            float64 nrow_a = v_f32_sub_b(0.0f, row_a);
+            float64 acc = row_b;
 #ifdef UPPER
-            for (int k = i + 1; k < n; k++)
+            for (int k = n - 1; k > i; k--)
 #else
             for (int k = 0; k < i; k++)
 #endif
             {
-                float64 aik = lane_bcast(row_a, k);
-                sum = v_f32_mac_b(aik, x[k], sum);
+                acc = v_f32_mac_b(lane_bcast(nrow_a, k), x[k], acc);
             }
-            float64 acc = v_f32_sub_b(row_b, sum);
 #ifndef UNIT_DIAG
             float64 diag = lane_bcast(row_a, i);
             // |diag| >= 2^64: scale diag and acc by 2^-64 (exact) so recip(diag) is never subnormal, which the

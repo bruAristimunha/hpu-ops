@@ -65,6 +65,21 @@ void batch_dim(tpc_lib_api::TensorAccessPattern& p, int d)
     p.mapping[d].end_b = 0;
 }
 
+// Every tensor of these kernels is [cols, rows, batch] (the batch flattened by the Python side): a 4-D or 5-D tensor
+// would have its extra dimensions silently ignored by the kernel's coordinates, so it is refused. (Fewer dims are
+// kept: a graph may drop a trailing size-1 batch.)
+bool rank3(const tpc_lib_api::HabanaKernelParams* in, unsigned inputs)
+{
+    for (unsigned i = 0; i < inputs; i++)
+    {
+        if (in->inputTensors[i].geometry.dims > 3)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 tpc_lib_api::GlueCodeReturn copy_elf(tpc_lib_api::HabanaKernelInstantiation* out, const char* start, const char* end)
 {
     const unsigned isa = static_cast<unsigned>(end - start);
@@ -102,7 +117,7 @@ tpc_lib_api::GlueCodeReturn solve_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
     const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
     const uint64_t m = identity ? n : in->inputTensors[1].geometry.maxSizes[0];
     const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
-    if (n > kMaxN || m > kMaxN ||
+    if (!rank3(in, inputs) || n > kMaxN || m > kMaxN ||
         in->inputTensors[0].geometry.maxSizes[1] != n ||
         (!identity && (in->inputTensors[1].geometry.maxSizes[1] != n ||
                        in->inputTensors[1].geometry.maxSizes[2] != batch)))
@@ -227,7 +242,7 @@ tpc_lib_api::GlueCodeReturn tri_solve_defs(tpc_lib_api::HabanaKernelParams* in,
     const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
     const uint64_t m = in->inputTensors[1].geometry.maxSizes[0];
     const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
-    if (n > kMaxN || m > kMaxN ||
+    if (!rank3(in, 2) || n > kMaxN || m > kMaxN ||
         in->inputTensors[0].geometry.maxSizes[1] != n ||
         in->inputTensors[1].geometry.maxSizes[1] != n ||
         in->inputTensors[1].geometry.maxSizes[2] != batch)
