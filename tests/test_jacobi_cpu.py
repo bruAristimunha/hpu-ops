@@ -70,3 +70,17 @@ def test_padding_never_mixes_with_the_spectrum():
     w, V = jacobi.block_eigh(A, eigh32)
     assert w[0, :13].abs().max() < 1e-4 * w.abs().max()
     assert (V.mT @ V - torch.eye(33)).abs().max() < 1e-5
+
+
+def test_large_eigh_opt_out(monkeypatch):
+    """``HPU_OPS_LARGE_EIGH=cpu`` declines eigh past the kernel on HPU (hpu-ops' CPU route, faster); the default
+    takes it (the block Jacobi, on the card); at or below the kernel's size the variable changes nothing."""
+    from hpu_ops import tpc
+
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    takes = E._tpc_takes("hpu")
+    big, small = torch.randn(64, 64), torch.randn(32, 32)
+    monkeypatch.delenv(E.LARGE_EIGH, raising=False)
+    assert takes(big, "L", True) is True
+    monkeypatch.setenv(E.LARGE_EIGH, "cpu")
+    assert takes(big, "L", True) is False and takes(small, "L", True) is True

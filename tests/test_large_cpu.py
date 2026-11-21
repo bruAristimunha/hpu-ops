@@ -620,3 +620,42 @@ def test_equilibration_is_exact_on_ordinary_inputs(large_on_cpu):
     for k in (-40, 0, 37):
         X, D, S = linalg._gj_inv(A * 2.0 ** k)
         assert torch.equal(X * 2.0 ** k, X0) and torch.equal(D * 2.0 ** -k, D0) and torch.equal(S, S0)
+
+
+# ---- adversarial pass on the blocked route: odd sizes, views, broadcast, 2-D, repeated calls
+
+
+@pytest.mark.parametrize("n", [65, 129, 130, 257])
+def test_blocked_odd_sizes(n, blocked):
+    A = torch.randn(1, n, n, generator=torch.Generator().manual_seed(n)) + n ** 0.5 * torch.eye(n)
+    X, D, S = tpc.gj_inv(A)
+    ref = torch.linalg.inv(A.double())
+    assert rel(X, ref) <= max(1e-5, 10 * rel(torch.linalg.inv(A), ref))
+    assert sum(tpc._panel_widths(n)) == n
+
+
+def test_blocked_views_broadcast_and_2d(large_on_cpu, monkeypatch):
+    monkeypatch.setattr(tpc, "_square_pays", lambda n, b: False)
+    g = torch.Generator().manual_seed(11)
+    big = torch.randn(3, 140, 140, generator=g) + 12 * torch.eye(140)
+    B = torch.randn(4, 140, 2, generator=g)
+    with cpu_as_hpu(linalg.install_solve), cpu_as_hpu(linalg.install_inv_det):
+        X1 = torch.linalg.solve(big[1:2].mT, B)  # a transposed view of an offset slice, broadcast against batch 4
+        X2 = torch.linalg.solve(big[0], B[0])  # 2-D
+        X3 = torch.linalg.inv(big[2].mT)
+        X3b = torch.linalg.inv(big[2].mT)  # the same call twice: same result
+    want1 = torch.linalg.solve(big[1:2].mT.double(), B.double())
+    assert X1.shape == (4, 140, 2) and rel(X1, want1) < 1e-5
+    assert rel(X2, torch.linalg.solve(big[0].double(), B[0].double())) < 1e-5
+    assert rel(X3, torch.linalg.inv(big[2].mT.double())) < 1e-5 and torch.equal(X3, X3b)
+
+
+def test_blocked_extreme_scales(large_on_cpu, monkeypatch):
+    """Powers of two from 2^-100 to 2^100 on the blocked route: the equilibration leaves ordinary ranges alone and the
+    results scale exactly."""
+    monkeypatch.setattr(tpc, "_square_pays", lambda n, b: False)
+    A = permuted(1, 140, seed=12)
+    X0, D0, _ = linalg._gj_inv(A)
+    for k in (-100, -70, 70, 100):
+        X, D, _ = linalg._gj_inv(A * 2.0 ** k)
+        assert torch.equal(X * 2.0 ** k, X0) and torch.equal(D * 2.0 ** -k, D0), k

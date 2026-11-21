@@ -13,6 +13,8 @@ the TPC one-sided Jacobi kernel of ``hpu_ops.tpc`` (n = 22, batch 32, lazy: 0.54
 ``EIGH_MAXN``, the call on ``hpu`` is declined and runs through hpu-ops' own CPU route
 (``linalg._on_cpu``), which is not Habana's fallback. The composite stays the path of the CPU stand-in.
 """
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -43,9 +45,18 @@ def _tpc_takes(device_type):
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
             return False
+        if device_type == "hpu" and args[0].shape[-1] > tpc.EIGH_MAXN and os.environ.get(LARGE_EIGH) == "cpu":
+            return False  # the opt-out: hpu-ops' CPU route past the kernel (see LARGE_EIGH)
         return device_type != "hpu" or tpc.ready()
 
     return tpc_takes
+
+
+# Past tpc.EIGH_MAXN eigh runs the block Jacobi on the card: measured on Gaudi2 (bridge 1.21.4) it is slower than the
+# CPU route it replaces (EEGSPDNet's step, eigh at n = 220: 575 against 164 ms eager, 200 against 64 lazy, medians of 3
+# alternating rounds; tests/linalg_steps.py). ``HPU_OPS_LARGE_EIGH=cpu`` (read per call) asks for the CPU route there
+# instead: faster, not on the card.
+LARGE_EIGH = "HPU_OPS_LARGE_EIGH"
 
 
 def _use_block(A):
