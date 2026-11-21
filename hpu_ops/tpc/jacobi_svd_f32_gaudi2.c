@@ -53,10 +53,15 @@ static inline float64 unpack_hi_half(float64 p)
     return v_f32_mov_dual_group_b(p, 0xFFFFFFFF, 3, 1, MkWr(1, 1), out);
 }
 
+// 1/sqrt(x): the hardware estimate, then one Newton step in residual form, e = 1 - (x r) r with the product rounded
+// once (an FMA), r + (r / 2) e. The plain step r (1.5 - x r^2 / 2) keeps an estimate 1 ulp low near 1 (its fixed
+// point), which shrank every rotation by an ulp: the accumulated rotations' orthogonality drifted with n, 6.1e-6 at
+// n = 32 on Gaudi2 against torch's 1.3e-6 (found by team Z on its complex kernels).
 static inline float64 rsqrt_newton(float64 x)
 {
     float64 r = v_rsqrt_f32(x);
-    return v_f32_mul_b(r, v_f32_mac_b(v_f32_mul_b(-0.5f, x), v_f32_mul_b(r, r), 1.5f));
+    float64 e = v_f32_mac_b(v_f32_sub_b(0.0f, v_f32_mul_b(x, r)), r, 1.0f);
+    return v_f32_mac_b(v_f32_mul_b(r, 0.5f), e, r);
 }
 
 #define RR_PAIR(r, k, rr_m, p, q)          \

@@ -446,9 +446,15 @@ def _red_add(v):
     return v[0]
 
 
-def _rsqrt_newton(x):
-    r = hw_rsqrt(x)
-    return mul(r, mac(mul(F32(-0.5), x), mul(r, r), F32(1.5)))
+def _rsqrt_newton(x, legacy=False, estimate=None):
+    """``rsqrt_newton`` of jacobi_svd_f32_gaudi2.c: the hardware estimate (``hw_rsqrt``, or ``estimate``), then one
+    Newton step in residual form, r + (r / 2) (1 - (x r) r) with an FMA; ``legacy``: the plain step r (1.5 - x r^2 / 2)
+    of before, whose fixed point keeps an estimate 1 ulp low near 1."""
+    r = hw_rsqrt(x) if estimate is None else estimate(x)
+    if legacy:
+        return mul(r, mac(mul(F32(-0.5), x), mul(r, r), F32(1.5)))
+    e = mac(sub(F32(0), mul(x, r)), r, F32(1))
+    return mac(mul(r, F32(0.5)), e, r)
 
 
 def _rr_pairs(r, n):
