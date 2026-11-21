@@ -1090,6 +1090,19 @@ def tri_solve_reference(A, B, upper=False, left=True, unitriangular=False):
     return torch.stack(rows, dim=-2)
 
 
+def _sort(x, descending=False):
+    """``(values, indices)`` of ``x`` sorted along the last dimension, NaN kept as NaN with an index in range: Gaudi's
+    sort returns NaN as +inf with out-of-range indices (measured, ``hpu_ops.extrema``), so the eigenvalues and singular
+    values of a matrix with a NaN came out +-inf, the vectors gathered with bad indices (code review #13). The order
+    key is ``x`` with NaN as +inf (``nan_to_num``, one op; NaN and +inf then tie, where torch puts NaN last); Gaudi
+    sorts a key without NaN right at these sizes (n <= 32; its non-stable sort went wrong past 1000 elements with
+    infs, and its 1-D stable sort runs on the CPU, so the sort is the plain one). The values are gathered from ``x``
+    (float data, an int64 index): two ops more than the sort alone."""
+    key = torch.nan_to_num(x, nan=float("inf"), posinf=float("inf"), neginf=float("-inf"))
+    order = key.sort(dim=-1, descending=descending)[1]
+    return x.gather(-1, order), order
+
+
 def eigh(A, upper):
     """``(w, V)`` of the symmetric matrix held in one triangle of ``A[..., n, n]`` (float32, n <= ``EIGH_MAXN``) from
     the TPC kernel: ``w`` ascending, the columns of ``V`` the eigenvectors. The kernel returns ``w`` unsorted and the
@@ -1106,7 +1119,7 @@ def eigh(A, upper):
     S_flat = S.reshape(-1, n, n).to(torch.float32).contiguous()
     _, Vt1 = _call(_eigh_op(), S_flat)
     W, Vt = _call(_eigh_refine_op(), S_flat, Vt1)
-    w, order = W.sort(-1)
+    w, order = _sort(W)
     V = Vt.gather(-2, order[..., :, None].expand_as(Vt)).mT
     return w.reshape(*batch, n), V.reshape(*batch, n, n)
 
@@ -1175,7 +1188,7 @@ def jacobi_svd(A, full_matrices=False, sort=True, flush=True):
     S = S.reshape(*batch, k)
     if not sort:
         return U, S, Vh
-    S, order = S.sort(-1, descending=True)
+    S, order = _sort(S, descending=True)
     if full:
         full_order = torch.cat([order, torch.arange(k, big, device=order.device).expand(*batch, big - k)], -1)
         u_ord, v_ord = (order, full_order) if swap else (full_order, order)
@@ -1195,7 +1208,7 @@ def jacobi_svdvals(A, sort=True, flush=True):
     no_t = m < n or (m == n and A.is_contiguous())
     A_t = _fresh((A if no_t else A.mT).reshape(-1, k, max(m, n)).to(torch.float32).contiguous())
     S = (_call(_svdvals_op(), A_t) if flush else _svdvals_op()(A_t)).reshape(*batch, k)
-    return S.sort(-1, descending=True).values if sort else S
+    return _sort(S, descending=True)[0] if sort else S
 
 
 def svd_reference(A, compute_uv=True, full_matrices=False):
