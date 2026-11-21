@@ -63,6 +63,9 @@ at the tensor's pickling:
   serves the CPU stand-in.
 - ``quantile`` / ``nanquantile`` as sort, gather and lerp (``quantile``): ATen's composite resizes an empty ``out``
   tensor, which aborts lazy mode ("Trying to resize tensor with non-existing TensorImpl").
+- ``bincount`` of 1-D integer inputs of 65536 to 2**24 elements with at most 4096 bins and no weights through one
+  ``aminmax`` read and ``histc`` in chunks of 256 bins (``small``, #21): Gaudi's kernel took 4.7-427 ms at 409600
+  elements (64 to 4096 bins), 2-43x longer.
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -83,7 +86,7 @@ import warnings
 
 import torch
 
-from . import composite, conv, eigh, im2col, indexing, linalg, quantile, serialization, tpc, upsample  # noqa: F401
+from . import composite, conv, eigh, im2col, indexing, linalg, quantile, serialization, small, tpc, upsample  # noqa: F401
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -97,7 +100,7 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
          linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, quantile.install,
-         serialization.install)
+         small.install_bincount, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
