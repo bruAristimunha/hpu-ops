@@ -49,6 +49,11 @@ def _native_linear_vec(device_type, decomposition):
         count("linear")
         size = upsample_compute_output_size(input.size(), output_size, scale_factors)
         scale = scale_factors[0] if scale_factors else None
+        if device_type in _INDEXED and below_autograd() and _linear_index_takes(input, size, align_corners, scale):
+            # traced below autograd (compiled inference_mode()): neither of install_linear_forward's kernels sees the
+            # .default node emitted here, which would keep Gaudi's drifting kernel; the index path goes in the graph
+            count("linear_index")
+            return linear_by_index(input, size, align_corners, scale)
         return aten.upsample_linear1d.default(input, size, align_corners, scale)
 
     return kernel
@@ -122,12 +127,21 @@ def _linear_device_kernels(op):
     return autograd, backend
 
 
+_INDEXED = set()  # device types with install_linear_forward in: the traced .vec kernel takes the index path too
+
+
 def install_linear_forward(device_type):
-    """Linear 1-D upsampling on ``device_type`` from explicit indices where Gaudi's kernel is inexact, eager and traced.
-    Returns an undo."""
+    """Linear 1-D upsampling on ``device_type`` from explicit indices where Gaudi's kernel is inexact, eager and traced
+    (compiled ``inference_mode()`` graphs through ``install_linear``'s ``.vec`` kernel). Returns an undo."""
     op = aten.upsample_linear1d.default
     autograd, backend = _linear_device_kernels(op)
-    return register_kernels(device_type, [(op, "Autograd{}", autograd), (op, "{}", backend)])
+    undo = register_kernels(device_type, [(op, "Autograd{}", autograd), (op, "{}", backend)])
+    _INDEXED.add(device_type)
+
+    def undo_flag():
+        _INDEXED.discard(device_type)
+
+    return chain([undo, undo_flag])
 
 
 def _float32(value):

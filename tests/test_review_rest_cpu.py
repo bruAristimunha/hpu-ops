@@ -79,3 +79,44 @@ def test_compiled_inference_mode_splits_same_and_unbatched_large_kernels(monkeyp
     got, widths = _conv_widths(layer, x, context)
     assert widths and all(max(w) <= 256 for w in widths), widths
     torch.testing.assert_close(got, want, atol=1e-4, rtol=1e-4)
+
+
+# ---- (6) compiled inference_mode graphs kept Gaudi's drifting linear upsampling kernel
+
+
+@pytest.mark.parametrize("length, size", [(9920, 10000), (1000, 1500), (1000, 2000)])
+@pytest.mark.parametrize("context", [torch.inference_mode, torch.no_grad])
+def test_compiled_inference_mode_linear_upsampling_takes_the_index_path(length, size, context):
+    """The review's input: ``F.interpolate(x, size=10000, mode='linear')`` of a 9920-sample signal (NeuroPose),
+    compiled under ``inference_mode()``: the graph was exactly ``{aten.upsample_linear1d.default}``. Now the explicit
+    index path, as eager and compiled ``no_grad()``; a power-of-two factor keeps the native op."""
+    import torch.nn.functional as F
+    from test_cpu import compiled, cpu_as_hpu, ops
+    from hpu_ops import _dispatch, upsample
+
+    x = torch.randn(2, 3, length)
+    f = lambda t: F.interpolate(t, size=size, mode="linear")  # noqa: E731
+    nodes = []
+    both = lambda d: _dispatch.chain([upsample.install_linear(d), upsample.install_linear_forward(d)])  # noqa: E731
+    with cpu_as_hpu(both) as calls, context():
+        got = compiled(f, nodes, dynamic=False)(x)
+        counts = dict(calls)
+    want, cpu = f(x.double()), f(x)  # the index ops' error against float64 is the CPU float32 kernel's
+    assert (got.double() - want).abs().max() <= 2 * (cpu.double() - want).abs().max() + 1e-6
+    exact = size % length == 0 and (size // length) & (size // length - 1) == 0
+    assert ("aten.upsample_linear1d.default" in ops(nodes)) == exact, ops(nodes)
+    assert bool(counts.get("linear_index")) == (not exact), counts
+
+
+def test_linear_upsampling_without_the_forward_fix_keeps_the_native_op_traced():
+    """``install_linear`` alone (the forward fix not installed, or undone) keeps the native op in the graph."""
+    import torch.nn.functional as F
+    from test_cpu import compiled, cpu_as_hpu, ops
+    from hpu_ops import upsample
+
+    undo = upsample.install_linear_forward("cpu")
+    undo()
+    nodes = []
+    with cpu_as_hpu(upsample.install_linear), torch.inference_mode():
+        compiled(lambda t: F.interpolate(t, size=1500, mode="linear"), nodes, dynamic=False)(torch.randn(1, 1, 1000))
+    assert "aten.upsample_linear1d.default" in ops(nodes)
