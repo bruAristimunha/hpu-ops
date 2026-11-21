@@ -127,7 +127,9 @@ def cgj_solve(A, B, layout="pairs"):
     """``(X, D, S)`` for complex ``A (..., n, n)`` and ``B (..., n, m)`` (n <= ``COMPLEX_MAXN``, any m, broadcast
     batch): ``X = A^-1 B`` in ``layout``; ``D (..., 3, n)`` the pivots' re, im and modulus (U's diagonal of
     P A = L U); ``S (..., 4)`` = (phase re, phase im, info, (-1)^swaps), info = 1 + the first zero pivot (0 if none).
-    B's columns go through the kernel in chunks of ``COMPLEX_MAXN`` (D and S from the first)."""
+    B's columns go through the kernel in chunks of ``COMPLEX_MAXN``; D and S describe A and come from the first
+    chunk. A non-finite entry anywhere in A or B makes that batch member's X, D and S all NaN, whatever chunk it is
+    in (each launch poisons only its own chunk, so the flag is OR-ed across the chunks here)."""
     PA, PB = as_pairs(A, layout), as_pairs(B, layout)
     n = _square(PA)
     if PB.shape[-3] != n:
@@ -146,6 +148,12 @@ def cgj_solve(A, B, layout="pairs"):
     X = parts[0][0] if len(parts) == 1 else torch.cat([p[0].reshape(-1, 2, n, p[0].shape[-1]) for p in parts],
                                                        -1).reshape(-1, 2 * n, m)
     D, S = parts[0][1], parts[0][2]
+    if len(parts) > 1:  # a NaN/inf in a later chunk of B: poison X, D and S of that member, as one launch would
+        bad = torch.stack([p[2] for p in parts]).isnan().any(0).any(-1)
+        nan = X.new_full((), float("nan"))
+        X = torch.where(bad[:, None, None], nan, X)
+        D = torch.where(bad[:, None, None], nan, D)
+        S = torch.where(bad[:, None], nan, S)
     return from_pairs(_unplanar(X, batch, n, m), layout), D.reshape(*batch, 3, n), S.reshape(*batch, 4)
 
 

@@ -206,3 +206,16 @@ def test_sign_unit_modulus_random():
     sign, _ = cl.slogdet(pairs(crandn(64, 12, 12, seed=40)))
     assert float((sign.double().square().sum(-1).sqrt() - 1).abs().max()) <= 2 ** -23
 
+
+def test_nonfinite_in_later_chunk_poisons_member():
+    """A NaN/inf in any 32-column chunk of B makes that member's X, D and S NaN (as the single-launch case)."""
+    A, B = crandn(3, 6, 6, seed=41), crandn(3, 6, 70, seed=42)
+    for col, bad in ((50, math.nan), (69, math.inf), (3, math.nan)):
+        Bb = B.clone()
+        Bb[1, 2, col] = complex(bad, 0)
+        X, D, S = cl.cgj_solve(pairs(A), pairs(Bb))
+        assert X[1].isnan().all() and D[1].isnan().all() and S[1].isnan().all()
+        assert X[[0, 2]].isfinite().all() and D[[0, 2]].isfinite().all() and S[[0, 2]].isfinite().all()
+    _, D0, S0 = cl.cgj_solve(pairs(A), pairs(B))
+    _, D1, S1 = cl.cgj_inv(pairs(A))
+    assert torch.equal(D0, D1) and torch.equal(S0, S1)  # D and S describe A whatever B is
