@@ -284,9 +284,17 @@ def test_reduction_gradients_are_torch_s(card, name):
 
 
 def test_aminmax_has_no_derivative_as_torch(card):
-    x = rows().requires_grad_()
-    with pytest.raises(RuntimeError, match="not implemented"):
-        sum(torch.aminmax(x, dim=-1)).sum().backward()
+    """torch through 2.14 has no aminmax derivative (the rewrite raises its error too); from 2.15 it has one, and
+    the rewrite gives torch's gradient."""
+    f = lambda t: tuple(torch.aminmax(t, dim=-1))  # noqa: E731
+    try:
+        want = _reference(grads, f, rows())
+    except RuntimeError as error:
+        assert "not implemented" in str(error)
+        with pytest.raises(RuntimeError, match="not implemented"):
+            sum(torch.aminmax(rows().requires_grad_(), dim=-1)).sum().backward()
+        return
+    same(grads(f, rows()), want)
 
 
 def test_the_stand_in_drops_nan_like_the_card(monkeypatch):
