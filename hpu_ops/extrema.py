@@ -151,8 +151,10 @@ def _eager_native(op, composite):
     """At ``Autograd{}``: outside a tracer, torch's autograd kernel of ``op`` (over the backend kernel's fixed result:
     torch's gradient); traced, ``composite``."""
     def kernel(*args, **kwargs):
+        if _traced(args, kwargs):  # a CPU 0-d operand stays a graph scalar (moved, it adds a copy to every step)
+            return composite(*args, **kwargs)
         args = _onto_device(args)
-        if _BACKEND.get(_device(args)) and not _traced(args, kwargs):
+        if _BACKEND.get(_device(args)):
             return native(op)(*args, **kwargs)
         return composite(*args, **kwargs)
 
