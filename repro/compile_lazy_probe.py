@@ -3,16 +3,18 @@
     PT_HPU_LAZY_MODE=1 python3 repro/compile_lazy_probe.py mlp none   # one case in this process
 Models: mlp (Linear-ReLU-Linear), conv (Conv2d, the 4-D convolution Habana's weight permutation pass targets),
 SPDNet (spd_diag's, on a real BNCI2014_001 batch). Plugins: none, ops (hpu_ops.enable()), ops+complex (also
-hpu_complex.enable()). Each case: compile, three train steps (forward, backward, Adam); one ``CASE {json}`` line
+hpu_complex.enable()), ops:plain (hpu_ops.enable(), not compiled: the
+reference loss). Each case: compile, three train steps (forward, backward, Adam); one ``CASE {json}`` line
 with the status, the exception and its last frames."""
 import json
 import os
 import subprocess
 import sys
 import traceback
+import warnings
 
 MODELS = ("mlp", "conv", "SPDNet")
-PLUGINS = ("none", "ops", "ops+complex")
+PLUGINS = ("none", "ops", "ops+complex", "ops:plain")
 
 
 def build(name):
@@ -36,6 +38,8 @@ def build(name):
 def one(name, plugins):
     row = {"model": name, "plugins": plugins, "lazy": os.environ.get("PT_HPU_LAZY_MODE")}
     try:
+        compile_ = not plugins.endswith(":plain")
+        row["compiled"] = compile_
         if plugins != "none":
             sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             import hpu_ops
@@ -50,7 +54,11 @@ def one(name, plugins):
         hpu = torch.device("hpu")
         model, X, y = model.to(hpu), X.to(hpu), y.to(hpu)
         opt = torch.optim.Adam(model.parameters(), 1e-3)
-        compiled = torch.compile(model, backend="hpu_backend")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            compiled = torch.compile(model, backend="hpu_backend") if compile_ else model
+        row["warnings"] = [str(w.message)[:80] for w in caught if "lazy mode" in str(w.message)]
+        row["returned_model"] = compiled is model
         for _ in range(3):
             opt.zero_grad(set_to_none=True)
             out = compiled(X)
