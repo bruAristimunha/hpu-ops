@@ -806,15 +806,29 @@ def test_gj_is_declined_past_maxn_on_hpu_and_without_the_kernel(monkeypatch):
     assert takes(A) is True
     assert takes(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is False
     assert takes(torch.randn(tpc.MAXN, tpc.MAXN)) is True
+    large = linalg._tpc_takes("hpu", linalg._takes("hpu", "solve"), large=True)
+    n = tpc.LARGE_ANY_BATCH_N
+    assert large(torch.randn(n, n)) is True and large(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is True
+    assert large(torch.randn(tpc.LARGE_MIN_BATCH - 1, n + 1, n + 1)) is False  # past it, a small batch: fallback
+    assert large(torch.randn(tpc.LARGE_MIN_BATCH, n + 1, n + 1)) is True
+    assert large(torch.randn(tpc.LARGE_MIN_BATCH, tpc.LARGE_MAXN + 1, tpc.LARGE_MAXN + 1)) is False
     cpu = linalg._tpc_takes("cpu", linalg._takes("cpu", "solve"))
     monkeypatch.setattr(tpc, "ready", lambda: False)
     assert cpu(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is True  # the CPU stand-in keeps the composite
 
 
-def test_gj_not_used_past_maxn(gj_hook):
+def test_gj_used_to_large_maxn(gj_hook):
     torch.manual_seed(0)
     with cpu_as_hpu(linalg.install_solve):
         torch.linalg.solve(f32(2, n=tpc.MAXN + 1), torch.randn(2, tpc.MAXN + 1, 2))
+    assert gj_hook == [(2, tpc.MAXN + 1, tpc.MAXN + 1)]
+
+
+def test_gj_not_used_past_large_maxn(monkeypatch, gj_hook):
+    monkeypatch.setattr(tpc, "LARGE_MAXN", 80)  # the composite past it: keep the CPU test short
+    torch.manual_seed(0)
+    with cpu_as_hpu(linalg.install_solve):
+        torch.linalg.solve(f32(2, n=81), torch.randn(2, 81, 2))
     assert gj_hook == []
 
 
@@ -2555,6 +2569,31 @@ def test_eigh_bad_uplo_raises_like_torch(eigh_hook):
         with pytest.raises(RuntimeError, match=re.escape(str(native.value))):
             torch.linalg.eigvalsh(G, UPLO="X")
 
+
+LARGE_SOLVES = {
+    "matrix": (lambda a, b: torch.linalg.solve(a, b), lambda: torch.randn(4, 2, dtype=torch.float64)),
+    "left_false": (lambda a, b: torch.linalg.solve(a, b, left=False), lambda: torch.randn(2, 4, dtype=torch.float64)),
+    "vector": (lambda a, b: torch.linalg.solve(a, b), lambda: torch.randn(4, dtype=torch.float64)),
+    "broadcast": (lambda a, b: torch.linalg.solve(a, b), lambda: torch.randn(3, 4, 2, dtype=torch.float64)),
+}
+
+
+@pytest.mark.parametrize("case", list(LARGE_SOLVES))
+def test_large_solve_backward_reuses_the_inverse(case, monkeypatch, gj_hook):
+    """Past tpc.MAXN (lowered to 2 here) solve multiplies by the kernel's inverse and keeps it: the backward calls no
+    kernel, first and second order equal torch's."""
+    monkeypatch.setattr(tpc, "MAXN", 2)
+    torch.manual_seed(0)
+    f, make_b = LARGE_SOLVES[case]
+    inputs = [general(n=4).requires_grad_(), make_b().requires_grad_()]
+    want = f(*[x.detach() for x in inputs])
+    with cpu_as_hpu(linalg.install_solve):
+        X = f(*inputs)
+        torch.testing.assert_close(X, want)
+        before = len(gj_hook)
+        X.sum().backward()
+        assert len(gj_hook) == before, "the backward of a large solve called the kernel"
+        assert torch.autograd.gradgradcheck(f, inputs, atol=1e-5, rtol=1e-4)
 
 # ---- standalone LU (#10): lu_factor / lu_factor_ex, lu_solve, lu_unpack, linalg.lu
 

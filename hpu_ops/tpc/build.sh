@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Rebuilds liblinalg_tpc.so, the Gaudi2 TPC linalg kernels (gj_solve and gj_inv, Gauss-Jordan; jacobi_eigh and
+# Rebuilds liblinalg_tpc.so, the Gaudi2 TPC linalg kernels (gj_solve and gj_inv, Gauss-Jordan; gj_large{2..8}, the
+# in-place Gauss-Jordan inverse for 64 < n <= 512; jacobi_eigh and
 # jacobi_eigh_refine, one-sided Jacobi; tri_solve_{lower,upper}[_unit], substitution; jacobi_svd[_full], jacobi_svdvals;
 # householder_product; matrix_exp[_frechet]; lu_factor, lu_perm, lu_solve), and copies it next to this
 # script.

@@ -122,6 +122,9 @@ def main():
                              "(the A/B is the hpu_ops on PYTHONPATH)")
     parser.add_argument("--with-eigh", action="store_true",
                         help="also fail a model whose step makes eigh fall back (installs eigh if enable() did not)")
+    parser.add_argument("--large-maxn", type=int, default=None,
+                        help="set hpu_ops.tpc.LARGE_MAXN before enable() (64: n > 64 solve/inv/det/slogdet take the "
+                             "parent branch's route, Habana's fallback, for an A/B in one checkout)")
     parser.add_argument("--models", default=",".join(MODEL_NAMES),
                         help="comma-separated subset of " + ", ".join(MODEL_NAMES))
     args = parser.parse_args()
@@ -132,6 +135,8 @@ def main():
     from spd_diag.models import MODELS
 
     import hpu_ops
+    if args.large_maxn is not None:
+        hpu_ops.tpc.LARGE_MAXN = args.large_maxn
     P._enable_device("hpu")  # hpu_ops.enable() and hpu_complex.enable(), whichever hpu_ops is on PYTHONPATH
     eigh = getattr(hpu_ops, "eigh", None)
     if args.with_eigh:
@@ -144,7 +149,8 @@ def main():
     print("PLUGINS hpu_ops", getattr(hpu_ops, "__version__", "?"), hpu_ops.__file__, "hpu_complex",
           getattr(hpu_complex, "__version__", "?"), "enabled by spd_diag; baseline (fallbacks recorded)", baseline,
           "eigh checked", eigh_checked, "tpc_ready",
-          getattr(getattr(hpu_ops, "tpc", None), "ready", lambda: None)(), "lazy", LAZY, flush=True)
+          getattr(getattr(hpu_ops, "tpc", None), "ready", lambda: None)(), "large_maxn",
+          getattr(getattr(hpu_ops, "tpc", None), "LARGE_MAXN", None), "lazy", LAZY, flush=True)
     cache = open_cache(DATASET)
     info, sd = cache.info, cache.subject(cache.subjects[0], "X")
     X = torch.as_tensor(sd.X[:BATCH], dtype=torch.float32)

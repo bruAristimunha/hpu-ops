@@ -13,6 +13,12 @@
   integer ones, are not detected, as in torch); B is never scaled by 1/pivot before the cancellation, and a
   multiplier below 2^-126 is carried scaled by 2^64 so it is not flushed when its product is normal. A zero pivot makes its elimination step a no-op and its row of X
   zero, so later pivots stay finite.
+- ``torch.ops.linalg_tpc.gj_large(A[b, n, n]) -> (R, P, Q, D, S)`` for 64 < n <= ``LARGE_MAXN`` (512): the in-place
+  Gauss-Jordan inverse with partial pivoting (implicit: no row moves), one matrix per index-space member, the first
+  rows in local memory and the others re-read from global memory on each step (one ASO per step). ``A^-1 = R[P, :][:,
+  Q]``, ``D`` the pivots, ``S[:, 1]`` the info; one ELF per ``ceil(n / 64)``. ``gj_solve`` and ``gj_inv`` route n >
+  ``MAXN`` to it: ``inv`` is two gathers of ``R``, ``solve`` the matmul ``(R @ B[P])[P]``, the sign of ``det`` the
+  parity of ``P``.
 - ``torch.ops.linalg_tpc.tri_solve_{lower,upper}[_unit](A[b, n, n], B[b, n, m]) -> X[b, n, m]``: forward or back
   substitution without pivoting for float32, n <= 64 (B columns chunked by 64; ``left=False`` through ``.mT`` and the
   flipped triangle). The other triangle (and the diagonal for ``_unit``) is never read. Each ``X[i]`` is ``B[i]``
@@ -47,6 +53,12 @@ import torch
 MAXN = 64  # MAXN of gj_solve and tri_solve (main)
 SMALL_MAXN = 32  # MAXN of jacobi_svd, matrix_exp, lu_factor, lu_perm and lu_solve
 MAXHH = 64
+LARGE_MAXN = 512  # NMAX of gj_large_f32_gaudi2.c: gj_solve and gj_inv take 64 < n <= LARGE_MAXN through it
+# The in-place kernel runs one matrix per TPC (24 on Gaudi2), so a small batch leaves the card idle: measured on
+# Gaudi2 (bridge 1.21.4, eager, mean of synced calls), batch 1 n = 384 and batch 1 to 4 n = 512 were slower than
+# Habana's CPU fallback, batch 1 n <= 300 and batch 32 n <= 256 not (see ``large_pays``).
+LARGE_ANY_BATCH_N = 256  # up to here the kernel takes any batch
+LARGE_MIN_BATCH = 8  # past it, at least this many matrices
 EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
@@ -125,7 +137,17 @@ static habana::PartialOutputMetaDataVector tri_solve_meta(const at::Stack& input
   auto b = inputs[1].toTensor();
   return {habana::PartialOutputMetaData{b.scalar_type(), b.sizes().vec()}};
 }
+static habana::PartialOutputMetaDataVector large_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto batch = a.size(0), n = a.size(1);
+  return {habana::PartialOutputMetaData{a.scalar_type(), {batch, n, 64 * ((n + 63) / 64)}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {batch, 2}}};
+}
 static bool registered = [] {
+  habana::custom_op::registerUserCustomOp("linalg_tpc::gj_large", "gj_large_f32_gaudi2", large_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", eigh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh_refine", "jacobi_eigh_refine_f32_gaudi2",
                                           eigh_meta, nullptr);
@@ -161,6 +183,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::gj_inv");
   auto out = desc.execute(inputs);
   return {out[0], out[1], out[2]};
+}
+using Large = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
+Large gj_large(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::gj_large");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2], out[3], out[4]};
 }
 std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
@@ -239,6 +268,7 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v
   return {out[0], out[1]};
 }
 TORCH_LIBRARY(linalg_tpc, m) {
+  m.def("gj_large(Tensor a) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
@@ -258,6 +288,7 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
+  m.impl("gj_large", gj_large);
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
   m.impl("jacobi_svd", jacobi_svd);
@@ -277,6 +308,12 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
+  m.impl("gj_large", [](at::Tensor a) {
+    auto bt = a.size(0), n = a.size(1);
+    auto v = a.new_empty({bt, n});
+    return std::make_tuple(a.new_empty({bt, n, 64 * ((n + 63) / 64)}), v, a.new_empty({bt, n}), a.new_empty({bt, n}),
+                           a.new_empty({bt, 2}));
+  });
   m.impl("gj_solve", [](at::Tensor a, at::Tensor b) {
     return std::make_tuple(b.new_empty(b.sizes()), b.new_empty({a.size(0), a.size(1)}), b.new_empty({a.size(0), 2}));
   });
@@ -351,6 +388,21 @@ static bool registered_solve = [] {
                                                  {1, c10::ScalarType::Float, dshape},
                                                  {2, c10::ScalarType::Float, sshape}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static auto rshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  auto n = a.size(1);
+  return std::vector<int64_t>{a.size(0), n, 64 * ((n + 63) / 64)};
+};
+static bool registered_large = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, rshape},
+                                                 {1, c10::ScalarType::Float, dshape},
+                                                 {2, c10::ScalarType::Float, dshape},
+                                                 {3, c10::ScalarType::Float, dshape},
+                                                 {4, c10::ScalarType::Float, sshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::gj_large", "gj_large_f32_gaudi2", in, out, nullptr);
   return true;
 }();
 static bool registered_inv = [] {
@@ -473,6 +525,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gj_inv(at::Tensor a) {
   auto out = op.execute(inputs);
   return {out[0], out[1], out[2]};
 }
+using Large = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
+Large gj_large(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::gj_large");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2], out[3], out[4]};
+}
 std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(at::Tensor a) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_svd");
   std::vector<c10::IValue> inputs{a};
@@ -549,6 +608,7 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v
   return {out[0], out[1]};
 }
 TORCH_LIBRARY(linalg_tpc, m) {
+  m.def("gj_large(Tensor a) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
@@ -568,6 +628,7 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
+  m.impl("gj_large", gj_large);
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
   m.impl("jacobi_svd", jacobi_svd);
@@ -731,6 +792,12 @@ def _inv_op():
     return torch.ops.linalg_tpc.gj_inv
 
 
+def _large_op():
+    """``torch.ops.linalg_tpc.gj_large``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.gj_large
+
+
 def _svd_op():
     """``torch.ops.linalg_tpc.jacobi_svd``, built on first use."""
     _load()
@@ -878,12 +945,78 @@ def _tri_chunked(op, A, B):
     return torch.cat([_call(op, A, _fresh(chunk.contiguous())) for chunk in B.split(MAXN, -1)], -1)
 
 
-def _check(A, n, *others):
-    if A.dim() < 2 or n > MAXN or A.shape[-2] != n:
-        raise ValueError(f"hpu_ops.tpc takes square A with n <= {MAXN}, got {tuple(A.shape)}")
+def _check(A, n, *others, limit=MAXN):
+    if A.dim() < 2 or n > limit or A.shape[-2] != n:
+        raise ValueError(f"hpu_ops.tpc takes square A with n <= {limit}, got {tuple(A.shape)}")
     if any(t.dtype != torch.float32 for t in (A, *others)):
         # the kernels compute in float32: a float64 input would be downcast silently
         raise ValueError(f"hpu_ops.tpc takes float32 tensors, got {[str(t.dtype) for t in (A, *others)]}")
+
+
+def large_pays(n, batch):
+    """Whether the routing sends ``batch`` matrices of order ``n`` (``MAXN`` < n <= ``LARGE_MAXN``) to the in-place
+    kernel: eager mode, not tracing under ``torch.compile``, and n <= ``LARGE_ANY_BATCH_N`` or at least
+    ``LARGE_MIN_BATCH`` matrices. In lazy mode (and compiled) the call keeps main's route (Habana's fallback):
+    measured on Gaudi2, bridge 1.21.4, EEGSPDNet's lazy step was 73.2 against 63.0 ms median with the kernel (its graph
+    boundary, gathers and checks), and the compiled path was not measured faster."""
+    eager = os.environ.get("PT_HPU_LAZY_MODE", "1") == "0" and not torch.compiler.is_compiling()
+    return eager and n <= LARGE_MAXN and (n <= LARGE_ANY_BATCH_N or batch >= LARGE_MIN_BATCH)
+
+
+def _parity(P):
+    """``(-1)^inversions`` of the permutations ``P[b, n]`` (float, exact integers): the sign of the row order."""
+    n = P.shape[-1]
+    later = torch.ones(n, n, dtype=torch.bool, device=P.device).triu(1)
+    inversions = ((P[..., :, None] > P[..., None, :]) & later).sum((-2, -1))
+    return (1 - 2 * (inversions % 2)).to(P.dtype)
+
+
+def _rows(X, index):
+    """``X[..., index, :]`` for a float index ``[b, n]`` (exact integers): a gather of float data."""
+    return X.gather(-2, index.long()[..., None].expand(*index.shape, X.shape[-1]))
+
+
+def _large_raw(A, sign=True):
+    """The kernel's ``(R, P, Q, D, S)`` for ``A[b, n, n]``, ``S[:, 0]`` set to the sign of the pivot order (0 when
+    not ``sign``: solve and inv do not read it, and its [b, n, n] comparison costs eager launches) and a matrix with
+    a NaN given NaN pivots (LAPACK's results are NaN there; the kernel's need not be)."""
+    R, P, Q, D, S = _call(_large_op(), A)
+    nan = A.isnan().any(-1).any(-1)
+    D = D.masked_fill(nan[..., None], float("nan"))
+    if sign:
+        S = torch.stack([_parity(P), S[..., 1]], -1)
+    return R, P, Q, D, S, nan
+
+
+def large_factors(A):
+    """``(D, S)`` of the in-place kernel for ``A[..., n, n]`` (64 < n <= ``LARGE_MAXN``), for ``det`` and
+    ``slogdet``: the pivots and (sign, info), without forming the inverse."""
+    n = A.shape[-1]
+    _check(A, n, limit=LARGE_MAXN)
+    batch = A.shape[:-2]
+    _, _, _, D, S, _ = _large_raw(_flat(A, batch, n, n))
+    return _unflatten(D, batch, n), _unflatten(S, batch, 2)
+
+
+def _large(A, B=None, sign=True):
+    """``(X, D, S)`` of the in-place Gauss-Jordan kernel for ``A[b, n, n]`` (64 < n <= ``LARGE_MAXN``): ``X =
+    A^-1`` (``B`` None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel
+    divides each row by its pivot at the end: ``A^-1 = R[P, :][:, Q]``, and ``A^-1 B = (R @ B[P])[P]`` (with ``Q =
+    P^-1``, ``R[:, Q] @ B = R @ B[P]``); a zero pivot gives a zero row (info is set)."""
+    n = A.shape[-1]
+    R, P, Q, D, S, nan = _large_raw(A, sign)
+    R = R[..., :n]
+    # the kernel divides each row by its pivot itself (a torch division by a pivot of 1e38 zeroed the row in lazy mode:
+    # the card's division multiplies by a reciprocal, subnormal hence flushed, and a 2^-64 prescale was folded away)
+    Y = _rows(R, P) if B is None else _rows(R @ _rows(B, P), P)
+    if B is None:
+        # no Newton step: on the kernel's float32 replica it gained little at condition <= 1e4 and lost past 1e6
+        # (n = 220, condition 1e7: 6.8e-2 against 4.5e-2 without, LAPACK 4.7e-2)
+        X = Y.gather(-1, Q.long()[..., None, :].expand(*Q.shape[:-1], n, n))
+    else:
+        X = Y
+    X = X.masked_fill(nan[..., None, None], float("nan"))
+    return X, D, S
 
 
 def gj_solve(A, B):
@@ -892,20 +1025,23 @@ def gj_solve(A, B):
     zero pivot in the kernel's elimination order, else 0; it can differ from LAPACK's);
     shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
     n, m = A.shape[-1], B.shape[-1]
-    _check(A, n, B)
+    _check(A, n, B, limit=LARGE_MAXN)
     if B.dim() < 2 or B.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.gj_solve takes B with n rows, got {tuple(A.shape)} and {tuple(B.shape)}")
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
-    X, D, S = _chunked(_flat(A, batch, n, n), _flat(B, batch, n, m))
+    solve = _chunked if n <= MAXN else _large
+    X, D, S = solve(_flat(A, batch, n, n), _flat(B, batch, n, m))
     return _unflatten(X, batch, n, m), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
-def gj_inv(A):
-    """``(A^-1, D, S)`` for ``A[..., n, n]``: ``gj_solve`` against the identity, which the kernel builds itself."""
+def gj_inv(A, sign=True):
+    """``(A^-1, D, S)`` for ``A[..., n, n]``: ``gj_solve`` against the identity, which the kernel builds itself.
+    Past ``MAXN``, ``sign=False`` leaves ``S[..., 0]`` 0 (not computed)."""
     n = A.shape[-1]
-    _check(A, n)
+    _check(A, n, limit=LARGE_MAXN)
     batch = A.shape[:-2]
-    X, D, S = _call(_inv_op(), _flat(A, batch, n, n))
+    A = _flat(A, batch, n, n)
+    X, D, S = _call(_inv_op(), A) if n <= MAXN else _large(A, sign=sign)
     return _unflatten(X, batch, n, n), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 

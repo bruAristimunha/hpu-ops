@@ -1,6 +1,7 @@
 """On a Gaudi card: the linalg composites through their public torch calls, against torch on the CPU in float64.
     PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_on_hpu.py [--baseline]
-Per op and n in 16, 22, 64, 128 (batch 32, float32): forward, and backward where differentiable. The eight kernel ops
+Per op and n in 16, 22, 64, 128, and for solve, inv, det and slogdet also 96, 220, 256 (batch 32, float32): forward,
+and backward where differentiable. The eight kernel ops
 (solve, inv, det, slogdet, solve_triangular, cholesky_solve, eigh, eigvalsh) also run at the kernel's edges, n in
 1, 3, 21, 31, 32, for correctness and fallback only (no timing loop), and eigh and eigvalsh on an indefinite
 (G + G^T) / 2 at n = 3, 22, 32. A case fails when
@@ -47,6 +48,7 @@ HPU = torch.device("hpu")
 torch.manual_seed(0)
 
 SIZES = (16, 22, 64, 128)
+LARGE_SIZES = (96, 220, 256)  # also for solve, inv, det and slogdet: the in-place kernel (gj_large) past n = 64
 GATE_SIZES = (1, 3, 21, 31, 32)  # the kernels' edges: n = 1, odd sizes, one below, at the limit; no timing
 INDEFINITE_SIZES = (3, 22, 32)
 BATCH = 32
@@ -61,6 +63,8 @@ EIGH_FALLBACKS = []  # baseline: the fallback deltas seen for eigh (the positive
 ops_linalg = None  # hpu_ops.linalg, imported in main
 ops_tpc = None  # hpu_ops.tpc, imported in main
 tpc_maxn = 64  # hpu_ops.tpc.MAXN, set in main
+large_maxn = 512  # hpu_ops.tpc.LARGE_MAXN (solve, inv, det, slogdet), set in main
+LARGE_OPS = ("linalg.solve", "linalg.inv", "linalg.det", "linalg.slogdet")  # and their variants, not solve_triangular
 eigh_maxn = 32  # hpu_ops.tpc.EIGH_MAXN, set in main
 small_maxn = 32  # hpu_ops.tpc.SMALL_MAXN (SVD family, matrix_exp, LU ops), set in main
 SMALL_OPS = ("linalg.svd", "linalg.svdvals", "linalg.pinv", "linalg.lstsq", "linalg.matrix_norm", "linalg.matrix_rank",
@@ -173,6 +177,32 @@ def make_solve_broadcast(b, n, dtype):
 def make_solve_big(b, n, dtype):
     """A batch of ``b + 4`` matrices; the case solves with the slice ``[2:2 + b]``, a view with an offset."""
     return [pivoting(b + 4, n, dtype), torch.randn(b, n, 3, dtype=dtype)]
+
+
+def make_cayley(b, n, dtype):
+    """``(I - S / 2, I + S / 2)`` for a skew-symmetric S: the Cayley map of torch's orthogonal parametrization
+    (EEGSPDNet's BiMap, n = 220)."""
+    g = torch.randn(b, n, n, dtype=dtype) / math.sqrt(n)
+    S = g - g.mT
+    eye = torch.eye(n, dtype=dtype)
+    return [eye - S / 2, eye + S / 2]
+
+
+def make_tiny_multiplier(b, n, dtype):
+    """Review round (gj_large): the pivot row [1e30, 1e-9] divided by its pivot would flush 1e-39 to zero."""
+    A = torch.eye(n, dtype=dtype).repeat(b, 1, 1) + 0.01 * torch.randn(b, n, n, dtype=dtype) / n
+    A[:, :2, :] = 0
+    A[:, 0, 0], A[:, 0, 1], A[:, 1, 0], A[:, 1, 1] = 1e30, 1e-9, 1e30, 2e-9
+    return [A]
+
+
+def make_huge_pivot(b, n, dtype):
+    """Review round (gj_large): a pivot >= 2^126, whose reciprocal is subnormal."""
+    A = torch.eye(n, dtype=dtype).repeat(b, 1, 1) + 0.01 * torch.randn(b, n, n, dtype=dtype) / n
+    A[:, :2, :] = 0
+    A[:, 0, :2] = 1e38
+    A[:, 1, 0], A[:, 1, 1] = 1.0, 2.0
+    return [A]
 
 
 def make_triangular_upper_unit(b, n, dtype):
@@ -408,6 +438,21 @@ CASES = (
          sizes=INDEFINITE_SIZES),
     Case("linalg.eigvalsh.indefinite", make_indefinite, lambda x: L.eigvalsh(x), float64=False, tpc=True,
          sizes=INDEFINITE_SIZES),
+    Case("linalg.inv.tiny_multiplier", make_tiny_multiplier, lambda x: L.inv(x), loss=None, float64=False, tpc=True,
+         sizes=(70,)),
+    Case("linalg.det.tiny_multiplier", make_tiny_multiplier, lambda x: L.det(x), loss=None, float64=False, tpc=True,
+         sizes=(70,)),
+    Case("linalg.inv.huge_pivot", make_huge_pivot, lambda x: L.inv(x), loss=None, float64=False, tpc=True,
+         sizes=(70,)),
+    Case("linalg.slogdet.huge_pivot", make_huge_pivot, lambda x: L.slogdet(x), err_slogdet, None, float64=False,
+         tpc=True, sizes=(70,)),
+    Case("linalg.solve.cayley", make_cayley, lambda a, b: L.solve(a, b), float64=False, tpc=True, sizes=(96, 220)),
+    Case("linalg.solve.left_false_large", make_solve_right, lambda a, b: L.solve(a, b, left=False), float64=False,
+         tpc=True, sizes=(220,)),
+    Case("linalg.solve.vector_rhs_large", make_solve_vector, lambda a, b: L.solve(a, b), float64=False, tpc=True,
+         sizes=(220,)),
+    Case("linalg.solve.broadcast_batch_large", make_solve_broadcast, lambda a, b: L.solve(a, b), float64=False,
+         tpc=True, sizes=(130,)),
     Case("linalg.solve.left_false", make_solve_right, lambda a, b: L.solve(a, b, left=False), float64=False,
          tpc=True, sizes=(22,)),
     Case("linalg.solve.vector_rhs", make_solve_vector, lambda a, b: L.solve(a, b), float64=False, tpc=True,
@@ -589,8 +634,9 @@ def run_case(case, n, timed=True):
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
     # fallbacks recorded, not failed: baseline, and the TPC ops past the kernel's n limit
+    large = case.name.split(".")[:2] in [op.split(".") for op in LARGE_OPS]
     limit = (eigh_maxn if case.name in ("linalg.eigh", "linalg.eigvalsh")
-             else small_maxn if case.name.startswith(SMALL_OPS) else tpc_maxn)
+             else small_maxn if case.name.startswith(SMALL_OPS) else large_maxn if large else tpc_maxn)
     expected = BASELINE or (case.tpc and n > limit)
     problems = hard + ([] if expected else soft)
     row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft, notes=notes)
@@ -641,10 +687,10 @@ def run_float64(case):
     return not problems
 
 
-def singular_input():
-    """float32 matrices, batch 32 at n = 22: element 1 all zero (native and LU of A report the same message), element
-    2 with one zero row (a zero pivot in U, so det is exactly 0)."""
-    A = pivoting(BATCH, SINGULAR_N, torch.float32)
+def singular_input(n=SINGULAR_N):
+    """float32 matrices, batch 32 at n (22, and 220 for the in-place kernel): element 1 all zero (native and LU of A
+    report the same message), element 2 with one zero row (a zero pivot in U, so det is exactly 0)."""
+    A = pivoting(BATCH, n, torch.float32)
     A[1] = 0
     A[2, 5] = 0
     return A
@@ -681,15 +727,15 @@ def run_singular_triangle(op, fn, expected):
     return not problems
 
 
-def run_singular(op, fn):
+def run_singular(op, fn, n=SINGULAR_N):
     """A singular batch on the card: ``det`` exactly 0 and ``slogdet`` (0, -inf) for elements 1 and 2; ``solve`` and
     ``inv`` raise torch's own message, captured from a CPU run; no fallback, no CPU warning."""
-    row = {"op": f"singular.{op}", "n": SINGULAR_N, "batch": BATCH, "dtype": "float32", "lazy": LAZY,
+    row = {"op": f"singular.{op}", "n": n, "batch": BATCH, "dtype": "float32", "lazy": LAZY,
            "baseline": BASELINE}
     problems = []
     try:
-        A = singular_input()
-        B = torch.randn(BATCH, SINGULAR_N, 3)
+        A = singular_input(n)
+        B = torch.randn(BATCH, n, 3)
         call = (lambda x: fn(x, B.to(HPU))) if op == "solve" else fn
         call_cpu = (lambda x: fn(x, B)) if op == "solve" else fn
         raises, want = op in ("solve", "inv"), None
@@ -718,7 +764,7 @@ def run_singular(op, fn):
                 else:
                     zero = bool((out[0][1:3] != 0).any() or not torch.isneginf(out[1][1:3]).all())
                     problems += ["slogdet of a singular element is not (0, -inf)"] * zero
-        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+        problems += ["fell back"] * bool(rec["fallback"] and n <= large_maxn) + cpu_warnings(rec)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         problems.append(f"exception {e!r}"[:300])
     emit(**row, status="fail" if problems else "ok", problems=problems)
@@ -1561,7 +1607,7 @@ def run_lazy_single_call_checks(tpc):
 
 
 def main():
-    global BASELINE, ops_linalg, ops_tpc, tpc_maxn, eigh_maxn, small_maxn
+    global BASELINE, ops_linalg, ops_tpc, tpc_maxn, eigh_maxn, small_maxn, large_maxn
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--baseline", action="store_true", help="skip hpu_ops.enable()")
     parser.add_argument("--with-eigh", action="store_true",
@@ -1573,7 +1619,9 @@ def main():
     from hpu_ops import linalg as ops_linalg
     from hpu_ops import tpc
     ops_tpc = tpc
+    # past n = 64 the in-place kernel runs in eager mode only (tpc.large_pays); lazy mode expects main's route
     tpc_maxn, eigh_maxn, small_maxn = tpc.MAXN, tpc.EIGH_MAXN, tpc.SMALL_MAXN
+    large_maxn = tpc.MAXN if LAZY else tpc.LARGE_MAXN
     if not BASELINE:
         hpu_ops.enable()
     complex_state = "skipped (baseline)"
@@ -1591,7 +1639,8 @@ def main():
         results.append(check_tpc(tpc))
     cases = [c for c in CASES if not args.only or any(s in c.name for s in args.only)]
     for case in cases:
-        results += [run_case(case, n) for n in case.sizes or SIZES]
+        large = case.name.split(".")[:2] in [op.split(".") for op in LARGE_OPS]
+        results += [run_case(case, n) for n in case.sizes or (SIZES + LARGE_SIZES if large else SIZES)]
         if case.gate:
             results += [run_case(case, n, timed=False) for n in GATE_SIZES]
         if case.float64:
@@ -1601,7 +1650,7 @@ def main():
         results += [run_eigh_adversarial(kind, n, seed) for kind in ("deg_rotated", "illcond_1e6", "scaled_1e30")
                     for n in (16, 22) for seed in range(3)]
         for op, fn in (("solve", L.solve), ("inv", L.inv), ("det", L.det), ("slogdet", L.slogdet)):
-            results.append(run_singular(op, fn))
+            results += [run_singular(op, fn, n) for n in (SINGULAR_N, 220)]
         results += run_lazy_single_call_checks(tpc)
         for op, fn in (("solve_triangular", lambda T, B: L.solve_triangular(T, B, upper=False)),
                        ("cholesky_solve", lambda T, B: torch.cholesky_solve(B, T))):

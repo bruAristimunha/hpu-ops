@@ -168,6 +168,86 @@ def tri_solve(A, B, upper=False, unitriangular=False, legacy=False):
     return x
 
 
+def gj_large(A, legacy=False):
+    """``(R, P, Q, D, S)`` of ``gj_large_f32_gaudi2.c`` (the in-place Gauss-Jordan inverse, 64 < n <= 512) for one
+    matrix ``A[n, n]``, row by row in the kernel's order (each step's pass over the rows; the next pivot row is the
+    first unused row of largest |new column k + 1|, a NaN candidate counting as 0). ``legacy=True`` replays the kernel
+    before the review: the pivot row normalized by 1/pivot before the elimination (tiny quotients flushed) and NaN
+    candidates never taken."""
+    a = np.array(A, dtype=F32)  # tensor loads are not flushed; every op is
+    n = a.shape[0]
+    w = 64 * ((n + 63) // 64)
+    R = np.zeros((n, w), F32)
+    R[:, :n] = a
+    used = np.zeros(n, bool)
+    P, Q, D = np.zeros(n, F32), np.zeros(n, F32), np.zeros(n, F32)
+    info = F32(0)
+    lanes = np.arange(w)
+
+    def pick(cand):
+        best, idx = F32(-1), 0
+        for i in range(n):
+            c = cand[i] if legacy or cand[i] == cand[i] else F32(0)
+            if c > best:
+                best, idx = c, i
+        return idx
+
+    p = pick(np.abs(R[:, 0]))
+    nw = R[p].copy()
+    for k in range(n):
+        more = k + 1 < n
+        pk = nw[k]
+        D[k], P[k] = pk, p
+        if pk == 0 and info == 0:
+            info = F32(k + 1)
+        s = _scale(pk)
+        used[p] = True
+        Q[p] = k
+        col = R[:, k].copy()
+        y = R.copy()
+        y[:, k] = 0
+        if legacy:
+            inv = mul(recip(mul(pk, s), zero_to_inf=False)[0], s)
+            pw = mul(np.where(lanes == k, F32(1), nw), inv)
+            nf = sub(F32(0), col)
+            y = mac(pw[None, :], nf[:, None], y)
+        else:
+            pw = np.where(lanes == k, F32(1), nw).astype(F32)
+            with np.errstate(invalid="ignore", over="ignore"):
+                pws = np.where(np.abs(pw) < np.inf, mul(pw, F32(2.0 ** -64)), F32(0)).astype(F32)
+            pks = mul(pk, s)
+            ninv = sub(F32(0), recip(pks, zero_to_inf=False)[0])
+            cs = mul(col, s)
+            q = mul(cs, ninv)
+            r = mac(q, pks, cs)
+            q = q if ninv == 0 else mac(r, ninv, q)
+            with np.errstate(invalid="ignore", over="ignore"):
+                qs = mul(mul(col, F32(2.0 ** 64) if s == 1 else F32(1)), ninv)
+            qs = np.where(q == 0, qs, F32(0)).astype(F32)
+            y = mac(pws[None, :], qs[:, None], mac(pw[None, :], q[:, None], y))
+        y[p] = pw
+        R = y.astype(F32)
+        if more:
+            cand = np.where(used, F32(-1), np.abs(R[:, k + 1]))
+            p = pick(cand)
+            nw = R[p].copy()
+    if not legacy:  # each row divided by its pivot: |pivot| >= 2^64 scaled by 2^-64 first
+        dr = np.zeros(n, F32)
+        dr[P.astype(int)] = D
+        ds = _scale(dr)
+        R = mul(mul(R, ds[:, None]), recip(mul(dr, ds), zero_to_inf=False)[:, None])
+    return R, P, Q, D, np.array([0, info], F32)
+
+
+def gj_large_op(legacy=False):
+    """A stand-in for ``torch.ops.linalg_tpc.gj_large``: the replica per batch element, torch tensors out."""
+    import torch
+
+    def op(A):
+        outs = [gj_large(a.detach().cpu().numpy(), legacy) for a in A]
+        return tuple(torch.from_numpy(np.stack([o[j] for o in outs])) for j in range(5))
+
+    return op
 # ---- team D kernels: matrix_exp, lu_factor / lu_solve, jacobi_svd -------------------------------------------------
 # The same conventions as above (float32 rounding at every op, FTZ/DAZ, an FMA rounded once). Two hardware functions
 # are modelled, not replayed bit for bit: ``v_reciprocal_f32`` as the correctly rounded float32 reciprocal and
