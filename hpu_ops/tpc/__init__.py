@@ -1133,6 +1133,15 @@ def gj_solve_reference(A, B):
     return X, D, S
 
 
+def _float32(*tensors):
+    """The kernels compute in float32 on real data: a complex tensor would be cast with its imaginary part dropped
+    (Codex review, minor: ``matrix_exp(tensor([[1 + 1j]]))`` gave 2.71828), so a direct call with one raises. Real
+    floating dtypes are cast as before: on the card a float64 tensor holds float32 values (hpu-ops#16), and the
+    routes pass float32 only."""
+    if any(t.is_complex() or not t.is_floating_point() for t in tensors):
+        raise ValueError(f"hpu_ops.tpc takes real floating (float32) tensors, got {[str(t.dtype) for t in tensors]}")
+
+
 def _check_small(A, n):
     if A.dim() < 2 or n > SMALL_MAXN or A.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc takes square A with n <= {SMALL_MAXN}, got {tuple(A.shape)}")
@@ -1146,6 +1155,7 @@ def _check_svd(A):
 def jacobi_svd(A, full_matrices=False, sort=True, flush=True):
     """SVD ``(U, S, Vh)`` for ``A[..., m, n]`` (float32, m, n <= ``SMALL_MAXN``) from the one-sided Jacobi kernel."""
     _check_svd(A)
+    _float32(A)
     batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
     k = min(m, n)
     full = full_matrices and m != n
@@ -1177,6 +1187,7 @@ def jacobi_svd(A, full_matrices=False, sort=True, flush=True):
 def jacobi_svdvals(A, sort=True, flush=True):
     """Singular values ``S`` for ``A[..., m, n]`` (float32, m, n <= ``SMALL_MAXN``) from ``-DNO_UV``."""
     _check_svd(A)
+    _float32(A)
     batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
     k = min(m, n)
     if A.numel() == 0:
@@ -1327,6 +1338,7 @@ def householder_product(A, tau, flush=True):
     """Householder product ``Q`` for ``A[..., m, n]`` and ``tau[..., k]`` (float32, m <= ``MAXHH``, m >= n >= k)."""
     if A.dim() < 2:
         raise ValueError(f"hpu_ops.tpc takes 2D+ A, got {tuple(A.shape)}")
+    _float32(A, tau)
     batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
     k = tau.shape[-1]
     if m > MAXHH or m < n or k > n or tau.dim() != A.dim() - 1 or tau.shape[:-1] != batch:
@@ -1368,6 +1380,7 @@ def matrix_exp(A, flush=True):
     """Matrix exponential ``exp(A)`` for ``A[..., n, n]`` (float32, n <= ``SMALL_MAXN``) from the Gaudi2 TPC kernel."""
     n = A.shape[-1]
     _check_small(A, n)
+    _float32(A)
     if A.numel() == 0:
         return A.new_empty(A.shape, dtype=torch.float32)
     batch = A.shape[:-2]
@@ -1381,6 +1394,7 @@ def matrix_exp_frechet(A, G, flush=True):
     """Adjoint Fréchet derivative ``L_exp(A^T, G)`` for ``A, G[..., n, n]`` (float32, n <= ``SMALL_MAXN``) on Gaudi2 TPC."""
     n = A.shape[-1]
     _check_small(A, n)
+    _float32(A, G)
     batch = torch.broadcast_shapes(A.shape[:-2], G.shape[:-2])
     if A.numel() == 0:
         return A.new_empty(*batch, n, n, dtype=torch.float32)
@@ -1423,6 +1437,7 @@ def lu_factor(A, pivots=True):
     ``pivots=False`` only ``(LU, perm)``: ``linalg.lu`` needs no pivots or info."""
     n = A.shape[-1]
     _check_small(A, n)
+    _float32(A)
     batch = A.shape[:-2]
     LU, PV = _call(_lu_op(), _fresh(A.reshape(-1, n, n).to(torch.float32).contiguous()))
     if not pivots:
@@ -1459,6 +1474,7 @@ def lu_solve(LU, pivots, B):
     swaps, then forward and back substitution. One launch per chunk."""
     n, m = LU.shape[-1], B.shape[-1]
     _check_small(LU, n)
+    _float32(LU, B)
     if B.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.lu_solve takes B with n rows, got {tuple(LU.shape)} and {tuple(B.shape)}")
     batch = torch.broadcast_shapes(LU.shape[:-2], pivots.shape[:-1], B.shape[:-2])

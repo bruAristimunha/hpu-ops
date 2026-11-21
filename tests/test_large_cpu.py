@@ -387,3 +387,20 @@ def test_review_lu_factor_flushed_multiplier():
     assert LU[1, 1] == LU_t[1, 1] == 0 and info == int(info_t) == 2 and (piv == piv_t.numpy()).all()
     LU0, _, _, info0 = kr.lu_factor(A.numpy(), legacy_tiny=True)
     assert LU0[1, 1] == 2.0 ** -30 and info0 == 0
+
+
+@pytest.mark.parametrize("call", [
+    lambda: tpc.matrix_exp(torch.tensor([[1 + 1j]])),
+    lambda: tpc.matrix_exp_frechet(torch.eye(2), torch.eye(2, dtype=torch.complex64)),
+    lambda: tpc.jacobi_svd(torch.eye(2, dtype=torch.complex64)),
+    lambda: tpc.jacobi_svdvals(torch.eye(2, dtype=torch.complex128)),
+    lambda: tpc.householder_product(torch.eye(2, dtype=torch.complex64), torch.zeros(1, dtype=torch.complex64)),
+    lambda: tpc.lu_factor(torch.eye(2, dtype=torch.complex64)),
+    lambda: tpc.lu_solve(torch.eye(2), torch.ones(2, dtype=torch.int32), torch.ones(2, 1, dtype=torch.complex64)),
+    lambda: tpc.matrix_exp(torch.eye(2, dtype=torch.int64)),
+])
+def test_review_direct_wrappers_reject_complex(call):
+    """Codex minor: the direct TPC wrappers raise on complex (and integer) data instead of casting it (complex lost
+    its imaginary part: exp([[1 + 1j]]) gave 2.71828). The check runs before any kernel is touched."""
+    with pytest.raises(ValueError, match="real floating"):
+        call()
