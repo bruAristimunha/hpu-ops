@@ -17,8 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from . import tpc
-from ._dispatch import register_paired
-from .linalg import _kernels, _takes
+from .linalg import _function, _kernels, _takes, register_paired
 
 aten = torch.ops.aten
 JACOBI_SWEEPS = 10
@@ -91,6 +90,7 @@ def eigh(A, upper=False):
     return w, V.gather(-1, order[..., None, :].expand_as(V))
 
 
+@_function
 class Eigh(torch.autograd.Function):
     """``aten._linalg_eigh`` from parallel Jacobi, with torch's Hermitian backward (``linalg_eig_backward``) over the
     result. ``V`` is empty when ``compute_v`` is false."""
