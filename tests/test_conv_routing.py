@@ -45,7 +45,9 @@ def route(monkeypatch, mode, x_shape, w_shape, stride=1, padding=0, dilation=1, 
         torch.testing.assert_close(got.float(), want.float(), rtol=eps, atol=1e-5)
         bound = 4 * eps
     else:
-        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+        # the split and the native op sum in different orders (Linux CPU convolutions are threaded, so the native
+        # order varies): elementwise only to that noise; accuracy is the float64 check below
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4 * float(want.abs().max()))
         bound = 1e-5 if dtype is torch.float32 else 1e-12
     for g, r in zip([got] + list(grads), ref):
         assert float((g.double() - r).abs().max() / r.abs().max()) < bound, (dtype, x_shape, w_shape)
@@ -308,7 +310,7 @@ def test_compiled_inference_mode_splits_like_ordinary_capture(monkeypatch):
         widths = [n.args[1].meta["val"].shape[-1] for n in nodes if n.target is torch.ops.aten.convolution.default]
         assert sorted(widths) == [95, 256], (context, widths)
         assert calls.get("large_conv")
-        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4 * float(want.abs().max()))
 
 
 def test_16_bit_bias_where_the_device_adds_it(monkeypatch):
