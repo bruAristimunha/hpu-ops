@@ -33,6 +33,20 @@ def below_autograd():
     return torch._C._dispatch_tls_is_dispatch_key_excluded(DispatchKey.AutogradFunctionality)
 
 
+def tracing(t):
+    """Whether a tracer sees ``t``: ``torch.compile`` (Dynamo, where ``is_compiling()``; AOT autograd's fake tensors
+    and the ``FunctionalTensor`` wrappers around them, where it is False), a fake mode, or ``make_fx`` (a proxy mode,
+    also on real tensors). ``linalg._tracing``'s test, for the modules that cannot import linalg."""
+    from torch._subclasses.fake_tensor import is_fake
+    from torch._subclasses.functional_tensor import FunctionalTensor
+
+    if torch.compiler.is_compiling() or is_fake(t) or (isinstance(t, FunctionalTensor) and is_fake(t.elem)):
+        return True
+    if torch._guards.detect_fake_mode() is not None:
+        return True
+    return torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY) is not None
+
+
 def chain(undos):
     """One undo that runs ``undos`` in reverse order."""
 

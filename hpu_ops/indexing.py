@@ -43,10 +43,12 @@ wrong (bridge 1.21.4).
 ``index_put_`` with integer indices keeps the native kernels, and so do lazy-mode calls below autograd (inference
 mode), where Habana's ``HPU`` kernel of ``index`` is registered.
 """
+import math
+
 import torch
 from torch._C import DispatchKey
 
-from ._dispatch import count, register_kernels
+from ._dispatch import count, register_kernels, tracing
 
 aten = torch.ops.aten
 INTEGER = (torch.int64, torch.int32)
@@ -73,11 +75,9 @@ def _in_range(t, size):
 
 
 def _tracing(t):
-    """True while ``torch.compile`` traces (dynamo, or AOT autograd's fake tensors): index arithmetic then goes on the
-    device, in the graph, instead of on the host."""
-    from torch._subclasses.fake_tensor import is_fake
-
-    return torch.compiler.is_compiling() or is_fake(t)
+    """True while a tracer sees ``t`` (``_dispatch.tracing``: dynamo, AOT autograd's fake and functional tensors, a
+    fake or proxy mode): index arithmetic then goes on the device, in the graph, instead of on the host."""
+    return tracing(t)
 
 
 def _off_device(self, t):
@@ -146,32 +146,47 @@ def index_select_flat(self, indices, checked=True):
     on_host = not _tracing(self) and all(indices[i].device.type == "cpu" for i in pos)
     device = torch.device("cpu") if on_host else self.device
     shape = tuple(bshape) + tuple(self.shape[d] for d in mids)
-    # dims of an expanded input (stride 0) hold one value: select from one element of them, not from a copy of all
+    # dims of an expanded input (stride 0) hold one value: select from one element of them, not from a copy of all.
+    # With a gradient the backward is ``_ExpandedSelect``'s, at the true indices: through the slice autograd would
+    # put it all at index 0 of the expanded dim, wrong for the expanded tensor itself (a leaf ``zeros(3, 1).expand(3,
+    # 4).requires_grad_()``, ``retain_grad``, hooks, ``autograd.grad``: [3, 0, 0, 0] for [0, 1, 0, 2]). Under a
+    # ``torch.func`` transform or forward-mode AD (no Function there) ``self`` is materialized instead.
     sizes = tuple(self.shape)
     flat_dims = [d for d in range(start, end + 1) if sizes[d] > 1 and self.stride(d) == 0]
+    if flat_dims and _transformed():
+        self, flat_dims = self.contiguous(), []
+    full = self
+    exact = bool(flat_dims) and torch.is_grad_enabled() and full.requires_grad
     if flat_dims:
         self = self[tuple(slice(0, 1) if d in flat_dims else slice(None) for d in range(self.dim()))]
-    lin = ok = None
+    lin = lin_true = ok = None
     for d in range(start, end + 1):
         size = sizes[d]
         if d in mids:
             j = mids.index(d)
-            term = torch.zeros(size, device=device, dtype=torch.int64) if d in flat_dims else torch.arange(
-                size, device=device)
-            term = term.reshape((size,) + (1,) * (len(mids) - 1 - j))
+            true = torch.arange(size, device=device).reshape((size,) + (1,) * (len(mids) - 1 - j))
+            term = torch.zeros_like(true) if d in flat_dims else true
         else:
             t = indices[d].to(device=device, dtype=torch.int64)
             if not checked:
                 valid = (t >= -size) & (t < size)
                 ok = valid if ok is None else ok & valid
-            t = torch.zeros_like(t) if d in flat_dims else torch.where(t < 0, t + size, t)
-            term = t.reshape(tuple(t.shape) + (1,) * len(mids))
+            true = torch.where(t < 0, t + size, t).reshape(tuple(t.shape) + (1,) * len(mids))
+            term = torch.zeros_like(true) if d in flat_dims else true
         lin = term if lin is None else lin * self.shape[d] + term
+        if exact:
+            lin_true = true if lin_true is None else lin_true * size + true
     if ok is not None:
-        lin = torch.where(ok.reshape(tuple(ok.shape) + (1,) * len(mids)), lin, -1)
+        keep = ok.reshape(tuple(ok.shape) + (1,) * len(mids))
+        lin = torch.where(keep, lin, -1)
+        lin_true = None if lin_true is None else torch.where(keep, lin_true, -1)
     lin = torch.broadcast_to(lin, shape)
     flat = self.flatten(start, end) if end > start else self
-    out = flat.index_select(start, lin.reshape(-1).to(self.device))
+    if exact:
+        lin_true = torch.broadcast_to(lin_true, shape).reshape(-1).to(self.device)
+        out = _ExpandedSelect.apply(full, flat.detach(), lin.reshape(-1).to(self.device), lin_true, start, end)
+    else:
+        out = flat.index_select(start, lin.reshape(-1).to(self.device))
     if lin.dim() == 0:
         return out.squeeze(start)  # 0-d indices (direct aten calls): the indexed dims go away
     out = out.unflatten(start, shape) if lin.dim() != 1 else out
@@ -180,6 +195,33 @@ def index_select_flat(self, indices, checked=True):
         order = list(range(start, start + nb)) + list(range(start)) + list(range(start + nb, out.dim()))
         out = out.permute(order).contiguous()
     return out
+
+
+class _ExpandedSelect(torch.autograd.Function):
+    """``index_select`` of the flattened dims ``start..end`` of ``full``, computed from ``flat`` (``full`` with its
+    expanded dims sliced to one element, flattened) at ``lin``, with the backward of the select of ``full`` itself at
+    ``lin_true``: the gradient lands at the true indices of the expanded dims, input-sized as ATen's index
+    backward."""
+
+    @staticmethod
+    def forward(ctx, full, flat, lin, lin_true, start, end):
+        ctx.save_for_backward(lin_true)
+        ctx.sizes, ctx.start, ctx.end = tuple(full.shape), start, end
+        return flat.index_select(start, lin)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (lin_true,) = ctx.saved_tensors
+        sizes, start, end = ctx.sizes, ctx.start, ctx.end
+        flat = sizes[:start] + (math.prod(sizes[start:end + 1]),) + sizes[end + 1:]
+        g = grad.new_zeros(flat).index_add(start, lin_true, grad)
+        return (g.unflatten(start, sizes[start:end + 1]) if end > start else g), None, None, None, None, None
+def _transformed():
+    """Whether a ``torch.func`` transform or forward-mode AD is active (an autograd.Function applied from a
+    dispatcher kernel has no kernel under the transforms, and ``_ExpandedSelect`` no jvp)."""
+    if getattr(torch.autograd.forward_ad, "_current_level", -1) >= 0:
+        return True
+    return torch._C._functorch.peek_interpreter_stack() is not None
 
 
 def _expand_masks(indices):

@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch._C import DispatchKey
 
-from ._dispatch import count, register_kernels
+from ._dispatch import count, register_kernels, tracing
 
 aten = torch.ops.aten
 MAX_INDEX = 1 << 24  # spatial index elements (kh * kw * oh * ow, int64: 128 MiB); larger calls keep the native op
@@ -104,11 +104,9 @@ def _is_4d_non_overlap(height, width, kernel_size, dilation, padding, stride):
 
 
 def _tracing(t):
-    """True while ``torch.compile`` traces (dynamo, or AOT autograd's fake tensors): build index tensors on the device,
-    in the graph, instead of on the host."""
-    from torch._subclasses.fake_tensor import is_fake
-
-    return torch.compiler.is_compiling() or is_fake(t)
+    """True while a tracer sees ``t`` (``_dispatch.tracing``: dynamo, AOT autograd's fake and functional tensors, a
+    fake or proxy mode): build index tensors on the device, in the graph, instead of on the host."""
+    return tracing(t)
 
 
 def _fresh(res, src):
