@@ -70,6 +70,10 @@ def untied(x):
     return x
 
 
+SORTS = {"sort", "sort_desc_dim0", "topk3", "topk3_small", "kthvalue2", "msort", "argsort_stable",
+         "sort_stable_desc_idx", "topk3_idx", "kthvalue2_idx"}
+
+
 def weighted(o):
     return (o * torch.arange(1, o.numel() + 1, dtype=o.dtype, device=o.device).reshape(o.shape)).sum()
 
@@ -120,6 +124,8 @@ def main():
             for name, f in table.items():
                 if only and name not in only:
                     continue
+                if name in SORTS and os.environ.get("HPU_OPS_EXACT_SORT") != "1":
+                    continue  # the sort family is opt-in
                 row = {"case": name, "dtype": str(dtype)[6:], "lazy": LAZY, "compile": a.compile}
                 x = untied(x0) if name in TIES_NATIVE else x0
                 try:

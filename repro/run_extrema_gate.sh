@@ -13,6 +13,10 @@ for s in $STEPS; do
     probes)
       timeout 1800 python3 "$SRC/repro/probe_reduction_nan.py" --enable > "$OUT/map_$M.txt" 2>&1; echo "map rc=$? $(tail -1 $OUT/map_$M.txt)"
       timeout 900 python3 "$SRC/repro/probe_extrema_grads.py" > "$OUT/grads_$M.txt" 2>&1; echo "grads rc=$? $(tail -1 $OUT/grads_$M.txt)"
+      timeout 1800 python3 "$SRC/repro/probe_reduction_nan.py" --enable --inference > "$OUT/map_inference_$M.txt" 2>&1
+      echo "map inference rc=$? $(tail -1 $OUT/map_inference_$M.txt)"
+      timeout 600 python3 "$SRC/repro/probe_extrema_out.py" > "$OUT/out_$M.txt" 2>&1; echo "out/inplace/inference rc=$? $(tail -1 $OUT/out_$M.txt)"
+      timeout 600 python3 "$SRC/repro/probe_adaptive_pool.py" > "$OUT/adaptive_$M.txt" 2>&1; echo "adaptive rc=$? $(grep -c 'nan_ok=True values_ok=True indices_ok=True' $OUT/adaptive_$M.txt)/8 ok"
       if [ "$M" = 0 ]; then
         timeout 2400 python3 "$SRC/repro/probe_extrema_grads.py" --compile > "$OUT/grads_compile.txt" 2>&1
         echo "grads compile rc=$? $(tail -1 $OUT/grads_compile.txt)"

@@ -5,6 +5,6 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 export HPU_OPS_EXACT_SORT=1  # the sort family timed too
 for r in 0 1 2; do
   for fix in on off; do
-    timeout 900 python3 "$SRC/tests/bench_extrema.py" --fix $fix --round $r 2>&1 | grep -E '^BENCH|Error'
+    timeout 900 python3 "$SRC/tests/bench_extrema.py" --fix $fix --round $r "$@" 2>&1 | grep -E '^BENCH|Error'
   done
 done

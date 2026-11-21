@@ -57,8 +57,11 @@ CASES = {  # name: (function of the inputs, inputs, differentiable)
 }
 
 
-def timed(f, xs, train, reps):
+def timed(f, xs, train, reps, inference=False):
     def call():
+        if inference:
+            with torch.inference_mode():
+                return f(*xs)
         if train:
             ins = [x.detach().requires_grad_() for x in xs]
             out = f(*ins)
@@ -86,15 +89,17 @@ def main():
     ap.add_argument("--fix", choices=("on", "off"), required=True)
     ap.add_argument("--reps", type=int, default=50)
     ap.add_argument("--round", type=int, default=0)
+    ap.add_argument("--inference", action="store_true", help="forward under torch.inference_mode() only")
     a = ap.parse_args()
     on = a.fix == "on"
     if on:
         extrema.install("hpu")
     inputs = {name: tuple(x.to(HPU) for x in xs) for name, (_, xs, _) in CASES.items()}
     for name, (f, _, diff) in CASES.items():
-        for train in ((False, True) if diff else (False,)):
-            ms, fb = timed(f, inputs[name], train, a.reps)
-            print("BENCH " + json.dumps({"case": name, "train": train, "fix": on, "round": a.round, "ms": round(ms, 4),
+        for train in ((False,) if a.inference else (False, True) if diff else (False,)):
+            ms, fb = timed(f, inputs[name], train, a.reps, a.inference)
+            print("BENCH " + json.dumps({"case": name + (" [inference]" if a.inference else ""), "train": train,
+                                         "fix": on, "round": a.round, "ms": round(ms, 4),
                                          "fallbacks_per_call": fb, "lazy": LAZY}), flush=True)
 
 

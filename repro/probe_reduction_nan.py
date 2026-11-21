@@ -212,12 +212,19 @@ def cases():
     return out
 
 
+INFERENCE = False
+
+
 def run_case(name, fn, build, kinds, spec, n, dtype, compile_):
     x = build(n, dtype)
     row = {"case": name, "n": n, "dtype": str(dtype).split(".")[-1], "lazy": LAZY, "compile": compile_}
     try:
         f = torch.compile(fn, backend="hpu_backend", dynamic=False) if compile_ else fn
-        got = f(put(x))
+        if INFERENCE:
+            with torch.inference_mode():
+                got = f(put(x))
+        else:
+            got = f(put(x))
         if LAZY:
             htcore.mark_step()
         got = to_cpu(got)
@@ -247,9 +254,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--enable", action="store_true")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--inference", action="store_true", help="run the card's calls under torch.inference_mode()")
     ap.add_argument("--only", default="")
     ap.add_argument("--sizes", default=",".join(map(str, SIZES)))
     a = ap.parse_args()
+    global INFERENCE
+    INFERENCE = a.inference
     if a.enable:
         import hpu_ops
         hpu_ops.enable()
