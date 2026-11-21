@@ -168,12 +168,13 @@ def tri_solve(A, B, upper=False, unitriangular=False, legacy=False):
     return x
 
 
-def gj_large(A, legacy=False):
+def gj_large(A, legacy=False, legacy_growth=False):
     """``(R, P, Q, D, S)`` of ``gj_large_f32_gaudi2.c`` (the in-place Gauss-Jordan inverse, 64 < n <= 512) for one
     matrix ``A[n, n]``, row by row in the kernel's order (each step's pass over the rows; the next pivot row is the
     first unused row of largest |new column k + 1|, a NaN candidate counting as 0). ``legacy=True`` replays the kernel
     before the review: the pivot row normalized by 1/pivot before the elimination (tiny quotients flushed) and NaN
-    candidates never taken."""
+    candidates never taken. ``legacy_growth=True``: the kernel before the stored pivot row was normalized by a power of
+    two (Codex review #17: the quotients of used rows overflowed)."""
     a = np.array(A, dtype=F32)  # tensor loads are not flushed; every op is
     n = a.shape[0]
     w = 64 * ((n + 63) // 64)
@@ -181,6 +182,7 @@ def gj_large(A, legacy=False):
     R[:, :n] = a
     used = np.zeros(n, bool)
     P, Q, D = np.zeros(n, F32), np.zeros(n, F32), np.zeros(n, F32)
+    drv = np.zeros(n, F32)  # row i's pivot, times the 2^-e that normalized the row as stored
     info = F32(0)
     lanes = np.arange(w)
 
@@ -198,6 +200,11 @@ def gj_large(A, legacy=False):
         more = k + 1 < n
         pk = nw[k]
         D[k], P[k] = pk, p
+        # the stored pivot row normalized by 2^-e (pivot = 2^e m, m in [1, 2)): 2^-126 for e = 127; 1 for a zero,
+        # subnormal or non-finite pivot (Codex review #17)
+        pe = (int(_u32(pk)) >> 23) & 0xFF
+        ns = F32(1) if legacy_growth or pe in (0, 255) else _f32((max(254 - pe, 1)) << 23)
+        drv[p] = mul(pk, ns)
         if pk == 0 and info == 0:
             info = F32(k + 1)
         s = _scale(pk)
@@ -225,26 +232,25 @@ def gj_large(A, legacy=False):
                 qs = mul(mul(col, F32(2.0 ** 64) if s == 1 else F32(1)), ninv)
             qs = np.where(q == 0, qs, F32(0)).astype(F32)
             y = mac(pws[None, :], qs[:, None], mac(pw[None, :], q[:, None], y))
-        y[p] = pw
+        y[p] = pw if legacy or legacy_growth else mul(pw, ns)
         R = y.astype(F32)
         if more:
             cand = np.where(used, F32(-1), np.abs(R[:, k + 1]))
             p = pick(cand)
             nw = R[p].copy()
-    if not legacy:  # each row divided by its pivot: |pivot| >= 2^64 scaled by 2^-64 first
-        dr = np.zeros(n, F32)
-        dr[P.astype(int)] = D
+    if not legacy:  # each row divided by its pivot (scaled with the row): |pivot| >= 2^64 scaled by 2^-64 first
+        dr = drv
         ds = _scale(dr)
         R = mul(mul(R, ds[:, None]), recip(mul(dr, ds), zero_to_inf=False)[:, None])
     return R, P, Q, D, np.array([0, info], F32)
 
 
-def gj_large_op(legacy=False):
+def gj_large_op(legacy=False, legacy_growth=False):
     """A stand-in for ``torch.ops.linalg_tpc.gj_large``: the replica per batch element, torch tensors out."""
     import torch
 
     def op(A):
-        outs = [gj_large(a.detach().cpu().numpy(), legacy) for a in A]
+        outs = [gj_large(a.detach().cpu().numpy(), legacy, legacy_growth) for a in A]
         return tuple(torch.from_numpy(np.stack([o[j] for o in outs])) for j in range(5))
 
     return op
