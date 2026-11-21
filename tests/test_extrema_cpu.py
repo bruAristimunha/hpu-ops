@@ -305,9 +305,17 @@ def test_reduction_gradients_are_torch_s(card, name):
 
 
 def test_aminmax_has_no_derivative_as_torch(card):
-    x = rows().requires_grad_()
-    with pytest.raises(RuntimeError, match="not implemented"):
-        sum(torch.aminmax(x, dim=-1)).sum().backward()
+    """torch through 2.14 has no aminmax derivative (the rewrite raises its error too); from 2.15 it has one, and
+    the rewrite gives torch's gradient."""
+    f = lambda t: tuple(torch.aminmax(t, dim=-1))  # noqa: E731
+    try:
+        want = _reference(grads, f, rows())
+    except RuntimeError as error:
+        assert "not implemented" in str(error)
+        with pytest.raises(RuntimeError, match="not implemented"):
+            sum(torch.aminmax(rows().requires_grad_(), dim=-1)).sum().backward()
+        return
+    same(grads(f, rows()), want)
 
 
 def test_the_stand_in_drops_nan_like_the_card(monkeypatch):
@@ -921,6 +929,16 @@ def test_internal_sort_skips_the_rewrite_under_compile(card):
     got = compiled(lambda t: extrema.internal_sort(t, -1, True), nodes, dynamic=False)(x)
     same(tuple(got), _reference(lambda t: tuple(torch.sort(t, -1, True)), x))
     assert card["sort"] == 0
+
+
+def test_inplace_ops_keep_a_cpu_scalar_self_on_the_cpu():
+    """In-place ops keep ``self`` where it is (review of #48): moving it made ``clamp_`` write into a moved copy and
+    return it, where torch raises its device error; out of place, a CPU 0-d operand moves as before."""
+    s, bound = torch.tensor(5.0), torch.tensor(7.0, device="meta")
+    assert extrema._onto_device((s, bound), keep_self=True)[0] is s
+    assert extrema._onto_device((s, bound))[0].device.type == "meta"
+    with pytest.raises(RuntimeError, match="device"):  # what the native kernel then does with a CPU self
+        torch.ops.aten.clamp_.Tensor(s, bound, None)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

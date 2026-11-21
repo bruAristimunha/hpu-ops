@@ -113,7 +113,9 @@ def test_replica_unit_triangle_overflow(upper):
     else:
         A[2, :2] = 1
         B[:3] = BIG
-    want = torch.linalg.solve_triangular(A, B, upper=upper, unitriangular=True)
+    # the exact solution (float64, rounded once): torch's float32 trsm is the platform BLAS's, and some sum
+    # x_0 + x_1 first (CI's x86 runners from torch 2.7: -inf), which is what the kernel must not do
+    want = torch.linalg.solve_triangular(A.double(), B.double(), upper=upper, unitriangular=True).float()
     assert torch.isfinite(want).all()
     if not upper:
         assert np.isneginf(replica_tri(A, B, upper, True, legacy=True)[2, 0])  # Codex's -inf
@@ -129,7 +131,9 @@ def test_unit_triangle_overflow_through_the_kernel_arithmetic(replica_tri_hook):
     with cpu_as_hpu(linalg.install_solve_triangular) as calls:
         got = torch.linalg.solve_triangular(A, B, upper=False, unitriangular=True)
     assert calls["solve_triangular"] == 1
-    torch.testing.assert_close(got, torch.linalg.solve_triangular(A, B, upper=False, unitriangular=True))
+    want = torch.linalg.solve_triangular(A.double(), B.double(), upper=False, unitriangular=True).float()
+    assert torch.isfinite(want).all()
+    torch.testing.assert_close(got, want)  # the exact solution: torch's float32 BLAS can overflow here (see above)
 
 
 # ---- 3. Gauss-Jordan overflow of a well-conditioned RHS (B scaled by 1/pivot before cancellation) ----
@@ -252,13 +256,14 @@ def test_tiny_multiplier_through_the_kernel_arithmetic(replica_gj_hook, case):
 
 def test_duplicate_rows_info_differs_from_torch():
     """Documented in the README: exact duplicate rows of general values cancel exactly on the kernel (info != 0, so
-    solve and inv raise) while torch's LAPACK leaves a rounding residue (info 0)."""
+    solve and inv raise). torch's info there is its LAPACK's: macOS Accelerate leaves a rounding residue (info 0),
+    Linux MKL / OpenBLAS cancel exactly too (info 2), so only the kernel's is asserted."""
     torch.manual_seed(0)
     for n in (2, 3, 5, 17, 63):
         A = torch.randn(n, n)
         A[1] = A[0]
         B = torch.ones(n, 1)
-        assert torch.linalg.solve_ex(A, B).info == 0 and replica_gj(A, B)[2][1] != 0
+        assert replica_gj(A, B)[2][1] != 0
 
 
 # ---- 5. solve_triangular(out=): int destination and a destination that requires grad raise as in torch ----

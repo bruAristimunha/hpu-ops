@@ -32,7 +32,8 @@ below and the README's sweep table): one input channel, wide only in the last di
 eager mode (>= 8 for widths 512 to 2000), any width >= 257 at stride >= 8 in lazy mode, no wider than measured.
 TensorCSPNet's default ``(4, 4356)`` stride ``(1, 484)`` is in it. 16-bit chunks are convolved and summed in float32
 and the bias is added once, at the end, before the one rounding, as ATen's CPU convolution does. Compiled
-``inference_mode()`` graphs split too (through ``conv{n}d``'s Python composite kernel).
+``inference_mode()`` graphs split too (through ``conv{n}d``'s Python composite kernel), ``padding="same"`` and unbatched
+inputs included (``"same"`` becomes ATen's int padding before it reaches the split).
 
 Not fixed, compiled (``torch.compile(backend="hpu_backend")``): the graph compiler rejects some split graphs whatever the
 chunk width. With 256-wide chunks (used): conv1d k = 351 over 1000 fails in a bundling pass (``Cannot add a node DEDW to
@@ -66,16 +67,37 @@ def _as_list(value, n):
     return [value] * n if isinstance(value, int) else list(value)
 
 
+def _same_as_ints(conv, n, input, weight, bias, stride, dilation, groups):
+    """``padding="same"`` as ATen's ``_convolution_mode`` computes it: ``d * (k - 1)`` zeros per dim, half on each
+    side, the odd one on the right through ``F.pad`` of the input; then ``conv{n}d.default`` with int padding, which
+    the large-kernel split reads (traced under ``inference_mode()`` ATen's composite called ``aten.convolution``
+    directly, so a 351-wide ``"same"`` kernel stayed whole)."""
+    dil = _as_list(dilation, n)
+    total = [d * (k - 1) for d, k in zip(dil, weight.shape[2:])]
+    left = [t // 2 for t in total]
+    extra = [t - 2 * lo for t, lo in zip(total, left)]
+    if any(extra):
+        input = F.pad(input, [v for e in reversed(extra) for v in (0, e)])
+    return conv(input, weight, bias, _as_list(stride, n), left, dil, groups)
+
+
 def _valid_as_zeros(device_type, n, original):
-    """``conv{n}d.padding`` for tracing: ``"valid"`` on ``device_type`` as ``n`` zeros; anything else ``original``."""
+    """``conv{n}d.padding`` for tracing on ``device_type``: ``"valid"`` as ``n`` zeros, ``"same"`` (stride 1, static
+    kernel sizes) as ATen's int padding (``_same_as_ints``); anything else ``original``, which raises ATen's errors."""
     conv = getattr(aten, f"conv{n}d").default
 
     def kernel(input, weight, *rest):
         bias, stride, padding, dilation, groups = (*rest, *DEFAULTS[len(rest):])
-        if input.device.type != device_type or padding != "valid":
+        if input.device.type != device_type:
             return original(input, weight, *rest)
-        count("valid_conv")
-        return conv(input, weight, bias, _as_list(stride, n), [0] * n, _as_list(dilation, n), groups)
+        if padding == "valid":
+            count("valid_conv")
+            return conv(input, weight, bias, _as_list(stride, n), [0] * n, _as_list(dilation, n), groups)
+        if (padding == "same" and all(s == 1 for s in _as_list(stride, n)) and weight.dim() == n + 2
+                and static(*weight.shape[2:], *_as_list(dilation, n))):
+            count("same_conv")
+            return _same_as_ints(conv, n, input, weight, bias, stride, dilation, groups)
+        return original(input, weight, *rest)
 
     return kernel
 
@@ -361,16 +383,20 @@ CONV_DEFAULTS = (None, 1, 0, 1, 1)  # conv{n}d.default: bias, stride, padding, d
 def _traced_large_kernel(device_type, n, original):
     """``conv{n}d.default``'s ``CompositeImplicitAutograd`` Python kernel, which the tracers decompose to where
     autograd is excluded (a compiled ``inference_mode()`` graph: ``AutogradHPU`` is skipped and the proxy mode sits
-    above ``HPU``, so neither kernel above sees the call): the same split for ``device_type`` tensors."""
+    above ``HPU``, so neither kernel above sees the call): the same split for ``device_type`` tensors, batched or
+    unbatched (``(C, L)``: split as ``(1, C, L)``, as ATen's ``batchify`` does before ``aten.convolution``)."""
 
     def kernel(input, weight, *rest):
         bias, stride, padding, dilation, groups = (*rest, *CONV_DEFAULTS[len(rest):])
-        if input.device.type == device_type and isinstance(padding, (int, list, tuple)):
+        if (input.device.type == device_type and isinstance(padding, (int, list, tuple))
+                and input.dim() in (n + 1, n + 2)):
             stride, padding, dilation = (_as_list(v, n) for v in (stride, padding, dilation))
+            batched = input if input.dim() == n + 2 else input.unsqueeze(0)  # unbatched, as ATen's batchify
             mode = _mode(input, device_type)
-            if _large_kernel_takes(mode, input, weight, bias, stride, padding, dilation, False, [0] * n, groups):
+            if _large_kernel_takes(mode, batched, weight, bias, stride, padding, dilation, False, [0] * n, groups):
                 count("large_conv")
-                return _split_conv(_traced_conv, mode, input, weight, bias, stride, padding, dilation, groups)
+                out = _split_conv(_traced_conv, mode, batched, weight, bias, stride, padding, dilation, groups)
+                return out if batched is input else out.squeeze(0)
         return original(input, weight, *rest)
 
     return kernel

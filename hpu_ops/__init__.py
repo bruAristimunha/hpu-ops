@@ -190,7 +190,9 @@ def enable():
         import habana_frameworks.torch.core  # noqa: F401  (Habana's kernels first: they are never overridden)
     except ImportError:
         return
-    tpc.install_kernel_path()  # before the first HPU op: Habana reads the kernel path when the device initialises
+    with warnings.catch_warnings(record=True) as path_warnings:  # warned after the fixes are in (-W error)
+        warnings.simplefilter("always")
+        tpc.install_kernel_path()  # before the first HPU op: Habana reads the kernel path when the device initialises
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"
@@ -209,5 +211,7 @@ def enable():
 
     _STATE["undo"] = undo_once
     _strict_from_env()
-    if not _attention_fused():  # last: under -W error the fixes are already in
+    for caught in path_warnings:  # last, as the attention hint: under -W error the fixes are already in
+        warnings.warn(caught.message, stacklevel=2)
+    if not _attention_fused():
         warnings.warn(ATTENTION_HINT, stacklevel=2)
