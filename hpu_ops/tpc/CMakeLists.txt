@@ -114,3 +114,27 @@ foreach(KERNEL matrix_exp_f32_gaudi2 matrix_exp_frechet_f32_gaudi2)
     set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
     target_link_libraries(linalg_tpc ${KERNEL})
 endforeach()
+
+# complex64 Jacobi: jacobi_ceigh (pass 1) and jacobi_ceigh_refine (-DREFINE_PASS) share jacobi_ceigh_f32_gaudi2.c;
+# jacobi_csvd and jacobi_csvdvals (-DNO_UV) share jacobi_csvd_f32_gaudi2.c; both include jacobi_cjacobi_common.h.
+foreach(KERNEL jacobi_ceigh_f32_gaudi2 jacobi_ceigh_refine_f32_gaudi2 jacobi_csvd_f32_gaudi2 jacobi_csvdvals_f32_gaudi2)
+    set(SOURCE ${KERNEL})
+    set(DEFINES "")
+    if(KERNEL STREQUAL "jacobi_ceigh_refine_f32_gaudi2")
+        set(SOURCE jacobi_ceigh_f32_gaudi2)
+        set(DEFINES -DREFINE_PASS)
+    elseif(KERNEL STREQUAL "jacobi_csvdvals_f32_gaudi2")
+        set(SOURCE jacobi_csvd_f32_gaudi2)
+        set(DEFINES -DNO_UV)
+    endif()
+    add_custom_command(
+        OUTPUT ${KERNEL}_x86.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE}.c ${CMAKE_CURRENT_SOURCE_DIR}/jacobi_cjacobi_common.h
+        COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE}.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
+        COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 ${DEFINES} -I${TPC_INCLUDE_DIR}/
+                -I${CMAKE_CURRENT_SOURCE_DIR} ./${KERNEL}.c -c
+        COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
+    add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
+    set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
+    target_link_libraries(linalg_tpc ${KERNEL})
+endforeach()

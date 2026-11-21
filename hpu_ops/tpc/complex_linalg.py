@@ -8,7 +8,12 @@ the input's layout; nothing runs on the CPU.
 - ``cgj_solve`` / ``cgj_inv`` (``cgj_solve_f32_gaudi2.c``): Gauss-Jordan with partial pivoting by
   cabs1 = |re| + |im| (LAPACK icamax, as MPS's complex LU), n <= ``COMPLEX_MAXN``. One launch, plus one transpose
   in (pairs to planes) and one out.
-- ``solve``, ``inv``, ``slogdet``, ``det`` on top of them. The phase of the determinant is computed in the kernel as
+- ``eigh`` / ``eigvalsh`` (``jacobi_ceigh_f32_gaudi2.c``, two launches): complex one-sided Jacobi on the shifted
+  Hermitian matrix, then the adaptive-shift refinement pass (the real ``jacobi_eigh``'s structure; the rotation makes
+  the rows' inner product real with a phase, as XLA's eigh_expander and MPS's Eigh kernel), n <= ``COMPLEX_MAXN``.
+- ``svd`` / ``svdvals`` (``jacobi_csvd_f32_gaudi2.c``, one launch): complex one-sided Jacobi SVD, thin factors,
+  m, n <= ``COMPLEX_MAXN``.
+- ``solve``, ``inv``, ``slogdet``, ``det`` on top of the Gauss-Jordan kernels. The phase of the determinant is computed in the kernel as
   (-1)^swaps * prod(u_kk / |u_kk|) (torch's ``lu_det_P`` times ``sgn(diag U)``, JAX's ``_slogdet_lu``), each factor
   normalized, the product renormalized once; logabsdet = sum(log |u_kk|) (one log and one sum on the card).
 
@@ -20,6 +25,7 @@ import torch
 
 from . import _call, _fresh, lazy_mode  # noqa: F401  (lazy_mode: re-exported for the callers' checks)
 from . import _load
+from ..extrema import internal_sort
 
 COMPLEX_MAXN = 32  # MAXN of the complex kernels: a row of each plane is one 64-lane vector, 4 planes in 32 KB
 
@@ -28,6 +34,30 @@ def _cgj_op():
     """``torch.ops.linalg_tpc.cgj_solve``, built on first use."""
     _load()
     return torch.ops.linalg_tpc.cgj_solve
+
+
+def _ceigh_op():
+    """``torch.ops.linalg_tpc.jacobi_ceigh`` (pass 1), built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_ceigh
+
+
+def _ceigh_refine_op():
+    """``torch.ops.linalg_tpc.jacobi_ceigh_refine`` (pass 2), built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_ceigh_refine
+
+
+def _csvd_op():
+    """``torch.ops.linalg_tpc.jacobi_csvd``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_csvd
+
+
+def _csvdvals_op():
+    """``torch.ops.linalg_tpc.jacobi_csvdvals``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_csvdvals
 
 
 def _cgj_inv_op():
@@ -77,6 +107,10 @@ def _unplanar(X, batch, r, c):
     return X.reshape(-1, 2, r, c).permute(0, 2, 3, 1).contiguous().reshape(*batch, r, c, 2)
 
 
+def _empty(batch):
+    return any(b == 0 for b in batch)
+
+
 def _square(P, limit=COMPLEX_MAXN):
     n = P.shape[-2]
     if P.shape[-3] != n or n > limit or n < 1:
@@ -98,6 +132,12 @@ def cgj_solve(A, B, layout="pairs"):
         raise ValueError(f"hpu_ops.tpc.cgj_solve takes B with n rows, got pairs {tuple(PA.shape)} and {tuple(PB.shape)}")
     m = PB.shape[-2]
     batch = torch.broadcast_shapes(PA.shape[:-3], PB.shape[:-3])
+    if _empty(batch) or m == 0:  # no launch for an empty batch; D and S still describe A when only m is 0
+        X = PB.new_zeros(*batch, n, m, 2)
+        if _empty(batch):
+            return from_pairs(X, layout), PA.new_zeros(*batch, 3, n), PA.new_zeros(*batch, 4)
+        _, D, S = cgj_inv(PA.expand(*batch, n, n, 2))
+        return from_pairs(X, layout), D, S
     a = _planar(PA, batch)
     op = _cgj_op()
     parts = [_call(op, a, _planar(chunk, batch)) for chunk in PB.split(COMPLEX_MAXN, -2)]
@@ -112,6 +152,8 @@ def cgj_inv(A, layout="pairs"):
     PA = as_pairs(A, layout)
     n = _square(PA)
     batch = PA.shape[:-3]
+    if _empty(batch):
+        return from_pairs(PA.new_zeros(PA.shape), layout), PA.new_zeros(*batch, 3, n), PA.new_zeros(*batch, 4)
     X, D, S = _call(_cgj_inv_op(), _planar(PA, batch))
     return from_pairs(_unplanar(X, batch, n, n), layout), D.reshape(*batch, 3, n), S.reshape(*batch, 4)
 
@@ -132,6 +174,8 @@ def slogdet(A, layout="pairs"):
     PA = as_pairs(A, layout)
     _square(PA)
     batch = PA.shape[:-3]
+    if _empty(batch):
+        return PA.new_zeros(*batch, 2), PA.new_zeros(batch)
     _, D, S = _call(_cgj_inv_op(), _planar(PA, batch))  # X (A^-1) is not read: no transpose back
     return S[:, :2].reshape(*batch, 2), D[:, 2, :].log().sum(-1).reshape(batch)
 
@@ -158,3 +202,103 @@ def cgj_reference(A, B=None, layout="pairs"):
     D = torch.stack([d.real, d.imag, d.abs()], -2)
     S = torch.stack([phase.real, phase.imag, torch.zeros_like(perm_sign), perm_sign], -1)
     return torch.view_as_real(X), D, S
+
+
+# ---- Jacobi: eigh, svd ---------------------------------------------------------------------------------------------
+
+
+def _conj_t_planar(X, r, c):
+    """Planar ``(b, 2r, c)`` of M -> planar ``(b, 2c, r)`` of M^H (a transpose and a negation of the imaginary plane)."""
+    X = X.reshape(-1, 2, r, c).transpose(-1, -2)
+    return torch.cat([X[:, :1], -X[:, 1:]], 1).reshape(-1, 2 * c, r).contiguous()
+
+
+def _eigh_raw(PA, upper):
+    """``(W [b, n] unsorted, rows [b, 2, n, n])`` of the two kernel passes; rows[:, :, j] = x_j^H, planar."""
+    n = _square(PA)
+    a = _planar(PA, PA.shape[:-3])
+    if upper:  # the lower triangle of A^H is the conjugate of A's upper triangle
+        a = _fresh(_conj_t_planar(a, n, n))
+    V1, H = _call(_ceigh_op(), a)
+    W, V = _call(_ceigh_refine_op(), H, V1)
+    return W, V.reshape(-1, 2, n, n)
+
+
+def eigh(A, UPLO="L", layout="pairs"):
+    """``torch.linalg.eigh`` for a complex Hermitian A (n <= ``COMPLEX_MAXN``) held in the ``UPLO`` triangle (the
+    imaginary parts of the diagonal are ignored, as LAPACK's heevd): ``(w (...,  n) ascending float32, V)`` with V's
+    columns the eigenvectors as pairs (``(..., n, n, 2)`` or interleaved); each column's phase is arbitrary, as in
+    torch. Two kernel launches, a sort and a gather on the card."""
+    PA = as_pairs(A, layout)
+    n = _square(PA)
+    batch = PA.shape[:-3]
+    if _empty(batch):
+        return PA.new_zeros(*batch, n), from_pairs(PA.new_zeros(PA.shape), layout)
+    if n == 1:  # trivial (and kernels with no rotation at all are not worth a launch)
+        w = PA[..., 0, 0, 0].reshape(*batch, 1).clone()
+        V = torch.stack([torch.ones_like(w), torch.zeros_like(w)], -1)[..., None, :]
+        return w, from_pairs(V, layout)
+    W, R = _eigh_raw(PA, UPLO.upper() == "U")
+    w, order = internal_sort(W, -1)
+    R = R.gather(2, order[:, None, :, None].expand_as(R))  # rows j sorted
+    V = torch.stack([R[:, 0].mT, -R[:, 1].mT], -1)  # V[i, j] = conj(x_j^H[i])
+    return w.reshape(*batch, n), from_pairs(V.reshape(*batch, n, n, 2), layout)
+
+
+def eigvalsh(A, UPLO="L", layout="pairs"):
+    """``torch.linalg.eigvalsh`` for a complex Hermitian A: the eigenvalues of ``eigh``, ascending."""
+    PA = as_pairs(A, layout)
+    n = _square(PA)
+    if _empty(PA.shape[:-3]):
+        return PA.new_zeros(*PA.shape[:-3], n)
+    if n == 1:
+        return PA[..., 0, 0, 0].reshape(*PA.shape[:-3], 1).clone()
+    W, _ = _eigh_raw(PA, UPLO.upper() == "U")
+    return internal_sort(W, -1)[0].reshape(*PA.shape[:-3], n)
+
+
+def _svd_input(A, layout):
+    P = as_pairs(A, layout)
+    m, n = P.shape[-3], P.shape[-2]
+    if max(m, n) > COMPLEX_MAXN or min(m, n) < 1:
+        raise ValueError(f"hpu_ops.tpc.complex_linalg.svd takes 1 <= m, n <= {COMPLEX_MAXN}, got pairs {tuple(P.shape)}")
+    a = _planar(P, P.shape[:-3])
+    wide = m <= n  # orthogonalize the rows of A (k = m), else those of A^H (k = n)
+    return P, m, n, wide, (a if wide else _fresh(_conj_t_planar(a, m, n)))
+
+
+def svd(A, full_matrices=False, layout="pairs"):
+    """``torch.linalg.svd`` for a complex A (m, n <= ``COMPLEX_MAXN``): ``(U, S, Vh)`` with U ``(..., m, k)`` and Vh
+    ``(..., k, n)`` as pairs (k = min(m, n)), S descending float32. ``full_matrices=True`` is taken for square A only
+    (it is the thin SVD there); for non-square A it raises NotImplementedError (no null-space completion of the
+    longer side yet). One kernel launch, a sort and gathers on the card."""
+    P, m, n, wide, a = _svd_input(A, layout)
+    if full_matrices and m != n:
+        raise NotImplementedError("hpu_ops.tpc.complex_linalg.svd: full_matrices=True for non-square A")
+    batch, k = P.shape[:-3], min(m, n)
+    big = max(m, n)
+    if _empty(batch):
+        return (from_pairs(P.new_zeros(*batch, m, k, 2), layout), P.new_zeros(*batch, k),
+                from_pairs(P.new_zeros(*batch, k, n, 2), layout))
+    Wn, S, J = _call(_csvd_op(), a)
+    Wn = Wn.reshape(-1, 2, k, big)
+    J = J.reshape(-1, 2, k, k)
+    S, order = internal_sort(S, -1, descending=True)
+    Wn = Wn.gather(2, order[:, None, :, None].expand_as(Wn))
+    J = J.gather(2, order[:, None, :, None].expand_as(J))
+    # A_t = J^H S Wn: wide (A_t = A): U = J^H, Vh = Wn; tall (A_t = A^H): U = Wn^H, Vh = J
+    X, Y = (J, Wn) if wide else (Wn, J)
+    U = torch.stack([X[:, 0].mT, -X[:, 1].mT], -1)
+    Vh = torch.stack([Y[:, 0], Y[:, 1]], -1)
+    return (from_pairs(U.reshape(*batch, m, k, 2), layout), S.reshape(*batch, k),
+            from_pairs(Vh.reshape(*batch, k, n, 2), layout))
+
+
+def svdvals(A, layout="pairs"):
+    """``torch.linalg.svdvals`` for a complex A (m, n <= ``COMPLEX_MAXN``): descending float32, from the kernel without
+    U and V (no polish sweeps there)."""
+    P, m, n, _, a = _svd_input(A, layout)
+    if _empty(P.shape[:-3]):
+        return P.new_zeros(*P.shape[:-3], min(m, n))
+    S = _call(_csvdvals_op(), a)
+    return internal_sort(S, -1, descending=True)[0].reshape(*P.shape[:-3], min(m, n))

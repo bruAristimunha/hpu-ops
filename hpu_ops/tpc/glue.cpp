@@ -57,6 +57,14 @@ extern const char _binary___cgj_solve_f32_gaudi2_o_start[];
 extern const char _binary___cgj_solve_f32_gaudi2_o_end[];
 extern const char _binary___cgj_inv_f32_gaudi2_o_start[];
 extern const char _binary___cgj_inv_f32_gaudi2_o_end[];
+extern const char _binary___jacobi_ceigh_f32_gaudi2_o_start[];
+extern const char _binary___jacobi_ceigh_f32_gaudi2_o_end[];
+extern const char _binary___jacobi_ceigh_refine_f32_gaudi2_o_start[];
+extern const char _binary___jacobi_ceigh_refine_f32_gaudi2_o_end[];
+extern const char _binary___jacobi_csvd_f32_gaudi2_o_start[];
+extern const char _binary___jacobi_csvd_f32_gaudi2_o_end[];
+extern const char _binary___jacobi_csvdvals_f32_gaudi2_o_start[];
+extern const char _binary___jacobi_csvdvals_f32_gaudi2_o_end[];
 }
 
 namespace {
@@ -81,6 +89,10 @@ const char* kTriLowerUnit = "tri_solve_lower_unit_f32_gaudi2";
 const char* kTriUpperUnit = "tri_solve_upper_unit_f32_gaudi2";
 const char* kCSolve = "cgj_solve_f32_gaudi2";  // complex64 Gauss-Jordan, planar re/im rows
 const char* kCInv = "cgj_inv_f32_gaudi2";      // the same source with -DIDENTITY_B
+const char* kCEigh = "jacobi_ceigh_f32_gaudi2";
+const char* kCEighRefine = "jacobi_ceigh_refine_f32_gaudi2";  // -DREFINE_PASS
+const char* kCSvd = "jacobi_csvd_f32_gaudi2";
+const char* kCSvdvals = "jacobi_csvdvals_f32_gaudi2";  // -DNO_UV
 constexpr uint64_t kMaxComplexN = 32;  // MAXN of the complex kernels (n complex columns, 2n planar rows)
 constexpr uint64_t kMaxN = 64;      // MAXN of gj_solve and tri_solve
 constexpr uint64_t kMaxSmallN = 32; // MAXN of jacobi_svd, matrix_exp, lu_factor and lu_solve
@@ -278,6 +290,116 @@ tpc_lib_api::GlueCodeReturn csolve_defs(tpc_lib_api::HabanaKernelParams* in,
 
     return identity ? copy_elf(out, _binary___cgj_inv_f32_gaudi2_o_start, _binary___cgj_inv_f32_gaudi2_o_end)
                     : copy_elf(out, _binary___cgj_solve_f32_gaudi2_o_start, _binary___cgj_solve_f32_gaudi2_o_end);
+}
+
+void full3(tpc_lib_api::TensorAccessPattern& p, uint64_t d0, uint64_t d1)
+{
+    base_pattern(p);
+    full_dim(p, 0, d0);
+    full_dim(p, 1, d1);
+    batch_dim(p, 2);
+}
+
+void full2(tpc_lib_api::TensorAccessPattern& p, uint64_t d0)
+{
+    base_pattern(p);
+    full_dim(p, 0, d0);
+    batch_dim(p, 1);
+}
+
+tpc_lib_api::GlueCodeReturn check_io(tpc_lib_api::HabanaKernelParams* in, unsigned inputs, unsigned outputs)
+{
+    if (in->inputTensorNr != inputs)
+    {
+        in->inputTensorNr = inputs;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_COUNT;
+    }
+    if (in->outputTensorNr != outputs)
+    {
+        in->outputTensorNr = outputs;
+        return tpc_lib_api::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
+    }
+    for (unsigned i = 0; i < inputs; i++)
+    {
+        if (in->inputTensors[i].geometry.dataType != tpc_lib_api::DATA_F32)
+        {
+            return tpc_lib_api::GLUE_INCOMPATIBLE_DATA_TYPE;
+        }
+    }
+    return rank3(in, inputs) ? tpc_lib_api::GLUE_SUCCESS : tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+}
+
+// Complex Hermitian Jacobi. Pass 1: A [n, 2n, batch] -> V, H [n, 2n, batch]; refine: H, V1 [n, 2n, batch] -> W [n,
+// batch], V [n, 2n, batch]. Planar rows (re then im).
+tpc_lib_api::GlueCodeReturn ceigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
+                                       bool refine)
+{
+    const unsigned inputs = refine ? 2 : 1;
+    auto status = check_io(in, inputs, 2);
+    if (status != tpc_lib_api::GLUE_SUCCESS)
+    {
+        return status;
+    }
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    if (n > kMaxComplexN || in->inputTensors[0].geometry.maxSizes[1] != 2 * n ||
+        (refine && (in->inputTensors[1].geometry.maxSizes[0] != n || in->inputTensors[1].geometry.maxSizes[1] != 2 * n ||
+                    in->inputTensors[1].geometry.maxSizes[2] != batch)))
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+    for (unsigned i = 0; i < inputs; i++)
+    {
+        full3(out->inputTensorAccessPattern[i], n, 2 * n);
+    }
+    if (refine)
+    {
+        full2(out->outputTensorAccessPattern[0], n);
+    }
+    else
+    {
+        full3(out->outputTensorAccessPattern[0], n, 2 * n);
+    }
+    full3(out->outputTensorAccessPattern[1], n, 2 * n);
+    return refine ? copy_elf(out, _binary___jacobi_ceigh_refine_f32_gaudi2_o_start,
+                             _binary___jacobi_ceigh_refine_f32_gaudi2_o_end)
+                  : copy_elf(out, _binary___jacobi_ceigh_f32_gaudi2_o_start, _binary___jacobi_ceigh_f32_gaudi2_o_end);
+}
+
+// Complex one-sided Jacobi SVD: A_t [big, 2k, batch] (k <= big <= 32) -> Wn [big, 2k, batch], S [k, batch], J [k, 2k,
+// batch]; svdvals: S alone.
+tpc_lib_api::GlueCodeReturn csvd_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
+                                      bool vals)
+{
+    auto status = check_io(in, 1, vals ? 1 : 3);
+    if (status != tpc_lib_api::GLUE_SUCCESS)
+    {
+        return status;
+    }
+    const uint64_t big = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t rows = in->inputTensors[0].geometry.maxSizes[1];
+    const uint64_t k = rows / 2;
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    if (big > kMaxComplexN || rows % 2 || k > big || k == 0)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+    full3(out->inputTensorAccessPattern[0], big, 2 * k);
+    if (vals)
+    {
+        full2(out->outputTensorAccessPattern[0], k);
+        return copy_elf(out, _binary___jacobi_csvdvals_f32_gaudi2_o_start, _binary___jacobi_csvdvals_f32_gaudi2_o_end);
+    }
+    full3(out->outputTensorAccessPattern[0], big, 2 * k);
+    full2(out->outputTensorAccessPattern[1], k);
+    full3(out->outputTensorAccessPattern[2], k, 2 * k);
+    return copy_elf(out, _binary___jacobi_csvd_f32_gaudi2_o_start, _binary___jacobi_csvd_f32_gaudi2_o_end);
 }
 
 tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
@@ -789,7 +911,7 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 20 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 24 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
@@ -812,6 +934,10 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint3
         strcpy(guids[17].name, kLarge);
         strcpy(guids[18].name, kCSolve);
         strcpy(guids[19].name, kCInv);
+        strcpy(guids[20].name, kCEigh);
+        strcpy(guids[21].name, kCEighRefine);
+        strcpy(guids[22].name, kCSvd);
+        strcpy(guids[23].name, kCSvdvals);
     }
     if (kernelCount != nullptr)
     {
@@ -902,6 +1028,22 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (strcmp(params->guid.name, kCInv) == 0)
     {
         return csolve_defs(params, instance, true);
+    }
+    if (strcmp(params->guid.name, kCEigh) == 0)
+    {
+        return ceigh_defs(params, instance, false);
+    }
+    if (strcmp(params->guid.name, kCEighRefine) == 0)
+    {
+        return ceigh_defs(params, instance, true);
+    }
+    if (strcmp(params->guid.name, kCSvd) == 0)
+    {
+        return csvd_defs(params, instance, false);
+    }
+    if (strcmp(params->guid.name, kCSvdvals) == 0)
+    {
+        return csvd_defs(params, instance, true);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }
