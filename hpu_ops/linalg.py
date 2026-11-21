@@ -71,6 +71,14 @@ def _is_fake(t):
     return isinstance(t, FunctionalTensor) and is_fake(t.elem)
 
 
+def _tracing(t):
+    """Whether a tracer sees ``t``: ``torch.compile`` (Dynamo, or AOT autograd's fake and functional tensors, where
+    ``torch.compiler.is_compiling()`` is False), a fake mode, or ``make_fx`` (a proxy mode, also on real tensors)."""
+    if _is_fake(t) or torch._guards.detect_fake_mode() is not None:
+        return True
+    return torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY) is not None
+
+
 def _bind(op, args, kwargs):
     """The arguments of a call to ``op`` in schema order, defaults filled in."""
     rest = op._schema.arguments[len(args):]
@@ -132,7 +140,8 @@ def _tpc_takes(device_type, takes, matrix_at=0, maxn=None, large=False):
         if large and len(args) > 1 and isinstance(args[1], torch.Tensor):  # solve: B's batch broadcasts A's
             B = args[1]
             batch = torch.broadcast_shapes(batch, B.shape[:-1] if _is_vector_rhs(A, B) else B.shape[:-2])
-        return large and tpc.large_pays(n, math.prod(batch)) and tpc.ready()
+        # eager only (tpc.large_pays): a traced graph (compile, AOT, make_fx) keeps main's route (codex review #19)
+        return large and not _tracing(A) and tpc.large_pays(n, math.prod(batch)) and tpc.ready()
 
     return tpc_takes
 
@@ -251,16 +260,34 @@ def _out_on_cpu(op, args, kwargs, outs):
     return values[0] if len(values) == 1 else values
 
 
-def _kernels(device_type, op, name, function, takes, backend=True):
+def _traced_with_grad(args, kwargs):
+    """Whether a declined call is being traced (compile, AOT, make_fx) with its autograd recorded: grad mode on, a
+    real floating tensor argument that requires grad, all on one device, no functorch transform."""
+    tensors = [x for x in pytree.tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor)]
+    if not tensors or _transformed() or not torch.is_grad_enabled() or not any(t.requires_grad for t in tensors):
+        return False
+    if len({t.device for t in tensors}) > 1 or not all(t.is_floating_point() for t in tensors):
+        return False
+    return any(_tracing(t) for t in tensors)
+
+
+def _kernels(device_type, op, name, function, takes, backend=True, traced=None):
     """The ``(op, key, kernel)`` entries for ``register_kernels``: ``function`` for the calls ``takes`` accepts, else
     ``op``'s own kernel at autograd, and the CPU below it. With ``backend=False`` only the autograd entry is made:
     ops whose torch derivative reads the LU factors (solve_ex, det, slogdet) must reach Habana's own kernel below
-    autograd, as our placeholder factors would turn a traced native backward into NaN (symbolic shapes, recompiles)."""
+    autograd, as our placeholder factors would turn a traced native backward into NaN (symbolic shapes, recompiles).
+    ``traced`` (those ops) takes the calls a tracer sees declined with grad recorded: the graph's node is still the
+    op, but at run time it reaches the autograd kernel again with real tensors, where ``takes`` may accept it (the
+    large route is eager-only, a symbolic shape is static) and return placeholder factors. torch's traced derivative
+    would read them (NaN gradients of STaRNet(64)'s n = 96 Cayley solve compiled); ``traced``'s backward reads ``A``
+    and the outputs only, so either run-time route gives torch's gradient."""
 
     def autograd_kernel(*args, **kwargs):
         if takes(*args, **kwargs):
             count(name)
             return function.apply(*_bind(op, args, kwargs))
+        if traced is not None and _traced_with_grad(args, kwargs):
+            return traced.apply(op, *_bind(op, args, kwargs))
         return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
 
     def backend_kernel(*args, **kwargs):  # below autograd: inference mode, tracers' decompositions
@@ -713,7 +740,8 @@ def install_solve(device_type):
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
     takes = _tpc_takes(device_type, shapes_ok, large=True)
-    return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes, backend=False)])
+    return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes, backend=False,
+                                                         traced=_TracedSolveEx)])
 
 
 def _inverse(LU, pivots):
@@ -787,14 +815,26 @@ class Det(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad, *_):
         A, det = ctx.saved_tensors
-        cofactor = (grad * det)[..., None, None] * InvEx.apply(A, False)[0].mH
-        if torch.is_grad_enabled():
-            # torch's derivative in grad mode (double backward): the SVD formula for |det| < 100 eps, whose cofactor
-            # is right on a singular matrix, where det * A^-H is 0. The check is a host sync, in grad mode only.
-            singular = det.abs() < 100 * torch.finfo(A.dtype).eps
-            if bool(singular.any()):
-                return torch.where(singular[..., None, None], _det_grad_singular(A, grad), cofactor)
-        return cofactor
+        return _det_backward(A, det, grad, lambda M: InvEx.apply(M, False)[0])
+
+
+def _det_backward(A, det, grad, inverse):
+    """``g det A^-H`` with ``inverse(A)``; in grad mode (double backward) a singular A takes torch's SVD formula."""
+    cofactor = (grad * det)[..., None, None] * inverse(A).mH
+    if torch.is_grad_enabled():
+        # torch's derivative in grad mode (double backward): the SVD formula for |det| < 100 eps, whose cofactor
+        # is right on a singular matrix, where det * A^-H is 0. The check is a host sync, in grad mode only.
+        singular = det.abs() < 100 * torch.finfo(A.dtype).eps
+        if _tracing(A):
+            # no host read in a traced graph: both formulas, selected per matrix; the cofactor of a singular matrix
+            # is taken on the identity instead, so its non-finite inverse does not reach where's derivative
+            mask = singular[..., None, None]
+            safe = torch.where(mask, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device), A)
+            cofactor = (grad * det)[..., None, None] * inverse(safe).mH
+            return torch.where(mask, _det_grad_singular(A, grad), cofactor)
+        if bool(singular.any()):
+            return torch.where(singular[..., None, None], _det_grad_singular(A, grad), cofactor)
+    return cofactor
 
 
 def _det_grad_singular(A, grad):
@@ -847,6 +887,80 @@ class Slogdet(torch.autograd.Function):
         return grad[..., None, None] * InvEx.apply(A, False)[0].mH
 
 
+def _below_autograd(op, *args, **kwargs):
+    """``op`` at the key below autograd: the native kernel (Habana's on ``hpu``), a plain node to a tracer."""
+    with torch._C._AutoDispatchBelowAutograd():
+        return op(*args, **kwargs)
+
+
+def _plain_inverse(A):
+    """``A^-1`` through the public op: in a traced backward, whatever route ``linalg.inv_ex`` takes."""
+    return torch.linalg.inv_ex(A)[0]
+
+
+class _TracedSolveEx(torch.autograd.Function):
+    """A traced ``_linalg_solve_ex`` that ``takes`` declined (``_kernels``' ``traced``): the op's own forward, torch's
+    backward from ``A`` and ``X`` (``gB = solve(A^H, g)``, ``gA = -gB X^H``), never from ``LU`` and ``pivots``,
+    which the node may return as placeholders at run time."""
+
+    @staticmethod
+    def forward(ctx, op, A, B, left, check_errors):
+        X, LU, pivots, info = _below_autograd(op, A, B, left=left, check_errors=check_errors)
+        ctx.save_for_backward(A, X)
+        ctx.left = left
+        ctx.vector = _is_vector_rhs(A, B)
+        ctx.B_shape = B.shape
+        ctx.mark_non_differentiable(LU, pivots, info)
+        return X, LU, pivots, info
+
+    @staticmethod
+    def backward(ctx, grad, *_):
+        A, X = ctx.saved_tensors
+        gB = torch.linalg.solve(A.mH, grad, left=ctx.left)
+        gA = None
+        if ctx.needs_input_grad[1]:
+            g, x = (gB.unsqueeze(-1), X.unsqueeze(-1)) if ctx.vector else (gB, X)
+            gA = (-(g @ x.mH) if ctx.left else -(x.mH @ g)).sum_to_size(A.shape)
+        return None, gA, gB.sum_to_size(ctx.B_shape), None, None
+
+
+class _TracedDet(torch.autograd.Function):
+    """A traced ``_linalg_det`` that ``takes`` declined: the op's forward, ``Det``'s backward through the public
+    inverse, never from ``LU`` and ``pivots`` (see ``_TracedSolveEx``)."""
+
+    @staticmethod
+    def forward(ctx, op, A):
+        det, LU, pivots = _below_autograd(op, A)
+        ctx.save_for_backward(A, det)
+        ctx.mark_non_differentiable(LU, pivots)
+        return det, LU, pivots
+
+    @staticmethod
+    def backward(ctx, grad, *_):
+        A, det = ctx.saved_tensors
+        return None, _det_backward(A, det, grad, _plain_inverse)
+
+
+class _TracedSlogdet(torch.autograd.Function):
+    """A traced ``_linalg_slogdet`` that ``takes`` declined: the op's forward, ``Slogdet``'s backward
+    (``g A^-H``) through the public inverse, never from ``LU`` and ``pivots`` (see ``_TracedSolveEx``)."""
+
+    @staticmethod
+    def forward(ctx, op, A):
+        sign, logabsdet, LU, pivots = _below_autograd(op, A)
+        ctx.save_for_backward(A)
+        ctx.mark_non_differentiable(LU, pivots)
+        ctx.set_materialize_grads(False)
+        return sign, logabsdet, LU, pivots
+
+    @staticmethod
+    def backward(ctx, _sign, grad, *_):
+        if grad is None:  # only sign was used: real sign has no gradient
+            return None, None
+        (A,) = ctx.saved_tensors
+        return None, grad[..., None, None] * _plain_inverse(A).mH
+
+
 def install_inv_det(device_type):
     """``linalg.inv``/``inv_ex``, ``det`` and ``slogdet`` on ``device_type`` from the masked LU and two triangular
     matmuls. Returns an undo."""
@@ -854,7 +968,8 @@ def install_inv_det(device_type):
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
         takes = _tpc_takes(device_type, _takes(device_type, name), large=True)
-        groups.append(_kernels(device_type, op, name, function, takes, backend=name == "inv"))
+        traced = {"det": _TracedDet, "slogdet": _TracedSlogdet}.get(name)
+        groups.append(_kernels(device_type, op, name, function, takes, backend=name == "inv", traced=traced))
     return register_paired(device_type, groups)
 
 
@@ -899,6 +1014,8 @@ def _pinv_takes(device_type, name="pinv"):
         for tol in (atol, rtol):
             if tol is not None and not _tol_tensor_ok(tol, A.shape[:-2]):
                 return False
+            if tol is not None and tol.requires_grad and torch.is_grad_enabled():
+                return False  # torch's own kernel raises: atol and rtol are not differentiable (codex review, minor)
         return True
 
     return takes
@@ -982,23 +1099,27 @@ class Svd(torch.autograd.Function):
         Uk, Vhk = U[..., :k], Vh[..., :k, :]
         gA = (Uk * gS.unsqueeze(-2)) @ Vhk if gS is not None else U.new_zeros(*S.shape[:-1], m, n)
         if gU is not None or gVh is not None:
-            S_scale = S.amax(-1, keepdim=True).clamp(min=1e-36)
-            s = S / S_scale
-            s2 = s * s
-            ds2 = s2.unsqueeze(-2) - s2.unsqueeze(-1)
-            F = torch.where(ds2 != 0, 1.0 / torch.where(ds2 != 0, ds2, 1.0), 0.0)
-            s_over_scale = s / S_scale
+            # torch's S_j / (S_j^2 - S_i^2) and S_i / (S_j^2 - S_i^2), as (S_j / (S_j + S_i)) / (S_j - S_i): no
+            # square, so neither it nor its derivative (double backward) over- or underflows for distinct values
+            # (codex review #7: diag(1e18, 2.0001, 2) was NaN); equal values give 0 (torch's are non-finite there)
+            Sj, Si = S.unsqueeze(-2), S.unsqueeze(-1)
+            diff, total = Sj - Si, Sj + Si
+            distinct = diff != 0
+            safe_diff = torch.where(distinct, diff, 1.0)
+            safe_total = torch.where(total != 0, total, 1.0)
             S_inv = torch.where(S != 0, 1.0 / torch.where(S != 0, S, 1.0), 0.0)
             if gU is not None:
                 gUk = gU[..., :k]
                 UhgU = Uk.mH @ gUk
-                gA = gA + (Uk @ ((F * (UhgU - UhgU.mH)) * s_over_scale.unsqueeze(-2))) @ Vhk
+                G1 = torch.where(distinct, (Sj / safe_total) / safe_diff, 0.0)
+                gA = gA + (Uk @ ((UhgU - UhgU.mH) * G1)) @ Vhk
                 if m > k:
                     gA = gA + ((gUk - Uk @ UhgU) * S_inv.unsqueeze(-2)) @ Vhk
             if gVh is not None:
                 gVhk = gVh[..., :k, :]
                 gVhV = gVhk @ Vhk.mH
-                gA = gA + (Uk @ ((-F) * (gVhV - gVhV.mH) * s_over_scale.unsqueeze(-1))) @ Vhk
+                G2 = torch.where(distinct, (Si / safe_total) / safe_diff, 0.0)
+                gA = gA - (Uk @ ((gVhV - gVhV.mH) * G2)) @ Vhk
                 if n > k:
                     gA = gA + (Uk * S_inv.unsqueeze(-2)) @ (gVhk - gVhV @ Vhk)
         return gA, None, None, None
@@ -1016,7 +1137,8 @@ def install_svd(device_type):
     entries = _kernels(device_type, aten._linalg_svd.default, "svd", Svd, takes)
 
     def svd_u_backend(A, full_matrices=False, compute_uv=True, *, driver=None, U, S, Vh):
-        if takes(A, full_matrices, compute_uv, driver=driver):
+        same = all(t.dtype == A.dtype for t in (U, S, Vh))  # else torch's own kernel raises its dtype error
+        if same and takes(A, full_matrices, compute_uv, driver=driver):
             count("svd")
             u, s, vh = Svd.compute(A, full_matrices, compute_uv, driver)
         else:
@@ -1026,6 +1148,9 @@ def install_svd(device_type):
         if compute_uv:
             U.resize_(u.shape).copy_(u)
             Vh.resize_(vh.shape).copy_(vh)
+        else:  # as torch: U and Vh resized to empty
+            U.resize_(0)
+            Vh.resize_(0)
         return U, S, Vh
 
     entries.append((aten._linalg_svd.U, "{}", svd_u_backend))
@@ -1055,6 +1180,8 @@ def install_svd(device_type):
     def _norm_dims(A, dim):
         if len(dim) != 2 or A.dim() < 2:
             return None
+        if not all(-A.dim() <= d < A.dim() for d in dim):
+            return None  # torch's own decomposition raises its IndexError (codex review, minor)
         d0, d1 = dim[0] % A.dim(), dim[1] % A.dim()
         return None if d0 == d1 else (d0, d1)
 
@@ -1097,28 +1224,42 @@ def install_svd(device_type):
     return register_kernels(device_type, entries)
 
 
-def _pinv_tol(S, m, n, atol=None, rtol=None):
-    """``max(atol, rtol * S_max)`` with torch's ``get_atol_rtol`` defaults: a missing ``atol`` is 0; a missing ``rtol``
-    is ``eps * max(m, n)``, or 0 where ``atol > 0`` (``atol <= 0`` keeps the default)."""
-    S_max = S[..., :1] if S.shape[-1] == 0 else S.amax(-1, keepdim=True)
-    default_rtol = max(m, n) * torch.finfo(S.dtype).eps
-    if atol is None and rtol is None:
-        return S_max * default_rtol
-    t_atol = atol.to(device=S.device, dtype=S.dtype).unsqueeze(-1) if atol is not None else S.new_zeros(())
-    if rtol is not None:
-        t_rtol = rtol.to(device=S.device, dtype=S.dtype).unsqueeze(-1)
-    else:
-        t_rtol = torch.where(t_atol > 0, 0.0, default_rtol).to(S.dtype)
-    return torch.maximum(t_atol, t_rtol * S_max)
+def _greater(x, t):
+    """``x > t`` exactly: a Python number ``t`` is compared as a real number (rounded to ``x``'s dtype, ``>`` becomes
+    ``>=`` where the rounding went up), a tensor in float64 off ``hpu`` (as torch's comparison with its float64
+    tolerances) and in ``x``'s dtype on ``hpu``, where float64 holds float32 values."""
+    if not isinstance(t, torch.Tensor):
+        t = float(t)
+        r = float(torch.tensor(t, dtype=x.dtype))
+        return x >= r if r > t else x > r
+    wide = x.dtype if x.device.type == "hpu" else torch.promote_types(x.dtype, torch.float64)
+    return x.to(wide) > t.to(device=x.device, dtype=wide)
 
 
-def _pinv_tol_scalar(S, m, n, atol=None, rtol=None):
-    """``_pinv_tol`` for float ``atol`` / ``rtol``."""
+def _keep(S, m, n, atol=None, rtol=None):
+    """The singular values torch keeps: ``S > max(atol, rtol * S_max)`` with torch's ``get_atol_rtol`` defaults (a
+    missing ``atol`` is 0; a missing ``rtol`` is ``eps * max(m, n)``, or 0 where ``atol > 0``), compared as torch
+    compares them, in float64 (``_greater``), not after rounding the tolerance to ``S``'s dtype (codex review #13:
+    ``atol = 1 - 1e-9`` rounded to float32 1 dropped the identity's singular values). ``atol`` and ``rtol`` are
+    Python numbers or tensors of the batch shape."""
     S_max = S[..., :1] if S.shape[-1] == 0 else S.amax(-1, keepdim=True)
     default_rtol = max(m, n) * torch.finfo(S.dtype).eps
+    tensor = lambda t: t.to(S.device).unsqueeze(-1) if isinstance(t, torch.Tensor) else t  # noqa: E731
+    atol, rtol = tensor(atol), tensor(rtol)
     if rtol is None:
-        rtol = 0.0 if atol is not None and atol > 0 else default_rtol
-    return torch.maximum(S.new_full((), 0.0 if atol is None else atol), rtol * S_max)
+        if atol is None:
+            rtol = default_rtol
+        elif isinstance(atol, torch.Tensor):
+            rtol = torch.where(atol > 0, 0.0, default_rtol).double()
+        else:
+            rtol = 0.0 if atol > 0 else default_rtol
+    keep = S > 0 if atol is None else _greater(S, atol)
+    wide = S.dtype if S.device.type == "hpu" else torch.promote_types(S.dtype, torch.float64)
+    if isinstance(rtol, torch.Tensor):
+        bound = rtol.to(wide) * S_max.to(wide)
+    else:
+        bound = S_max.to(wide) * rtol
+    return keep & _greater(S, bound)
 
 
 def _pinv_backward(A, P, gP):
@@ -1132,8 +1273,7 @@ class Pinv(torch.autograd.Function):
     @staticmethod
     def compute(A, atol, rtol, hermitian):
         U, S, Vh = Svd.compute(A, False, True, sort=False)
-        tol = _pinv_tol(S, A.shape[-2], A.shape[-1], atol, rtol)
-        S_inv = torch.where(S > tol, S.reciprocal(), 0.0)
+        S_inv = torch.where(_keep(S, A.shape[-2], A.shape[-1], atol, rtol), S.reciprocal(), 0.0)
         return (Vh.mH * S_inv.unsqueeze(-2)) @ U.mH
 
     @staticmethod
@@ -1170,7 +1310,9 @@ def _lstsq_eval(A, B, rcond, driver):
     fake = _is_fake(S)
     S_max = S[..., :1] if need_sort else S.amax(-1, keepdim=True)
     if fake:
-        S_inv = torch.where(S > S_max * rtol_val, S.reciprocal(), 0.0)
+        # traced gels only (the others declined above): gels ignores rcond and assumes full rank, as in eager, where
+        # a rank-deficient input is declined to torch's gels (codex review #11)
+        S_inv = S.reciprocal()
         bad = None
     else:
         S_min = S[..., -1:] if need_sort else S.amin(-1, keepdim=True)
@@ -1190,24 +1332,28 @@ def _lstsq_eval(A, B, rcond, driver):
     sv_out = S if driver in ("gelsd", "gelss") else A.new_empty(0)
     if bad is not None and bool(bad):
         return None
-    return sol, U, S_inv, Vh, residuals, rank_out, sv_out, rtol_val, vector
+    return sol, U, S, Vh, residuals, rank_out, sv_out, rtol_val, vector
 
 
 class _Lstsq(torch.autograd.Function):
+    """The differentiable lstsq solution. The backward is torch's (``linalg_lstsq_backward``): through
+    ``linalg.pinv(A)`` at pinv's default tolerance, whatever ``rcond`` the forward used (codex review #12)."""
+
     @staticmethod
-    def forward(ctx, A, B, sol, U, S_inv, Vh, residuals, rank_out, sv_out, rtol_val, vector):
-        ctx.save_for_backward(A, B, U, S_inv, Vh)
+    def forward(ctx, A, B, sol, U, S, Vh, residuals, rank_out, sv_out, rtol_val, vector):
+        ctx.save_for_backward(A, B, U, S, Vh)
         ctx.options = (rtol_val, vector)
         ctx.mark_non_differentiable(residuals, rank_out, sv_out)
         return sol, residuals, rank_out, sv_out
 
     @staticmethod
     def backward(ctx, g_sol, *_):
-        A, B, U, S_inv, Vh = ctx.saved_tensors
-        rtol_val, vector = ctx.options
+        A, B, U, S, Vh = ctx.saved_tensors
+        _, vector = ctx.options
         if torch.is_grad_enabled():
-            P = Pinv.apply(A, None, A.new_full((), rtol_val), False)
+            P = Pinv.apply(A, None, None, False)
         else:
+            S_inv = torch.where(_keep(S, A.shape[-2], A.shape[-1]), S.reciprocal(), 0.0)
             P = (Vh.mH * S_inv.unsqueeze(-2)) @ U.mH
         g_sol_mat = g_sol.unsqueeze(-1) if vector else g_sol
         gA = None
@@ -1263,7 +1409,8 @@ def install_matrix_rank(device_type):
         def run(A, tol):
             count("svd")
             S = Svd.compute(A.detach(), False, False, sort=False)[1]
-            return (S > tol).sum(-1, dtype=torch.int64)
+            # torch's legacy overload: atol = tol, rtol = 0, so a negative tol counts no zero (codex review, minor)
+            return _keep(S, A.shape[-2], A.shape[-1], tol, 0.0).sum(-1, dtype=torch.int64)
 
         def kernel(*args, **kwargs):
             A, tol, hermitian = _bind(op, args, kwargs)
@@ -1286,8 +1433,7 @@ def install_matrix_rank(device_type):
         def run(A, tol):
             count("svd")
             S = Svd.compute(A.detach(), False, False, sort=False)[1]
-            t = tol.to(device=S.device, dtype=S.dtype).unsqueeze(-1)
-            return (S > t).sum(-1, dtype=torch.int64)
+            return _keep(S, A.shape[-2], A.shape[-1], tol, 0.0).sum(-1, dtype=torch.int64)
 
         def kernel(*args, **kwargs):
             A, tol, hermitian = _bind(op, args, kwargs)
@@ -1312,8 +1458,7 @@ def install_matrix_rank(device_type):
         def run(A, atol, rtol):
             count("svd")
             S = Svd.compute(A.detach(), False, False, sort=False)[1]
-            tol = _pinv_tol(S, A.shape[-2], A.shape[-1], atol, rtol)
-            return (S > tol).sum(-1, dtype=torch.int64)
+            return _keep(S, A.shape[-2], A.shape[-1], atol, rtol).sum(-1, dtype=torch.int64)
 
         def kernel(*args, **kwargs):
             A, atol, rtol, hermitian = _bind(op, args, kwargs)
@@ -1333,8 +1478,7 @@ def install_matrix_rank(device_type):
         def run(A, atol, rtol):
             count("svd")
             S = Svd.compute(A.detach(), False, False, sort=False)[1]
-            tol = _pinv_tol_scalar(S, A.shape[-2], A.shape[-1], atol, rtol)
-            return (S > tol).sum(-1, dtype=torch.int64)
+            return _keep(S, A.shape[-2], A.shape[-1], atol, rtol).sum(-1, dtype=torch.int64)
 
         def kernel(*args, **kwargs):
             A, atol, rtol, hermitian = _bind(op, args, kwargs)
@@ -1400,6 +1544,32 @@ _PADE13_C = (
 _EXPM_STRATEGY = "auto"  # "auto" | "tpc" | "item" | "masked8" | "masked12" | "masked16"
 
 
+def _expm_counts(A):
+    """The kernels' scaling count of each matrix of ``A`` (from its 1-norm, ``_expm_scaling``), on the host (one sync)
+    and, unless all are equal, as a tensor ``[..., 1, 1]`` with the matching scales ``2^-s``: each matrix is scaled
+    and squared by its own count, so one matrix's norm never changes another's result (codex review #9)."""
+    counts = [_expm_scaling(x) for x in A.detach().abs().sum(-2).amax(-1).reshape(-1).tolist()]
+    if len(set(counts)) <= 1:
+        return (counts[0] if counts else 0), None, None
+    shape = (*A.shape[:-2], 1, 1)
+    s_t = torch.tensor(counts, dtype=A.dtype).reshape(shape).to(A.device)
+    scale = torch.tensor([math.ldexp(1.0, -c) for c in counts], dtype=A.dtype).reshape(shape).to(A.device)
+    return max(counts), s_t, scale
+
+
+def _expm_traced_counts(A, s_max):
+    """``(s_t, scale)`` while tracing: the counts from the 1-norms on the device, at most ``s_max``."""
+    norm = A.detach().abs().sum(-2).amax((-1,), keepdim=True).unsqueeze(-1)
+    s_t = torch.ceil(torch.log2(torch.clamp(norm / _PADE13_THETA, min=1.0))).clamp(0, s_max)
+    return s_t, 2.0 ** (-s_t)
+
+
+def _expm_s_max():
+    """The traced branches' scaling cap: the kernels' (``_EXPM_S_MAX``, every finite float32 norm) unless a
+    ``masked<k>`` strategy asks for ``k`` (a lower cap mis-scales larger norms: -1e10 I gave NaN at 16)."""
+    return int(_EXPM_STRATEGY[6:]) if _EXPM_STRATEGY.startswith("masked") else _EXPM_S_MAX
+
+
 def _pade13_uv(A_s):
     n = A_s.shape[-1]
     c = _PADE13_C
@@ -1419,22 +1589,16 @@ def _pade13_uv(A_s):
 
 def _matrix_exp_composite(A, use_grad):
     if _is_fake(A) or _EXPM_STRATEGY.startswith("masked"):
-        s_max = int(_EXPM_STRATEGY[6:]) if _EXPM_STRATEGY.startswith("masked") else 16
-        norm = A.detach().abs().sum(-2).amax((-1,), keepdim=True).unsqueeze(-1)
-        s_t = torch.ceil(torch.log2(torch.clamp(norm / _PADE13_THETA, min=1.0))).clamp(0, s_max)
-        A_s = A * (2.0 ** (-s_t))
-        U, V = _pade13_uv(A_s)
-        R = SolveEx.apply(V - U, V + U, True, False)[0] if use_grad else SolveEx.compute(V - U, V + U, True, False)[0]
-        for k in range(s_max):
-            R = torch.where(s_t > k, R @ R, R)
-        return R
-    norm = float(A.detach().abs().sum(-2).amax().item())
-    s = _expm_scaling(norm)
-    A_s = A if s == 0 else A * math.ldexp(1.0, -s)
+        s_max = _expm_s_max()
+        s_t, scale = _expm_traced_counts(A, s_max)
+    else:
+        s_max, s_t, scale = _expm_counts(A)
+        scale = scale if s_t is not None else math.ldexp(1.0, -s_max)
+    A_s = A if s_t is None and s_max == 0 else A * scale
     U, V = _pade13_uv(A_s)
     R = SolveEx.apply(V - U, V + U, True, False)[0] if use_grad else SolveEx.compute(V - U, V + U, True, False)[0]
-    for _ in range(s):
-        R = R @ R
+    for k in range(s_max):
+        R = R @ R if s_t is None else torch.where(s_t > k, R @ R, R)
     return R
 
 
@@ -1442,17 +1606,16 @@ def _matrix_exp_frechet_torch(A, gY):
     """Adjoint Fréchet derivative ``L_exp(A^T, gY)`` via Padé-13 + ``SolveEx`` (supports double backward)."""
     At = A.mT
     if _is_fake(A) or _is_fake(gY) or _EXPM_STRATEGY.startswith("masked"):
-        s_max = int(_EXPM_STRATEGY[6:]) if _EXPM_STRATEGY.startswith("masked") else 16
-        norm = At.detach().abs().sum(-2).amax((-1,), keepdim=True).unsqueeze(-1)
-        s_t = torch.ceil(torch.log2(torch.clamp(norm / _PADE13_THETA, min=1.0))).clamp(0, s_max)
-        scale = 2.0 ** (-s_t)
+        s_max = _expm_s_max()
+        s_t, scale = _expm_traced_counts(At, s_max)
         As, Es = At * scale, gY * scale
-        s = None
     else:
-        norm = float(At.detach().abs().sum(-2).amax().item())
-        s = _expm_scaling(norm)
-        scale = math.ldexp(1.0, -s)
-        As, Es = (At, gY) if s == 0 else (At * scale, gY * scale)
+        s_max, s_t, scale = _expm_counts(At)
+        if s_t is None:
+            scale = math.ldexp(1.0, -s_max)
+            As, Es = (At, gY) if s_max == 0 else (At * scale, gY * scale)
+        else:
+            As, Es = At * scale, gY * scale
     n = As.shape[-1]
     c = _PADE13_C
     eye = torch.eye(n, dtype=As.dtype, device=As.device)
@@ -1479,17 +1642,16 @@ def _matrix_exp_frechet_torch(A, gY):
     D = V - U
     R = SolveEx.apply(D, V + U, True, False)[0]
     L = SolveEx.apply(D, (LV + LU) - (LV - LU) @ R, True, False)[0]
-    if s is None:
-        for k in range(s_max):
+    for k in range(s_max):
+        if s_t is None:
+            L = R @ L + L @ R
+            if k + 1 < s_max:
+                R = R @ R
+        else:
             active = s_t > k
             L = torch.where(active, R @ L + L @ R, L)
             if k + 1 < s_max:
                 R = torch.where(active, R @ R, R)
-    else:
-        for step in range(s):
-            L = R @ L + L @ R
-            if step + 1 < s:
-                R = R @ R
     return L
 
 
@@ -1522,6 +1684,9 @@ class MatrixExp(torch.autograd.Function):
                 return _MATRIX_EXP_FRECHET(A.detach(), gY.detach())
             if A.device.type == "hpu" and tpc.ready():
                 return tpc.matrix_exp_frechet(A, gY)
+        if not torch.is_grad_enabled() and _is_fake(A) and A.device.type == "hpu" and tpc.ready() and \
+                _EXPM_STRATEGY in ("auto", "tpc"):
+            return tpc.matrix_exp_frechet(A, gY)  # traced first backward: the kernel, per-matrix scaling to 126
         return _matrix_exp_frechet_torch(A, gY)
 
 
@@ -1554,7 +1719,7 @@ def install_matrix_exp(device_type):
     op_out = aten.linalg_matrix_exp.out
 
     def expm_out_be(A, *, out):
-        if takes(A):
+        if out.dtype == A.dtype and takes(A):  # else torch's own kernel raises its dtype error
             count("matrix_exp")
             res = MatrixExp.compute(A)
         elif device_type == "cpu":
@@ -1604,7 +1769,10 @@ def _compact_wy_factors(A, tau):
     m, k = A.shape[-2], tau.shape[-1]
     Y = torch.tril(A[..., :k], -1) + torch.eye(m, k, dtype=A.dtype, device=A.device)
     S = torch.triu(Y.mH @ Y, 1)
-    U = torch.eye(k, dtype=A.dtype, device=A.device) + tau.unsqueeze(-1) * S
+    # a zero tau is the identity reflector: its row of tau S is 0 even where S overflowed (0 * Inf was NaN; codex #16).
+    # Only there: elsewhere tau S keeps its derivative in tau (double backward at tau = 0)
+    tS = tau.unsqueeze(-1) * S
+    U = torch.eye(k, dtype=A.dtype, device=A.device) + torch.where((tau.unsqueeze(-1) == 0) & S.isinf(), 0.0, tS)
     return Y, S, U
 
 
@@ -1708,7 +1876,7 @@ def install_householder_product(device_type):
     entries = _kernels(device_type, op, "householder_product", HouseholderProduct, takes)
 
     def hh_out_be(A, tau, *, out):
-        if takes(A, tau):
+        if out.dtype == A.dtype and takes(A, tau):  # else torch's own kernel raises its dtype error
             count("householder_product")
             res = HouseholderProduct.compute(A, tau)
         else:
@@ -1744,7 +1912,8 @@ def _lu_factor(A):
 # Variant knobs, measured on Gaudi2 (bridge 1.21.4, TEAM_REPORT): how lu_solve and lu_unpack turn pivots into the
 # permutation, "kernel" (one TPC launch) or "torch" (``pivots_to_perm``, n small gathers: slower in both modes);
 # how lu_solve solves, "kernel" (the TPC getrs kernel, left and not adjoint only), "gj" (A = P L U rebuilt, one
-# Gauss-Jordan kernel) or "tri" (``lu_solve``'s triangular inverses, not adjoint). "auto": kernel, else gj.
+# Gauss-Jordan kernel; loses the factors' accuracy, codex review #14) or "tri" (``lu_solve``'s triangular inverses,
+# not adjoint). "auto": kernel, else two triangular solves with the factors (``_lu_solve_factors``).
 _LU_PERM_MODE = "auto"
 _LU_SOLVE_MODE = "auto"
 # The getrs hook ``(LU, pivots, B) -> X`` for the CPU tests; None means ``tpc.lu_solve`` on HPU.
@@ -1774,17 +1943,17 @@ def _unpack(LU):
 
 
 def _lu_backward(A, P, L, U, gL, gU):
-    """torch's ``linalg_lu_backward`` for square A = P L U: ``P L^-H [tril(L^H gL, -1) + triu(gU U^H)] U^-H``,
-    written as ``A^-H (U^H M L^H P^T) A^-H`` (``P L^-H = A^-H U^H`` and ``U^-H = L^H P^T A^-H``), so the two
-    triangular inverses become one inverse of A through ``InvEx`` (the TPC Gauss-Jordan kernel on Gaudi2) and
-    matmuls. Differentiable (double backward)."""
+    """torch's ``linalg_lu_backward`` for square A = P L U: ``P L^-H [tril(L^H gL, -1) + triu(gU U^H)] U^-H``, as two
+    triangular solves with the factors themselves (``SolveTriangular``: the TPC substitution kernel on Gaudi2), never
+    through ``A^-1``: its sandwich ``A^-H U^H M ...`` squared the scale of A first (1e20 I overflowed, 1e-24 I
+    underflowed; codex review #15). Differentiable (double backward)."""
     M = A.new_zeros(()).expand(A.shape)
     if gL is not None:
         M = M + torch.tril(L.mH @ gL, -1)
     if gU is not None:
         M = M + torch.triu(gU @ U.mH)
-    Ai = InvEx.apply(A, False)[0]
-    return Ai.mH @ (U.mH @ M @ L.mH @ P.mT) @ Ai.mH
+    X = SolveTriangular.apply(L.mH, M, True, True, True)  # L^-H M
+    return P @ SolveTriangular.apply(U.mH, X, False, False, False)  # P (L^-H M) U^-H
 
 
 class LuFactorEx(torch.autograd.Function):
@@ -1848,11 +2017,28 @@ def _lu_matrix(LU, pivots):
     return _perm_matrix(_lu_perm(pivots, LU.dtype), n) @ (L @ U)
 
 
+def _lu_solve_factors(LU, pivots, B, left, adjoint):
+    """``A^-1 B``, ``A^-H B``, ``B A^-1`` or ``B A^-H`` for ``A = P L U`` from the packed factors directly: two
+    triangular solves (``SolveTriangular.compute``: the TPC substitution kernel on Gaudi2) and a matmul with ``P``.
+    ``A`` is never rebuilt (its rounding loses what the factors hold), and ``B`` is always a matrix (no vector
+    heuristic: ``lu_solve`` has none); the batches of the factors and of ``B`` broadcast as in torch."""
+    P = _perm_matrix(_lu_perm(pivots, LU.dtype), LU.shape[-1])
+    tri = SolveTriangular.compute
+    if left and not adjoint:  # U^-1 L^-1 P^T B
+        return tri(LU, tri(LU, P.mT @ B, False, True, True), True, True, False)
+    if left:  # A^H = U^H L^H P^T: P L^-H U^-H B
+        return P @ tri(LU.mH, tri(LU.mH, B, False, True, False), True, True, True)
+    if not adjoint:  # X P L U = B: B U^-1 L^-1 P^T
+        return tri(LU, tri(LU, B, True, False, False), False, False, True) @ P.mT
+    # X U^H L^H P^T = B: (B P) L^-H U^-H
+    return tri(LU.mH, tri(LU.mH, B @ P, True, False, True), False, False, False)
+
+
 class LuSolve(torch.autograd.Function):
-    """``aten.linalg_lu_solve`` (square): ``A = P L U`` rebuilt with matmuls, then one Gauss-Jordan solve (the TPC
-    kernel on Gaudi2) of ``A``, or ``A^H`` with ``adjoint``, from the left or the right. Rebuilding costs one rounding
-    of ``L U`` (relative error about n eps |L||U| / |A|, as LAPACK's backward error). ``pivots`` is not
-    differentiable; the backward is torch's: ``gB`` the adjoint solve and ``gLU`` through ``A = P L U``."""
+    """``aten.linalg_lu_solve`` (square): left and not adjoint the TPC getrs kernel on Gaudi2; the other cases (and
+    without the kernel) two triangular solves with the factors themselves and a matmul with ``P``
+    (``_lu_solve_factors``). ``pivots`` is not differentiable; the backward is torch's: ``gB`` the adjoint solve and
+    ``gLU`` through ``A = P L U``."""
 
     @staticmethod
     def compute(LU, pivots, B, left=True, adjoint=False):
@@ -1865,8 +2051,13 @@ class LuSolve(torch.autograd.Function):
         if mode == "tri" and not adjoint:
             batch = torch.broadcast_shapes(LU.shape[:-2], B.shape[:-2])
             return lu_solve(LU.expand(*batch, *LU.shape[-2:]), pivots.expand(*batch, LU.shape[-1]), B, left)
-        A = _lu_matrix(LU, pivots)
-        return SolveEx.compute(A.mH if adjoint else A, B, left, False)[0]
+        if mode == "gj":  # measurement knob: A = P L U rebuilt, one Gauss-Jordan solve (loses the factors' accuracy)
+            A = _lu_matrix(LU, pivots)
+            batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+            A = A.expand(*batch, *A.shape[-2:])
+            B = B.expand(*batch, *B.shape[-2:])  # same rank as A: never linalg.solve's vector case
+            return SolveEx.compute(A.mH if adjoint else A, B, left, False)[0]
+        return _lu_solve_factors(LU, pivots, B, left, adjoint)
 
     @staticmethod
     def forward(ctx, LU, pivots, B, left=True, adjoint=False):
@@ -1902,9 +2093,9 @@ class LuUnpack(torch.autograd.Function):
 
     @staticmethod
     def compute(LU, pivots, unpack_data=True, unpack_pivots=True):
-        empty = LU.new_empty(0)
-        L, U = _unpack(LU) if unpack_data else (empty, empty)
-        P = _perm_matrix(_lu_perm(pivots, LU.dtype), LU.shape[-1]) if unpack_pivots else empty
+        # distinct empty tensors (as torch's): one object returned twice would resize both (codex review, minor)
+        L, U = _unpack(LU) if unpack_data else (LU.new_empty(0), LU.new_empty(0))
+        P = _perm_matrix(_lu_perm(pivots, LU.dtype), LU.shape[-1]) if unpack_pivots else LU.new_empty(0)
         return P, L, U
 
     @staticmethod

@@ -17,8 +17,8 @@
   Gauss-Jordan inverse with partial pivoting (implicit: no row moves), one matrix per index-space member, the first
   rows in local memory and the others re-read from global memory on each step (one ASO per step). ``A^-1 = R[P, :][:,
   Q]``, ``D`` the pivots, ``S[:, 1]`` the info; one ELF per ``ceil(n / 64)``. ``gj_solve`` and ``gj_inv`` route n >
-  ``MAXN`` to it: ``inv`` is two gathers of ``R``, ``solve`` the matmul ``(R @ B[P])[P]``, the sign of ``det`` the
-  parity of ``P``.
+  ``MAXN`` to it on ``A^T`` (LAPACK's pivot order on the matrix torch's CPU kernels factor): ``inv`` is two gathers
+  of ``R^T``, ``solve`` the matmul ``(R^T @ B[Q])[Q]``, the sign of ``det`` the parity of ``P``.
 - ``torch.ops.linalg_tpc.tri_solve_{lower,upper}[_unit](A[b, n, n], B[b, n, m]) -> X[b, n, m]``: forward or back
   substitution without pivoting for float32, n <= 64 (B columns chunked by 64; ``left=False`` through ``.mT`` and the
   flipped triangle). The other triangle (and the diagonal for ``_unit``) is never read. Each ``X[i]`` is ``B[i]``
@@ -959,7 +959,10 @@ def large_pays(n, batch):
     ``LARGE_MIN_BATCH`` matrices. In lazy mode (and compiled) the call keeps main's route (Habana's fallback):
     measured on Gaudi2, bridge 1.21.4, EEGSPDNet's lazy step was 73.2 against 63.0 ms median with the kernel (its graph
     boundary, gathers and checks), and the compiled path was not measured faster."""
-    eager = os.environ.get("PT_HPU_LAZY_MODE", "1") == "0" and not torch.compiler.is_compiling()
+    # lazy_mode(), the one reading of the mode every route uses (the variable unset is eager on bridge 1.21.4,
+    # measured in the pod; reading the variable here with another default declined default eager calls). Tracing
+    # (make_fx, AOT autograd, where is_compiling() is False) is declined by the caller, which sees the tensors.
+    eager = not lazy_mode() and not torch.compiler.is_compiling()
     return eager and n <= LARGE_MAXN and (n <= LARGE_ANY_BATCH_N or batch >= LARGE_MIN_BATCH)
 
 
@@ -977,10 +980,14 @@ def _rows(X, index):
 
 
 def _large_raw(A, sign=True):
-    """The kernel's ``(R, P, Q, D, S)`` for ``A[b, n, n]``, ``S[:, 0]`` set to the sign of the pivot order (0 when
-    not ``sign``: solve and inv do not read it, and its [b, n, n] comparison costs eager launches) and a matrix with
-    a NaN given NaN pivots (LAPACK's results are NaN there; the kernel's need not be)."""
-    R, P, Q, D, S = _call(_large_op(), A)
+    """The kernel's ``(R, P, Q, D, S)`` for ``A[b, n, n]`` run on ``A^T`` (``R[P, :][:, Q] = A^-T``), ``S[:, 0]`` set
+    to the sign of the pivot order (0 when not ``sign``: solve and inv do not read it, and its [b, n, n] comparison
+    costs eager launches) and a matrix with a NaN given NaN pivots (LAPACK's results are NaN there; the kernel's need
+    not be). ``A^T``, as torch: its CPU solve, inv and det factor the row-major A as LAPACK's column-major A^T, so
+    the pivot order is LAPACK's on the matrix torch hands it. On ``A`` the kernel took the other order, and partial
+    pivoting's 2^(n-1) growth on Wilkinson's matrix (``W = I - tril(1, -1)``, last column 1; condition 58 at n =
+    130) overflowed where torch's factors stay bounded (Codex review #1); torch overflows on ``W^T``, and so do we."""
+    R, P, Q, D, S = _call(_large_op(), A.mT.contiguous())
     nan = A.isnan().any(-1).any(-1)
     D = D.masked_fill(nan[..., None], float("nan"))
     if sign:
@@ -1000,19 +1007,19 @@ def large_factors(A):
 
 def _large(A, B=None, sign=True):
     """``(X, D, S)`` of the in-place Gauss-Jordan kernel for ``A[b, n, n]`` (64 < n <= ``LARGE_MAXN``): ``X =
-    A^-1`` (``B`` None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel
-    divides each row by its pivot at the end: ``A^-1 = R[P, :][:, Q]``, and ``A^-1 B = (R @ B[P])[P]`` (with ``Q =
-    P^-1``, ``R[:, Q] @ B = R @ B[P]``); a zero pivot gives a zero row (info is set)."""
+    A^-1`` (``B`` None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel runs on ``A^T`` (see
+    ``_large_raw``) and divides each row by its pivot at the end: ``A^-T = R[P, :][:, Q]``, so ``A^-1 = R^T[Q, :][:,
+    P]`` and ``A^-1 B = (R^T @ B[Q])[Q]`` (with ``Q = P^-1``); a zero pivot gives a zero column (info is set)."""
     n = A.shape[-1]
     R, P, Q, D, S, nan = _large_raw(A, sign)
-    R = R[..., :n]
+    Rt = R[..., :n].mT
     # the kernel divides each row by its pivot itself (a torch division by a pivot of 1e38 zeroed the row in lazy mode:
     # the card's division multiplies by a reciprocal, subnormal hence flushed, and a 2^-64 prescale was folded away)
-    Y = _rows(R, P) if B is None else _rows(R @ _rows(B, P), P)
+    Y = _rows(Rt, Q) if B is None else _rows(Rt @ _rows(B, Q), Q)
     if B is None:
         # no Newton step: on the kernel's float32 replica it gained little at condition <= 1e4 and lost past 1e6
         # (n = 220, condition 1e7: 6.8e-2 against 4.5e-2 without, LAPACK 4.7e-2)
-        X = Y.gather(-1, Q.long()[..., None, :].expand(*Q.shape[:-1], n, n))
+        X = Y.gather(-1, P.long()[..., None, :].expand(*P.shape[:-1], n, n))
     else:
         X = Y
     X = X.masked_fill(nan[..., None, None], float("nan"))
@@ -1126,6 +1133,15 @@ def gj_solve_reference(A, B):
     return X, D, S
 
 
+def _float32(*tensors):
+    """The kernels compute in float32 on real data: a complex tensor would be cast with its imaginary part dropped
+    (Codex review, minor: ``matrix_exp(tensor([[1 + 1j]]))`` gave 2.71828), so a direct call with one raises. Real
+    floating dtypes are cast as before: on the card a float64 tensor holds float32 values (hpu-ops#16), and the
+    routes pass float32 only."""
+    if any(t.is_complex() or not t.is_floating_point() for t in tensors):
+        raise ValueError(f"hpu_ops.tpc takes real floating (float32) tensors, got {[str(t.dtype) for t in tensors]}")
+
+
 def _check_small(A, n):
     if A.dim() < 2 or n > SMALL_MAXN or A.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc takes square A with n <= {SMALL_MAXN}, got {tuple(A.shape)}")
@@ -1139,6 +1155,7 @@ def _check_svd(A):
 def jacobi_svd(A, full_matrices=False, sort=True, flush=True):
     """SVD ``(U, S, Vh)`` for ``A[..., m, n]`` (float32, m, n <= ``SMALL_MAXN``) from the one-sided Jacobi kernel."""
     _check_svd(A)
+    _float32(A)
     batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
     k = min(m, n)
     full = full_matrices and m != n
@@ -1170,6 +1187,7 @@ def jacobi_svd(A, full_matrices=False, sort=True, flush=True):
 def jacobi_svdvals(A, sort=True, flush=True):
     """Singular values ``S`` for ``A[..., m, n]`` (float32, m, n <= ``SMALL_MAXN``) from ``-DNO_UV``."""
     _check_svd(A)
+    _float32(A)
     batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
     k = min(m, n)
     if A.numel() == 0:
@@ -1320,6 +1338,7 @@ def householder_product(A, tau, flush=True):
     """Householder product ``Q`` for ``A[..., m, n]`` and ``tau[..., k]`` (float32, m <= ``MAXHH``, m >= n >= k)."""
     if A.dim() < 2:
         raise ValueError(f"hpu_ops.tpc takes 2D+ A, got {tuple(A.shape)}")
+    _float32(A, tau)
     batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
     k = tau.shape[-1]
     if m > MAXHH or m < n or k > n or tau.dim() != A.dim() - 1 or tau.shape[:-1] != batch:
@@ -1361,6 +1380,7 @@ def matrix_exp(A, flush=True):
     """Matrix exponential ``exp(A)`` for ``A[..., n, n]`` (float32, n <= ``SMALL_MAXN``) from the Gaudi2 TPC kernel."""
     n = A.shape[-1]
     _check_small(A, n)
+    _float32(A)
     if A.numel() == 0:
         return A.new_empty(A.shape, dtype=torch.float32)
     batch = A.shape[:-2]
@@ -1374,6 +1394,7 @@ def matrix_exp_frechet(A, G, flush=True):
     """Adjoint Fréchet derivative ``L_exp(A^T, G)`` for ``A, G[..., n, n]`` (float32, n <= ``SMALL_MAXN``) on Gaudi2 TPC."""
     n = A.shape[-1]
     _check_small(A, n)
+    _float32(A, G)
     batch = torch.broadcast_shapes(A.shape[:-2], G.shape[:-2])
     if A.numel() == 0:
         return A.new_empty(*batch, n, n, dtype=torch.float32)
@@ -1416,6 +1437,7 @@ def lu_factor(A, pivots=True):
     ``pivots=False`` only ``(LU, perm)``: ``linalg.lu`` needs no pivots or info."""
     n = A.shape[-1]
     _check_small(A, n)
+    _float32(A)
     batch = A.shape[:-2]
     LU, PV = _call(_lu_op(), _fresh(A.reshape(-1, n, n).to(torch.float32).contiguous()))
     if not pivots:
@@ -1452,6 +1474,7 @@ def lu_solve(LU, pivots, B):
     swaps, then forward and back substitution. One launch per chunk."""
     n, m = LU.shape[-1], B.shape[-1]
     _check_small(LU, n)
+    _float32(LU, B)
     if B.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.lu_solve takes B with n rows, got {tuple(LU.shape)} and {tuple(B.shape)}")
     batch = torch.broadcast_shapes(LU.shape[:-2], pivots.shape[:-1], B.shape[:-2])

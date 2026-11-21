@@ -142,6 +142,10 @@ def cases(n, b):
         ("lu_factor", lambda x: (lambda lu, piv: (lu, piv))(*L.lu_factor(x)), (P,)),
         ("lu_factor_ex", lambda x: L.lu_factor_ex(x)[:2], (P,)),
         ("lu_solve", lambda x, bb: L.lu_solve(*L.lu_factor(x), bb), (P, Bs)),
+        ("lu_solve_adjoint", lambda x, bb: L.lu_solve(*L.lu_factor(x), bb, adjoint=True), (P, Bs)),
+        ("lu_solve_right", lambda x, bb: L.lu_solve(*L.lu_factor(x), bb.mT, left=False), (P, Bs)),
+        ("lu_solve_bwd", grad_of(lambda x, bb: L.lu_solve(*L.lu_factor(x), bb)), (P, Bs)),
+        ("lu_factor_bwd", grad_of(lambda x: L.lu_factor(x)[0]), (P,)),
         ("lu_unpack", lambda x: torch.lu_unpack(*L.lu_factor(x)), (P,)),
         ("lu", lambda x: L.lu(x), (P,)),
         # what #13 is for: one forward and backward of an orthogonal-parametrized layer (spd_learn's BiMap pattern)

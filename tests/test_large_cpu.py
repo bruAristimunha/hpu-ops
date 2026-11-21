@@ -103,7 +103,7 @@ def test_extreme_pivots(make, replica):
 @pytest.mark.parametrize("make", [tiny_multiplier, huge_pivot])
 def test_extreme_pivots_failed_before(make, monkeypatch):
     legacy(monkeypatch)
-    A = make()[None]
+    A = make().mT[None]  # the route runs the kernel on A^T: this hands the kernel the matrix of the review
     X, D, S = tpc.gj_inv(A)
     det = float(S[0, 0] * D.double().prod(-1))
     true = float(torch.linalg.det(A.double()))
@@ -133,7 +133,7 @@ def test_nan_gives_nan(replica):
 
 def test_singular_info_and_zero_rows(replica):
     A = permuted(3, 70)
-    A[1, :, 7] = 0
+    A[1, 7, :] = 0  # a zero row: column 7 of the A^T the kernel runs on
     X, D, S = tpc.gj_inv(A)
     assert S[1, 1] == 8 and D[1].prod() == 0 and torch.isfinite(X).all()
     assert torch.equal(S[[0, 2], 1], torch.zeros(2))
@@ -215,3 +215,192 @@ def test_large_route_declines_under_compile(monkeypatch):
     monkeypatch.setenv("PT_HPU_LAZY_MODE", "0")
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     assert tpc.large_pays(220, 1) is False
+
+
+# ---- Codex review of #30/#32 (CODEX_REVIEW.txt): #1 pivot-tie growth, #17 used-row quotient overflow
+
+
+def wilkinson(n=130):
+    """Codex #1: ``W = I - tril(1, -1)``, last column 1, halved (condition 58.3, entries <= 0.5): partial pivoting on
+    W doubles the last column at every step (2^128 at n = 130); torch factors the row-major A as LAPACK's A^T."""
+    W = torch.eye(n) - torch.tril(torch.ones(n, n), -1)
+    W[:, -1] = 1
+    return W / 2
+
+
+def growth_used_row(n=65):
+    """Codex #17: ``[[2^70, 2^70], [0, 2^-70]]`` in eye(65): eliminating the used row 0 at step 1 takes 2^140."""
+    A = torch.eye(n)
+    A[0, 0], A[0, 1], A[1, 1] = 2.0 ** 70, 2.0 ** 70, 2.0 ** -70
+    return A
+
+
+@pytest.mark.parametrize("make", [wilkinson, growth_used_row, lambda: growth_used_row().mT.contiguous(),
+                                  lambda: tiny_multiplier().mT.contiguous(), lambda: huge_pivot().mT.contiguous()])
+def test_review_growth_inputs(make, replica):
+    """#1 and #17 (and the transposes the A^T route hands the kernel): inverse, solve, det and slogdet as torch."""
+    A = make()[None]
+    n = A.shape[-1]
+    ref = torch.linalg.inv(A.double())
+    X, D, S = tpc.gj_inv(A)
+    assert torch.isfinite(X).all() and S[0, 1] == 0
+    assert rel(X, ref) < 1e-5
+    B = torch.ones(1, n, 1)
+    Y, _, _ = tpc.gj_solve(A, B)
+    assert rel(Y, torch.linalg.solve(A.double(), B.double())) < 1e-5
+    D2, S2 = tpc.large_factors(A)
+    sign, logabsdet = torch.linalg.slogdet(A.double())
+    assert torch.equal(S2[..., 0].double(), sign)
+    torch.testing.assert_close(D2.double().abs().log().sum(-1), logabsdet, rtol=0, atol=1e-4)
+
+
+def test_review_wilkinson_through_solve_det(large_on_cpu):
+    """#1 through the public ops: det 0.5 and logabsdet -0.693147 as torch, a finite solve against ones."""
+    A = wilkinson()
+    with cpu_as_hpu(linalg.install_inv_det) as calls:
+        det = torch.linalg.det(A)
+        sl = torch.linalg.slogdet(A)
+        assert sum(calls.values()) == 2
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        x = torch.linalg.solve(A, torch.ones(130))
+        assert sum(calls.values()) == 1
+    torch.testing.assert_close(det, torch.tensor(0.5), rtol=1e-5, atol=0)
+    torch.testing.assert_close(sl.logabsdet, torch.tensor(-0.693147), rtol=1e-5, atol=0)
+    assert rel(x, torch.linalg.solve(A.double(), torch.ones(130, dtype=torch.float64))) < 1e-5
+
+
+def test_review_growth_failed_before():
+    """The kernel on A itself (main's route) overflows on #1; without the scaled used rows it overflows on #17."""
+    _, _, _, D, S = kr.gj_large(wilkinson().numpy())
+    assert S[1] == 0 and not np.isfinite(np.prod(D.astype(np.float64)))
+    for A in (growth_used_row(), tiny_multiplier().mT):  # #17 itself; the review-1 matrix as the A^T route hands it
+        R, _, _, _, S = kr.gj_large(A.numpy(), legacy_growth=True)
+        assert S[1] == 0 and not np.isfinite(R).all()
+        assert np.isfinite(kr.gj_large(A.numpy())[0]).all()
+
+
+def test_review_check_script_judges_the_inverse(replica):
+    """Codex #20: ``check_large_replica``'s verdict fails a wrong inverse or det even when the raw outputs match."""
+    import check_large_replica as chk
+
+    A = torch.eye(65)[None]
+    X, D, S = tpc.gj_inv(A)
+    base = {"bit_equal_R_P_Q_D_S": [True] * 5, "P_is_permutation": True}
+    assert chk.verdict({**base, **chk.accuracy(A, X, D, S)})
+    assert not chk.verdict({**base, **chk.accuracy(A, torch.zeros_like(X), D, S)})
+    assert not chk.verdict({**base, **chk.accuracy(A, X, 2 * D, S)})
+    assert not chk.verdict({**base, **chk.accuracy(A, X.fill_(float("nan")), D, S)})
+
+
+@pytest.mark.parametrize("d, info, det", [(2.0 ** -100, 2, 0.0), (2.0 ** -101, 0, -0.5)])
+def test_review_exact_singularity_and_sign(d, info, det, replica):
+    """Codex #2: ``[[2^100, 2^100], [2^-100, d]]`` in eye(65). On A (main's route) the multiplier 2^-200 flushed:
+    info 0 at d = 2^-100 and det +0.5 at 2^-101. On A^T (torch's orientation) the rows tie and cancel exactly:
+    info 2 (torch raises) and det -0.5, as torch."""
+    A = torch.eye(65)
+    A[0, 0], A[0, 1], A[1, 0], A[1, 1] = 2.0 ** 100, 2.0 ** 100, 2.0 ** -100, d
+    D, S = tpc.large_factors(A[None])
+    assert int(S[0, 1]) == info == int(torch.linalg.inv_ex(A).info)
+    assert float(S[0, 0] * D.double().prod(-1)) == det == float(torch.linalg.det(A.double()))
+    _, _, _, D0, S0 = kr.gj_large(A.numpy())  # main's route, the kernel on A
+    assert (S0[1], float(np.prod(D0.astype(np.float64)))) != (info, det)
+
+
+@pytest.mark.parametrize("block, info", [([[0.0, 1.0], [float("nan"), 1.0]], 0), ([[1.0, float("inf")], [0.0, 1.0]], 2)])
+def test_review_nonfinite_info_as_torch(block, info, replica):
+    """Codex minor: with NaN or Inf entries the info (so whether check_errors raises) is torch's, as the kernel now
+    pivots A^T as LAPACK does (main reported 1 and 0)."""
+    A = torch.eye(65)
+    A[:2, :2] = torch.tensor(block)
+    _, _, S = tpc.gj_inv(A[None])
+    assert int(S[0, 1]) == info == int(torch.linalg.inv_ex(A).info)
+    assert int(kr.gj_large(A.numpy())[4][1]) != info  # main's route, the kernel on A
+
+
+
+# ---- (B) extreme-range findings: the kernels' arithmetic on their replicas
+
+# ---- Codex review #8 / #10: matrix_exp_f32_gaudi2.c's reciprocal and finiteness test, on its replica
+
+
+def test_review_expm_constant_component():
+    """#8: exp(diag(-1e8, 0))[1, 1] is 1: the reciprocal of 1 is now exactly 1 (was 0.99999994, squared 25 times)."""
+    A = np.diag([-1e8, 0.0]).astype(np.float32)
+    assert kr.rcp_newton(np.float32(1))[0] == 1 and kr.rcp_newton(np.float32(1), legacy=True)[0] < 1
+    assert kr.matrix_exp(A)[1, 1] == 1 and kr.matrix_exp(A)[0, 0] == 0
+    assert abs(kr.matrix_exp(A, legacy_rcp=True)[1, 1] - 0.13530262) < 1e-6  # the review's value, reproduced
+    x = np.float32(2.0) ** np.arange(-60, 60, 7, dtype=np.float32)
+    assert np.array_equal(kr.rcp_newton(x), (1 / x.astype(np.float64)).astype(np.float32))  # powers of two exact
+
+
+def test_review_expm_finite_norm_at_float_max():
+    """#10: the 1x1 matrix [[-FLT_MAX]]: a finite norm, 126 halvings, exp = 0 as torch (0 halvings and NaN before)."""
+    big = np.float32(-np.finfo(np.float32).max)
+    assert kr.expm_scaling(np.array([[big]])) == 126 and not (np.abs(big) <= np.float32(3.4e38))
+    assert kr.matrix_exp(np.array([[big]]))[0, 0] == 0
+    assert torch.linalg.matrix_exp(torch.tensor([[big]]))[0, 0] == 0
+
+
+# ---- Codex review #16: a zero Householder coefficient next to an overflowing dot product
+
+
+def zero_tau_input(m=4):
+    A = torch.zeros(m, 2)
+    A[2:4, 0] = 3e38
+    A[2:4, 1] = 1
+    return A, torch.tensor([0.0, 2 / 3])
+
+
+def test_review_householder_zero_tau_replica():
+    """#16 on the kernel's replica: Q's second column is torch's [0, 1/3, -2/3, -2/3] (four NaNs before)."""
+    A, tau = zero_tau_input()
+    want = torch.linalg.householder_product(A.double(), tau.double())
+    Q = torch.from_numpy(kr.householder_product(A.numpy(), tau.numpy()))
+    torch.testing.assert_close(Q.double(), want, rtol=1e-6, atol=1e-6)
+    assert torch.from_numpy(kr.householder_product(A.numpy(), tau.numpy(), legacy=True))[:, 1].isnan().all()
+    g = torch.Generator().manual_seed(3)  # ordinary inputs: the replica agrees with torch
+    B, t = torch.randn(22, 8, generator=g), torch.rand(8, generator=g) + 0.5
+    torch.testing.assert_close(torch.from_numpy(kr.householder_product(B.numpy(), t.numpy())).double(),
+                               torch.linalg.householder_product(B.double(), t.double()), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("m", [4, 65])
+def test_review_householder_zero_tau_route(m, monkeypatch):
+    """#16 through the route: m <= 64 on the replica (``_HOUSEHOLDER``), m = 65 through the compact-WY composite."""
+    A, tau = zero_tau_input(m)
+    rep = lambda a, t: torch.stack([torch.from_numpy(kr.householder_product(x.numpy(), y.numpy()))  # noqa: E731
+                                    for x, y in zip(a.reshape(-1, *a.shape[-2:]), t.reshape(-1, t.shape[-1]))])
+    monkeypatch.setattr(linalg, "_HOUSEHOLDER", lambda a, t: rep(a, t).reshape(a.shape))
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        Q = torch.linalg.householder_product(A, tau)
+        assert sum(calls.values()) == 1
+    want = torch.linalg.householder_product(A.double(), tau.double())
+    torch.testing.assert_close(Q.double(), want, rtol=1e-6, atol=1e-6)
+
+
+def test_review_lu_factor_flushed_multiplier():
+    """Codex #5: ``[[2^100, 2^100], [2^-30, 2^-30]]`` is singular: U[1, 1] = 0 and info 2 as torch (the multiplier
+    2^-130 flushes, so L keeps 0, but its scaled copy still cancels the row). Before: U[1, 1] = 2^-30, info 0."""
+    A = torch.tensor([[2.0 ** 100, 2.0 ** 100], [2.0 ** -30, 2.0 ** -30]])
+    LU, piv, _, info = kr.lu_factor(A.numpy())
+    LU_t, piv_t, info_t = torch.linalg.lu_factor_ex(A)
+    assert LU[1, 1] == LU_t[1, 1] == 0 and info == int(info_t) == 2 and (piv == piv_t.numpy()).all()
+    LU0, _, _, info0 = kr.lu_factor(A.numpy(), legacy_tiny=True)
+    assert LU0[1, 1] == 2.0 ** -30 and info0 == 0
+
+
+@pytest.mark.parametrize("call", [
+    lambda: tpc.matrix_exp(torch.tensor([[1 + 1j]])),
+    lambda: tpc.matrix_exp_frechet(torch.eye(2), torch.eye(2, dtype=torch.complex64)),
+    lambda: tpc.jacobi_svd(torch.eye(2, dtype=torch.complex64)),
+    lambda: tpc.jacobi_svdvals(torch.eye(2, dtype=torch.complex128)),
+    lambda: tpc.householder_product(torch.eye(2, dtype=torch.complex64), torch.zeros(1, dtype=torch.complex64)),
+    lambda: tpc.lu_factor(torch.eye(2, dtype=torch.complex64)),
+    lambda: tpc.lu_solve(torch.eye(2), torch.ones(2, dtype=torch.int32), torch.ones(2, 1, dtype=torch.complex64)),
+    lambda: tpc.matrix_exp(torch.eye(2, dtype=torch.int64)),
+])
+def test_review_direct_wrappers_reject_complex(call):
+    """Codex minor: the direct TPC wrappers raise on complex (and integer) data instead of casting it (complex lost
+    its imaginary part: exp([[1 + 1j]]) gave 2.71828). The check runs before any kernel is touched."""
+    with pytest.raises(ValueError, match="real floating"):
+        call()
