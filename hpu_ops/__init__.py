@@ -63,6 +63,14 @@ at the tensor's pickling:
   serves the CPU stand-in.
 - ``quantile`` / ``nanquantile`` as sort, gather and lerp (``quantile``): ATen's composite resizes an empty ``out``
   tensor, which aborts lazy mode ("Trying to resize tensor with non-existing TensorImpl").
+- NaN through the max/min family (``extrema``): Gaudi's ``amax`` / ``amin``, ``max`` / ``min`` (whole, dim, binary),
+  ``median``, ``aminmax``, ``argmax`` / ``argmin``, ``maximum`` / ``minimum``, ``fmax`` / ``fmin``, ``clamp`` with
+  tensor bounds, the inf-norms and ``max_pool2d`` / ``max_pool3d`` drop NaN, eager, lazy and compiled
+  (``amax([nan, 1, 2])`` is ``-inf``). Each runs Gaudi's kernel and puts NaN where torch has it, with torch's
+  indices (the first NaN) and gradients; in 16-bit dtypes ``argmax`` / ``max(dim)`` of a row of ``-inf`` no longer
+  return the out-of-range index ``n``. ``softmax``, ``log_softmax``, ``logsumexp``, ``cummax`` and the sums were
+  right and stay native. Not fixed: ``sort`` / ``topk`` / ``kthvalue`` / ``argsort`` with NaN (and float ``sort``
+  of 1000+ elements with infs, even without NaN, returns out-of-range indices).
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -83,7 +91,7 @@ import warnings
 
 import torch
 
-from . import composite, conv, eigh, im2col, indexing, linalg, quantile, serialization, tpc, upsample  # noqa: F401
+from . import composite, conv, eigh, extrema, im2col, indexing, linalg, quantile, serialization, tpc, upsample  # noqa: F401
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -97,7 +105,7 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
          linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, quantile.install,
-         serialization.install)
+         extrema.install, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
