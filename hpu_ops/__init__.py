@@ -74,9 +74,16 @@ at the tensor's pickling:
   with indices in range where Gaudi's float sort returns out-of-range ones (NaN, and any real infinity at an n that
   is not a power of two), eager, lazy and compiled; ``HPU_OPS_EXACT_SORT=0`` keeps Gaudi's sort. hpu-ops' own
   eigenvalue / singular-value sorts keep Gaudi's sort, so the SPD steps keep main's cost.
+- ``histc`` with a bound given as a Python float, or more than 300 bins (``small``): Gaudi's kernel reads its bounds
+  as ints and aborts the process on a float one, and does not compile from about 350 bins. The CPU kernel's bin
+  edges are found on the host, the card only compares (bucketize) and counts; bit for bit ATen's one-thread result,
+  eager, lazy, compiled and in inference mode.
 - ``bincount`` of 1-D integer inputs of 65536 to 2**24 elements with at most 4096 bins and no weights through one
   ``aminmax`` read and ``histc`` in chunks of 256 bins (``small``, #21): Gaudi's kernel took 4.7-427 ms at 409600
   elements (64 to 4096 bins), 2-43x longer.
+- Warnings for the 8-byte dtypes in eager mode (``wide``), at the copy to the card: float64 views with a storage
+  offset read and write at twice the offset, int64 values past int32 are computed on their low 32 bits. Neither is
+  fixable at the dispatcher at a cost a model would accept (see the README, "float64").
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -89,6 +96,12 @@ at the tensor's pickling:
     ("create tensor invalid permutation 4 2": FBCNet, FBMSNet, at times EEGNet and Deep4Net). Off, CBraMod steps
     2% faster and CodeBrain the same.
 
+In lazy mode (``PT_HPU_LAZY_MODE=1``), ``torch.compile(model, backend="hpu_backend")`` called after ``enable()`` warns
+once and returns ``model`` uncompiled (``lazy_compile``; ``HPU_OPS_LAZY_COMPILE=raise``: a one-line error instead):
+Habana supports the backend in eager mode only (1.21.4 support matrix), and in lazy mode it fails deep inside (an
+undefined symbol in the recipe compiler, ``torch.ops.hpu.weight_permutation`` missing). Run with
+``PT_HPU_LAZY_MODE=0`` to compile.
+
 Masked attention needs a Habana setting that is read when its library loads, so it must be exported before Python
 starts. The setting is per bridge version, listed in the README; ``enable()`` warns when it did not take effect.
 """
@@ -97,7 +110,8 @@ import warnings
 
 import torch
 
-from . import composite, conv, eigh, extrema, im2col, indexing, linalg, quantile, serialization, small, tpc, upsample  # noqa: F401
+from . import (composite, conv, eigh, extrema, im2col, indexing, lazy_compile, linalg, quantile,  # noqa: F401
+               serialization, small, tpc, upsample, wide)
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -111,7 +125,8 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
          linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, quantile.install,
-         extrema.install, small.install_bincount, serialization.install)
+         extrema.install, small.install_bincount, small.install_histc,
+         wide.install_copy_checks, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
@@ -133,6 +148,17 @@ def _attention_fused(device_type="hpu"):
                for op in ("scaled_dot_product_attention", "_scaled_dot_product_fused_attention_overrideable"))
 
 
+def _lazy():
+    """Whether Habana's bridge runs in lazy mode (read after ``habana_frameworks.torch.core`` loads): its own
+    ``is_lazy``; on a bridge without it, ``PT_HPU_LAZY_MODE == "1"`` (unset counts as eager, 1.21.4's default:
+    its bridge configuration prints ``PT_HPU_LAZY_MODE = 0`` when the variable is unset)."""
+    try:
+        from habana_frameworks.torch.utils.internal import is_lazy
+    except ImportError:
+        return os.environ.get("PT_HPU_LAZY_MODE", "0") == "1"
+    return is_lazy()
+
+
 def enable():
     """Install the rewrites and turn off the broken passes. Idempotent; a no-op off a Gaudi stack."""
     if _STATE.get("undo"):
@@ -146,6 +172,12 @@ def enable():
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"
     undo = _install("hpu")
+    if _lazy():  # Habana's compile backend does not run in lazy mode: uncompiled with one warning (or raise)
+        try:
+            undo = chain([undo, lazy_compile.install(lazy_compile.NAME)])
+        except Exception:
+            undo()  # no half-enabled state: a later enable() starts clean
+            raise
 
     def undo_once():  # clears the state, so enable() after the undo installs again
         if _STATE.get("undo") is undo_once:
