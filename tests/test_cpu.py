@@ -833,3 +833,17 @@ def test_enable_is_a_no_op_off_gaudi(monkeypatch):
     monkeypatch.delenv("PT_HPU_DISABLE_pass_weight_permutation", raising=False)
     hpu_ops.enable()
     assert hpu_ops._STATE.get("undo") is None and "PT_HPU_DISABLE_pass_weight_permutation" not in os.environ
+
+
+@pytest.mark.parametrize("row", [[float("inf"), 100.0, 0.0], [3e38, 3e38, 0.0]])
+def test_logsumexp_keeps_aten_gradient_with_every_fix_in_lazy_mode(monkeypatch, row):
+    """Issue #21's lazy logsumexp composite was dropped (round 2: no gain in a training step, and a NaN gradient next
+    to +inf / a softmax gradient where the result rounds to the max). No fix may register logsumexp, in lazy mode too."""
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    x = torch.tensor([row], requires_grad=True)
+    (want,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
+    with cpu_as_hpu(hpu_ops._install) as calls:
+        assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::logsumexp", "AutogradCPU")
+        (got,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
+    assert not calls.get("logsumexp")
+    torch.testing.assert_close(got, want, equal_nan=True)
