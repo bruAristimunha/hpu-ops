@@ -61,8 +61,8 @@ def _positions(indices):
 def _in_range(t, size):
     """True when every value of a CPU index tensor is in [-size, size), False when one is not. None when it is not read
     on the host: on the device (that would need a sync), or fake while ``torch.compile`` traces."""
-    if t.device.type != "cpu":
-        return None
+    if t.device.type != "cpu" or _tracing(t):
+        return None  # traced: since torch 2.10 the failed read below leaves unbacked symbols that dynamo rejects
     if t.numel() == 0:
         return True
     try:
