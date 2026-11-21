@@ -1,7 +1,9 @@
 """On a Gaudi card: one train step (forward, backward, Adam) of the SPD models that use the linalg composites.
-    PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_steps.py [--baseline] [--with-eigh] [--models TSMNet,EEGSPDNet]
+    PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_steps.py [--baseline] [--with-eigh] [--compile] [--models TSMNet,EEGSPDNet]
 SPDNet, TSMNet, TensorCSPNet, EEGSPDNet and GBWAtt on a real batch of 32 at BNCI2014_001's width (22 channels):
 five warm-up steps, then the mean ms of 20 steps and the CPU-fallback ops per step (bridge ``cpu_fallback`` metric).
+``--compile`` runs the forward through ``torch.compile(model, backend="hpu_backend")`` (the backward through its
+compiled graph; Adam stays eager) and records the warm-up's ms too, where the compilation happens.
 A model fails when its step errors or when one of the ops of the linalg composites falls back: solve_triangular,
 cholesky_solve, solve, inv, det and slogdet, and eigh too when hpu_ops installs it (this branch's enable() does;
 ``--with-eigh`` also installs it for an origin/main without it). One ``RESULT {json}`` line per model; the last line
@@ -64,9 +66,9 @@ def resolve(name, models):
     return found[0]
 
 
-def run_model(name, P, info, X, y, baseline, linalg_ops):
+def run_model(name, P, info, X, y, baseline, linalg_ops, compile_=False):
     row = {"model": name, "dataset": DATASET, "n_ch": X.shape[1], "batch": BATCH, "lazy": LAZY,
-           "baseline": baseline}
+           "baseline": baseline, "compile": compile_}
     try:
         torch.manual_seed(0)
         ops_linalg = sys.modules.get("hpu_ops.linalg")  # origin/main's hpu_ops has no linalg module
@@ -80,10 +82,11 @@ def run_model(name, P, info, X, y, baseline, linalg_ops):
             model.fit_graph(X)
         opt = torch.optim.Adam(model.parameters(), 1e-3)
         yb = y.to(HPU)
+        forward = torch.compile(model, backend="hpu_backend") if compile_ else model
 
         def step():
             opt.zero_grad(set_to_none=True)
-            out = model(xb)
+            out = forward(xb)
             out = out[0] if isinstance(out, tuple) else out
             torch.nn.functional.cross_entropy(out, yb).backward()
             if LAZY:
@@ -93,9 +96,11 @@ def run_model(name, P, info, X, y, baseline, linalg_ops):
                 htcore.mark_step()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
+            t = time.perf_counter()
             for _ in range(WARMUP):
                 step()
             sync()
+            row["warmup_ms"] = round((time.perf_counter() - t) * 1e3)
             f0 = fb_ops()
             t = time.perf_counter()
             for _ in range(STEPS):
@@ -125,6 +130,8 @@ def main():
     parser.add_argument("--large-maxn", type=int, default=None,
                         help="set hpu_ops.tpc.LARGE_MAXN before enable() (64: n > 64 solve/inv/det/slogdet take the "
                              "parent branch's route, Habana's fallback, for an A/B in one checkout)")
+    parser.add_argument("--compile", action="store_true",
+                        help='run the forward through torch.compile(backend="hpu_backend")')
     parser.add_argument("--models", default=",".join(MODEL_NAMES),
                         help="comma-separated subset of " + ", ".join(MODEL_NAMES))
     args = parser.parse_args()
@@ -150,7 +157,7 @@ def main():
           getattr(hpu_complex, "__version__", "?"), "enabled by spd_diag; baseline (fallbacks recorded)", baseline,
           "eigh checked", eigh_checked, "tpc_ready",
           getattr(getattr(hpu_ops, "tpc", None), "ready", lambda: None)(), "large_maxn",
-          getattr(getattr(hpu_ops, "tpc", None), "LARGE_MAXN", None), "lazy", LAZY, flush=True)
+          getattr(getattr(hpu_ops, "tpc", None), "LARGE_MAXN", None), "lazy", LAZY, "compile", args.compile, flush=True)
     cache = open_cache(DATASET)
     info, sd = cache.info, cache.subject(cache.subjects[0], "X")
     X = torch.as_tensor(sd.X[:BATCH], dtype=torch.float32)
@@ -161,10 +168,11 @@ def main():
         try:
             name = resolve(name, MODELS)
         except KeyError as e:
-            emit(model=name, dataset=DATASET, lazy=LAZY, baseline=baseline, status="error", error=str(e)[:400])
+            emit(model=name, dataset=DATASET, lazy=LAZY, baseline=baseline, compile=args.compile, status="error",
+                 error=str(e)[:400])
             results.append(False)
             continue
-        results.append(run_model(name, P, info, X, y, baseline, linalg_ops))
+        results.append(run_model(name, P, info, X, y, baseline, linalg_ops, args.compile))
     print(f"SUMMARY {len(results)} models, {results.count(False)} failed", flush=True)
     return 0 if all(results) else 1
 

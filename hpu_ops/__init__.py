@@ -88,6 +88,12 @@ at the tensor's pickling:
     ("create tensor invalid permutation 4 2": FBCNet, FBMSNet, at times EEGNet and Deep4Net). Off, CBraMod steps
     2% faster and CodeBrain the same.
 
+In lazy mode (``PT_HPU_LAZY_MODE=1``), ``torch.compile(model, backend="hpu_backend")`` called after ``enable()`` warns
+once and returns ``model`` uncompiled (``lazy_compile``; ``HPU_OPS_LAZY_COMPILE=raise``: a one-line error instead):
+Habana supports the backend in eager mode only (1.21.4 support matrix), and in lazy mode it fails deep inside (an
+undefined symbol in the recipe compiler, ``torch.ops.hpu.weight_permutation`` missing). Run with
+``PT_HPU_LAZY_MODE=0`` to compile.
+
 Masked attention needs a Habana setting that is read when its library loads, so it must be exported before Python
 starts. The setting is per bridge version, listed in the README; ``enable()`` warns when it did not take effect.
 """
@@ -96,7 +102,8 @@ import warnings
 
 import torch
 
-from . import composite, conv, eigh, extrema, im2col, indexing, linalg, quantile, serialization, small, tpc, upsample  # noqa: F401
+from . import (composite, conv, eigh, extrema, im2col, indexing, lazy_compile, linalg, quantile,  # noqa: F401
+               serialization, small, tpc, upsample)
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -132,6 +139,17 @@ def _attention_fused(device_type="hpu"):
                for op in ("scaled_dot_product_attention", "_scaled_dot_product_fused_attention_overrideable"))
 
 
+def _lazy():
+    """Whether Habana's bridge runs in lazy mode (read after ``habana_frameworks.torch.core`` loads): its own
+    ``is_lazy``; on a bridge without it, ``PT_HPU_LAZY_MODE == "1"`` (unset counts as eager, 1.21.4's default:
+    its bridge configuration prints ``PT_HPU_LAZY_MODE = 0`` when the variable is unset)."""
+    try:
+        from habana_frameworks.torch.utils.internal import is_lazy
+    except ImportError:
+        return os.environ.get("PT_HPU_LAZY_MODE", "0") == "1"
+    return is_lazy()
+
+
 def enable():
     """Install the rewrites and turn off the broken passes. Idempotent; a no-op off a Gaudi stack."""
     if _STATE.get("undo"):
@@ -145,6 +163,12 @@ def enable():
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"
     undo = _install("hpu")
+    if _lazy():  # Habana's compile backend does not run in lazy mode: uncompiled with one warning (or raise)
+        try:
+            undo = chain([undo, lazy_compile.install(lazy_compile.NAME)])
+        except Exception:
+            undo()  # no half-enabled state: a later enable() starts clean
+            raise
 
     def undo_once():  # clears the state, so enable() after the undo installs again
         if _STATE.get("undo") is undo_once:
