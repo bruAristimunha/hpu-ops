@@ -588,13 +588,16 @@ def _rows(X, index):
 
 def _large(A, B=None):
     """``(X, D, S)`` of the in-place Gauss-Jordan kernel for ``A[b, n, n]`` (64 < n <= ``LARGE_MAXN``): ``X =
-    A^-1`` (``B`` None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel leaves ``R`` with ``A^-1 =
+    A^-1`` (``B`` None; refined by one Newton step) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel leaves ``R`` with ``A^-1 =
     R[P, :][:, Q]``, so ``A^-1 B = (R @ B[Q^-1 order])[P]``: with ``Q = P^-1``, ``R[:, Q] @ B = R @ B[P]``."""
     n = A.shape[-1]
     R, P, Q, D, S = _call(_large_op(), A)
     R = R[..., :n]
     if B is None:
         X = _rows(R, P).gather(-1, Q.long()[..., None, :].expand(*Q.shape[:-1], n, n))
+        # One Newton step on the MME, X + X (I - A X): Gauss-Jordan's inverse is about 2x LAPACK's error (the kernel
+        # equals the same algorithm on the CPU); measured on Gaudi2 at n = 220, 1.7e-6 to 8.7e-7 (CPU float32 7.0e-7)
+        X = X + X @ (torch.eye(n, dtype=X.dtype, device=X.device) - A @ X)
     else:
         X = _rows(R @ _rows(B, P), P)
     # A NaN in A: LAPACK's results are NaN; the kernel's are not always (measured on Gaudi2: a NaN at (0, 0) of a
