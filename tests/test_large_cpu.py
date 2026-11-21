@@ -198,3 +198,19 @@ def test_batch_threshold_counts_the_broadcast_batch(monkeypatch):
     assert takes(A, torch.empty(tpc.LARGE_MIN_BATCH, n, 3)) is True
     assert takes(A, torch.empty(1, n, 3)) is False
     assert takes(A[0], torch.empty(tpc.LARGE_MIN_BATCH, n, 1)) is True  # 2-D A
+
+
+def test_division_by_a_huge_pivot_never_uses_a_subnormal_reciprocal(replica, monkeypatch):
+    """Measured on Gaudi2: Y / 1e38 multiplied by a flushed reciprocal and zeroed the row. Emulate that division."""
+    real_div = torch.Tensor.__truediv__
+
+    def card_div(a, b):
+        r = 1.0 / b if isinstance(b, torch.Tensor) else 1.0 / torch.tensor(b)
+        r = torch.where(r.abs() < 2.0 ** -126, 0.0, r)
+        return a * r
+
+    monkeypatch.setattr(torch.Tensor, "__truediv__", card_div)
+    A = huge_pivot()[None]
+    X, _, _ = tpc.gj_inv(A)
+    monkeypatch.setattr(torch.Tensor, "__truediv__", real_div)
+    assert rel(X, torch.linalg.inv(A.double())) < 1e-5

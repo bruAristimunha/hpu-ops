@@ -89,17 +89,20 @@ static inline float64 lut_free_recip(float64 x)
     return as_float64(res);
 }
 
-// q = -col / pivot rounded (Markstein: one FMA residual correction), and qs = q * 2^64 where q flushed (else 0)
-static inline void multipliers(float64 col, float64 scale, float64 pks, float64 ninv, float64 up, float64* q,
-                               float64* qs)
+// q = -col / pivot rounded (Markstein: one FMA residual correction)
+static inline float64 quotient(float64 col, float64 scale, float64 pks, float64 ninv)
 {
     float64 cs = v_f32_mul_b(col, scale);
     float64 t = v_f32_mul_b(cs, ninv);
     float64 r = v_f32_mac_b(t, pks, cs);
     // no correction when 1/pivot is 0 (an infinite or zero pivot): 0 * inf in r would make q NaN
-    t = v_f32_sel_eq_f32_b(ninv, 0.0f, t, v_f32_mac_b(r, ninv, t));
-    *q = t;
-    *qs = v_f32_sel_eq_f32_b(t, 0.0f, v_f32_mul_b(v_f32_mul_b(col, up), ninv), 0.0f);
+    return v_f32_sel_eq_f32_b(ninv, 0.0f, t, v_f32_mac_b(r, ninv, t));
+}
+
+// qs = q * 2^64 where q flushed to zero, else 0 (used against the pivot row * 2^-64)
+static inline float64 small_quotient(float64 col, float64 q, float64 up, float64 ninv)
+{
+    return v_f32_sel_eq_f32_b(q, 0.0f, v_f32_mul_b(v_f32_mul_b(col, up), ninv), 0.0f);
 }
 
 void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
@@ -232,7 +235,9 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                     {
                         x[r][v] = cache[base + v];
                     }
-                    multipliers(lane_bcast(cache[base + vk], lk), scale, pks, ninv, up, &q[r], &qs[r]);
+                    const float64 col = lane_bcast(cache[base + vk], lk);
+                    q[r] = quotient(col, scale, pks, ninv);
+                    qs[r] = small_quotient(col, q[r], up, ninv);
                     // candidate for step k + 1: the new value at column k + 1 of an unused row (same fused ops as below)
                     float64 cd = v_f32_abs_b(v_f32_mac_b(pksn, qs[r], v_f32_mac_b(pkn, q[r], lane_bcast(cache[base + vkn], lkn))));
                     cd = v_f32_sel_eq_f32_b(cd, cd, cd, 0.0f);  // NaN counts as 0
@@ -278,7 +283,9 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                     float64 xk = v_f32_ld_tnsr_b(c, R);
                     c[0] = 64 * vkn;
                     float64 xkn = v_f32_ld_tnsr_b(c, R);
-                    multipliers(lane_bcast(xk, lk), scale, pks, ninv, up, &q[r], &qs[r]);
+                    const float64 col = lane_bcast(xk, lk);
+                    q[r] = quotient(col, scale, pks, ninv);
+                    qs[r] = small_quotient(col, q[r], up, ninv);
                     float64 cd = v_f32_abs_b(v_f32_mac_b(pksn, qs[r], v_f32_mac_b(pkn, q[r], lane_bcast(xkn, lkn))));
                     cd = v_f32_sel_eq_f32_b(cd, cd, cd, 0.0f);  // NaN counts as 0
                     cd = v_f32_sel_eq_f32_b(lane_bcast(used[ii[r] / 64], ii[r] % 64), 1.0f, -1.0f, cd);

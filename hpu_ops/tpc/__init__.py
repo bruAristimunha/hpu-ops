@@ -633,7 +633,10 @@ def _large(A, B=None):
     R = R[..., :n]
     zero = D == 0
     Y = _rows(R, P) if B is None else _rows(R @ _rows(B, P), P)
-    Y = (Y / torch.where(zero, 1.0, D)[..., None]).masked_fill(zero[..., None], 0.0)
+    # |pivot| >= 2^64: numerator and pivot scaled by 2^-64 (exact) first, as the kernels do, since the card's division
+    # multiplies by a reciprocal that is subnormal, hence flushed, past 2^126 (measured: a 1e38 pivot zeroed its row)
+    s = torch.where(D.abs() >= 2.0 ** 64, 2.0 ** -64, 1.0)
+    Y = ((Y * s[..., None]) / torch.where(zero, 1.0, D * s)[..., None]).masked_fill(zero[..., None], 0.0)
     if B is None:
         # no Newton step: on the kernel's float32 replica it gained little at condition <= 1e4 and lost past 1e6
         # (n = 220, condition 1e7: 6.8e-2 against 4.5e-2 without, LAPACK 4.7e-2)
