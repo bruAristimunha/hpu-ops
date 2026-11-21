@@ -190,6 +190,7 @@ Large gj_large(at::Tensor a) {
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::gj_large");
   auto out = desc.execute(inputs);
   return {out[0], out[1], out[2], out[3], out[4]};
+}
 std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_svd");
@@ -530,6 +531,7 @@ Large gj_large(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto out = op.execute(inputs);
   return {out[0], out[1], out[2], out[3], out[4]};
+}
 std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd(at::Tensor a) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_svd");
   std::vector<c10::IValue> inputs{a};
@@ -794,6 +796,8 @@ def _large_op():
     """``torch.ops.linalg_tpc.gj_large``, built on first use."""
     _load()
     return torch.ops.linalg_tpc.gj_large
+
+
 def _svd_op():
     """``torch.ops.linalg_tpc.jacobi_svd``, built on first use."""
     _load()
