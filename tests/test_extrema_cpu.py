@@ -828,3 +828,17 @@ def test_the_sort_family_keeps_the_native_op_under_compile(card):
     f = lambda t: t.sort(-1).values  # noqa: E731
     compiled(f, nodes, dynamic=False)(rows(dtype=torch.float32))
     assert "aten.sort.stable" not in ops(nodes) and card["sort"] == 0
+
+
+def test_nan_propagation_opt_out(monkeypatch):
+    """``HPU_OPS_NAN_PROPAGATION=0`` installs nothing: Gaudi's ops (here the stand-in) run as they are."""
+    monkeypatch.setattr(extrema, "native_out", gaudi_out)
+    monkeypatch.setenv("HPU_OPS_NAN_PROPAGATION", "0")
+    x = rows(dtype=torch.float32)
+    with cpu_as_hpu(extrema.install) as calls:
+        x.amax(-1)
+    assert not calls and not extrema._BACKEND
+    monkeypatch.setenv("HPU_OPS_NAN_PROPAGATION", "1")
+    with cpu_as_hpu(extrema.install) as calls:
+        assert torch.isnan(x.amax(-1)[0])
+    assert calls["amax"]

@@ -25,6 +25,13 @@ On 1.21 and 1.22, `enable()` warns when the setting did not take effect: Habana'
 
 Compile with `dynamic=False`, or keep one batch size (`drop_last=True`). A new batch size otherwise makes the shapes symbolic, and linear upsampling falls back to the slow decomposition, with a warning.
 
+### NaN propagation (on by default)
+
+`enable()` makes Gaudi's max/min ops propagate NaN as torch does (see `extrema` in the table below). Measured cost,
+eager training steps against origin/main (3 alternating rounds, medians): TensorCSPNet +7%, GBWAtt +9%, EEGSPDNet
++8%, SPDNet and TSMNet within noise; lazy within noise. `export HPU_OPS_NAN_PROPAGATION=0` before `enable()` keeps
+Gaudi's NaN-dropping ops. `HPU_OPS_EXACT_SORT=1` adds the exact sort family (off by default: up to +22% eager).
+
 ### float64
 
 Gaudi2 stores float64 as float32 when a tensor is copied to it: `1 + 2**-40` comes back as `1`. No result computed on the card can be float64-exact. For float64 linalg, hpu-ops computes on the CPU, over the values the card holds, and warns once per op (hpu-ops#16). The kernels above take float32 only.

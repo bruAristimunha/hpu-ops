@@ -882,10 +882,13 @@ def _out_kernel(out_op, functional, names):
 def install(device_type, exact_sort=None):
     """NaN propagation of Gaudi's max/min ops on ``device_type``: the backend layer at its backend key, the traced
     composites (and the inf-norms, the whole-tensor reductions' backward, the out= overloads) at its autograd key.
-    Returns an undo. The sort family (``sort``, ``argsort``, ``msort``, ``topk``, ``kthvalue``) only with
+    Returns an undo. ``HPU_OPS_NAN_PROPAGATION=0`` in the environment installs nothing (Gaudi's NaN-dropping ops
+    stay; measured, the rewrite costs eager SPD steps up to about 9%, lazy within noise). The sort family (``sort``, ``argsort``, ``msort``, ``topk``, ``kthvalue``) only with
     ``exact_sort`` (default: the environment's ``HPU_OPS_EXACT_SORT=1``): measured eager, it made the training steps
     of the SPD models up to 22% slower (hpu-ops' own eigh and SVD sort their eigenvalues; TensorCSPNet 205 to 250 ms),
     lazy within noise."""
+    if os.environ.get("HPU_OPS_NAN_PROPAGATION") == "0":  # opt-out, read when enable() runs (like HPU_OPS_TPC=0)
+        return lambda: None
     if exact_sort is None:
         exact_sort = os.environ.get("HPU_OPS_EXACT_SORT") == "1"
     traced = []  # (op, composite): handed to torch's autograd kernel outside a tracer
