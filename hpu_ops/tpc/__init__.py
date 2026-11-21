@@ -603,13 +603,16 @@ def _rows(X, index):
     return X.gather(-2, index.long()[..., None].expand(*index.shape, X.shape[-1]))
 
 
-def _large_raw(A):
-    """The kernel's ``(R, P, Q, D, S)`` for ``A[b, n, n]``, ``S[:, 0]`` set to the sign of the pivot order and a
-    matrix with a NaN given NaN pivots (LAPACK's results are NaN there; the kernel's need not be)."""
+def _large_raw(A, sign=True):
+    """The kernel's ``(R, P, Q, D, S)`` for ``A[b, n, n]``, ``S[:, 0]`` set to the sign of the pivot order (0 when
+    not ``sign``: solve and inv do not read it, and its [b, n, n] comparison costs eager launches) and a matrix with
+    a NaN given NaN pivots (LAPACK's results are NaN there; the kernel's need not be)."""
     R, P, Q, D, S = _call(_large_op(), A)
     nan = A.isnan().any(-1).any(-1)
     D = D.masked_fill(nan[..., None], float("nan"))
-    return R, P, Q, D, torch.stack([_parity(P), S[..., 1]], -1), nan
+    if sign:
+        S = torch.stack([_parity(P), S[..., 1]], -1)
+    return R, P, Q, D, S, nan
 
 
 def large_factors(A):
@@ -622,13 +625,13 @@ def large_factors(A):
     return _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
-def _large(A, B=None):
+def _large(A, B=None, sign=True):
     """``(X, D, S)`` of the in-place Gauss-Jordan kernel for ``A[b, n, n]`` (64 < n <= ``LARGE_MAXN``): ``X =
     A^-1`` (``B`` None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel
     divides each row by its pivot at the end: ``A^-1 = R[P, :][:, Q]``, and ``A^-1 B = (R @ B[P])[P]`` (with ``Q =
     P^-1``, ``R[:, Q] @ B = R @ B[P]``); a zero pivot gives a zero row (info is set)."""
     n = A.shape[-1]
-    R, P, Q, D, S, nan = _large_raw(A)
+    R, P, Q, D, S, nan = _large_raw(A, sign)
     R = R[..., :n]
     # the kernel divides each row by its pivot itself (a torch division by a pivot of 1e38 zeroed the row in lazy mode:
     # the card's division multiplies by a reciprocal, subnormal hence flushed, and a 2^-64 prescale was folded away)
@@ -658,13 +661,14 @@ def gj_solve(A, B):
     return _unflatten(X, batch, n, m), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
-def gj_inv(A):
-    """``(A^-1, D, S)`` for ``A[..., n, n]``: ``gj_solve`` against the identity, which the kernel builds itself."""
+def gj_inv(A, sign=True):
+    """``(A^-1, D, S)`` for ``A[..., n, n]``: ``gj_solve`` against the identity, which the kernel builds itself.
+    Past ``MAXN``, ``sign=False`` leaves ``S[..., 0]`` 0 (not computed)."""
     n = A.shape[-1]
     _check(A, n, limit=LARGE_MAXN)
     batch = A.shape[:-2]
     A = _flat(A, batch, n, n)
-    X, D, S = _call(_inv_op(), A) if n <= MAXN else _large(A)
+    X, D, S = _call(_inv_op(), A) if n <= MAXN else _large(A, sign=sign)
     return _unflatten(X, batch, n, n), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 

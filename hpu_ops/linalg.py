@@ -128,11 +128,12 @@ def _gj(A, B):
     return solver(A.expand(*batch, *A.shape[-2:]), B.expand(*batch, *B.shape[-2:]))
 
 
-def _gj_inv(A):
-    """``(A^-1, D, S)``: the kernel with the identity as right-hand side, built in the kernel."""
+def _gj_inv(A, sign=True):
+    """``(A^-1, D, S)``: the kernel with the identity as right-hand side, built in the kernel (``sign=False``: the
+    in-place kernel's ``S[..., 0]`` is not computed)."""
     if _GJ is not None and not (_LARGE_ON_CPU and A.shape[-1] > tpc.MAXN):
         return _gj(A, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
-    return tpc.gj_inv(A)
+    return tpc.gj_inv(A, sign=sign)
 
 
 def _gj_factors(A):
@@ -574,6 +575,7 @@ def _inv_solve(A, B, Ainv, left):
     """``A^-1 B`` (``B A^-1`` if not ``left``) from the inverse, with one residual step ``X += A^-1 (B - A X)``: on the
     in-place kernel's float32 replica (n = 220) the forward error then matches LAPACK's from condition 1 to 1e7 (the
     product with the inverse alone was up to 1.5x worse). A non-finite correction (Inf in A) is dropped."""
+    A = A.contiguous()  # a strided view here gave wrong residuals under torch.compile on Gaudi2 (see SolveEx)
     X = Ainv @ B if left else B @ Ainv
     C = Ainv @ (B - A @ X) if left else (B - X @ A) @ Ainv
     return X + torch.where(torch.isfinite(C), C, 0.0)
@@ -622,8 +624,11 @@ class SolveEx(torch.autograd.Function):
         Ainv = None
         if _use_tpc(A):
             if A.shape[-1] > tpc.MAXN:
-                Ainv, _, S = _gj_inv(A)
-                result = _inv_solve(A, rhs, Ainv, left)
+                # one contiguous copy for the kernel and the residual: under torch.compile on Gaudi2 the residual's
+                # A @ X with A a strided view of a graph input beside the kernel's copy gave 7e-2 error at n = 150
+                Ac = A.contiguous()
+                Ainv, _, S = _gj_inv(Ac, sign=False)
+                result = _inv_solve(Ac, rhs, Ainv, left)
             else:
                 result, _, S = _gj_solve(A, rhs, left)
             LU, pivots = _unused_factors(A)
@@ -701,7 +706,7 @@ class InvEx(torch.autograd.Function):
     @staticmethod
     def compute(A, check_errors):
         if _use_tpc(A):
-            X, _, S = _gj_inv(A)
+            X, _, S = _gj_inv(A, sign=False)
             info = _gj_info(S, A.shape[:-2])
         else:
             LU, pivots = lu(A)
