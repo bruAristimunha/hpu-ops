@@ -20,4 +20,4 @@ jobs:
           python-version: "3.12"
       - run: pip install "${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
       - run: pip install pytest numpy .
-      - run: cd /tmp && python -m pytest "$GITHUB_WORKSPACE/tests/test_cpu.py" -q  # the installed package
+      - run: cd /tmp && python -m pytest "$GITHUB_WORKSPACE/tests/test_cpu.py" "$GITHUB_WORKSPACE/tests/test_linalg_cpu.py" -q  # the installed package
