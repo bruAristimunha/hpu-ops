@@ -353,3 +353,199 @@ def test_nan_propagation_opt_out_keeps_the_exact_sort(monkeypatch):
         torch.sort(x)
         assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::sort", "AutogradCPU")
     assert not calls
+
+
+# ---- (15) the gradient with respect to an expanded (stride-0) tensor itself landed at index 0
+
+
+def _index_rewrite(monkeypatch, off=False):
+    from test_cpu import cpu_as_hpu
+    from hpu_ops import indexing
+
+    if off:
+        monkeypatch.setattr(indexing, "_off_device", lambda self, t: True)
+    return cpu_as_hpu(indexing.install_index)
+
+
+def _expanded_cases():
+    from torch.func import grad, jvp
+
+    idx = torch.tensor([1, 3, 3])
+    w = torch.tensor([1.0, 10.0, 100.0])
+
+    def leaf_grad():  # the review's input
+        leaf = torch.zeros(3, 1).expand(3, 4).requires_grad_()
+        leaf[:, idx].sum().backward()
+        return leaf.grad
+
+    def leaf_weighted():
+        leaf = torch.zeros(3, 1).expand(3, 4).requires_grad_()
+        (leaf[:, idx] * w).sum().backward()
+        return leaf.grad
+
+    def retained():
+        base = torch.randn(3, 1, requires_grad=True)
+        e = base.expand(3, 4)
+        e.retain_grad()
+        (e[:, idx] * w).sum().backward()
+        return torch.cat([e.grad.flatten(), base.grad.flatten()])
+
+    def autograd_grad():
+        e = torch.randn(1, 4).expand(5, 4).requires_grad_()
+        return torch.autograd.grad((e[torch.tensor([0, 4, 4])][:, idx] * w).sum(), e)[0]
+
+    def parameter():
+        p = torch.nn.Parameter(torch.randn(3, 1).expand(3, 4))
+        (p[:, idx] * w).sum().backward()
+        return p.grad
+
+    def mask():
+        e = torch.zeros(3, 1).expand(3, 4).requires_grad_()
+        (e[:, torch.tensor([False, True, False, True])] * torch.tensor([1.0, 10.0])).sum().backward()
+        return e.grad
+
+    def func_grad():
+        return grad(lambda t: (t[:, idx] * w).sum())(torch.randn(3, 1).expand(3, 4))
+
+    def func_jvp():  # an expanded primal cannot be made dual (torch raises); expanded inside the function
+        return jvp(lambda b: b.expand(5, 4)[torch.tensor([0, 4])][:, idx], (torch.randn(1, 4),),
+                   (torch.arange(4.0).reshape(1, 4),))[1]
+
+    def forward_values():  # no gradient: the shortcut stays, the values are the same
+        return torch.randn(3, 1).expand(3, 4)[:, idx]
+
+    return {f.__name__: f for f in (leaf_grad, leaf_weighted, retained, autograd_grad, parameter, mask, func_grad,
+                                     func_jvp, forward_values)}
+
+
+@pytest.mark.parametrize("name", list(_expanded_cases()))
+@pytest.mark.parametrize("off", [False, True])
+def test_gradient_of_an_expanded_tensor_lands_at_its_indices(monkeypatch, name, off):
+    """``leaf = torch.zeros(3, 1).expand(3, 4).requires_grad_(); leaf[:, torch.tensor([1, 3, 3])].sum().backward()``
+    gave ``leaf.grad`` rows [3, 0, 0, 0] instead of [0, 1, 0, 2]."""
+    f = _expanded_cases()[name]
+    torch.manual_seed(0)
+    want = f()
+    torch.manual_seed(0)
+    with _index_rewrite(monkeypatch, off) as calls:
+        got = f()
+    assert calls["index"], calls
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+def test_expanded_index_without_a_gradient_keeps_the_one_element_shortcut(monkeypatch):
+    """Without a gradient the stride-0 dim is still read from its one element (no copy of the expanded dims)."""
+    from hpu_ops import indexing
+
+    seen = []
+    real = torch.Tensor.index_select
+    monkeypatch.setattr(torch.Tensor, "index_select", lambda self, *a: seen.append(self.shape) or real(self, *a))
+    x = torch.randn(3, 1).expand(3, 4)
+    with _index_rewrite(monkeypatch):
+        torch.testing.assert_close(indexing.index_select_flat(x, [None, torch.tensor([1, 3, 3])]),
+                                   x[:, torch.tensor([1, 3, 3])])
+        indexing.index_select_flat(x.clone().requires_grad_(), [None, torch.tensor([1, 3])])
+    assert seen[0] == (3, 1), seen
+
+
+# ---- efficiency: the tracing checks missed AOT's FunctionalTensor (host index build + copy every compiled step)
+
+
+def test_compiled_index_and_unfold_build_their_indices_in_the_graph(monkeypatch):
+    """The review's probe: ``x[:, idx]`` with a CPU index tensor (spd_learn's triu_indices) and ``F.unfold`` under
+    ``torch.compile``: in AOT's functional pass ``indexing._tracing`` / ``im2col._tracing`` answered False, so the
+    linear index was built on the host."""
+    import torch.nn.functional as F
+    from functorch.compile import make_boxed_func
+    from torch._dynamo.backends.common import aot_autograd
+    from torch._subclasses.functional_tensor import FunctionalTensor
+
+    from hpu_ops import im2col, indexing
+
+    answers = []
+    for module in (indexing, im2col):
+        real = module._tracing
+        monkeypatch.setattr(module, "_tracing", lambda t, real=real: answers.append(
+            (type(t) is FunctionalTensor, real(t))) or real(t))
+    idx = torch.tensor([0, 2])
+
+    def f(x):
+        return x[:, idx].sum() + F.unfold(x.unsqueeze(1), (2, 2), padding=1).sum()
+
+    backend = aot_autograd(fw_compiler=lambda gm, _: make_boxed_func(gm.forward),
+                           bw_compiler=lambda gm, _: make_boxed_func(gm.forward))
+    monkeypatch.setattr(indexing, "_off_device", lambda self, t: True)
+    from test_cpu import cpu_as_hpu
+
+    with cpu_as_hpu(lambda d: __import__("hpu_ops")._dispatch.chain([indexing.install_index(d), im2col.install(d)])):
+        torch._dynamo.reset()
+        torch.compile(f, backend=backend)(torch.randn(3, 4, requires_grad=True)).backward()
+    assert any(functional for functional, _ in answers), answers
+    assert all(traced for _, traced in answers), answers
+
+
+def test_expanded_index_double_backward_and_compiled_gradients(monkeypatch):
+    from test_cpu import compiled
+
+    idx = torch.tensor([1, 3, 3])
+    w = torch.tensor([1.0, 10.0, 100.0], dtype=torch.float64)
+
+    def second(e):
+        (g,) = torch.autograd.grad((e[:, idx] ** 3 * w).sum(), e, create_graph=True)
+        (gg,) = torch.autograd.grad((g * torch.arange(12.0, dtype=e.dtype).reshape(3, 4)).sum(), e)
+        return g.detach(), gg
+
+    def leaf():
+        return torch.linspace(-1, 1, 3, dtype=torch.float64).reshape(3, 1).expand(3, 4).requires_grad_()
+
+    want = second(leaf())
+    with _index_rewrite(monkeypatch, off=True) as calls:
+        got = second(leaf())
+    assert calls["index"]
+    for g, x in zip(got, want):
+        torch.testing.assert_close(g, x, atol=1e-12, rtol=0)
+
+    def step(e):
+        return (e[:, idx] * w).sum()
+
+    e = leaf()
+    step(e).backward()
+    want = e.grad
+    with _index_rewrite(monkeypatch, off=True) as calls:
+        e = leaf()
+        compiled(step, [], dynamic=False)(e).backward()
+    assert calls["index"]
+    torch.testing.assert_close(e.grad, want, atol=0, rtol=0)
+
+
+# ---- cut item: enable() under -W error installed nothing when the kernel-path step warned
+
+
+ENABLE_WERROR = """
+import os, pathlib, sys, types, warnings
+import torch
+for name in ("habana_frameworks", "habana_frameworks.torch", "habana_frameworks.torch.core"):
+    sys.modules[name] = types.ModuleType(name)
+import hpu_ops
+from hpu_ops import tpc
+if sys.argv[1] == "late":
+    tpc._initialized = lambda: True  # the HPU was used before enable()
+else:
+    tpc.LIB = pathlib.Path("/nonexistent/liblinalg_tpc.so")
+warnings.simplefilter("error")
+try:
+    hpu_ops.enable()
+    raised = "none"
+except UserWarning as error:
+    raised = "kernels" if "TPC linalg kernels" in str(error) else "other"
+print(raised, "undo" in hpu_ops._STATE, os.environ.get("PT_HPU_DISABLE_pass_weight_permutation"),
+      torch._C._dispatch_has_kernel_for_dispatch_key("aten::glu", "AutogradHPU"))
+"""
+
+
+@pytest.mark.parametrize("case", ["late", "missing"])
+def test_enable_under_warnings_as_errors_installs_the_fixes_first(case):
+    """``python -W error`` with ``tpc.install_kernel_path()`` warning (the HPU used before ``enable()``, or the
+    kernel library missing): ``enable()`` raised before any fix was installed. Now the warning is raised last."""
+    code = ENABLE_WERROR.replace('sys.argv[1]', repr(case))
+    assert _run(code) == "kernels True True True"
