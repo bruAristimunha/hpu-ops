@@ -245,3 +245,38 @@ def test_histc_many_bins_in_16_bit_use_bucketize_and_keep_positions_past_the_end
         out = torch.histc(x, 500, -3.0, 3.0)
     assert calls["histc"] == 1
     same(out, _clamped_reference(x, 500, -3.0, 3.0), exact=True)
+
+
+# ---- adversarial pass -------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("args", [(64, 0.0, 63), (64, 0, 63.0), (64, -0.0, 1.0), (3, 1e-45, 2e-45), (5, -1.0, -0.5),
+                                  (100000, 0.0, 1.0), (2, 0.5, 0.5000001)])
+def test_histc_adversarial_bounds(args):
+    x = torch.cat([torch.rand(500) * 2 - 1, torch.tensor([1e-45, 2e-45, -0.0, 0.0, 0.5, 0.5000001])])
+    _check(x, *args)
+
+
+def test_histc_two_calls_and_interleaved_dtypes_share_no_state_wrongly():
+    small._EDGE_CACHE.clear()
+    xs = [_data(300, -1.0, 1.0, d) for d in (torch.float32, torch.bfloat16, torch.float16, torch.float32)]
+    refs = [torch.histc(x, 50, -1.0, 1.0) for x in xs]
+    with cpu_as_hpu(small.install_histc):
+        outs = [torch.histc(x, 50, -1.0, 1.0) for x in xs]
+    for o, r in zip(outs, refs):
+        same(o, r, exact=True)
+    assert len(small._EDGE_CACHE) == 3
+
+
+def test_histc_non_float_inputs_keep_atens_kernel():
+    with cpu_as_hpu(small.install_histc) as calls, pytest.raises(RuntimeError, match="not implemented"):
+        torch.histc(torch.arange(5), 4, 0.0, 4.0)
+    assert calls["histc"] == 0
+
+
+def test_histc_under_inference_mode_keeps_atens_kernel():
+    x = torch.rand(3, 50)
+    with cpu_as_hpu(small.install_histc) as calls:
+        with torch.inference_mode():
+            a = torch.histc(x[0], 8, 0.0, 1.0)
+    same(a, torch.histc(x[0], 8, 0.0, 1.0), exact=True)
+    assert calls["histc"] == 0  # below autograd: Habana's kernel (README, Known gaps)

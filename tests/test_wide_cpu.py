@@ -89,3 +89,17 @@ def test_undo_removes_the_kernel():
     assert torch._C._dispatch_has_kernel_for_dispatch_key("aten::copy_", "CPU")
     undo()
     assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::copy_", "CPU")
+
+
+def test_int64_cast_to_another_dtype_and_card_sources_are_not_scanned():
+    big = torch.tensor([2 ** 40])
+    with cpu_as_hpu(wide.install_copy_checks), warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = _copy(big, torch.float32)  # a cast: the card gets float32
+    assert out.item() == 2.0 ** 40
+
+
+def test_copy_under_inference_mode_and_no_grad_still_checks():
+    with cpu_as_hpu(wide.install_copy_checks), torch.inference_mode():
+        with pytest.warns(UserWarning, match="outside the int32 range"):
+            _copy(torch.tensor([-(2 ** 40)]))

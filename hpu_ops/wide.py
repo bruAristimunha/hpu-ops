@@ -17,9 +17,9 @@ so the copy that puts such data on the card warns once (``repro/float64_storage_
   views, ``cat``, ``==`` and ``.float()`` keep all 64 bits. Lazy mode raises at the copy instead ("Error when
   trying to cast Long to Int"). In both modes a result past the int32 range from in-range inputs wraps or saturates
   (``2**31 - 1 + 1`` gives ``2**31 - 1``, ``2**20 * 2**20`` gives 0) and float32 to int64 saturates at the int32
-  bounds: no copy-time check can see that. Here a CPU int64 tensor copied to the card is scanned on the host (one
-  ``aminmax``) until the first out-of-range one is found; ``HPU_OPS_INT64_CHECK=raise`` raises instead of warning,
-  ``=0`` skips the scan.
+  bounds: no copy-time check can see that. Here a CPU int64 tensor copied into an int64 card tensor is scanned on
+  the host (one ``aminmax``) until the first out-of-range one is found; ``HPU_OPS_INT64_CHECK=raise`` raises instead
+  of warning, ``=0`` skips the scan.
 
 Registered at the ``HPU`` key of ``copy_``, where eager Habana has no kernel (``copy_`` resolves to ATen's
 composite there, which the kernel calls); lazy mode registers its own ``copy_``, so nothing is installed there.
@@ -85,7 +85,8 @@ def _plain(t):
 
 def copy_checks(self, src, device_type):
     """The checks of a ``self.copy_(src)`` whose ``self`` is on ``device_type``."""
-    if isinstance(src, torch.Tensor) and src.dtype == torch.int64 and src.device.type == "cpu" and _plain(src):
+    if (self.dtype == torch.int64 and isinstance(src, torch.Tensor) and src.dtype == torch.int64
+            and src.device.type == "cpu" and _plain(src)):
         check_int64_source(src)
     if self.dtype == torch.float64:
         _warn_once("float64", FLOAT64_WARNING)
