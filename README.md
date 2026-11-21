@@ -98,7 +98,7 @@ What it sees (source column of the report):
 `allow=("host sync", "cpu op")` (or `HPU_OPS_STRICT_ALLOW="host sync,cpu op"`) leaves sources out. `torch.save`'s
 host copy is never counted.
 
-The per-op attribution is a `TorchDispatchMode`. It costs about 40-60 us per op (bridge 1.21.4, eager and lazy,
+The per-op attribution is a `TorchDispatchMode`. It costs about 10-25 us per op in eager mode and 45-60 us in lazy mode (bridge 1.21.4,
 `tests/strict_probe.py`), so time steps outside it. A dispatch mode and torch.compile do not mix: under an ordinary
 mode Dynamo skips the frame and keeps skipping it after the block; under an infra mode it recompiles at every call
 (its guards see the mode's dispatch keys). So inside a per-op block, compiled code runs eagerly
