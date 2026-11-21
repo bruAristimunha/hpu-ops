@@ -1,5 +1,5 @@
-"""Gaudi probe: every ``aten.index.Tensor`` call (below autograd) in one GBWAtt train step, with its shapes, whether
-``index_2d`` takes it, and the bridge's CPU-fallback delta around it.
+"""Gaudi probe: every ``aten.index.Tensor`` call (below autograd) in one GBWAtt train step, with its shapes and the
+bridge's CPU-fallback delta around it.
     PT_HPU_LAZY_MODE=0 python3 repro/probe_gbw_index.py"""
 import json
 import os
@@ -22,7 +22,6 @@ class Index(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if func is not torch.ops.aten.index.Tensor:
             return func(*args, **(kwargs or {}))
-        from hpu_ops.composite import _index_2d_takes
         before = fb()
         out = func(*args, **(kwargs or {}))
         after = fb()
@@ -31,7 +30,6 @@ class Index(TorchDispatchMode):
         print("INDEX " + json.dumps({
             "self": [list(self_.shape), str(self_.dtype), str(self_.device)],
             "indices": [None if i is None else [list(i.shape), str(i.dtype), str(i.device)] for i in idx],
-            "index_2d_takes": _index_2d_takes(self_, idx),
             "fallback_delta": {k: after[k] - before.get(k, 0) for k in after if after[k] - before.get(k, 0)},
             "where": where}), flush=True)
         return out

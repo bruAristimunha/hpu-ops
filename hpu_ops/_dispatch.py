@@ -81,3 +81,20 @@ def register_kernels(device_type, kernels):
             op._dispatch_cache.clear()
 
     return undo
+
+
+def register_paired(device_type, groups):
+    """``register_kernels`` for ``groups``, lists of ``(op, key, kernel)`` whose first entry is the autograd kernel and
+    the others the backend kernels below it. A backend kernel is registered only together with its autograd kernel:
+    if the autograd key of a group already has a kernel on this bridge, none of the group is, as ours at the
+    backend key under Habana's autograd kernel would split the op between the two (inference mode ours, training
+    Habana's). A taken backend key alone only skips that key (the CPU stand-in's case: the CPU kernels stay, our
+    autograd kernel computes by itself). Returns an undo."""
+    undos = []
+    for group in groups:
+        op, key, _ = group[0]
+        assert key.startswith("Autograd"), key
+        if torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), key.format(device_type.upper())):
+            continue
+        undos.append(register_kernels(device_type, group))
+    return chain(undos)

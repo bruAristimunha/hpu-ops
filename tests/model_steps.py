@@ -114,6 +114,8 @@ def main():
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--without", default="", help="comma-separated hpu_ops install_* fixes to leave out")
     parser.add_argument("--ab", default="", help="leave these out, run, install them, run again (same process)")
+    parser.add_argument("--first", default="", help="comma-separated module.install_* to install before enable(), "
+                        "so they take their keys first (fixes not in FIXES, e.g. composite.install_index_put)")
     args = parser.parse_args()
     import hpu_complex
     import hpu_ops
@@ -123,9 +125,14 @@ def main():
         raise SystemExit(f"unknown fixes {skip - names}; known: {sorted(names)}")
     later = [f for f in hpu_ops.FIXES if f.__name__ in set(args.ab.split(","))]
     hpu_ops.FIXES = tuple(f for f in hpu_ops.FIXES if f.__name__ not in skip)
+    import importlib
+    first = [s for s in args.first.split(",") if s]
+    for name in first:
+        module, fix = name.rsplit(".", 1)
+        getattr(importlib.import_module(f"hpu_ops.{module}"), fix)("hpu")
     hpu_ops.enable()
     hpu_complex.enable()
-    print("PLUGINS", hpu_ops.__file__, "lazy", LAZY, "left out", sorted(skip), flush=True)
+    print("PLUGINS", hpu_ops.__file__, "lazy", LAZY, "left out", sorted(skip), "first", first, flush=True)
     ok = run(args, "baseline" if skip else "fixed")
     if later:
         for fix in later:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hpu-ops"
-version = "0.3.0"
+version = "0.4.0"
 description = "Fixes for what Intel Gaudi's PyTorch stack lacks or gets wrong, at the root or with Habana's own switches (unmodified model code)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -14,7 +14,8 @@ requires-python = ">=3.9"
 # Intel's Habana installer (a PyPI torch would shadow the fork).
 
 [tool.setuptools]
-packages = ["hpu_ops"]
+packages = ["hpu_ops", "hpu_ops.tpc"]
 
 [tool.setuptools.package-data]
 hpu_ops = ["*.txt"]
+"hpu_ops.tpc" = ["*.so", "*.c", "*.cpp", "*.sh", "CMakeLists.txt"]

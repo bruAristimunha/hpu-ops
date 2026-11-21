@@ -23,9 +23,40 @@ at the tensor's pickling:
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
   roll wrongly (EMG2QwertyNet's input gradient).
-- Boolean-mask scalar ``index_put_`` / ``index_put`` via ``torch.where`` and trailing 2-D integer ``index.Tensor`` via
-  ``index_select`` (``composite``): ``aten::_index_put_impl_`` has no HPU kernel, so a mid-backward mask assignment
-  flushes the lazy DSD ``index`` backward graph and triggers ``synStatus 30`` in ``GBWAtt``.
+- Advanced indexing by integer tensors, ``X[..., rows, cols]``, as one ``index_select`` of the indexed dims
+  flattened (``indexing``): with CPU index tensors Gaudi's eager kernel ran on the CPU, and in lazy mode its
+  backward, the accumulating ``_index_put_impl_`` with indices that do not lead, returns wrong sums from batch 2 to
+  8 on; ``index_select``'s backward is right (spd_learn's ``vech`` and ``vec_to_sym``: in lazy mode every gradient
+  before them was wrong in 9 SPD models). ``X[:, mask]`` through its ``nonzero`` into the same ``index_select``.
+  A boolean-mask put of one value as ``where`` (``indexing``): in lazy mode, in one graph with index puts and
+  reads, Habana's launch fails (SPNN).
+- ``F.unfold`` and ``F.fold`` (``im2col``): ``aten::im2col`` and ``aten::col2im`` have no HPU kernel and ran on the
+  CPU, eager and lazy (SSGCNet, MAtt, GyroAtt, SPDMetaFormer, CorAtt). Non-overlapping 4-D patches as reshapes,
+  others as ``index_select`` and ``index_add``.
+- ``linalg.solve_triangular`` and ``cholesky_solve`` of float32 matrices with n <= 64 run through a TPC substitution
+  kernel (``tpc.tri_solve``, two substitutions for ``cholesky_solve``): they have no HPU kernel and ran on the CPU.
+  Substitution keeps CPU float32's accuracy on ill-conditioned triangles. Cholesky's and QR's backward use them.
+- ``linalg.inv``, ``det`` and ``slogdet`` from the masked LU and triangular matmuls (``linalg``), as ``linalg.solve``.
+- On Gaudi2 those composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
+  ``linalg.solve``, ``inv``, ``det`` and ``slogdet`` of float32 matrices
+  with n <= 64 run through a TPC Gauss-Jordan kernel with partial pivoting (``tpc``), one matrix per index-space
+  member. Eager, batch 32, n = 22, mean ms per call in two processes: solve 2.9 / 1.3 against 6.1 / 2.5 for the
+  fallback, inv 2.0 / 1.2 against 4.3 / 2.0, det 0.67 / 0.69 against 2.7 / 1.2. Lazy, per call, within the card's
+  noise of the fallback (slogdet slower); the card's noise is about 2x between processes
+  (``tests/linalg_percall.py``). Habana reads the kernel path when the device initialises, so ``enable()``
+  must run before the first HPU op, else the kernel is off (one warning). The kernels
+  are off too on a device that is not a Gaudi2 and with ``HPU_OPS_TPC=0`` in the environment. Calls the kernel does
+  not take (n > 64, float64, kernel off): ``inv`` runs through hpu-ops' own CPU route, which is not Habana's
+  fallback; ``solve``, ``det`` and ``slogdet`` register only at the autograd key and reach Habana's own kernel and
+  its CPU fallback (bridge-counted).
+- ``linalg.eigh`` and ``eigvalsh`` of float32 matrices with n <= 32 run through a TPC one-sided Jacobi kernel
+  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32, n = 22: 0.81 / 2.6 ms
+  in two processes against 3.9 / 2.3 for the fallback (lazy 0.54 / 1.0 against 2.4 / 2.7); batch 1024 3.7 ms against
+  52 ms (older run); within about
+  3.8x of CPU float32 accuracy, also on repeated eigenvalues, condition 1e6 and inputs scaled by 1e30.
+  Without the kernel, or past n = 32, the call is declined and runs through hpu-ops' own CPU route, not Habana's
+  fallback: the parallel-Jacobi composite of ``eigh`` was measured slower than the fallback on Gaudi2, so it only
+  serves the CPU stand-in.
 - ``quantile`` / ``nanquantile`` as sort, gather and lerp (``quantile``): ATen's composite resizes an empty ``out``
   tensor, which aborts lazy mode ("Trying to resize tensor with non-existing TensorImpl").
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
@@ -48,7 +79,7 @@ import warnings
 
 import torch
 
-from . import composite, conv, quantile, serialization, upsample
+from . import composite, conv, eigh, im2col, indexing, linalg, quantile, serialization, tpc, upsample  # noqa: F401
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -56,8 +87,10 @@ __all__ = ["enable"]
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
-         composite.install_embedding, composite.install_roll, composite.install_index_put, composite.install_index_2d,
-         quantile.install, serialization.install)
+         composite.install_embedding, composite.install_roll, indexing.install_index, indexing.install_mask_fill, im2col.install,
+         linalg.install_solve_triangular, linalg.install_cholesky_solve,
+         linalg.install_solve, linalg.install_inv_det, eigh.install_eigh, quantile.install,
+         serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
@@ -87,9 +120,17 @@ def enable():
         import habana_frameworks.torch.core  # noqa: F401  (Habana's kernels first: they are never overridden)
     except ImportError:
         return
+    tpc.install_kernel_path()  # before the first HPU op: Habana reads the kernel path when the device initialises
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"
-    _STATE["undo"] = _install("hpu")
+    undo = _install("hpu")
+
+    def undo_once():  # clears the state, so enable() after the undo installs again
+        if _STATE.get("undo") is undo_once:
+            del _STATE["undo"]
+            undo()
+
+    _STATE["undo"] = undo_once
     if not _attention_fused():  # last: under -W error the fixes are already in
         warnings.warn(ATTENTION_HINT, stacklevel=2)

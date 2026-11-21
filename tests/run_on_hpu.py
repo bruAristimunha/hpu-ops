@@ -262,19 +262,16 @@ for mode in ("eager", "compiled"):
     expect(f"input gradient of a stack of rolls by -1, 0, +1, {mode}", err <= 1e-6 and calls["roll_zero"] > 0,
            f"max|err| {err:.1e}")
 
-# ---- boolean-mask index_put_ / index_put and trailing 2-D index.Tensor (GBWAtt lazy synStatus 30)
+# ---- boolean-mask index_put_ and trailing 2-D index.Tensor (GBWAtt lazy synStatus 30, #20; main's indexing fixes)
 calls.clear()
 def mask_assign(t):
     y = t * 2.0
     y[y <= 0] = 0
     return y
 check("boolean-mask index_put_ (scalar)", mask_assign, (torch.randn(8, 18),), atol=1e-5)
-expect("boolean-mask index_put_ took torch.where", calls["bool_index_put_"] > 0, f"{calls['bool_index_put_']} times")
-calls.clear()  # inference mode reaches only the HPU-key kernel: a registration skipped there would show as 0 calls
-check("boolean-mask index_put_ (inference_mode)", mask_assign, (torch.randn(8, 18),), atol=1e-5,
+expect("boolean-mask index_put_ took where (mask_fill)", calls["mask_fill"] > 0, f"{calls['mask_fill']} times")
+check("boolean-mask index_put_ (inference_mode, native op)", mask_assign, (torch.randn(8, 18),), atol=1e-5,
       context=torch.inference_mode)
-expect("boolean-mask index_put_ at the HPU key (inference_mode)", calls["bool_index_put_"] > 0,
-       f"{calls['bool_index_put_']} times")
 
 class _MaskInBwd(torch.autograd.Function):
     @staticmethod
@@ -298,14 +295,14 @@ def gbw_repro_step():
     root = _MaskInBwd.apply(m_bwd)
     (root @ x_bwd @ root)[..., ixs_cpu[0], ixs_cpu[1]].sum().backward()
 fallbacks_gbw = cpu_fallbacks(gbw_repro_step)
-expect("GBWAtt mask-in-backward + Vech index_2d on card (no fallback)",
-       not fallbacks_gbw and calls["bool_index_put_"] > 0 and calls["index_2d"] > 0,
+expect("GBWAtt mask-in-backward + Vech index on card (no fallback)",
+       not fallbacks_gbw and calls["mask_fill"] > 0 and calls["index"] > 0,
        f"fallbacks={fallbacks_gbw}, calls={dict(calls)}")
 
 calls.clear()
 check("trailing 2-D index.Tensor (Vech triu_indices)", lambda t: t[..., ixs_cpu[0], ixs_cpu[1]],
       (torch.randn(4, 3, 18, 18),), atol=1e-5)
-expect("trailing 2-D index.Tensor took index_select", calls["index_2d"] > 0, f"{calls['index_2d']} times")
+expect("trailing 2-D index.Tensor took index_select", calls["index"] > 0, f"{calls['index']} times")
 
 # ---- linear upsampling by other than a power of two: Gaudi's forward kernel drifts with the length (NeuroPose's
 # 9920 to 10000: 34% off), and its backward is less exact than the CPU's at some sizes. Output and input gradient as
