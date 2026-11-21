@@ -549,3 +549,18 @@ def test_enable_under_warnings_as_errors_installs_the_fixes_first(case):
     kernel library missing): ``enable()`` raised before any fix was installed. Now the warning is raised last."""
     code = ENABLE_WERROR.replace('sys.argv[1]', repr(case))
     assert _run(code) == "kernels True True True"
+
+
+def test_a_cpu_0d_operand_is_moved_to_the_device_at_the_autograd_key():
+    """On the card, eager with autograd on, ``torch.maximum(torch.tensor(0.), x_hpu)`` raised "Missing cases in
+    'toPyObject' wrapped number handling" below autograd (bridge 1.21.4, main and the backend fix alike): the CPU 0-d
+    operand goes to the device first, its gradient passed back by ``to``."""
+    from hpu_ops import extrema
+
+    c, d = torch.tensor(0.5, requires_grad=True), torch.ones(3, device="meta")
+    moved = extrema._onto_device((c, d, None, 2.0))
+    assert moved[0].device.type == "meta" and moved[0].dim() == 0 and moved[0].requires_grad
+    assert moved[1] is d and moved[2:] == (None, 2.0)
+    cpu_only = (torch.tensor(0.5), torch.ones(3))
+    assert extrema._onto_device(cpu_only) is cpu_only
+    assert torch.result_type(*moved[:2]) == torch.result_type(c, d)

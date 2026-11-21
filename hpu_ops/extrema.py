@@ -130,10 +130,23 @@ def _traced(args, kwargs):
     return any(not _concrete(t) for t in ts)
 
 
+def _onto_device(args):
+    """``args`` with each CPU 0-d tensor moved to the device of the others (``maximum(torch.tensor(0.), x_hpu)``,
+    which torch takes): Gaudi's eager kernels below autograd get it as a wrapped Float number, which the dispatcher
+    cannot hand to the Python backend kernels ("Missing cases in 'toPyObject' wrapped number handling", measured,
+    bridge 1.21.4). A 0-d tensor on the device promotes as on the CPU; ``to`` passes its gradient back."""
+    dev = next((a.device for a in args if isinstance(a, torch.Tensor) and a.device.type != "cpu"), None)
+    if dev is None:
+        return args
+    return tuple(a.to(dev) if isinstance(a, torch.Tensor) and a.device.type == "cpu" and a.dim() == 0 else a
+                 for a in args)
+
+
 def _eager_native(op, composite):
     """At ``Autograd{}``: outside a tracer, torch's autograd kernel of ``op`` (over the backend kernel's fixed result:
     torch's gradient); traced, ``composite``."""
     def kernel(*args, **kwargs):
+        args = _onto_device(args)
         if _BACKEND.get(_device(args)) and not _traced(args, kwargs):
             return native(op)(*args, **kwargs)
         return composite(*args, **kwargs)
