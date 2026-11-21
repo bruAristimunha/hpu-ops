@@ -51,6 +51,8 @@ def batch(n_ch, size):
 
 def run(args, label):
     from spd_diag import protocol as P
+    import hpu_ops
+    hpu_ops._STATE["calls"].clear()
     row = {"run": label, "model": args.model, "n_ch": args.ch, "batch": args.batch, "lazy": LAZY,
            "compile": args.compile, "k": args.k, "bridge": "1.21.4"}
     try:
@@ -95,6 +97,7 @@ def run(args, label):
         row["fallback_per_step"] = {k_: v / args.steps for k_, v in delta(f0, fb_ops()).items()}
         row["cpu_warnings"] = sorted({str(w.message)[:160] for w in caught if "runs on the CPU" in str(w.message)})
         row["status"] = "ok"
+        row["hpu_ops_calls"] = dict(hpu_ops._STATE["calls"])  # an A/B whose "fixed" run shows no rewrite is void
     except Exception as e:  # noqa: BLE001  (a failing run is a row)
         row.update(status="error", error=repr(e)[:600],
                    where=[f"{f.filename.split('site-packages/')[-1]}:{f.lineno}"
@@ -127,16 +130,17 @@ def main():
     hpu_ops.FIXES = tuple(f for f in hpu_ops.FIXES if f.__name__ not in skip)
     import importlib
     first = [s for s in args.first.split(",") if s]
+    handles = []  # each install's undo owns its torch.library registrations: dropped, they are deregistered
     for name in first:
         module, fix = name.rsplit(".", 1)
-        getattr(importlib.import_module(f"hpu_ops.{module}"), fix)("hpu")
+        handles.append(getattr(importlib.import_module(f"hpu_ops.{module}"), fix)("hpu"))
     hpu_ops.enable()
     hpu_complex.enable()
     print("PLUGINS", hpu_ops.__file__, "lazy", LAZY, "left out", sorted(skip), "first", first, flush=True)
     ok = run(args, "baseline" if skip else "fixed")
     if later:
         for fix in later:
-            fix("hpu")
+            handles.append(fix("hpu"))
         ok = run(args, "fixed") and ok
     return 0 if ok else 1
 

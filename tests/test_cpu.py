@@ -504,6 +504,8 @@ def test_large_kernel_channels_last_non_contiguous_bf16_and_inference_mode(monke
     w_nc = torch.randn(4, 7, 2, 3, dtype=torch.float64).permute(0, 3, 2, 1)
     want_nc = train_step(lambda a, k: F.conv2d(a, k), x_nc, w_nc)
 
+    want_bf16 = train_step(lambda a, k, bias: F.conv2d(a, k, bias),
+                           x_cl.float().bfloat16(), w_cl.float().bfloat16(), b.float().bfloat16())
     with cpu_as_hpu(conv.install_large_kernel) as calls:
         got_cl = train_step(lambda a, k: F.conv2d(a, k, b), x_cl, w_cl)
         assert got_cl[0].is_contiguous(memory_format=torch.channels_last)
@@ -527,10 +529,13 @@ def test_large_kernel_channels_last_non_contiguous_bf16_and_inference_mode(monke
     assert_same(got_nc, want_nc)
     assert_same([got_inf], [want_cl[0]])
     assert got_bf16[0].dtype == torch.bfloat16
-    for a, r in zip(got_bf16, want_f64):
-        torch.testing.assert_close(a.double(), r, rtol=2e-2, atol=2e-2 * r.abs().max().item())
-    for a, r in zip(got_ac, want_f64):
-        torch.testing.assert_close(a.double(), r, rtol=2e-2, atol=2e-2 * r.abs().max().item())
+    # the output against the native bf16 op elementwise (both sum in float32 and round once), gradients against
+    # float64 relative to their largest entry: a split that zeroed one bf16 output entry fails both
+    eps = torch.finfo(torch.bfloat16).eps
+    for got16 in (got_bf16, got_ac):
+        torch.testing.assert_close(got16[0].float(), want_bf16[0].float(), rtol=eps, atol=1e-5)
+        for a, r in zip(got16[1:], want_f64[1:]):
+            assert float((a.double() - r).abs().max() / r.abs().max()) < 8 * eps
 
 
 def test_large_kernel_dynamic_batch_vs_dynamic_spatial(monkeypatch):

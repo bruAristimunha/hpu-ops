@@ -110,9 +110,10 @@ def case(name, fn, make, ref=True):
 def UNDO():
     """Undo enable(): reload the dispatcher state so the next case's native run is native."""
     import hpu_ops
-    undo = hpu_ops._STATE.pop("undo", None)
+    undo = hpu_ops._STATE.get("undo")  # enable()'s undo clears the state itself; popped first, it undid nothing
     if callable(undo):
         undo()
+    assert "undo" not in hpu_ops._STATE
 
 
 def grad_of(f):
