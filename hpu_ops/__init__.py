@@ -75,8 +75,8 @@ at the tensor's pickling:
   hpu-ops' own eigh and SVD sort their eigenvalues, and the exact sort made eager SPD steps up to 22% slower.
 - ``histc`` with a bound given as a Python float, or more than 300 bins (``small``): Gaudi's kernel reads its bounds
   as ints and aborts the process on a float one, and does not compile from about 350 bins. The CPU kernel's bin
-  edges are found on the host, the card only compares (bucketize, or a float32 estimate corrected against the
-  edges) and counts; bit for bit ATen's bins, eager, lazy and compiled.
+  edges are found on the host, the card only compares (bucketize) and counts; bit for bit ATen's one-thread result,
+  eager, lazy, compiled and in inference mode.
 - ``bincount`` of 1-D integer inputs of 65536 to 2**24 elements with at most 4096 bins and no weights through one
   ``aminmax`` read and ``histc`` in chunks of 256 bins (``small``, #21): Gaudi's kernel took 4.7-427 ms at 409600
   elements (64 to 4096 bins), 2-43x longer.

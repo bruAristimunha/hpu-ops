@@ -25,6 +25,7 @@ Registered at the ``HPU`` key of ``copy_``, where eager Habana has no kernel (``
 composite there, which the kernel calls); lazy mode registers its own ``copy_``, so nothing is installed there.
 """
 import os
+import threading
 import warnings
 
 import torch
@@ -35,7 +36,7 @@ from ._dispatch import register_kernels
 aten = torch.ops.aten
 INT32_MIN, INT32_MAX = -(1 << 31), (1 << 31) - 1
 _WARNED = set()
-_SCANNING = []
+_SCAN = threading.local()  # per thread: another thread's scan is not this thread's own nested copy
 
 FLOAT64_WARNING = (
     "A float64 tensor was copied to the HPU. On Gaudi2 (bridge 1.21.4) it holds float32 values, and in eager mode an "
@@ -57,24 +58,31 @@ def _warn_once(key, message):
         warnings.warn(message, stacklevel=3)
 
 
-def check_int64_source(src):
-    """Warn once (or raise, ``HPU_OPS_INT64_CHECK=raise``) when ``src``, a CPU int64 tensor about to be copied to the
-    card, holds a value outside the int32 range. After the first warning no tensor is scanned."""
-    setting = os.environ.get("HPU_OPS_INT64_CHECK", "warn")
-    if setting == "0" or src.numel() == 0 or (setting != "raise" and "int64" in _WARNED):
-        return
-    if _SCANNING:  # the scan's own copies (a strided view made contiguous) are not checked
-        return
-    _SCANNING.append(True)
-    try:
-        lo, hi = (int(v) for v in torch.aminmax(src))
-    finally:
-        _SCANNING.pop()
+def _report(lo, hi, setting):
     if lo < INT32_MIN or hi > INT32_MAX:
         message = INT64_WARNING.format(lo=lo, hi=hi)
         if setting == "raise":
             raise RuntimeError(message)
         _warn_once("int64", message)
+
+
+def check_int64_source(src):
+    """Warn once (or raise, ``HPU_OPS_INT64_CHECK=raise``) when ``src``, a CPU int64 tensor (or a Python int) about to
+    be copied to the card, holds a value outside the int32 range. After the first warning no tensor is scanned."""
+    setting = os.environ.get("HPU_OPS_INT64_CHECK", "warn")
+    if setting == "0" or (setting != "raise" and "int64" in _WARNED):
+        return
+    if isinstance(src, int):  # copy_(<Python int>): ATen wraps it as a number
+        _report(src, src, setting)
+        return
+    if src.numel() == 0 or getattr(_SCAN, "active", False):  # the scan's own copies are not checked
+        return
+    _SCAN.active = True
+    try:
+        lo, hi = (int(v) for v in torch.aminmax(src))
+    finally:
+        _SCAN.active = False
+    _report(lo, hi, setting)
 
 
 def _plain(t):
@@ -85,8 +93,12 @@ def _plain(t):
 
 def copy_checks(self, src, device_type):
     """The checks of a ``self.copy_(src)`` whose ``self`` is on ``device_type``."""
-    if (self.dtype == torch.int64 and isinstance(src, torch.Tensor) and src.dtype == torch.int64
-            and src.device.type == "cpu" and _plain(src)):
+    if self.numel() == 0:  # nothing reaches the card (an empty broadcast)
+        return
+    if self.dtype == torch.int64 and (
+            (isinstance(src, int) and not isinstance(src, bool))
+            or (isinstance(src, torch.Tensor) and src.dtype == torch.int64 and src.device.type == "cpu"
+                and _plain(src))):
         check_int64_source(src)
     if self.dtype == torch.float64:
         _warn_once("float64", FLOAT64_WARNING)
@@ -94,8 +106,12 @@ def copy_checks(self, src, device_type):
 
 def install_copy_checks(device_type):
     """The int64 and float64 checks at ``copy_`` to ``device_type`` where the device has no ``copy_`` kernel of its
-    own (Habana's eager mode). Returns an undo."""
+    own (Habana's eager mode). Returns an undo. A Python kernel cannot take named tensors (torch raises "Named tensors
+    are currently unsupported in TorchScript" before the kernel runs), so a named tensor copied to the card fails
+    while the checks are installed: ``HPU_OPS_COPY_CHECKS=0`` before ``enable()`` leaves ``copy_`` alone."""
     op = aten.copy_.default
+    if os.environ.get("HPU_OPS_COPY_CHECKS", "1") == "0":
+        return lambda: None
 
     def kernel(self, src, non_blocking=False):
         if self.device.type == device_type:

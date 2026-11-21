@@ -55,13 +55,37 @@ CASES = [  # (bins, lo, hi, dtype, shape-view)
 ]
 
 
+def reference(held, bins, lo, hi):
+    """ATen's CPU histc with one thread on the values the card holds. Where ATen's 16-bit position passes the last bin
+    its kernel writes outside the histogram (undefined behaviour): it is not called; the reference is then its
+    positions with those in the last bin, capped as its one-thread counts are."""
+    if held.dtype in (torch.bfloat16, torch.float16) and lo < hi:
+        L, R = torch.tensor(lo, dtype=held.dtype), torch.tensor(hi, dtype=held.dtype)
+        inside = held[(held >= L) & (held <= R)]
+        pos = ((inside - L) * torch.tensor(bins, dtype=held.dtype) / (R - L)).trunc().long()
+        if bool((pos > bins).any()):
+            return small._cap(torch.bincount(pos.clamp(max=bins - 1), minlength=bins).float(), held.dtype)
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        return torch.histc(held, bins, lo, hi)
+    finally:
+        torch.set_num_threads(threads)
+
+
+def run(fn, compiled):
+    if not compiled:
+        return fn
+    import habana_frameworks.torch.dynamo  # noqa: F401
+
+    torch._dynamo.reset()  # one graph per case: no cache limit, no silent eager fallback
+    return torch.compile(fn, backend="hpu_backend", dynamic=False, fullgraph=True)
+
+
 def check(compiled=False):
     hpu_ops.enable()
+    mode = "compile" if compiled else ("lazy" if LAZY else "eager")
     bad = 0
-    f = lambda t, b, lo, hi: torch.histc(t, b, lo, hi)  # noqa: E731
-    if compiled:
-        import habana_frameworks.torch.dynamo  # noqa: F401
-        f = torch.compile(f, backend="hpu_backend", dynamic=False)
     for i, (bins, lo, hi, dtype, view) in enumerate(CASES):
         BINS[0] = bins
         x = data(3000, lo, hi, dtype, i)
@@ -75,46 +99,91 @@ def check(compiled=False):
         before = fallbacks()
         hpu_ops._STATE["calls"].clear()
         try:
-            got = f(h, bins, lo, hi)
+            got = run(lambda t: torch.histc(t, bins, lo, hi), compiled)(h)
             sync()
-            held = h.cpu()  # the values the card holds (float64: float32 values)
-            ref = torch.histc(held, bins, lo, hi)
-            exact = torch.equal(got.cpu(), ref)
-            if dtype in (torch.bfloat16, torch.float16):  # ATen counts in the 16-bit dtype; the route rounds once
-                exact = exact or torch.equal(got.cpu(), torch.histc(held.float(), bins, lo, hi).to(dtype)) or \
-                    torch.equal(got.cpu(), _exact16(held, bins, lo, hi))
-            tag = "ok  " if exact else "BAD "
+            held = h.cpu()  # what the card holds (float64: float32 values; .cpu() reads offset views right)
+            ref = reference(held, bins, lo, hi)
+            exact = got.dtype == ref.dtype and torch.equal(got.cpu(), ref)
             bad += not exact
-            print(f"{tag} {'compile' if compiled else ('lazy' if LAZY else 'eager')} bins={bins} [{lo}, {hi}] {dtype} "
-                  f"{view or ''} route={hpu_ops._STATE['calls']['histc']} fallbacks={fallbacks() - before}"
+            print(f"{'ok  ' if exact else 'BAD '} {mode} bins={bins} [{lo}, {hi}] {dtype} {view or ''} "
+                  f"route={hpu_ops._STATE['calls']['histc']} fallbacks={fallbacks() - before}"
                   + ("" if exact else f" differ {int((got.cpu() != ref).sum())}"), flush=True)
         except Exception as e:  # noqa: BLE001
             bad += 1
-            print(f"RAISE bins={bins} [{lo}, {hi}] {dtype} {view}: {str(e).splitlines()[0][:150]}", flush=True)
-    # equal float bounds: the data's range, ATen's errors
+            print(f"RAISE {mode} bins={bins} [{lo}, {hi}] {dtype} {view}: {str(e).splitlines()[0][:150]}", flush=True)
+    # equal float bounds: the data's range. Eager / lazy: ATen's bins and errors. Compiled: read on the card, the
+    # card's arithmetic (README: not ATen's at the edges; NaN / inf give counts where ATen raises).
     for x, lo in ((torch.rand(1000) * 5, 0.0), (torch.full((10,), 2.5), 2.5), (torch.tensor([1.0, math.nan]), 0.0),
                   (torch.tensor([0.0, math.inf]), 0.0)):
         try:
-            ref = torch.histc(x, 10, lo, lo)
+            ref = reference(x, 10, lo, lo)
         except RuntimeError as e:
             ref = e
         try:
-            got = torch.histc(x.to(hpu), 10, lo, lo)
+            got = run(lambda t: torch.histc(t, 10, lo, lo), compiled)(x.to(hpu))
             sync()
             ok = isinstance(ref, torch.Tensor) and torch.equal(got.cpu(), ref)
+            note = "" if ok or not compiled or isinstance(ref, torch.Tensor) else " (compiled: counts, documented)"
+            ok = ok or bool(note)
         except RuntimeError as e:
             ok = isinstance(ref, RuntimeError) and str(ref).replace("-nan", "nan") == str(e)
+            note = ""
         bad += not ok
-        print(f"{'ok  ' if ok else 'BAD '} equal bounds {lo} on {x[:3].tolist()}", flush=True)
+        print(f"{'ok  ' if ok else 'BAD '} {mode} equal bounds {lo} on {x[:3].tolist()}{note}", flush=True)
+    if not compiled:  # eager float64 views with an offset (read at twice the offset by Gaudi's eager kernels)
+        base = torch.tensor([0.0, 1.0, 2.0, 3.0, 2.5, 0.5], dtype=torch.float64)
+        hb = base.to(hpu)
+        views = (("h[1:2]", lambda t: t[1:2]), ("h[2:]", lambda t: t[2:]), ("row 1", lambda t: t.view(2, 3)[1]))
+        for name, view in views:
+            got = torch.histc(view(hb), 4, 0.0, 4.0)
+            sync()
+            ref = reference(view(base), 4, 0.0, 4.0)
+            ok = torch.equal(got.cpu(), ref)
+            bad += not ok
+            print(f"{'ok  ' if ok else 'BAD '} {mode} float64 offset view {name}: {got.cpu().tolist()} "
+                  f"(ATen {ref.tolist()})", flush=True)
+        x = torch.rand(2000)
+        ref = reference(x, 400, 0.0, 1.0)
+        with torch.inference_mode():
+            got = torch.histc(x.to(hpu), 400, 0.0, 1.0)
+        out = torch.empty(0, device=hpu)
+        torch.histc(x.to(hpu), 400, 0.0, 1.0, out=out)
+        sync()
+        for name, g in (("inference_mode", got), ("out=", out)):
+            ok = torch.equal(g.cpu(), ref)
+            bad += not ok
+            print(f"{'ok  ' if ok else 'BAD '} {mode} {name} 400 bins", flush=True)
+    bad += review_inputs(mode, compiled)
     print("FAILURES", bad, flush=True)
+    return bad
 
 
-def _exact16(held, bins, lo, hi):
-    """Exact counts, rounded once to the 16-bit dtype, of ATen's CPU bins (positions in the 16-bit dtype)."""
-    edges, low, high = small.histc_edges(float(lo), float(hi), bins, held.dtype)
-    m = (held >= low) & (held <= high)
-    p = torch.bucketize(held, edges[1:-1], right=True)
-    return torch.bincount(p[m], minlength=bins).to(held.dtype)
+def review_inputs(mode, compiled):
+    """The Codex review's inputs (PR #40), against ATen's one-thread CPU kernel or its error."""
+    bad = 0
+    cases = [("tiny range", torch.tensor([2e-38]), (400, 0.0, 1e-37)),
+             ("float64 2**27 equal bounds", torch.tensor([2.0 ** 27], dtype=torch.float64), (400, 0.0, 0.0)),
+             ("bf16 unreachable threshold", torch.tensor([1.0078125], dtype=torch.bfloat16), (514, 1.0, 1.0078125)),
+             ("bf16 4096 x 0.25", torch.full((4096,), 0.25, dtype=torch.bfloat16), (4, 0.0, 1.0)),
+             ("fp16 4096 x 0.25", torch.full((4096,), 0.25, dtype=torch.float16), (4, 0.0, 1.0)),
+             ("fp16 65504 equal bounds", torch.tensor([65504.0], dtype=torch.float16), (4, 0.0, 0.0)),
+             ("empty, 1e300 bound", torch.empty(0), (4, 0.0, 1e300))]
+    for name, x, args in cases:
+        if compiled and args[1] == args[2]:
+            continue  # equal bounds under compile: the card's arithmetic (documented)
+        try:
+            ref = reference(x, *args)
+        except RuntimeError as e:
+            ref = e
+        try:
+            got = run(lambda t: torch.histc(t, *args), compiled)(x.to(hpu))
+            sync()
+            ok = isinstance(ref, torch.Tensor) and torch.equal(got.cpu(), ref)
+        except Exception as e:  # noqa: BLE001
+            ok = isinstance(ref, RuntimeError) and "overflow" in str(e) and "overflow" in str(ref)
+        bad += not ok
+        print(f"{'ok  ' if ok else 'BAD '} {mode} review input: {name}", flush=True)
+    return bad
 
 
 def perf():
@@ -150,4 +219,5 @@ def perf():
 
 if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else "check"
-    {"check": check, "compile": lambda: check(compiled=True), "perf": perf}[what]()
+    result = {"check": check, "compile": lambda: check(compiled=True), "perf": perf}[what]()
+    sys.exit(1 if result else 0)

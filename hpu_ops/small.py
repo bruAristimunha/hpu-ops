@@ -30,7 +30,7 @@ import math
 import torch
 from torch._C import DispatchKey
 
-from ._dispatch import count, register_kernels, static
+from ._dispatch import chain, count, override_kernels, register_kernels, static
 from .linalg import _is_fake, _transformed
 
 aten = torch.ops.aten
@@ -105,27 +105,26 @@ def install_bincount(device_type):
 # bounds as ints: a bound passed as a Python float (any value, 0.0 too) fails with "expected int" from
 # habana::FillHistcParams (eager: in the launch thread, and the device stops); from about 350 bins its graph does not
 # compile; compiled graphs abort on both. Its float32 division is not IEEE (154 of 2**20 truncations of
-# (x - L) * bins / (R - L) differ from the CPU's), so the CPU's bins cannot be computed on the card directly:
+# (x - L) * bins / (R - L) differ from the CPU's), so the CPU's bins cannot be computed on the card:
 #   ATen's CPU histc puts x in bin trunc((x - L) * bins / (R - L)) in x's dtype (L, R rounded to it), the last bin
 #   closed, and skips x outside [L, R] (NaN too). That position is monotone in x, so bin k starts at the smallest
-#   value of the dtype whose position is >= k: ``histc_edges`` finds those on the host by bisection over the dtype's
-#   ordered bit patterns, with the CPU kernel's own arithmetic (cached per bounds, bins, dtype and device).
-# On the card, up to 256 bins, the bin is found by ``bucketize`` against those edges (exact comparisons; Gaudi's
-# bucketize is linear in the edges). Above, it is estimated in float32 (off by at most a few bins,
-# ``_correction_steps``) and corrected by comparing x with the edges of its estimated bin (two gathers per step;
-# 16-bit dtypes, whose bound needs more steps there, keep bucketize). Then counted through histc with Python-int
-# bounds up to 256 bins (``count_bins``), ``scatter_add_`` above. float64: the card holds
-# float32 values, compared with the edges rounded up to float32.
-HISTC_NATIVE_MAX_BINS = 300  # Gaudi's histc with int bounds: measured to 300 bins; 400 does not compile
+#   value of the dtype whose position is >= k (+inf when no value reaches it): ``histc_edges`` finds those on the
+#   host by bisection over the dtype's ordered bit patterns, with the CPU kernel's own arithmetic (cached per bounds,
+#   bins, dtype and device).
+# On the card only comparisons: one ``bucketize`` of x against those edges (Gaudi's is exact for finite values, and
+# linear in the number of edges), then the counts through histc with Python-int bounds up to 256 bins
+# (``count_bins``), ``scatter_add_`` above, capped as ATen's one-thread kernel caps them: it adds 1 in x's dtype, so
+# a bin stops at 2**p (p the significand bits: 256 in bfloat16, 2048 in float16, 2**24 in float32). float64: the
+# card holds float32 values, read through an offset-free view (eager reads float64 views with an offset at twice
+# the offset) and compared with the edges rounded up to float32.
+HISTC_NATIVE_MAX_BINS = 300  # Gaudi's histc with int bounds: measured to 300 bins; 350 does not compile
 HISTC_DTYPES = {torch.float32: (torch.int32, 32), torch.bfloat16: (torch.int16, 16), torch.float16: (torch.int16, 16),
                 torch.float64: (torch.int64, 64)}
-_C_NAMES = {torch.float32: "float", torch.float64: "double", torch.float16: "c10::Half",
-            torch.bfloat16: "c10::BFloat16"}
-_EDGE_CACHE = {}  # (lo, hi, bins, dtype, device) -> (edges on the device, low, high); bounded below
-UNIT_ROUNDOFF = {torch.float32: 2.0 ** -24, torch.float64: 2.0 ** -24, torch.bfloat16: 2.0 ** -8,
-                 torch.float16: 2.0 ** -11}  # float64: the float32 values the card holds
-HISTC_MAX_STEPS = 2  # more correction steps than this: bucketize
-HISTC_BUCKETIZE_MAX_BINS = 256  # bucketize up to here: Gaudi's is linear in the edges, the correction flat (measured)
+_C_NAMES = {torch.float32: "float", torch.float64: "double", torch.float16: "at::Half",
+            torch.bfloat16: "at::BFloat16"}
+SIGNIFICAND_BITS = {torch.float32: 24, torch.float64: 53, torch.bfloat16: 8, torch.float16: 11}
+EDGE_CACHE_SIZE = 64
+_EDGE_CACHE = {}  # (lo, hi, bins, dtype, device) -> (edges on the device, low, high)
 
 
 def _ordered(v):
@@ -147,24 +146,25 @@ def _unordered(k, dtype):
 
 
 def _to_dtype(value, dtype):
-    out = torch.tensor(value, dtype=torch.float64).to(dtype)
-    if torch.isinf(out) and not math.isinf(value):
+    """``value`` (a Python float) in ``dtype``, with ATen's overflow check: a finite value past the dtype's range
+    raises, also when it would round to the largest value (65505 in float16)."""
+    if math.isfinite(value) and abs(value) > torch.finfo(dtype).max:
         raise RuntimeError(f"value cannot be converted to type {_C_NAMES[dtype]} without overflow")
-    return out
+    return torch.tensor(value, dtype=torch.float64).to(dtype)
 
 
 def _float32(t, toward):
     """float64 ``t`` rounded to float32 toward ``toward`` (+-inf)."""
     near = t.float()
     off = near.double() < t if toward > 0 else near.double() > t
-    return torch.where(off, torch.nextafter(near, torch.tensor(toward)), near)
+    return torch.where(off, torch.nextafter(near, torch.full_like(near, toward)), near)
 
 
 def histc_edges(lo, hi, bins, dtype):
     """Host tensors ``(edges, low, high)`` for ATen's CPU histc over ``[lo, hi]`` (finite, ``lo < hi``) in ``dtype``:
-    ``edges[k]`` (k = 1 .. bins - 1) is the smallest value of ``dtype`` in bin ``k`` or above, ``edges[0] = -inf``,
-    ``edges[bins] = inf``; ``low`` / ``high`` the bounds as ATen compares them. For float64, everything rounded to the
-    float32 values the card holds."""
+    ``edges[k]`` (k = 1 .. bins - 1) is the smallest value of ``dtype`` whose position is ``k`` or more (``inf`` when
+    none is), ``edges[0] = -inf``, ``edges[bins] = inf``; ``low`` / ``high`` the bounds as ATen compares them. For
+    float64, everything rounded to the float32 values the card holds. Independent of the default dtype."""
     L, R = _to_dtype(lo, dtype), _to_dtype(hi, dtype)
     width = R - L
     if width == 0:  # distinct bounds that round to one value: ATen's position is trunc(0 / 0), measured bin 0
@@ -172,14 +172,15 @@ def histc_edges(lo, hi, bins, dtype):
         return _framed(edges), float(L), float(R)
     scale = torch.tensor(bins, dtype=dtype)
     k = torch.arange(1, bins, dtype=torch.float64)
+    top = int(_ordered(R.reshape(1))[0])
     below = torch.full((bins - 1,), int(_ordered(L.reshape(1))[0]), dtype=torch.int64)
-    above = torch.full((bins - 1,), int(_ordered(R.reshape(1))[0]), dtype=torch.int64)  # R is in bin `bins` >= k
+    above = torch.full((bins - 1,), top + 1, dtype=torch.int64)  # top + 1: no value in [L, R] reaches k
     while bool((below < above).any()):
         mid = (below >> 1) + (above >> 1) + (below & above & 1)  # the floor of the mean, without int64 overflow
-        reached = ((_unordered(mid, dtype) - L) * scale / width).trunc().to(torch.float64) >= k
+        reached = ((_unordered(mid.clamp(max=top), dtype) - L) * scale / width).trunc().to(torch.float64) >= k
         above = torch.where(reached, mid, above)
         below = torch.where(reached, below, mid + 1)
-    edges = _unordered(below, dtype)
+    edges = torch.where(below > top, torch.tensor(math.inf, dtype=dtype), _unordered(below.clamp(max=top), dtype))
     if dtype == torch.float64:  # float32 v >= e  <=>  v >= e rounded up to float32; v <= R  <=>  v <= R rounded down
         return _framed(_float32(edges, math.inf)), float(_float32(L, math.inf)), float(_float32(R, -math.inf))
     return _framed(edges), float(L), float(R)
@@ -204,23 +205,32 @@ def _edges_on(lo, hi, bins, dtype, device, traced):
         return torch.tensor(edges.tolist(), dtype=edges.dtype, device=device), low, high
     key = (lo, hi, bins, dtype, str(device))
     if key not in _EDGE_CACHE:
-        if len(_EDGE_CACHE) >= 64:
-            _EDGE_CACHE.pop(next(iter(_EDGE_CACHE)))
         edges, low, high = _host_edges(lo, hi, bins, dtype)
         _EDGE_CACHE[key] = (edges.to(device), low, high)
+        while len(_EDGE_CACHE) > EDGE_CACHE_SIZE:
+            _EDGE_CACHE.pop(next(iter(_EDGE_CACHE)))
     return _EDGE_CACHE[key]
 
 
-def _histc_range(x, lo, hi):
-    """ATen's ``histc_select_outer_bin_edges``: equal bounds take the data's range (one host read), equal again are
-    widened by 1; then ATen's checks. Returns None when the data's range would be needed under a tracer."""
+def _card_values(x, traced):
+    """The values ``x`` holds, flat, in the dtype the card compares them in (float64: float32). A float64 view with
+    a storage offset is read through an offset-free view of its whole storage first: Gaudi's eager kernels read such
+    views at twice the offset (``hpu_ops.wide``), ``.float()`` included."""
+    if x.dtype != torch.float64:
+        return x.reshape(-1)
+    if not traced and x.storage_offset() != 0:
+        whole = x.as_strided((x.untyped_storage().nbytes() // x.element_size(),), (1,), 0).float()
+        return whole.as_strided(x.shape, x.stride(), x.storage_offset()).reshape(-1)
+    return x.float().reshape(-1)
+
+
+def _histc_range(flat, lo, hi):
+    """ATen's ``histc_select_outer_bin_edges``: equal bounds take the data's range (one host read; the caller declines
+    under a tracer), equal again are widened by 1; then ATen's checks. ``flat``: ``_card_values`` of the input."""
     lo, hi = float(lo), float(hi)
-    if lo == hi and x.numel() > 0:
-        if not _concrete(x):
-            return None
-        flat = x.reshape(-1)
+    if lo == hi and flat.numel() > 0:
         # the NaN flag as a max of x != x: with isnan().any() (or a sum) in the same lazy graph, Habana's compile fails
-        lo, hi, nan = torch.stack([flat.amin(), flat.amax(), (flat != flat).to(x.dtype).amax()]).tolist()
+        lo, hi, nan = torch.stack([flat.amin(), flat.amax(), (flat != flat).to(flat.dtype).amax()]).tolist()
         if nan:
             lo = hi = math.nan
     if lo == hi:
@@ -232,46 +242,41 @@ def _histc_range(x, lo, hi):
     return lo, hi
 
 
-def _correction_steps(bins, dtype):
-    """A bound on how far the float32 estimate of a position can be from ATen's: ATen's position in ``dtype`` rounds
-    four times (``R - L``, ``x - L``, ``* bins``, ``/``), the estimate as often in float32 (and Gaudi's division is
-    within a few float32 ulps), so the two differ by less than 8 u bins (u the unit roundoff), the truncations by at
-    most 1 more."""
-    return 1 + int(8 * (UNIT_ROUNDOFF[dtype] + 2.0 ** -24) * bins)
+def _cap(counts, dtype):
+    """ATen's one-thread CPU kernel adds 1 per value in ``dtype``: a count stops at 2**p (p significand bits)."""
+    return counts.clamp(max=float(2 ** SIGNIFICAND_BITS[dtype])).to(dtype)
 
 
-def _estimate(flat, bins, low, high):
-    """The bin of each value of ``flat`` (all in ``[low, high]``) up to ``_correction_steps``, in ``[0, bins - 1]``."""
-    if high == low:  # bounds that round to one value: every value is in bin 0 (see histc_edges)
-        return torch.zeros_like(flat, dtype=torch.int64)
-    q = (flat.float() - low) * (bins / (high - low))
-    return q.clamp(0, bins - 1).long()
-
-
-def histc_by_edges(x, bins, lo, hi, traced=False):
-    """``torch.histc(x, bins, lo, hi)`` for finite ``lo < hi`` as ATen's CPU kernel bins it."""
-    edges, low, high = _edges_on(lo, hi, bins, x.dtype, x.device, traced)
-    flat = (x.float() if x.dtype == torch.float64 else x).reshape(-1)
-    inside = (flat >= low) & (flat <= high)  # NaN is outside
+def _count(position, inside, bins):
+    """float32 counts of ``position`` (in ``[0, bins - 1]``) where ``inside``."""
     if bins == 1:
-        return inside.sum(dtype=torch.float32).reshape(1).to(x.dtype)
-    steps = _correction_steps(bins, x.dtype)
-    if steps > HISTC_MAX_STEPS or bins <= HISTC_BUCKETIZE_MAX_BINS:
-        position = torch.bucketize(flat, edges[1:-1], right=True)
-    else:
-        probe = torch.where(inside, flat, low)  # values outside are not counted: any in-range stand-in will do
-        position = _estimate(probe, bins, low, high)
-        for _ in range(steps):  # each step moves a wrong position one bin toward ATen's, never past it
-            below = probe < edges.index_select(0, position)
-            above = probe >= edges.index_select(0, position + 1)
-            position = position - below.long() + above.long()
+        return inside.to(torch.int32).sum().reshape(1).float()
     if bins <= BINCOUNT_CHUNK:
-        counts = count_bins(torch.where(inside, position, -1).float(), bins)
-    else:  # one slot past the end takes the values outside
-        slots = torch.where(inside, position, bins)
-        counts = torch.zeros(bins + 1, dtype=torch.float32, device=x.device).scatter_add_(
-            0, slots, torch.ones_like(slots, dtype=torch.float32))[:bins]
-    return counts.to(x.dtype)
+        return count_bins(torch.where(inside, position, -1).float(), bins)
+    slots = torch.where(inside, position, bins)  # one slot past the end takes the values outside
+    return torch.zeros(bins + 1, dtype=torch.float32, device=position.device).scatter_add_(
+        0, slots, torch.ones_like(slots, dtype=torch.float32))[:bins]
+
+
+def histc_by_edges(x, bins, lo, hi, traced=False, flat=None):
+    """``torch.histc(x, bins, lo, hi)`` for finite ``lo < hi`` as ATen's one-thread CPU kernel computes it."""
+    edges, low, high = _edges_on(lo, hi, bins, x.dtype, x.device, traced)
+    flat = _card_values(x, traced) if flat is None else flat
+    inside = (flat >= low) & (flat <= high)  # NaN is outside
+    position = torch.bucketize(flat, edges[1:-1], right=True) if bins > 1 else None
+    return _cap(_count(position, inside, bins), x.dtype)
+
+
+def histc_traced_range(x, bins):
+    """Equal bounds under a tracer: the data's range is read on the card, so the bins come from the card's own
+    arithmetic (as Gaudi's kernel bins them: not ATen's at the edges), and NaN / inf give counts where ATen raises."""
+    flat = _card_values(x, traced=True)
+    lo, hi = flat.amin(), flat.amax()
+    same = lo == hi
+    lo, hi = torch.where(same, lo - 1, lo), torch.where(same, hi + 1, hi)
+    inside = (flat >= lo) & (flat <= hi)
+    q = ((flat - lo) * bins / (hi - lo)).nan_to_num(0.0).clamp(0, bins - 1)
+    return _cap(_count(q.long(), inside, bins), x.dtype)
 
 
 def _native_histc_ok(bins, lo, hi):
@@ -279,20 +284,58 @@ def _native_histc_ok(bins, lo, hi):
     return isinstance(lo, int) and isinstance(hi, int) and bins <= HISTC_NATIVE_MAX_BINS
 
 
+def _native_histc(x, bins, lo, hi):
+    """Gaudi's own kernel, through ``histc.out`` below autograd (``histc.default`` at the backend key is ours)."""
+    out = torch.empty(bins, dtype=x.dtype, device=x.device)
+    with torch._C._AutoDispatchBelowADInplaceOrView():
+        return aten.histc.out(x, bins, lo, hi, out=out)
+
+
+def _routed_histc(x, bins, lo, hi):
+    """The rewrite's result for a call it takes, or None for one it leaves to Gaudi's kernel."""
+    if not (x.dtype in HISTC_DTYPES and isinstance(bins, int) and bins > 0 and not _native_histc_ok(bins, lo, hi)
+            and not _transformed()):
+        return None
+    traced = _is_fake(x) or not _concrete(x)
+    count("histc")
+    if float(lo) == float(hi) and traced:
+        return histc_traced_range(x, bins)
+    flat = _card_values(x, traced)
+    bounds = _histc_range(flat, lo, hi)
+    for value in bounds:  # ATen converts the bounds to the dtype before it looks at the data
+        _to_dtype(value, x.dtype)
+    if x.numel() == 0:
+        return torch.zeros(bins, dtype=x.dtype, device=x.device)
+    return histc_by_edges(x, bins, *bounds, traced=traced, flat=flat)
+
+
 def install_histc(device_type):
     """``torch.histc`` on ``device_type`` through ``histc_by_edges`` where Gaudi's kernel fails: a bound given as a
-    Python float, or more than 300 bins. Returns an undo."""
-    op = aten.histc.default
+    Python float, or more than 300 bins. At ``Autograd{}`` (eager, lazy, traced graphs) for ``histc`` and
+    ``histc.out``, and at the backend key for ``histc`` (inference mode; Gaudi's kernel is then reached through
+    ``histc.out``). Returns an undo."""
+    op, out_op = aten.histc.default, aten.histc.out
 
-    def kernel(x, bins=100, min=0, max=0):  # noqa: A002  (ATen's argument names)
-        if (x.dtype in HISTC_DTYPES and isinstance(bins, int) and bins > 0 and not _native_histc_ok(bins, min, max)
-                and static(*x.shape) and not _transformed()):
-            bounds = _histc_range(x, min, max)
-            if bounds is not None:
-                count("histc")
-                if x.numel() == 0:
-                    return torch.zeros(bins, dtype=x.dtype, device=x.device)
-                return histc_by_edges(x, bins, *bounds, traced=_is_fake(x) or not _concrete(x))
-        return op._op_dk(DispatchKey.Autograd, x, bins, min, max)
+    def autograd_kernel(x, bins=100, min=0, max=0):  # noqa: A002  (ATen's argument names)
+        routed = _routed_histc(x, bins, min, max)
+        return op._op_dk(DispatchKey.Autograd, x, bins, min, max) if routed is None else routed
 
-    return register_kernels(device_type, [(op, "Autograd{}", kernel)])
+    def out_kernel(x, bins=100, min=0, max=0, *, out):  # noqa: A002
+        routed = _routed_histc(x, bins, min, max)
+        if routed is None:
+            return out_op._op_dk(DispatchKey.Autograd, x, bins, min, max, out=out)
+        out.resize_(routed.shape)
+        return out.copy_(routed)
+
+    def backend_kernel(x, bins=100, min=0, max=0):  # noqa: A002
+        routed = _routed_histc(x, bins, min, max)
+        return _native_histc(x, bins, min, max) if routed is None else routed
+
+    undos = [register_kernels(device_type, [(op, "Autograd{}", autograd_kernel), (out_op, "Autograd{}", out_kernel)]),
+             override_kernels(device_type, [(op, backend_kernel)])]
+
+    def undo():
+        chain(undos)()
+        _EDGE_CACHE.clear()
+
+    return undo
