@@ -254,6 +254,31 @@ def view_checks():
     check("inplace inv 2-D add_", inv2d)
 
 
+def ortho(Q):
+    """max |Q^T Q - I| of the columns of ``Q`` (float64, on the CPU)."""
+    Q = Q.detach().cpu().double()
+    return (Q.mT @ Q - torch.eye(Q.shape[-1], dtype=torch.float64)).abs().amax().item()
+
+
+def ortho_checks():
+    """Team Z's rsqrt bias: orthogonality of the Jacobi SVD's U, V and eigh's V on the card against torch's CPU
+    float32, with the values' error against float64 (batch 32, random)."""
+    torch.manual_seed(5)
+    for n in (4, 8, 16, 22, 32):
+        A = torch.randn(32, n, n)
+        S_ref = torch.linalg.svdvals(A.double())
+        U, S, Vh = torch.linalg.svd(A.to(HPU))
+        Ut, St, Vht = torch.linalg.svd(A)
+        report(f"ortho svd n={n}", ok=True, U=ortho(U), V=ortho(Vh.mT), torch_U=ortho(Ut), torch_V=ortho(Vht.mT),
+               S_rel=rel(S, S_ref), torch_S_rel=rel(St, S_ref))
+        M = (A + A.mT) / 2
+        w_ref = torch.linalg.eigvalsh(M.double())
+        w, V = torch.linalg.eigh(M.to(HPU))
+        wt, Vt = torch.linalg.eigh(M)
+        report(f"ortho eigh n={n}", ok=True, V=ortho(V), torch_V=ortho(Vt), w_rel=rel(w, w_ref),
+               torch_w_rel=rel(wt, w_ref))
+
+
 def timed(fn, reps=100):
     out = [fn() for _ in range(3)]
     sync()
@@ -288,7 +313,7 @@ def main():
         "habana_frameworks.torch").torch.__version__ if hasattr(__import__("habana_frameworks.torch").torch,
                                                                  "__version__") else "?")
     groups = {"autocast": autocast_checks, "expm": expm_checks, "aso": aso_checks, "nan": nan_checks,
-              "view": view_checks}
+              "view": view_checks, "ortho": ortho_checks}
     for name in filter(None, args.only.split(",")):
         groups[name]()
     if args.time:

@@ -542,3 +542,40 @@ def test_owned_outputs_odd_shapes():
         X, info = torch.linalg.solve_ex(M, Bm, left=False)
         LU, pivots = torch.linalg.lu_factor(M)
     assert X.requires_grad and not info.requires_grad and not pivots.requires_grad
+
+
+# ---- team Z's rsqrt bias, in the real one-sided Jacobi SVD kernel
+
+
+def low_estimate(x):
+    """The hardware rsqrt estimate 1 ulp low (as the card's sometimes is)."""
+    return np.nextafter(kr.hw_rsqrt(x), np.float32(0)).astype(np.float32)
+
+
+def test_svd_rsqrt_newton_is_unbiased():
+    """The plain Newton step r (1.5 - x r^2 / 2) keeps a 1-ulp-low estimate at 1 (0.99999994); the residual form gives
+    1. Over the kernel's replica, the low estimate with the plain step drifts the accumulated rotations' orthogonality
+    with n (1.0e-5 at n = 32; Gaudi2 measured 6.1e-6 before, 3.0e-6 after, torch 1.3e-6); with the residual step it
+    no longer depends on the estimate's bias."""
+    import functools
+
+    assert kr._rsqrt_newton(np.float32(1), legacy=True, estimate=low_estimate)[()] == np.float32(0.99999994)
+    assert kr._rsqrt_newton(np.float32(1), estimate=low_estimate)[()] == 1
+    torch.manual_seed(5)
+    A = torch.randn(32, 32).numpy()
+    real = kr._rsqrt_newton
+
+    def u_ortho(**kw):
+        kr._rsqrt_newton = functools.partial(real, **kw)
+        try:
+            U = np.asarray(kr.jacobi_svd(A)[0], np.float64)
+        finally:
+            kr._rsqrt_newton = real
+        return np.abs(U.T @ U - np.eye(32)).max()
+
+    torch_u = torch.linalg.svd(torch.tensor(A))[0].double()
+    bar = (torch_u.mT @ torch_u - torch.eye(32, dtype=torch.float64)).abs().max().item()
+    fixed_low, fixed_exact, legacy_low = u_ortho(estimate=low_estimate), u_ortho(), u_ortho(legacy=True,
+                                                                                         estimate=low_estimate)
+    assert legacy_low > 10 * bar and legacy_low > 4 * fixed_low  # the drift, and the fix of it
+    assert fixed_low < 2 * fixed_exact and fixed_exact < 5 * bar  # no longer depends on the estimate's bias
