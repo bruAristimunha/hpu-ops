@@ -45,6 +45,8 @@ void main(tensor A_t, tensor tau, tensor Q_t)
         int5 ct = {0, bt, 0, 0, 0};
         float64 tau_vec = v_f32_sel_geq_u32_b(lane, (unsigned)k, 0.0f, v_f32_ld_tnsr_b(ct, tau));
 
+        // tau_i = 0 is the identity reflector: q is kept as is (its dot product with v_i can overflow, and 0 times
+        // Inf made the product NaN; Codex review #16)
         for (int i = k - 1; i >= 0; i--)
         {
             float64 tau_i = reduce_add_64(v_f32_sel_eq_u32_b(lane, (unsigned)i, tau_vec, 0.0f));
@@ -60,18 +62,19 @@ void main(tensor A_t, tensor tau, tensor Q_t)
                 float64 d1 = reduce_add_64(v_f32_mul_b(vi, q1));
                 float64 d2 = reduce_add_64(v_f32_mul_b(vi, q2));
                 float64 d3 = reduce_add_64(v_f32_mul_b(vi, q3));
-                q[j]     = v_f32_mac_b(neg_tau_vi, d0, q0);
-                q[j + 1] = v_f32_mac_b(neg_tau_vi, d1, q1);
-                q[j + 2] = v_f32_mac_b(neg_tau_vi, d2, q2);
-                q[j + 3] = v_f32_mac_b(neg_tau_vi, d3, q3);
+                q[j]     = v_f32_sel_eq_f32_b(tau_i, 0.0f, q0, v_f32_mac_b(neg_tau_vi, d0, q0));
+                q[j + 1] = v_f32_sel_eq_f32_b(tau_i, 0.0f, q1, v_f32_mac_b(neg_tau_vi, d1, q1));
+                q[j + 2] = v_f32_sel_eq_f32_b(tau_i, 0.0f, q2, v_f32_mac_b(neg_tau_vi, d2, q2));
+                q[j + 3] = v_f32_sel_eq_f32_b(tau_i, 0.0f, q3, v_f32_mac_b(neg_tau_vi, d3, q3));
             }
             for (; j < n; j++)
             {
                 float64 qj = q[j];
                 float64 d = reduce_add_64(v_f32_mul_b(vi, qj));
-                q[j] = v_f32_mac_b(neg_tau_vi, d, qj);
+                q[j] = v_f32_sel_eq_f32_b(tau_i, 0.0f, qj, v_f32_mac_b(neg_tau_vi, d, qj));
             }
-            q[i] = v_f32_add_b(v_f32_sel_eq_u32_b(lane, (unsigned)i, 1.0f, 0.0f), neg_tau_vi);
+            q[i] = v_f32_sel_eq_f32_b(tau_i, 0.0f, v_f32_sel_eq_u32_b(lane, (unsigned)i, 1.0f, 0.0f),
+                                      v_f32_add_b(v_f32_sel_eq_u32_b(lane, (unsigned)i, 1.0f, 0.0f), neg_tau_vi));
         }
 
         for (int j = 0; j < n; j++)

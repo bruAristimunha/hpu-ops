@@ -2674,9 +2674,10 @@ def test_lu_solve_matches_torch(a_shape, b_cols, left, adjoint, lu_hook, gj_hook
     B = torch.randn(*batch, *((n, b_cols) if left else (b_cols, n)), dtype=torch.float64)
     compare(lambda lu_, b: torch.linalg.lu_solve(lu_, pivots, b, left=left, adjoint=adjoint), linalg.install_lu,
             LU, B, name="lu_solve", rtol=1e-7, atol=1e-7)
-    # the getrs kernel for left, not adjoint (also the backward of left adjoint), else A = P L U and Gauss-Jordan
+    # the getrs kernel for left, not adjoint (also the backward of left adjoint), else two triangular solves with
+    # the factors (A = P L U is never rebuilt, codex review #14: no Gauss-Jordan)
     assert any(c[0] == "solve" for c in lu_hook) == left
-    assert any(c[0] == "perm" for c in lu_hook) and gj_hook  # one direction of every pair runs Gauss-Jordan
+    assert any(c[0] == "perm" for c in lu_hook) and not gj_hook
 
 
 def test_lu_solve_double_backward_and_legacy(lu_hook):

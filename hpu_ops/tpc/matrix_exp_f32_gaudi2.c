@@ -83,6 +83,9 @@ static inline float64 rcp_newton(float64 x)
     y = v_f32_mul_b(y, v_f32_sub_b(2.0f, v_f32_mul_b(ax, y)));
     y = v_f32_mul_b(y, v_f32_sub_b(2.0f, v_f32_mul_b(ax, y)));
     y = v_f32_mul_b(y, v_f32_sub_b(2.0f, v_f32_mul_b(ax, y)));
+    // one step in FMA error form: e = 1 - ax y exactly rounded once, y += y e. The plain steps leave 1 ulp
+    // (rcp(1) = 0.99999994), which s squarings amplify: exp(diag(-1e8, 0))[1, 1] was 0.1353 (Codex review #8)
+    y = v_f32_mac_b(y, v_f32_mac_b(v_f32_sub_b(0.0f, ax), y, 1.0f), y);
     y = v_f32_sel_less_f32_b(x, 0.0f, v_f32_sub_b(0.0f, y), y);
     return v_f32_sel_eq_f32_b(x, 0.0f, 0.0f, y);
 }
@@ -299,7 +302,9 @@ void main(tensor A_in, tensor Y_out)
 #endif
 
         float64 norm1 = reduce_max_half32(col_sum);
-        float64 finite_ok = v_f32_sel_leq_f32_b(norm1, 3.4e38f, 1.0f, 0.0f);
+        // finite: below the Inf bit pattern (the literal 3.4e38f is under FLT_MAX: a finite norm in between was
+        // taken for Inf, 0 halvings, NaN; Codex review #10)
+        float64 finite_ok = v_f32_sel_less_u32_b(v_u32_and_b(as_uint64(norm1), 0x7FFFFFFFu), 0x7F800000u, 1.0f, 0.0f);
         float64 cur_norm = v_f32_mul_b(norm1, finite_ok);
         float64 scale = 1.0f;
         float64 s_vec = 0.0f;
