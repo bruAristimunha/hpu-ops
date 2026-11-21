@@ -23,7 +23,7 @@ hpu_ops.enable()
 
 On 1.21 and 1.22, `enable()` warns when the setting did not take effect: Habana's fused kernel is then not registered in the dispatcher. On 1.23+ the kernel is always registered and chosen per call, so `enable()` cannot tell whether your attention runs inside `sdpa_kernel`.
 
-`torch.compile(backend="hpu_backend")` needs eager mode (`PT_HPU_LAZY_MODE=0`, the default since 1.21): Habana's 1.21.4 support matrix lists it under "Eager + torch.compile" only. In lazy mode (`PT_HPU_LAZY_MODE=1`), `enable()` makes `torch.compile(..., backend="hpu_backend")` (and `torch._dynamo.optimize("hpu_backend")`) called after it raise one `RuntimeError` at that call, saying so; a function compiled before `enable()`, or the backend passed as a function, is not covered. Without hpu-ops, Habana's backend fails deep inside instead, on the first graph it receives (SPDNet: `_recipe_compiler_C.so: undefined symbol`, since lazy mode does not load the eager plugin that library links against; `torch.ops.hpu.weight_permutation`, read by the backend's partitioner, is not registered either). A model whose frames dynamo does not capture in lazy mode ran uncompiled (a Linear MLP: no graph reached the backend); with `enable()` that script now raises too. To compare the modes, see "Choosing a mode" below.
+`torch.compile(backend="hpu_backend")` needs eager mode (`PT_HPU_LAZY_MODE=0`, the default since 1.21): Habana's 1.21.4 support matrix lists it under "Eager + torch.compile" only. In lazy mode (`PT_HPU_LAZY_MODE=1`), after `enable()`, `torch.compile(model, backend="hpu_backend")` warns once, saying so, and returns `model` itself, which runs in lazy mode as if not compiled (SPDNet trains with the uncompiled lazy loss). `torch._dynamo.optimize("hpu_backend")` and a `torch.compile` bound before `enable()` get a pass-through backend: dynamo traces, the graph runs op by op in lazy mode. `HPU_OPS_LAZY_COMPILE=raise` makes it a `RuntimeError` at the call instead. A function compiled before `enable()`, or the backend passed as a function, is not covered. Without hpu-ops, Habana's backend fails deep inside on the first graph it receives (SPDNet: `_recipe_compiler_C.so: undefined symbol`, since lazy mode does not load the eager plugin that library links against; `torch.ops.hpu.weight_permutation`, read by the backend's partitioner, is not registered either), and a model whose frames dynamo does not capture runs uncompiled without notice (a Linear MLP). To compare the modes, see "Choosing a mode" below.
 
 Compile with `dynamic=False`, or keep one batch size (`drop_last=True`). A new batch size otherwise makes the shapes symbolic, and linear upsampling falls back to the slow decomposition, with a warning.
 
@@ -210,13 +210,13 @@ Model gradients against CPU float64 (`tests/model_parity.py --parts grads`, 21 m
 
 Same pod (Gaudi2, bridge 1.21.4, BNCI2014_001), batch 32, ms per training step (forward, backward, Adam; `torch.compile(model, backend="hpu_backend")` around the forward, Adam eager), two runs per mode, interleaved eager / compile / lazy (`tests/linalg_steps.py [--compile]`). Warm-up: the first five steps, in s, where compilation happens. 0 CPU fallbacks per step in every run.
 
-| model | eager | eager + compile | lazy | warm-up eager / compile / lazy (s) |
-|---|---|---|---|---|
-| SPDNet | 53.6, 43.6 | 17.5, 29.6 | **12.5, 15.3** | 0.3 / 2.1-3.0 / 1.8-2.1 |
-| TSMNet | 164.5, 145.8 | 54.9, 50.7 | 49.8, 50.2 | 1.0 / 12.3-13.9 / 4.4-4.8 |
-| TensorCSPNet | 220.0, 200.2 | **151.1, 164.7** | 174.9, 176.4 | 1.1 / 15.0-15.5 / 5.1-5.3 |
+| model | eager | eager + compile | lazy | lazy + `torch.compile` (runs uncompiled) | warm-up eager / compile / lazy (s) |
+|---|---|---|---|---|---|
+| SPDNet | 53.6, 43.6 | 17.5, 29.6 | **12.5, 15.3** | 18.3 | 0.3 / 2.1-3.0 / 1.8-2.1 |
+| TSMNet | 164.5, 145.8 | 54.9, 50.7 | 49.8, 50.2 | 48.6 | 1.0 / 12.3-13.9 / 4.4-4.8 |
+| TensorCSPNet | 220.0, 200.2 | **151.1, 164.7** | 174.9, 176.4 | 174.5 | 1.1 / 15.0-15.5 / 5.1-5.3 |
 
-Compiling is 1.3-3x faster per step than plain eager for all three, and it costs 2-15 s of compilation. Against lazy: SPDNet trains faster lazy, TSMNet the same, TensorCSPNet about 10% faster compiled. Lazy compiles less (2-5 s) but Habana no longer develops it ("a legacy fallback"), and `torch.compile` cannot run there (after `enable()`, a `RuntimeError` at the `torch.compile` call, see "Use"). The card's noise between runs is up to ±12 ms on SPDNet.
+Compiling is 1.3-3x faster per step than plain eager for all three, and it costs 2-15 s of compilation. Against lazy: SPDNet trains faster lazy, TSMNet the same, TensorCSPNet about 10% faster compiled. Lazy compiles less (2-5 s) but Habana no longer develops it ("a legacy fallback"), and `torch.compile` cannot run there (after `enable()` it runs the model uncompiled, with one warning, see "Use"). The card's noise between runs is up to ±12 ms on SPDNet.
 
 ### braindecode models
 
