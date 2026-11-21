@@ -1708,3 +1708,13 @@ def test_large_nan_in_A_gives_nan(large_reference):
     assert torch.isfinite(X[[0, 2]]).all() and torch.isfinite(D[[0, 2]]).all()
     Y, _, _ = tpc.gj_solve(A, torch.randn(3, 70, 2))
     assert Y[1].isnan().all() and torch.isfinite(Y[[0, 2]]).all()
+
+
+def test_large_inf_in_A_keeps_the_kernel_result(large_reference):
+    A = permuted(2, 70)
+    A[0, 0, 0] = float("inf")
+    X, _, _ = tpc.gj_inv(A)
+    R, P, Q, _, _ = tpc.gj_large_reference(A)
+    raw = R[..., :70].gather(1, P.long()[..., None].expand_as(A)).gather(2, Q.long()[:, None, :].expand_as(A))
+    torch.testing.assert_close(X[0], raw[0], equal_nan=True)
+    torch.testing.assert_close(X[1], torch.linalg.inv(A[1]), rtol=1e-4, atol=1e-4)

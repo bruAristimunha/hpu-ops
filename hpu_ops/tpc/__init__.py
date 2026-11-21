@@ -597,7 +597,9 @@ def _large(A, B=None):
         X = _rows(R, P).gather(-1, Q.long()[..., None, :].expand(*Q.shape[:-1], n, n))
         # One Newton step on the MME, X + X (I - A X): Gauss-Jordan's inverse is about 2x LAPACK's error (the kernel
         # equals the same algorithm on the CPU); measured on Gaudi2 at n = 220, 1.7e-6 to 8.7e-7 (CPU float32 7.0e-7)
-        X = X + X @ (torch.eye(n, dtype=X.dtype, device=X.device) - A @ X)
+        # (a non-finite correction, from an Inf in A, is dropped: the kernel's result keeps LAPACK's pattern there)
+        C = X @ (torch.eye(n, dtype=X.dtype, device=X.device) - A @ X)
+        X = X + torch.where(torch.isfinite(C), C, 0.0)
     else:
         X = _rows(R @ _rows(B, P), P)
     # A NaN in A: LAPACK's results are NaN; the kernel's are not always (measured on Gaudi2: a NaN at (0, 0) of a
