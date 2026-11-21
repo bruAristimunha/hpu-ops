@@ -1,6 +1,7 @@
 """On a Gaudi card: the linalg composites through their public torch calls, against torch on the CPU in float64.
     PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_on_hpu.py [--baseline]
-Per op and n in 16, 22, 64, 128, and for solve, inv, det and slogdet also 96, 220, 256 (batch 32, float32): forward, and backward where differentiable. The eight kernel ops
+Per op and n in 16, 22, 64, 128, and for solve, inv, det and slogdet also 96, 220, 256 (batch 32, float32): forward,
+and backward where differentiable. The eight kernel ops
 (solve, inv, det, slogdet, solve_triangular, cholesky_solve, eigh, eigvalsh) also run at the kernel's edges, n in
 1, 3, 21, 31, 32, for correctness and fallback only (no timing loop), and eigh and eigvalsh on an indefinite
 (G + G^T) / 2 at n = 3, 22, 32. A case fails when

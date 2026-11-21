@@ -1,6 +1,6 @@
 /* Batched in-place inverse of A on Gaudi2 TPC for 64 < n <= 512: Gauss-Jordan with partial pivoting, one matrix
- * per index-space member, built once per VA = ceil(n / 64) in 2..8. The rows do not fit the 80 KB of local memory: the first RC rows stay there, the others
- * are read and written in global memory (the output R) on every step.
+ * per index-space member, built once per VA = ceil(n / 64) in 2..8. The rows do not fit the 80 KB of local memory:
+ * the first RC rows stay there, the others are read and written in global memory (the output R) on every step.
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
  *   A [n, n, batch]   f32

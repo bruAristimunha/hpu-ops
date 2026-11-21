@@ -97,7 +97,8 @@ def main():
                 for k, v in fb.items():
                     r["fb"][k] = r["fb"].get(k, 0) + v
     for (name, phase), r in res.items():
-        print("RESULT " + json.dumps(dict(op=name, phase=phase, n=args.n, batch=BATCH, rhs=args.rhs, lazy=LAZY, bridge="1.21.4",
+        print("RESULT " + json.dumps(dict(op=name, phase=phase, n=args.n, batch=BATCH, rhs=args.rhs, lazy=LAZY,
+                                          bridge="1.21.4",
                                           iters=args.iters, ms_rounds=r["ms"],
                                           ms_mean=round(sum(r["ms"]) / len(r["ms"]), 3),
                                           fallback=r["fb"], cpu_warnings=r["cpu"])), flush=True)

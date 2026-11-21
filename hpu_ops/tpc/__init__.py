@@ -8,6 +8,12 @@
   (-1)^swaps of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can
   differ from LAPACK's, and is nonzero exactly when a pivot is exactly zero. The kernel zeroes the pivot row of a zero
   pivot so later pivots stay finite.
+- ``torch.ops.linalg_tpc.gj_large(A[b, n, n]) -> (R, P, Q, D, S)`` for 64 < n <= ``LARGE_MAXN`` (512): the in-place
+  Gauss-Jordan inverse with partial pivoting (implicit: no row moves), one matrix per index-space member, the first
+  rows in local memory and the others re-read from global memory on each step (one ASO per step). ``A^-1 = R[P, :][:,
+  Q]``, ``D`` the pivots, ``S[:, 1]`` the info; one ELF per ``ceil(n / 64)``. ``gj_solve`` and ``gj_inv`` route n >
+  ``MAXN`` to it: ``inv`` is two gathers of ``R``, ``solve`` the matmul ``(R @ B[P])[P]``, the sign of ``det`` the
+  parity of ``P``.
 - ``torch.ops.linalg_tpc.tri_solve_{lower,upper}[_unit](A[b, n, n], B[b, n, m]) -> X[b, n, m]``: forward or back
   substitution without pivoting for float32, n <= 64 (B columns chunked by 64; ``left=False`` through ``.mT`` and the
   flipped triangle). The other triangle (and the diagonal for ``_unit``) is never read. Substitution is backward

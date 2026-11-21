@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Rebuilds liblinalg_tpc.so, the Gaudi2 TPC linalg kernels (gj_solve and gj_inv, Gauss-Jordan; jacobi_eigh and
+# Rebuilds liblinalg_tpc.so, the Gaudi2 TPC linalg kernels (gj_solve and gj_inv, Gauss-Jordan; gj_large, the in-place
+# Gauss-Jordan inverse for 64 < n <= 512, one ELF per ceil(n / 64); jacobi_eigh and
 # jacobi_eigh_refine, one-sided Jacobi; tri_solve_{lower,upper}[_unit], substitution), and copies it next to this
 # script.
 # Run it inside the Gaudi image (it needs tpc-clang from habanalabs-tools 1.21.4, cmake, objcopy). The build happens
