@@ -20,9 +20,24 @@ def main():
     ap.add_argument("--models", default="SPDNet,TSMNet,TensorCSPNet,EEGSPDNet,GBWAtt")
     ap.add_argument("--no-sort", action="store_true", help="the sort family keeps the native op (bisection)")
     a = ap.parse_args()
-    if a.no_sort:
-        from hpu_ops import extrema
+    import collections
 
+    from hpu_ops import extrema
+
+    calls_out = collections.Counter()  # every backend-layer call (any dtype), by the .out overload it reaches
+    real_out = extrema.native_out
+
+    def counting(op, device_type):
+        fn = real_out(op, device_type)
+
+        def call(*args, **kwargs):
+            calls_out[str(op)] += 1
+            return fn(*args, **kwargs)
+
+        return call
+
+    extrema.native_out = counting
+    if a.no_sort:
         extrema._sortable = lambda x: False
     from spd_diag import protocol as P
     from spd_diag.cache import open_cache
@@ -53,9 +68,11 @@ def main():
 
         step()
         hpu_ops._STATE["calls"].clear()
+        calls_out.clear()
         step()
         calls = {k: v for k, v in hpu_ops._STATE["calls"].items() if k in EXTREMA}
-        print("COUNTS " + json.dumps({"model": name, "lazy": LAZY, "calls": calls}), flush=True)
+        print("COUNTS " + json.dumps({"model": name, "lazy": LAZY, "calls": calls,
+                                      "backend_calls": dict(calls_out)}), flush=True)
 
 
 if __name__ == "__main__":
