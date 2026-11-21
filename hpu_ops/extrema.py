@@ -33,9 +33,9 @@ maximum: both operands; clamp: torch's comparisons). At ``Autograd{}``: what ``t
 tensors never reach a backend kernel), the same fixes as a composite; outside a tracer these kernels hand the call to
 torch's autograd kernel, so nothing is fixed twice. ``max()`` / ``min()`` / ``median()`` keep their own backward
 (torch's reads the NaN flag on the host, a sync per call) and the inf-norms theirs (torch's formula with Gaudi's
-``sign(NaN) = NaN`` gives NaN where torch gives 0); the inf-norms are fixed at ``Autograd{}`` only, so inference mode
-keeps Gaudi's. ``out=`` calls are computed as the functional op and copied out (with autograd on; in inference mode
-Gaudi's ``.out`` kernels run). Integer and bool dtypes keep the native result. A NaN scalar bound of ``clamp``
+``sign(NaN) = NaN`` gives NaN where torch gives 0). ``out=`` calls are computed as the functional op and copied
+out (with autograd on; in inference mode Gaudi's ``.out`` kernels run). Integer and bool dtypes keep the native
+result. A NaN scalar bound of ``clamp``
 (``clamp(x, min=nan)``) is not rewritten: Gaudi gives FLT_MAX / inf (torch: ``x`` for one NaN bound, NaN for two).
 
 - With ``HPU_OPS_EXACT_SORT=1`` (off by default, see ``install``): ``sort`` / ``argsort`` / ``msort`` / ``topk`` /
@@ -306,7 +306,8 @@ class _InfNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, dims, keepdim, fn):
         r = fn(x)
-        r = torch.where(_nan_any(x, dims, keepdim), NAN, r)
+        if not (_BACKEND.get(x.device.type) and _concrete(x)):  # else the backend kernel fixed it
+            r = torch.where(_nan_any(x, dims, keepdim), NAN, r)
         ctx.save_for_backward(x, r)
         ctx.dims, ctx.keepdim = dims, keepdim
         return r
@@ -322,11 +323,13 @@ class _InfNorm(torch.autograd.Function):
 
 
 def _inf_norm(self, dim, keepdim, fn, name):
-    count(name)
     dims = _dims(self, dim)
     if _grad_needed(self):
         return _InfNorm.apply(self, dims, keepdim, fn)
     r = fn(self)
+    if _BACKEND.get(self.device.type) and _concrete(self):
+        return r
+    count(name)
     return torch.where(_nan_any(self, dims, keepdim), NAN, r)
 
 
@@ -747,6 +750,42 @@ def _b_clamp_inplace(out_op, name, dev):
     return kernel
 
 
+def _norm_dtype(x, dtype):
+    if dtype is not None:
+        return dtype
+    return x.real.dtype if x.is_complex() else x.dtype
+
+
+def _b_vector_norm(dev):
+    def kernel(self, ord=2, dim=None, keepdim=False, *, dtype=None):
+        dims = _dims(self, dim)
+        out = _empty(_reduced(self, dims, keepdim), _norm_dtype(self, dtype), self)
+        native_out(aten.linalg_vector_norm.out, dev)(self, ord, dim, keepdim, dtype=dtype, out=out)
+        if not _inf(ord) or not _floating(self) or self.is_complex():
+            return out
+        count("norm_inf")
+        return torch.where(_nan_any(self, dims, keepdim), NAN, out)
+
+    return kernel
+
+
+def _b_norm(dev, with_dim):
+    def kernel(self, p=2, dim=None, keepdim=False):
+        dims = _dims(self, dim if with_dim else None)
+        keepdim = keepdim if with_dim else False
+        out = _empty(_reduced(self, dims, keepdim), _norm_dtype(self, None), self)
+        if with_dim:
+            native_out(aten.norm.out, dev)(self, p, dim, keepdim, out=out)
+        else:  # norm.Scalar has no .out: the vector norm over every dim (the same values)
+            native_out(aten.linalg_vector_norm.out, dev)(self, 2 if p is None else p, None, False, out=out)
+        if not _inf(p) or not _floating(self) or self.is_complex():
+            return out
+        count("norm_inf")
+        return torch.where(_nan_any(self, dims, keepdim), NAN, out)
+
+    return kernel
+
+
 POOL_META = {2: aten.max_pool2d_with_indices.default, 3: aten.max_pool3d_with_indices.default}
 
 
@@ -789,6 +828,8 @@ def _backend_kernels(dev):
          (aten.clamp_.Tensor, _b_clamp_inplace(aten.clamp.Tensor_out, "clamp_tensor", dev)),
          (aten.clamp_min_.Tensor, _b_clamp_inplace(aten.clamp_min.Tensor_out, "clamp_tensor", dev)),
          (aten.clamp_max_.Tensor, _b_clamp_inplace(aten.clamp_max.Tensor_out, "clamp_tensor", dev)),
+         (aten.linalg_vector_norm.default, _b_vector_norm(dev)),
+         (aten.norm.ScalarOpt_dim, _b_norm(dev, True)), (aten.norm.Scalar, _b_norm(dev, False)),
          (aten.max_pool2d_with_indices.default, _b_pool(aten.max_pool2d_with_indices.out, "max_pool2d", dev, 2)),
          (aten.max_pool3d_with_indices.default, _b_pool(aten.max_pool3d_with_indices.out, "max_pool3d", dev, 3))]
     return k

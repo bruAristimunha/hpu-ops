@@ -113,6 +113,8 @@ def gaudi_out(op, device_type):
             a, b = args
             out = real(a, b, **kwargs)
             return out.copy_(torch.where(torch.isnan(a) | torch.isnan(b), a, out))
+        if op in (aten.linalg_vector_norm.out, aten.norm.out):  # NaN read as 0
+            return real(drop(x, 0.0), *rest, **kwargs)
         if op in (aten.clamp.Tensor_out, aten.clamp_min.Tensor_out, aten.clamp_max.Tensor_out):
             lows = op is not aten.clamp_max.Tensor_out
             bounds = [drop(b, -INF if k == 0 and lows else INF) for k, b in enumerate(rest)]
@@ -123,8 +125,8 @@ def gaudi_out(op, device_type):
 
 
 def gaudi(op):
-    """The functional ops hpu-ops rewrites at the autograd key only (inf-norms, sorts), as Gaudi computes them:
-    NaN read as 0 by the inf-norms, as +-inf by sort. Every other op is torch's own (it reaches the backend layer,
+    """The functional ops hpu-ops rewrites at the autograd key only (the sorts), as Gaudi computes them: NaN read as
+    +-inf. Every other op is torch's own (it reaches the backend layer,
     which calls ``gaudi_out``)."""
     real = REAL(op)
 
@@ -135,8 +137,6 @@ def gaudi(op):
         if op in (aten.sort.default, aten.sort.stable):
             desc = kwargs.get("descending", rest[1] if len(rest) > 1 else False)
             return real(drop(x, -INF if desc else INF), *rest, **kwargs)
-        if op in (aten.linalg_vector_norm.default, aten.norm.ScalarOpt_dim, aten.norm.Scalar):
-            return real(drop(x, 0.0), *rest, **kwargs)
         return real(*args, **kwargs)
 
     return fn
@@ -452,7 +452,7 @@ def test_non_contiguous_and_offset_views(card):
             same(f(v), _reference(f, v))
 
 
-INFERENCE = {**{k: v for k, v in REDUCTIONS.items() if not k.startswith(("norm", "vnorm"))},
+INFERENCE = {**REDUCTIONS,
              "maximum": lambda x: torch.maximum(x, x.flip(0)), "fmin": lambda x: torch.fmin(x, x.flip(0)),
              "clamp_t": lambda x: x.clamp(x.flip(0) - 1, x.flip(0) + 1),
              "clamp_inplace": lambda x: x.clone().clamp_(min=x.flip(0)),
