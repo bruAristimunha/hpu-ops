@@ -19,22 +19,26 @@ at the tensor's pickling:
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
   roll wrongly (EMG2QwertyNet's input gradient).
-- ``linalg.solve_triangular`` and ``cholesky_solve`` (``linalg.install_solve_triangular``, ``install_cholesky_solve``)
-  are NOT installed by ``enable()``: pivoted Gauss-Jordan on a triangle loses accuracy (no correct digits at n = 32
-  when ill-conditioned) and ``cholesky_solve`` squares the condition number. They run through Habana's fallback, as on
-  ``origin/main``, until a substitution kernel lands. Cholesky's and QR's backward use them, so they are unchanged too.
+- ``linalg.solve_triangular`` and ``cholesky_solve`` of float32 matrices with n <= 64 run through a TPC substitution
+  kernel (``tpc.tri_solve``, two substitutions for ``cholesky_solve``): they have no HPU kernel and ran on the CPU.
+  Substitution keeps CPU float32's accuracy on ill-conditioned triangles. Cholesky's and QR's backward use them.
 - ``linalg.inv``, ``det`` and ``slogdet`` from the masked LU and triangular matmuls (``linalg``), as ``linalg.solve``.
 - On Gaudi2 those composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
   ``linalg.solve``, ``inv``, ``det`` and ``slogdet`` of float32 matrices
-  with n <= 32 run through a TPC Gauss-Jordan kernel with partial pivoting (``tpc``), one matrix per index-space
-  member. Eager, batch 32, n = 22: solve 2.7 ms against about 4.5 ms for the fallback, inv 1.8 against 4.6, det 0.82
-  against 2.7 (lazy: 0.57, 0.48, 0.51 against about 2.2, 2.2, 1.4). Habana reads the kernel path when the device
-  initialises, so ``enable()`` must run before the first HPU op, else the kernel is off (one warning). The kernels
+  with n <= 64 run through a TPC Gauss-Jordan kernel with partial pivoting (``tpc``), one matrix per index-space
+  member. Eager, batch 32, n = 22, mean ms per call in two processes: solve 2.9 / 1.3 against 6.1 / 2.5 for the
+  fallback, inv 2.0 / 1.2 against 4.3 / 2.0, det 0.67 / 0.69 against 2.7 / 1.2. Lazy, per call, within the card's
+  noise of the fallback (slogdet slower); the card's noise is about 2x between processes
+  (``tests/linalg_percall.py``). Habana reads the kernel path when the device initialises, so ``enable()``
+  must run before the first HPU op, else the kernel is off (one warning). The kernels
   are off too on a device that is not a Gaudi2 and with ``HPU_OPS_TPC=0`` in the environment. Calls the kernel does
-  not take (n > 32, kernel off) run through hpu-ops' own CPU route, which is not Habana's fallback.
+  not take (n > 64, float64, kernel off): ``inv`` runs through hpu-ops' own CPU route, which is not Habana's
+  fallback; ``solve``, ``det`` and ``slogdet`` register only at the autograd key and reach Habana's own kernel and
+  its CPU fallback (bridge-counted).
 - ``linalg.eigh`` and ``eigvalsh`` of float32 matrices with n <= 32 run through a TPC one-sided Jacobi kernel
-  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32, n = 22: 1.27 ms
-  against about 3.7 ms for the fallback (lazy 0.80 against about 1.4); batch 1024 3.7 ms against 52 ms; within about
+  (``tpc``, ``eigh``): they fell back to the CPU in 21 of 21 SPD models. Eager, batch 32, n = 22: 0.81 / 2.6 ms
+  in two processes against 3.9 / 2.3 for the fallback (lazy 0.54 / 1.0 against 2.4 / 2.7); batch 1024 3.7 ms against
+  52 ms (older run); within about
   3.8x of CPU float32 accuracy, also on repeated eigenvalues, condition 1e6 and inputs scaled by 1e30.
   Without the kernel, or past n = 32, the call is declined and runs through hpu-ops' own CPU route, not Habana's
   fallback: the parallel-Jacobi composite of ``eigh`` was measured slower than the fallback on Gaudi2, so it only
@@ -67,7 +71,8 @@ __all__ = ["enable"]
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
-         composite.install_roll, linalg.install_solve, linalg.install_inv_det, eigh.install_eigh, serialization.install)
+         composite.install_roll, linalg.install_solve_triangular, linalg.install_cholesky_solve,
+         linalg.install_solve, linalg.install_inv_det, eigh.install_eigh, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "

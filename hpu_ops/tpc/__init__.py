@@ -1,20 +1,38 @@
-"""The Gaudi2 TPC Gauss-Jordan kernel behind ``linalg.solve``, ``inv``, ``det``, ``slogdet``, ``solve_triangular`` and
-``cholesky_solve``: ``torch.ops.linalg_tpc.gj_solve(A[b, n, n], B[b, n, m]) -> (X[b, n, m], D[b, n], S[b, 2])`` and
-``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel) for float32, n and m <= 32. One matrix per index-space
-member, rows in local memory, partial pivoting. ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign (-1)^swaps
-of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can differ from
-LAPACK's, and is nonzero exactly when a pivot is exactly zero. The kernel zeroes the pivot row of a zero pivot so
-later pivots stay finite.
+"""The Gaudi2 TPC kernels behind ``linalg.solve``, ``inv``, ``det``, ``slogdet``, ``solve_triangular``,
+``cholesky_solve`` and ``eigh``:
+
+- ``torch.ops.linalg_tpc.gj_solve(A[b, n, n], B[b, n, m]) -> (X[b, n, m], D[b, n], S[b, 2])`` and
+  ``gj_inv(A) -> (X, D, S)`` (B = identity, built in the kernel): Gauss-Jordan with partial pivoting for float32,
+  n <= 64 (B columns chunked by 64). One matrix per index-space member, rows in local memory, no LUT-based special
+  function (so the 80 KB of local memory are available). ``D`` holds the pivots (U's diagonal), ``S[:, 0]`` the sign
+  (-1)^swaps of the row permutation, ``S[:, 1]`` the info: the index follows the kernel's own elimination order, can
+  differ from LAPACK's, and is nonzero exactly when a pivot is exactly zero. The elimination is LU-style (a row minus
+  ``a_ik / pivot`` times the unnormalized pivot row, the quotient rounded with one FMA correction; X = B / diag(D) at
+  the end), so rows that are exact duplicates (or power-of-two multiples) cancel exactly and give a zero pivot,
+  where LAPACK's rounded multipliers can leave a residue and report info 0 (other rank-deficient matrices, e.g.
+  integer ones, are not detected, as in torch); B is never scaled by 1/pivot before the cancellation, and a
+  multiplier below 2^-126 is carried scaled by 2^64 so it is not flushed when its product is normal. A zero pivot makes its elimination step a no-op and its row of X
+  zero, so later pivots stay finite.
+- ``torch.ops.linalg_tpc.tri_solve_{lower,upper}[_unit](A[b, n, n], B[b, n, m]) -> X[b, n, m]``: forward or back
+  substitution without pivoting for float32, n <= 64 (B columns chunked by 64; ``left=False`` through ``.mT`` and the
+  flipped triangle). The other triangle (and the diagonal for ``_unit``) is never read. Each ``X[i]`` is ``B[i]``
+  minus the products one at a time in LAPACK's order (never a separate sum, which can overflow where the solution
+  does not). Substitution is backward stable, so it keeps CPU float32's accuracy on ill-conditioned triangles, which pivoted Gauss-Jordan does not.
+
+Both work in the normal float32 range: the card flushes subnormal inputs and results to zero (a subnormal entry
+counts as zero, so an all-subnormal matrix is singular on the card), while a pivot or diagonal up to the float32
+maximum is right (values >= 2^64 are scaled by 2^-64 before the reciprocal, which then never becomes subnormal).
 
 ``jacobi_eigh(A[b, n, n]) -> (W[b, n], Vt[b, n, n])`` is a one-sided Jacobi eigensolver of the same shape (float32,
 n <= ``EIGH_MAXN``): ``W`` unsorted, the rows of ``Vt`` the eigenvectors; ``eigh`` sorts them. Batch 32, n = 22,
-eager: 1.27 ms per call against about 3.7 ms for Habana's CPU fallback (the raw kernel takes 0.19 ms); batch 1024:
-3.7 ms against 52 ms. Accuracy within about 3.8x of CPU float32's, also on repeated eigenvalues, condition 1e6 and
-inputs scaled by 1e30.
+lazy: 0.54 / 1.0 ms per call in two processes against 2.4 / 2.7 for Habana's CPU fallback
+(``tests/linalg_percall.py``; the raw kernel took 0.19 ms in an older run); batch 1024: 3.7 ms against 52 ms (older
+run). Accuracy within about 3.8x of CPU float32's, also on repeated eigenvalues, condition 1e6 and inputs scaled by
+1e30.
 
 The torch-op composites of ``hpu_ops.linalg`` are correct but were measured 3-25x slower than Habana's CPU fallback
-per call on Gaudi2 (one launch per op). The solve kernel, batch 32, n = 22, eager: 2.7 ms against about 4.5 ms for
-the fallback (lazy 0.57 against about 2.2).
+per call on Gaudi2 (one launch per op). The solve kernel, batch 32, n = 22, eager: 2.9 / 1.3 ms in two processes against
+6.1 / 2.5 for the fallback; lazy 0.97 / 1.36 against 1.22 / 1.38, within the card's noise.
 
 Habana reads ``GC_KERNEL_PATH`` when the device initialises, so ``install_kernel_path`` must run before the first HPU
 op of the process; ``hpu_ops.enable()`` calls it. ``HPU_OPS_TPC=0`` in the environment keeps the kernels off.
@@ -26,7 +44,7 @@ import warnings
 
 import torch
 
-MAXN = 32
+MAXN = 64
 EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
@@ -69,12 +87,20 @@ static habana::PartialOutputMetaDataVector eigh_meta(const at::Stack& inputs) {
   return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1)}},
           habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()}};
 }
+static habana::PartialOutputMetaDataVector tri_solve_meta(const at::Stack& inputs) {
+  auto b = inputs[1].toTensor();
+  return {habana::PartialOutputMetaData{b.scalar_type(), b.sizes().vec()}};
+}
 static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", eigh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_eigh_refine", "jacobi_eigh_refine_f32_gaudi2",
                                           eigh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_solve", "gj_solve_f32_gaudi2", solve_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::gj_inv", "gj_inv_f32_gaudi2", inv_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::tri_solve_lower", "tri_solve_lower_f32_gaudi2", tri_solve_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::tri_solve_upper", "tri_solve_upper_f32_gaudi2", tri_solve_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::tri_solve_lower_unit", "tri_solve_lower_unit_f32_gaudi2", tri_solve_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::tri_solve_upper_unit", "tri_solve_upper_unit_f32_gaudi2", tri_solve_meta, nullptr);
   return true;
 }();
 
@@ -96,6 +122,16 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   auto out = desc.execute(inputs);
   return {out[0], out[1]};
 }
+static at::Tensor run_tri_solve(const char* op_name, at::Tensor a, at::Tensor b) {
+  std::vector<c10::IValue> inputs{a, b};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor(op_name);
+  return desc.execute(inputs)[0];
+}
+at::Tensor tri_solve_lower(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_lower", a, b); }
+at::Tensor tri_solve_upper(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_upper", a, b); }
+at::Tensor tri_solve_lower_unit(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_lower_unit", a, b); }
+at::Tensor tri_solve_upper_unit(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_upper_unit", a, b); }
+static at::Tensor tri_meta_tensor(at::Tensor, at::Tensor b) { return b.new_empty(b.sizes()); }
 std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v1) {
   std::vector<c10::IValue> inputs{a, v1};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_eigh_refine");
@@ -106,12 +142,20 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
+  m.def("tri_solve_lower(Tensor a, Tensor b) -> Tensor");
+  m.def("tri_solve_upper(Tensor a, Tensor b) -> Tensor");
+  m.def("tri_solve_lower_unit(Tensor a, Tensor b) -> Tensor");
+  m.def("tri_solve_upper_unit(Tensor a, Tensor b) -> Tensor");
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
   m.impl("jacobi_eigh", jacobi_eigh);
+  m.impl("tri_solve_lower", tri_solve_lower);
+  m.impl("tri_solve_upper", tri_solve_upper);
+  m.impl("tri_solve_lower_unit", tri_solve_lower_unit);
+  m.impl("tri_solve_upper_unit", tri_solve_upper_unit);
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
@@ -124,6 +168,10 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("jacobi_eigh", [](at::Tensor a) {
     return std::make_tuple(a.new_empty({a.size(0), a.size(1)}), a.new_empty(a.sizes()));
   });
+  m.impl("tri_solve_lower", tri_meta_tensor);
+  m.impl("tri_solve_upper", tri_meta_tensor);
+  m.impl("tri_solve_lower_unit", tri_meta_tensor);
+  m.impl("tri_solve_upper_unit", tri_meta_tensor);
   m.impl("jacobi_eigh_refine", [](at::Tensor a, at::Tensor v1) {
     return std::make_tuple(a.new_empty({a.size(0), a.size(1)}), a.new_empty(a.sizes()));
   });
@@ -170,6 +218,16 @@ static bool registered_eigh = [] {
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_eigh", "jacobi_eigh_f32_gaudi2", in, out, nullptr);
   return true;
 }();
+static bool registered_tri = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
+                                               {habana::custom_op::input_type::TENSOR, 1}};
+  std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, xshape_b}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::tri_solve_lower", "tri_solve_lower_f32_gaudi2", in, out, nullptr);
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::tri_solve_upper", "tri_solve_upper_f32_gaudi2", in, out, nullptr);
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::tri_solve_lower_unit", "tri_solve_lower_unit_f32_gaudi2", in, out, nullptr);
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::tri_solve_upper_unit", "tri_solve_upper_unit_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
 static bool registered_eigh_refine = [] {
   std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0},
                                                {habana::custom_op::input_type::TENSOR, 1}};
@@ -197,6 +255,15 @@ std::tuple<at::Tensor, at::Tensor> jacobi_eigh(at::Tensor a) {
   auto out = op.execute(inputs);
   return {out[0], out[1]};
 }
+static at::Tensor run_tri_solve(const char* op_name, at::Tensor a, at::Tensor b) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor(op_name);
+  std::vector<c10::IValue> inputs{a, b};
+  return op.execute(inputs)[0];
+}
+at::Tensor tri_solve_lower(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_lower", a, b); }
+at::Tensor tri_solve_upper(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_upper", a, b); }
+at::Tensor tri_solve_lower_unit(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_lower_unit", a, b); }
+at::Tensor tri_solve_upper_unit(at::Tensor a, at::Tensor b) { return run_tri_solve("linalg_tpc::tri_solve_upper_unit", a, b); }
 std::tuple<at::Tensor, at::Tensor> jacobi_eigh_refine(at::Tensor a, at::Tensor v1) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_eigh_refine");
   std::vector<c10::IValue> inputs{a, v1};
@@ -207,12 +274,20 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("gj_solve(Tensor a, Tensor b) -> (Tensor, Tensor, Tensor)");
   m.def("gj_inv(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_eigh(Tensor a) -> (Tensor, Tensor)");
+  m.def("tri_solve_lower(Tensor a, Tensor b) -> Tensor");
+  m.def("tri_solve_upper(Tensor a, Tensor b) -> Tensor");
+  m.def("tri_solve_lower_unit(Tensor a, Tensor b) -> Tensor");
+  m.def("tri_solve_upper_unit(Tensor a, Tensor b) -> Tensor");
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_solve", gj_solve);
   m.impl("gj_inv", gj_inv);
   m.impl("jacobi_eigh", jacobi_eigh);
+  m.impl("tri_solve_lower", tri_solve_lower);
+  m.impl("tri_solve_upper", tri_solve_upper);
+  m.impl("tri_solve_lower_unit", tri_solve_lower_unit);
+  m.impl("tri_solve_upper_unit", tri_solve_upper_unit);
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
 }
 """
@@ -353,13 +428,25 @@ def _eigh_refine_op():
     return torch.ops.linalg_tpc.jacobi_eigh_refine
 
 
+def _tri_op(upper, unitriangular):
+    """``torch.ops.linalg_tpc.tri_solve_*``, built on first use."""
+    _load()
+    name = "tri_solve" + ("_upper" if upper else "_lower") + ("_unit" if unitriangular else "")
+    return getattr(torch.ops.linalg_tpc, name)
+
+
+def _lazy():
+    """Lazy mode, and not tracing under ``torch.compile``."""
+    return os.environ.get("PT_HPU_LAZY_MODE", "1") != "0" and not torch.compiler.is_compiling()
+
+
 # Measured on Gaudi2, bridge 1.21.4, lazy mode: a TPC custom op whose inputs come from the pending lazy graph can fail
 # with "ValidateSyncInputTensors tensor_data is empty" (nondeterministic). A mark_step BEFORE the op prevents it (2 of
 # 2 gate runs race-free); a mark_step only AFTER the op does not, and packing the outputs into one tensor does not
 # either. The cost is one graph boundary per call; eager mode needs none.
 def _flush():
     """``mark_step`` in lazy mode; nothing in eager mode, while tracing under ``torch.compile``, or without Habana."""
-    if os.environ.get("PT_HPU_LAZY_MODE", "1") == "0" or torch.compiler.is_compiling():
+    if not _lazy():
         return
     try:
         import habana_frameworks.torch.core as htcore
@@ -368,10 +455,42 @@ def _flush():
     htcore.mark_step()
 
 
+# Measured on Gaudi2, bridge 1.21.4, lazy mode (repro/lazy_custom_op_output_cpu.py): the output of a custom op read
+# with ``.cpu()`` and no ATen op after it comes back wrong (relative error about 1); one ATen op after it gives the
+# right values. So in lazy mode each output is cloned: a copy, no extra graph boundary.
 def _call(op, *args):
-    """``op(*args)`` after a lazy graph boundary (``mark_step`` before the op only)."""
+    """``op(*args)`` after a lazy graph boundary (``mark_step`` before the op only); in lazy mode the outputs are
+    copies, so an ATen node always follows the custom op."""
     _flush()
-    return op(*args)
+    out = op(*args)
+    if not _lazy():
+        return out
+    return tuple(t.clone() for t in out) if isinstance(out, tuple) else out.clone()
+
+
+def _fresh(t):
+    """``t``, or a copy of it when it may alias other storage: a view (``_base``), an offset into its storage, or a
+    storage larger than ``t`` (inference-mode views have ``_base`` None), so the kernel never reads a view of a graph
+    input, which breaks lazy mode."""
+    if t._base is not None or t.storage_offset() != 0:
+        return t.clone()
+    try:
+        whole = t.untyped_storage().nbytes() == t.numel() * t.element_size()
+    except (RuntimeError, NotImplementedError):  # a tensor without accessible storage: copy, to be safe
+        whole = False
+    return t if whole else t.clone()
+
+
+def _flat(x, batch, *shape):
+    return _fresh(x.expand(*batch, *shape).reshape(-1, *shape).to(torch.float32).contiguous())
+
+
+def _unflatten(x, batch, *tail):
+    if not batch:
+        return x.squeeze(0)
+    if len(batch) == 1:
+        return x
+    return x.reshape(*batch, *tail)
 
 
 def _chunked(A, B):
@@ -380,13 +499,22 @@ def _chunked(A, B):
     op = _op()
     if B.shape[-1] <= MAXN:
         return _call(op, A, B)
-    parts = [_call(op, A, chunk.contiguous()) for chunk in B.split(MAXN, -1)]
+    parts = [_call(op, A, _fresh(chunk.contiguous())) for chunk in B.split(MAXN, -1)]
     return torch.cat([p[0] for p in parts], -1), parts[0][1], parts[0][2]
 
 
-def _check(A, n):
-    if n > MAXN or A.shape[-2] != n:
+def _tri_chunked(op, A, B):
+    if B.shape[-1] <= MAXN:
+        return _call(op, A, B)
+    return torch.cat([_call(op, A, _fresh(chunk.contiguous())) for chunk in B.split(MAXN, -1)], -1)
+
+
+def _check(A, n, *others):
+    if A.dim() < 2 or n > MAXN or A.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc takes square A with n <= {MAXN}, got {tuple(A.shape)}")
+    if any(t.dtype != torch.float32 for t in (A, *others)):
+        # the kernels compute in float32: a float64 input would be downcast silently
+        raise ValueError(f"hpu_ops.tpc takes float32 tensors, got {[str(t.dtype) for t in (A, *others)]}")
 
 
 def gj_solve(A, B):
@@ -395,13 +523,12 @@ def gj_solve(A, B):
     zero pivot in the kernel's elimination order, else 0; it can differ from LAPACK's);
     shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
     n, m = A.shape[-1], B.shape[-1]
-    _check(A, n)
-    if B.shape[-2] != n:
+    _check(A, n, B)
+    if B.dim() < 2 or B.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.gj_solve takes B with n rows, got {tuple(A.shape)} and {tuple(B.shape)}")
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
-    flat = lambda x, *shape: x.expand(*batch, *shape).reshape(-1, *shape).to(torch.float32).contiguous()  # noqa: E731
-    X, D, S = _chunked(flat(A, n, n), flat(B, n, m))
-    return X.reshape(*batch, n, m), D.reshape(*batch, n), S.reshape(*batch, 2)
+    X, D, S = _chunked(_flat(A, batch, n, n), _flat(B, batch, n, m))
+    return _unflatten(X, batch, n, m), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
 def gj_inv(A):
@@ -409,8 +536,46 @@ def gj_inv(A):
     n = A.shape[-1]
     _check(A, n)
     batch = A.shape[:-2]
-    X, D, S = _call(_inv_op(), A.reshape(-1, n, n).to(torch.float32).contiguous())
-    return X.reshape(*batch, n, n), D.reshape(*batch, n), S.reshape(*batch, 2)
+    X, D, S = _call(_inv_op(), _flat(A, batch, n, n))
+    return _unflatten(X, batch, n, n), _unflatten(D, batch, n), _unflatten(S, batch, 2)
+
+
+def tri_solve(A, B, upper=False, left=True, unitriangular=False):
+    """Solve ``A X = B`` (``X A = B`` if not ``left``) for triangular ``A[..., n, n]`` (n <= ``MAXN``)."""
+    n = A.shape[-1]
+    _check(A, n, B)
+    if B.dim() < 2 or B.shape[-2 if left else -1] != n:
+        raise ValueError(f"hpu_ops.tpc.tri_solve takes compatible B for left={left}, "
+                         f"got {tuple(A.shape)} and {tuple(B.shape)}")
+    A_eff = A if left else A.mT
+    B_eff = B if left else B.mT
+    upper_eff = upper if left else not upper
+    batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+    m = B_eff.shape[-1]
+    X = _tri_chunked(_tri_op(upper_eff, unitriangular), _flat(A_eff, batch, n, n), _flat(B_eff, batch, n, m))
+    X = _unflatten(X, batch, n, m)
+    return X if left else X.mT
+
+
+def tri_solve_reference(A, B, upper=False, left=True, unitriangular=False):
+    """``tri_solve`` in plain torch, the contract of the kernel (torch's own ``linalg.solve_triangular`` is what
+    the CPU tests override). Opposite triangle (and diagonal when ``unitriangular``) is never read. Detached: no
+    autograd through the kernel. For the CPU tests."""
+    if not left:
+        return tri_solve_reference(A.mT, B.mT, upper=not upper, left=True, unitriangular=unitriangular).mT
+    batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+    A = A.detach().expand(*batch, *A.shape[-2:])
+    B = B.detach().expand(*batch, *B.shape[-2:])
+    n = A.shape[-1]
+    rows = [None] * n
+    for i in (range(n - 1, -1, -1) if upper else range(n)):
+        rhs = B[..., i, :]
+        for j in (range(n - 1, i, -1) if upper else range(i)):  # the kernel's (and LAPACK's) order
+            rhs = rhs - A[..., i, j:j + 1] * rows[j]
+        if not unitriangular:
+            rhs = rhs / A[..., i, i:i + 1]
+        rows[i] = rhs
+    return torch.stack(rows, dim=-2)
 
 
 def eigh(A, upper):
@@ -445,8 +610,8 @@ def eigh_reference(A, upper):
 
 def gj_solve_reference(A, B):
     """``gj_solve`` in plain torch, the contract of the kernel: ``lu`` and ``lu_solve`` of ``hpu_ops.linalg``, ``D``
-    the diagonal of U (a zero pivot leaves later pivots finite; the kernel also zeroes the pivot's row, which this
-    reference does not), ``S[..., 0]`` the parity of the pivots and ``S[..., 1]`` the info. For the CPU tests."""
+    the diagonal of U (a zero pivot leaves later pivots finite; the kernel's row of X for it is zero, this
+    reference's is not finite), ``S[..., 0]`` the parity of the pivots and ``S[..., 1]`` the info. For the CPU tests."""
     from .. import linalg
 
     LU, pivots = linalg.lu(A)
