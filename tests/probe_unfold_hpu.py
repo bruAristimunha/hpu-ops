@@ -76,6 +76,39 @@ def case(name, make, chain):
     return row
 
 
+def write_case(name, write, card_want=None):
+    """``write(t)`` writes through an unfold view of ``t``; the base and the view must equal the CPU's after it (or
+    both raise)."""
+    f0 = fb()
+    torch.manual_seed(2)
+    x = torch.randn(4, 13)
+    xh = x.to("hpu")
+    x0 = x.clone()
+    row = {}
+    try:
+        view = write(x)
+        want_err = None
+    except RuntimeError as e:
+        view, want_err = None, str(e)[:60]
+    try:
+        viewh = write(xh)
+        mark()
+        got_err = None
+    except RuntimeError as e:
+        viewh, got_err = None, str(e)[:60]
+    row["same_error"] = (want_err is None) == (got_err is None)
+    if card_want is not None and got_err is None:
+        row["base_as_eager_card"] = close(xh, card_want(x0), "base")
+    elif want_err is None and got_err is None:
+        row["base"] = close(xh, x, "base")
+        row["view"] = close(viewh, view, "view")
+    mark()
+    d = fb()
+    row["fallbacks"] = {k: d[k] - f0.get(k, 0) for k in d if d[k] - f0.get(k, 0)}
+    print("CASE write", name, row, "cpu_error", want_err, "card_error", got_err, flush=True)
+    return row
+
+
 def make_on_hpu(x, name):
     """The same layout on the card: the CPU input's base moved, then the same view of it."""
     base = x._base if x._base is not None else x
@@ -106,6 +139,21 @@ def main():
         ("int32", lambda: torch.arange(40, dtype=torch.int32).reshape(4, 10), lambda t: t.unfold(1, 3, 2)),
     ]
     rows = [case(*c) for c in cases]
+
+    # writes THROUGH the view (and a view of it): base and view against the CPU's
+    writes = [
+        ("fill first of non-overlapping", lambda t: t.unfold(1, 3, 3).select(-1, 0).fill_(1)),
+        ("add first of overlapping", lambda t: t.unfold(1, 3, 1)[..., 0].add_(1)),
+        ("mul view of view", lambda t: t.unfold(1, 4, 2)[:, 1::2].select(-1, 1).mul_(3)),
+        ("copy_ whole non-overlapping", lambda t: t.unfold(1, 3, 3).copy_(torch.ones_like(t.unfold(1, 3, 3)))),
+        ("transposed base", lambda t: t.t().unfold(0, 3, 3).select(-1, 0).fill_(2)),
+    ]
+    for name, write in writes:
+        rows.append(write_case(name, write))
+    # undefined in torch: the CPU adds once per window holding an element, the card once per element, in eager
+    # mode with Habana's own unfold too (repro/unfold_overlapping_inplace.py); lazy must match eager's card result
+    rows.append(write_case("overlapping in-place add_ (undefined)", lambda t: t.unfold(1, 3, 1).add_(1),
+                           card_want=lambda x: x + 1))
 
     # TensorCSPNet's temporal block: hpu-ops' weight gradient, and its double backward
     f0 = fb()
@@ -146,6 +194,10 @@ def main():
 
 
 def summary(rows):
+    calls = hpu_ops._STATE["calls"]["unfold"]
+    rows.append({"rewrite_calls_as_expected": calls > 0 if LAZY else calls == 0})
+    print("CASE rewrite calls", calls, "expected", ">0 (lazy)" if LAZY else "0 (eager: Habana's kernel)",
+          rows[-1], flush=True)
     def is_bad(r):
         wrong = not all(v for v in r.values() if isinstance(v, bool))
         return "error" in r or wrong or "aten::unfold" in r.get("fallbacks", {})

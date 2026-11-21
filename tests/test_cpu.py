@@ -1531,8 +1531,30 @@ def test_unfold_is_the_same_view(unfold_key_free, name, make, dim, size, step):
 ])
 def test_unfold_raises_aten_errors(unfold_key_free, dim, size, step, match):
     x = torch.randn(4, 7, 13)
-    with cpu_as_hpu(composite.install_unfold), pytest.raises((RuntimeError, IndexError), match=match):
-        x.unfold(dim, size, step)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        with pytest.raises((RuntimeError, IndexError), match=match):
+            x.unfold(dim, size, step)
+    assert calls["unfold"] == 1  # the error is ATen's, raised from the rewrite's meta call
+
+
+def _write_through(t, overlapping=True):
+    """Writes through a view of an unfold of ``t`` (scaled first, so the graph input is not written): a copy instead
+    of a view would leave ``c`` unchanged and the output and its gradient would differ from ATen's."""
+    c = t * 1
+    c.unfold(-1, 3, 3).select(-1, 0).mul_(3)
+    if overlapping:  # torch.compile's functionalization bans this write, with ATen's kernel too
+        c.unfold(-1, 3, 1)[..., 1].add_(c.detach()[..., :1])
+    return c.sin()
+
+
+def test_unfold_writes_through_the_view_in_training(unfold_key_free):
+    x = torch.randn(3, 4, 11, dtype=torch.float64)
+    want = train_step(_write_through, x)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        got = train_step(_write_through, x)
+    assert calls["unfold"] == 2
+    assert_same(got, want)
+    assert not torch.equal(want[0], x.sin())  # the writes changed the output
 
 
 def test_unfold_gradients_and_double_backward(unfold_key_free):
@@ -1573,12 +1595,19 @@ def test_unfold_in_place_through_the_view_and_inference_mode(unfold_key_free):
 
 
 def test_unfold_compiles(unfold_key_free):
-    """Under torch.compile the tracers see unfold's meta kernel; the compiled result and gradients equal eager's."""
+    """Under torch.compile the tracers see unfold's meta kernel; the CPU stand-in's aot graph then runs the rewrite.
+    The compiled results and gradients equal eager's, also with writes through the view."""
     f = lambda t: (t.unfold(2, 4, 3) * 2).sum(-1)  # noqa: E731
     x = torch.randn(2, 3, 17, dtype=torch.float64)
-    with cpu_as_hpu(composite.install_unfold):
+    with cpu_as_hpu(composite.install_unfold) as calls:
         got = train_step(compiled(f, [], fullgraph=True), x)
+        # 18 = 6 windows of 3: torch 2.6's functionalization replays a write through an unfold with unfold_backward,
+        # which zeroes the elements no window covers (with ATen's kernel too), so the compiled write needs full cover
+        x18 = torch.randn(2, 3, 18, dtype=torch.float64)
+        written = train_step(compiled(lambda t: _write_through(t, False), [], fullgraph=True), x18)
+    assert calls["unfold"] > 0  # the CPU aot graph runs aten ops, so the rewrite (in hpu_backend's place) runs
     assert_same(got, train_step(f, x))
+    assert_same(written, train_step(lambda t: _write_through(t, False), x18))
 
 
 def test_one_channel_conv_weight_grad_takes_the_unfold_rewrite(unfold_key_free):
