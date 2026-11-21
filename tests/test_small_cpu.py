@@ -98,3 +98,49 @@ def test_install_undo_restores_atens_kernel():
     hpu_ops._STATE["calls"].clear()
     torch.bincount(torch.randint(0, 4, (1 << 16,)))
     assert sum(hpu_ops._STATE["calls"].values()) == 0
+
+
+# ---- adversarial pass (round 2) -------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("x,kw,taken", [
+    (torch.full((1 << 16,), 255, dtype=torch.uint8), {}, 1),  # 256 bins, every value in the last one
+    (torch.full((1 << 16,), 4095), {}, 1),  # 4096 bins exactly
+    (torch.full((1 << 16,), 4096), {}, 0),  # 4097 bins: after the read, Habana's kernel
+    (torch.zeros(1 << 16, dtype=torch.long), {"minlength": 4096}, 1),
+    (torch.randint(0, 50, (1 << 17,))[::2], {}, 1),  # a strided view
+    (torch.randint(0, 50, (2, 1 << 16))[1], {}, 1),  # an offset view
+    (torch.randint(0, 50, (1 << 16,)).expand(2, -1)[0], {}, 1),
+])
+def test_bincount_adversarial_inputs_match_aten(x, kw, taken):
+    ref = torch.bincount(x, **kw)
+    with cpu_as_hpu(small.install_bincount) as calls:
+        out, again = torch.bincount(x, **kw), torch.bincount(x, **kw)
+    assert calls["bincount"] == 2 * taken
+    same(out, ref, exact=True)
+    same(again, out, exact=True)
+
+
+def test_bincount_int8_negative_raises_and_bounds_of_the_size_range():
+    x = torch.randint(0, 10, (1 << 16,), dtype=torch.int8)
+    x[-1] = -128
+    with cpu_as_hpu(small.install_bincount), pytest.raises(RuntimeError, match="non-negative"):
+        torch.bincount(x)
+    assert small._takes(torch.zeros((1 << 24) - 1, dtype=torch.uint8))
+    assert not small._takes(torch.zeros(1 << 24, dtype=torch.uint8))  # float32 counts are exact below 2**24 only
+    assert not small._takes(torch.zeros((1 << 16) - 1, dtype=torch.uint8))
+
+
+def test_bincount_traced_and_0d_and_deterministic_keep_atens_behaviour():
+    x = torch.randint(0, 7, (1 << 16,))
+    with cpu_as_hpu(small.install_bincount) as calls:
+        compiled = torch.compile(lambda t: torch.bincount(t), backend="eager")(x)
+        with pytest.raises(RuntimeError):
+            torch.bincount(torch.tensor(3))
+        torch.use_deterministic_algorithms(True)
+        try:
+            det = torch.bincount(x)
+        finally:
+            torch.use_deterministic_algorithms(False)
+    same(compiled, torch.bincount(x), exact=True)
+    same(det, torch.bincount(x), exact=True)
+    assert calls["bincount"] >= 1

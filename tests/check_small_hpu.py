@@ -50,6 +50,13 @@ def main():
     for bins in (257, 300, 511, 512, 513, 1000, 4095, 4096):
         bincount_case(f"arange({bins}) repeated, chunked", torch.arange(bins).repeat(n // bins + 1), 1)
     bincount_case("131072 1000 bins random", torch.randint(0, 1000, (2 * n,)), 1)
+    bincount_case("uint8 all 255", torch.full((n,), 255, dtype=torch.uint8), 1)
+    bincount_case("4096 bins exactly (all 4095)", torch.full((n,), 4095), 1)
+    bincount_case("4097 bins (native after the read)", torch.full((n,), 4096), 0)
+    bincount_case("strided view", torch.randint(0, 50, (2 * n,))[::2], 1)
+    bincount_case("offset view", torch.randint(0, 50, (2, n))[1], 1)
+    for run in range(2):  # two graphs in a row
+        bincount_case(f"repeat run {run}", torch.randint(0, 64, (n,), generator=torch.Generator().manual_seed(1)), 1)
     bincount_case("65536 5000 bins (native)", torch.randint(0, 5000, (n,)), 0)
     bincount_case("4096 (native)", torch.randint(0, 64, (4096,)), 0)
     bincount_case("65536 weights (native)", torch.randint(0, 10, (n,)), 0, weights=torch.rand(n))
