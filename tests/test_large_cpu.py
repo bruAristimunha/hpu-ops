@@ -404,3 +404,87 @@ def test_review_direct_wrappers_reject_complex(call):
     its imaginary part: exp([[1 + 1j]]) gave 2.71828). The check runs before any kernel is touched."""
     with pytest.raises(ValueError, match="real floating"):
         call()
+
+
+# ---- Codex review #3 / #18 (PR #34, open there): inverses the in-place kernel cannot hold are redone on the CPU
+
+
+def _codex18(s=1e7):
+    A = torch.eye(65)
+    A[:2, :2] = 0.25 * torch.tensor([[7.0, s], [0.0, 0.9 * s]])
+    return A
+
+
+def test_review_subnormal_inverse_solve(large_on_cpu):
+    """#3: ``2^127 I`` (n = 65), B its first column: torch's solve is e_1. The kernel's inverse is 2^-127 I, flushed to
+    0 by its last division (info 0): main's route returned 0. The condition estimate is 0: redone on the CPU."""
+    A = torch.eye(65) * 2.0 ** 127
+    B = A[:, :1].clone()
+    Ainv, _, _ = tpc.gj_inv(A[None], sign=False)
+    assert torch.all(Ainv == 0)  # the kernel's (replica's) inverse: main's route multiplied by it
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        X = torch.linalg.solve(A, B)
+    assert calls["solve"]
+    with cpu_as_hpu(linalg.install_inv_det) as calls:
+        Xi = torch.linalg.inv(A)
+    assert calls["inv"]
+    assert torch.equal(X, torch.linalg.solve(A, B)) and X[0, 0] == 1
+    assert torch.equal(Xi, torch.linalg.inv(A))
+
+
+def test_review_residual_cannot_certify(large_on_cpu):
+    """#18: ``0.25 [[7, 1e7], [0, 9e6]]`` in eye(65), B its second column: torch gives x[0] = 0 exactly; main's route
+    (inverse, one float32 residual step) gave 0.0179, its residual rounding to 0. Condition estimate 2.7e7: redone on
+    the CPU, the backward too."""
+    A = _codex18()
+    B = A[:, 1:2].clone()
+    Ainv, _, _ = tpc.gj_inv(A[None], sign=False)
+    assert abs(float(linalg._inv_solve(A[None], B[None], Ainv, True)[0, 0, 0])) > 1e-2  # main's route
+    Ar, Br = A.clone().requires_grad_(), B.clone().requires_grad_()
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        X = torch.linalg.solve(Ar, Br)
+        X.sum().backward()
+    assert calls["solve"]
+    Aw, Bw = A.clone().requires_grad_(), B.clone().requires_grad_()
+    want = torch.linalg.solve(Aw, Bw)
+    want.sum().backward()
+    assert torch.equal(X, want) and X[0, 0] == 0
+    torch.testing.assert_close(Br.grad, Bw.grad)
+    torch.testing.assert_close(Ar.grad, Aw.grad)
+
+
+@pytest.mark.parametrize("left", [True, False])
+def test_review_redo_only_the_untrusted_matrices(left, large_on_cpu, monkeypatch):
+    """A batch with one bad matrix and a broadcast right-hand side: only that one goes to the CPU; the others keep the
+    kernel's answer; info is LAPACK's for the redone one."""
+    good = permuted(1, 65, seed=1)[0]
+    A = torch.stack([good, _codex18(), torch.eye(65) * 2.0 ** 127])
+    B = torch.randn(2, 1, 65, 3) if left else torch.randn(2, 1, 3, 65)
+    redone = []
+    real = linalg._redo_on_cpu
+
+    def spy(bad, *args, **kwargs):
+        redone.append(bad.tolist())
+        return real(bad, *args, **kwargs)
+
+    monkeypatch.setattr(linalg, "_redo_on_cpu", spy)
+    with cpu_as_hpu(linalg.install_solve):
+        X, info = torch.linalg.solve_ex(A, B, left=left)
+    assert redone == [[False, True, True]]
+    want = torch.linalg.solve(A.double(), B.double(), left=left)
+    assert rel(X[:, 0], want[:, 0]) < 1e-5 and torch.equal(X[:, 1:], torch.linalg.solve(A, B, left=left)[:, 1:])
+    assert X.shape == (2, 3) + B.shape[-2:]
+    assert torch.equal(info, torch.zeros(3, dtype=torch.int32))
+
+
+def test_review_untrusted_keeps_ordinary_matrices(replica):
+    """The condition estimate keeps the kernel for ordinary matrices (n = 65 to 200, batch 8): Gaussian plus 2 sqrt(n)
+    I (linalg_on_hpu's), the near-identity permutations; and most plain Gaussian ones (whose condition reaches 1e5 at
+    times from n = 128: those go to the CPU)."""
+    for n in (65, 128, 200):
+        g = torch.Generator().manual_seed(n)
+        for A in (torch.randn(8, n, n, generator=g) + 2 * n ** 0.5 * torch.eye(n), permuted(8, n, seed=n)):
+            Ainv, _, _ = tpc.gj_inv(A, sign=False)
+            assert not linalg._large_untrusted(A, Ainv).any(), n
+        A = torch.randn(8, n, n, generator=g)
+        assert linalg._large_untrusted(A, tpc.gj_inv(A, sign=False)[0]).sum() <= 2
