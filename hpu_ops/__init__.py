@@ -19,6 +19,9 @@ at the tensor's pickling:
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
   roll wrongly (EMG2QwertyNet's input gradient).
+- ``Tensor.unfold`` as ``as_strided`` with ATen's sizes and strides (``composite``): in lazy mode it had no HPU kernel,
+  ran on the CPU and returned a copy, not a view. hpu-ops' own one-channel conv weight gradient uses it (TensorCSPNet:
+  2 fallbacks per lazy step). Eager keeps Habana's kernel.
 - Advanced indexing by integer tensors, ``X[..., rows, cols]``, as one ``index_select`` of the indexed dims
   flattened (``indexing``): with CPU index tensors Gaudi's eager kernel ran on the CPU, and in lazy mode its
   backward, the accumulating ``_index_put_impl_`` with indices that do not lead, returns wrong sums from batch 2 to
@@ -81,7 +84,7 @@ __all__ = ["enable"]
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
-         composite.install_roll, indexing.install_index, indexing.install_mask_fill, im2col.install,
+         composite.install_roll, composite.install_unfold, indexing.install_index, indexing.install_mask_fill, im2col.install,
          linalg.install_solve_triangular, linalg.install_cholesky_solve,
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
