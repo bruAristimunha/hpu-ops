@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 import pytest
+from test_extrema_cpu import card  # noqa: F401  (the extrema fixture)
 import torch
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -120,3 +121,235 @@ def test_linear_upsampling_without_the_forward_fix_keeps_the_native_op_traced():
     with cpu_as_hpu(upsample.install_linear), torch.inference_mode():
         compiled(lambda t: F.interpolate(t, size=1500, mode="linear"), nodes, dynamic=False)(torch.randn(1, 1, 1000))
     assert "aten.upsample_linear1d.default" in ops(nodes)
+
+
+# ---- (9) compiled inference_mode graphs of the max/min family held the bare ops
+
+
+class _GaudiDropsNaN(torch.utils._python_dispatch.TorchDispatchMode):
+    """A graph's family ops as Gaudi computes them (measured, bridge 1.21.4): NaN read as -inf by the max ops, +inf by
+    the min ops, 0 by the inf-norms; maximum / minimum / clamp return the first operand where one is NaN. The graph's
+    other ops are torch's."""
+
+    LARGEST = {aten.amax.default, aten.max.default, aten.max.dim, aten.argmax.default, aten.median.default,
+               aten.median.dim, aten.aminmax.default}
+    SMALLEST = {aten.amin.default, aten.min.default, aten.min.dim, aten.argmin.default}
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        x, rest = args[0], args[1:]
+        if not (isinstance(x, torch.Tensor) and x.is_floating_point()):
+            return func(*args, **kwargs)
+        if func in self.LARGEST or func in self.SMALLEST:
+            return func(torch.where(torch.isnan(x), -INF if func in self.LARGEST else INF, x), *rest, **kwargs)
+        if func in (aten.maximum.default, aten.minimum.default, aten.fmax.default, aten.fmin.default):
+            a, b = args
+            return torch.where(torch.isnan(a) | torch.isnan(b), a, func(a, b))
+        if func is aten.linalg_vector_norm.default:
+            return func(torch.where(torch.isnan(x), 0.0, x), *rest, **kwargs)
+        if func in (aten.clamp.Tensor, aten.clamp_min.Tensor, aten.clamp_max.Tensor):
+            return func(torch.where(torch.isnan(x), 0.0, x),
+                        *[torch.where(torch.isnan(b), 0.0, b) if isinstance(b, torch.Tensor) else b for b in rest])
+        return func(*args, **kwargs)
+
+
+INFERENCE_CASES = {
+    "amax": lambda t: t.amax(-1), "amin": lambda t: t.amin(0), "max()": lambda t: t.max(), "min()": lambda t: t.min(),
+    "median()": lambda t: t.median(), "max(dim)": lambda t: t.max(-1).values, "min(dim) indices": lambda t: t.min(-1)[1],
+    "argmax": lambda t: t.argmax(-1), "argmin": lambda t: t.argmin(-1),
+    "aminmax": lambda t: torch.aminmax(t, dim=-1).max,
+    "maximum": lambda t: torch.maximum(t, t.flip(0)), "minimum": lambda t: torch.minimum(t, t.flip(0)),
+    "fmax": lambda t: torch.fmax(t, t.flip(0)), "clamp(t, t)": lambda t: t.clamp(t.flip(0) - 1, t.flip(0) + 1),
+    "clamp_(t)": lambda t: t.clone().clamp_(min=t.flip(0)),
+    "norm(inf, -1)": lambda t: t.norm(INF, -1), "vector_norm(inf)": lambda t: torch.linalg.vector_norm(t, INF, -1),
+}
+
+
+@pytest.mark.parametrize("name", list(INFERENCE_CASES))
+@pytest.mark.parametrize("context", [torch.inference_mode, torch.no_grad])
+def test_compiled_inference_mode_graphs_carry_the_nan_fix(monkeypatch, name, context):
+    """The review's case: ``torch.compile(lambda t: t.amax(-1))`` under ``inference_mode()`` on rows with NaN traced
+    ``{aten.amax.default}`` alone. The graph, run with Gaudi's NaN-dropping kernels and no hpu-ops in the dispatcher
+    (as the card's graph compiler runs it), now gives torch's values."""
+    from functorch.compile import make_boxed_func
+    from torch._dynamo.backends.common import aot_autograd
+
+    import test_extrema_cpu as T
+    from hpu_ops import extrema
+
+    f, x = INFERENCE_CASES[name], T.rows(n=8, dtype=torch.float32)
+    want = f(x)
+    graphs = []
+
+    def record(gm, example_inputs):
+        graphs.append(gm)
+        return make_boxed_func(gm.forward)
+
+    monkeypatch.setattr(extrema, "native", T.gaudi)
+    monkeypatch.setattr(extrema, "native_out", T.gaudi_out)
+    undo = extrema.install("cpu")
+    try:
+        torch._dynamo.reset()
+        with context():
+            torch.compile(f, backend=aot_autograd(fw_compiler=record), dynamic=False, fullgraph=True)(x)
+    finally:
+        undo()
+    assert len(graphs) == 1
+    with context(), _GaudiDropsNaN():
+        got = graphs[0](x)
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    T.same(got, want)
+
+
+# ---- (7) _Whole / _InfNorm were old-style Functions: torch.func transforms and forward-mode AD raised
+
+
+def _fwd(f, t):
+    import torch.autograd.forward_ad as fwAD
+
+    with fwAD.dual_level():
+        return fwAD.unpack_dual(f(fwAD.make_dual(t, torch.arange(1.0, t.numel() + 1).reshape(t.shape)))).tangent
+
+
+TRANSFORMS = {
+    "func.grad(t.max())": lambda t: torch.func.grad(lambda r: r.max())(t),
+    "func.grad(t.min())": lambda t: torch.func.grad(lambda r: r.min())(t),
+    "func.grad(t.median())": lambda t: torch.func.grad(lambda r: r.median())(t),
+    "func.grad(vector_norm(t, inf))": lambda t: torch.func.grad(lambda r: torch.linalg.vector_norm(r, INF))(t),
+    "func.grad(t.norm(inf))": lambda t: torch.func.grad(lambda r: r.norm(INF))(t),
+    "func.vjp(t.max())": lambda t: torch.func.vjp(lambda r: r.max(), t)[1](torch.tensor(1.0, dtype=t.dtype))[0],
+    "func.jacrev(t.max())": lambda t: torch.func.jacrev(lambda r: r.max())(t),
+    "vmap(grad(r.max()))": lambda t: torch.func.vmap(torch.func.grad(lambda r: r.max()))(t),
+    "vmap(grad(r.norm(-inf)))": lambda t: torch.func.vmap(torch.func.grad(lambda r: r.norm(-INF)))(t),
+    "forward AD max()": lambda t: _fwd(lambda d: d.max(), t.clone().requires_grad_()),
+    "forward AD median()": lambda t: _fwd(lambda d: d.median(), t.clone().requires_grad_()),
+    "forward AD vector_norm(inf, -1)": lambda t: _fwd(lambda d: torch.linalg.vector_norm(d, INF, -1),
+                                                      t.clone().requires_grad_()),
+    "forward AD norm(-inf, 0, keepdim)": lambda t: _fwd(lambda d: d.norm(-INF, 0, True), t.clone().requires_grad_()),
+    "forward AD vector_norm(inf) of all": lambda t: _fwd(lambda d: torch.linalg.vector_norm(d, INF),
+                                                         t.clone().requires_grad_()),
+}
+
+
+@pytest.mark.parametrize("name", list(TRANSFORMS))
+@pytest.mark.parametrize("nan", [True, False])
+def test_functorch_and_forward_ad_through_whole_reductions_and_inf_norms(card, name, nan):
+    """The review's input ``x = [[1., 3., 2.], [.5, 4., -1.]]``: ``torch.func.grad(lambda t: t.max())(x)`` raised
+    "must override the setup_context staticmethod", forward-mode AD "You must implement the jvp function". Now
+    torch's values, with and without a NaN."""
+    from test_extrema_cpu import _reference, same
+
+    x = torch.tensor([[1.0, 3.0, 2.0], [0.5, NAN if nan else 4.0, -1.0]], dtype=torch.float64)
+    f = TRANSFORMS[name]
+    same(f(x), _reference(f, x))
+
+
+# ---- (12) a CPU 0-d first operand placed the backend kernel's out on the CPU
+
+
+OUT_AS_TORCH = {aten.maximum.out: torch.maximum, aten.minimum.out: torch.minimum, aten.fmax.out: torch.fmax,
+                aten.fmin.out: torch.fmin, aten.clamp.Tensor_out: torch.clamp, aten.clamp_min.Tensor_out: torch.clamp_min,
+                aten.clamp_max.Tensor_out: torch.clamp_max}
+
+
+def _device_out(op, dev):
+    """A device's ``.out`` kernel as TensorIterator runs it: a CPU 0-d operand is taken as a scalar, ``out`` must be on
+    the device (Meta's own ``.out`` kernels are Python references that reject the CPU operand, unlike Gaudi's)."""
+
+    def kernel(*args, out, **kwargs):
+        r = OUT_AS_TORCH[op](*args, **kwargs)
+        if out.device != r.device:
+            raise RuntimeError(f"Expected out tensor to have device {r.device}, but got {out.device} instead")
+        return out.copy_(r)
+
+    return kernel
+
+
+@pytest.fixture
+def meta_kernels(monkeypatch):
+    """The backend layer's kernels for "meta" standing in for HPU, as the dispatcher calls them for a CPU 0-d operand
+    with a device tensor."""
+    from hpu_ops import extrema
+
+    monkeypatch.setattr(extrema, "native_out", _device_out)
+    return dict(extrema._backend_kernels("meta"))
+
+
+ZERO_D_FIRST = {  # the review's calls, as the dispatcher hands them to the backend kernels
+    "maximum(cpu0d, d)": (aten.maximum.default, lambda c, d: (c, d)),
+    "minimum(cpu0d, d)": (aten.minimum.default, lambda c, d: (c, d)),
+    "fmax(cpu0d, d)": (aten.fmax.default, lambda c, d: (c, d)), "fmin(cpu0d, d)": (aten.fmin.default, lambda c, d: (c, d)),
+    "clamp(cpu0d, min=d)": (aten.clamp.Tensor, lambda c, d: (c, d, None)),
+    "clamp(cpu0d, d, d)": (aten.clamp.Tensor, lambda c, d: (c, d, d)),
+    "clamp_min(cpu0d, d)": (aten.clamp_min.Tensor, lambda c, d: (c, d)),
+    "clamp_max(cpu0d, d)": (aten.clamp_max.Tensor, lambda c, d: (c, d)),
+    "clamp(d, min=cpu0d)": (aten.clamp.Tensor, lambda c, d: (d, c, None)),
+    "maximum(d, cpu0d)": (aten.maximum.default, lambda c, d: (d, c)),
+}
+
+
+@pytest.mark.parametrize("name", list(ZERO_D_FIRST))
+def test_a_cpu_0d_first_operand_gives_a_device_result(meta_kernels, name):
+    """``torch.maximum(torch.tensor(0.), x_hpu)``: torch dispatches it to the device, where the backend kernel
+    allocated ``out`` like the first operand, on the CPU ("Attempting to copy from device meta to device cpu")."""
+    op, args = ZERO_D_FIRST[name]
+    got = meta_kernels[op](*args(torch.tensor(0.5), torch.ones(3, device="meta")))
+    assert got.device.type == "meta" and got.shape == (3,) and got.dtype == torch.float32
+
+
+# ---- cut items: clamp_ of an integer tensor with float bounds, the opt-out cancelling the exact sort
+
+
+INPLACE = {
+    "arange(5).clamp_(min=full(1.5))": lambda: torch.arange(5).clamp_(min=torch.full((5,), 1.5)),
+    "arange(5, int32).clamp_(min=full(1.5))": lambda: torch.arange(5, dtype=torch.int32).clamp_(
+        min=torch.full((5,), 1.5)),
+    "arange(5).clamp_min_(full(1.5))": lambda: torch.arange(5).clamp_min_(torch.full((5,), 1.5)),
+    "arange(5).clamp_max_(full(2.5))": lambda: torch.arange(5).clamp_max_(torch.full((5,), 2.5)),
+    "arange(5).clamp_(min=tensor(1.5))": lambda: torch.arange(5).clamp_(min=torch.tensor(1.5)),
+}
+
+
+@pytest.mark.parametrize("name", list(INPLACE))
+@pytest.mark.parametrize("context", [torch.enable_grad, torch.no_grad, torch.inference_mode])
+def test_inplace_clamp_of_an_integer_tensor_with_float_bounds_raises_as_torch(card, name, context):
+    """torch raises "result type Float can't be cast to the desired output type Long"; the rewrite truncated."""
+    from test_extrema_cpu import _reference
+
+    with context():
+        with pytest.raises(RuntimeError, match="can't be cast to the desired output type") as want:
+            _reference(INPLACE[name])
+        with pytest.raises(RuntimeError, match="can't be cast to the desired output type") as got:
+            INPLACE[name]()
+    assert str(got.value) == str(want.value)
+
+
+def test_inplace_clamp_that_torch_allows_still_runs(card):
+    from test_extrema_cpu import _reference, same
+
+    for f in (lambda: torch.arange(5.0).clamp_(min=torch.full((5,), 1.5)),
+              lambda: torch.arange(5.0).clamp_(min=torch.full((5,), 1.5, dtype=torch.float64)),
+              lambda: torch.arange(5).clamp_(min=torch.full((5,), 2))):
+        same(f(), _reference(f))
+
+
+def test_nan_propagation_opt_out_keeps_the_exact_sort(monkeypatch):
+    """``HPU_OPS_NAN_PROPAGATION=0`` with ``HPU_OPS_EXACT_SORT=1``: the sort rewrite is registered (it was not) and
+    the max/min family stays native."""
+    from test_cpu import cpu_as_hpu
+    from hpu_ops import extrema
+
+    monkeypatch.setenv("HPU_OPS_NAN_PROPAGATION", "0")
+    monkeypatch.setenv("HPU_OPS_EXACT_SORT", "1")
+    x = torch.tensor([3.0, INF, 1.0, NAN, 2.0])
+    with cpu_as_hpu(extrema.install) as calls:
+        assert torch._C._dispatch_has_kernel_for_dispatch_key("aten::sort", "AutogradCPU")
+        torch.sort(x), x.amax()
+        assert not extrema._BACKEND
+    assert calls["sort"] and not calls["amax"]
+    assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::sort", "AutogradCPU")
+    monkeypatch.setenv("HPU_OPS_EXACT_SORT", "0")
+    with cpu_as_hpu(extrema.install) as calls:
+        torch.sort(x)
+        assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::sort", "AutogradCPU")
+    assert not calls

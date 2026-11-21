@@ -48,12 +48,13 @@ result. A NaN scalar bound of ``clamp``
 import functools
 import math
 import os
+import threading
 
 import torch
 from torch._C import DispatchKey
 from torch._subclasses.fake_tensor import is_fake
 
-from ._dispatch import chain, count, override_kernels, register_kernels
+from ._dispatch import chain, count, override_kernels, register_kernels, replace_py_kernels
 
 aten = torch.ops.aten
 NAN = float("nan")
@@ -154,6 +155,11 @@ def _grad_needed(*ts):
     return torch.is_grad_enabled() and any(isinstance(t, torch.Tensor) and t.requires_grad for t in ts)
 
 
+def _functorch():
+    """Whether a ``torch.func`` transform (grad, vjp, jacrev, vmap, ...) is active."""
+    return torch._C._functorch.peek_interpreter_stack() is not None
+
+
 # ---- amax / amin: NaN slices, torch's scale_grad_by_count gradient
 
 
@@ -197,19 +203,33 @@ def _amax_kernel(op, name):
 
 
 class _Whole(torch.autograd.Function):
+    """With a ``jvp`` (torch's evenly_read_jvp), so forward-mode AD runs through it. Under a ``torch.func`` transform
+    the kernels do not apply it (``_functorch``): a Function applied from inside a dispatcher kernel has no kernel
+    there (``custom_function_call``), so torch's autograd kernel runs over the fixed result."""
+
     @staticmethod
-    def forward(ctx, x, fn):
+    def forward(x, fn):
         r = fn(x)
         if not (_BACKEND.get(x.device.type) and _concrete(x)):  # else the backend kernel fixed it
             r = torch.where(torch.isnan(x).any(), NAN, r)
-        ctx.save_for_backward(x, r)
         return r
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        ctx.save_for_backward(inputs[0], output)
+        ctx.save_for_forward(inputs[0], output)
 
     @staticmethod
     def backward(ctx, grad):
         x, r = ctx.saved_tensors
         mask = (x == r) | (torch.isnan(x) & torch.isnan(r))  # a NaN result: split among the NaNs
         return mask * (grad / mask.sum()), None
+
+    @staticmethod
+    def jvp(ctx, tangent, _):
+        x, r = ctx.saved_tensors
+        mask = x == r  # torch's evenly_read_jvp: a NaN result matches nowhere, 0 / 0 gives NaN
+        return (mask * (tangent / mask.sum())).sum()
 
 
 def _whole_kernel(op, name):
@@ -218,7 +238,7 @@ def _whole_kernel(op, name):
         if not _floating(self):
             return fn(self)
         count(name)
-        if _grad_needed(self):
+        if _grad_needed(self) and not _functorch():
             return _Whole.apply(self, fn)
         r = fn(self)
         if _BACKEND.get(self.device.type) and _concrete(self):
@@ -302,15 +322,28 @@ def _inf(p):
     return p is not None and not isinstance(p, (complex, str)) and math.isinf(float(p))
 
 
+def _sign(x):
+    return (x > 0).to(x.dtype) - (x < 0).to(x.dtype)  # torch's sgn of a real NaN is 0 (Gaudi's is NaN)
+
+
 class _InfNorm(torch.autograd.Function):
+    """As ``_Whole``: torch's norm_backward and linalg_vector_norm_jvp at ``ord = +-inf``. Under a ``torch.func``
+    transform torch's own backward runs (on Gaudi, whose ``sign(NaN)`` is NaN, a NaN input's gradient is NaN there,
+    torch's 0)."""
+
     @staticmethod
-    def forward(ctx, x, dims, keepdim, fn):
+    def forward(x, dims, keepdim, fn):
         r = fn(x)
         if not (_BACKEND.get(x.device.type) and _concrete(x)):  # else the backend kernel fixed it
             r = torch.where(_nan_any(x, dims, keepdim), NAN, r)
-        ctx.save_for_backward(x, r)
-        ctx.dims, ctx.keepdim = dims, keepdim
         return r
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, dims, keepdim, _ = inputs
+        ctx.save_for_backward(x, output)
+        ctx.save_for_forward(x, output)
+        ctx.dims, ctx.keepdim = dims, keepdim
 
     @staticmethod
     def backward(ctx, grad):
@@ -318,13 +351,21 @@ class _InfNorm(torch.autograd.Function):
         g, r = _restore(grad, x, ctx.dims, ctx.keepdim), _restore(r, x, ctx.dims, ctx.keepdim)
         a = x.abs()
         mask = (a == r) | torch.isnan(a)
-        sign = (x > 0).to(x.dtype) - (x < 0).to(x.dtype)  # torch's sgn of a real NaN is 0
-        return sign * ((g / mask.sum(ctx.dims, keepdim=True)) * mask), None, None, None
+        return _sign(x) * ((g / mask.sum(ctx.dims, keepdim=True)) * mask), None, None, None
+
+    @staticmethod
+    def jvp(ctx, tangent, *_):
+        x, r = ctx.saved_tensors
+        r = _restore(r, x, ctx.dims, ctx.keepdim)
+        mask = ((x.abs() == r) | (torch.isnan(x) & torch.isnan(r))).to(x.dtype)
+        dims = ctx.dims if ctx.dims else list(range(x.dim()))
+        out = (_sign(x) * tangent * mask).sum(dims, keepdim=True) / mask.sum(dims, keepdim=True)
+        return out if ctx.keepdim or x.dim() == 0 else out.reshape(_reduced(x, dims, False))
 
 
 def _inf_norm(self, dim, keepdim, fn, name):
     dims = _dims(self, dim)
-    if _grad_needed(self):
+    if _grad_needed(self) and not _functorch():
         return _InfNorm.apply(self, dims, keepdim, fn)
     r = fn(self)
     if _BACKEND.get(self.device.type) and _concrete(self):
@@ -429,10 +470,24 @@ def _clamp_kernel(op, name, arity):
     return kernel
 
 
+def _check_inplace(self, r):
+    """torch's in-place rule: the result type must cast to ``self``'s (``arange(5).clamp_(min=full((5,), 1.5))``
+    raises, it does not truncate)."""
+    if not torch.can_cast(r.dtype, self.dtype):
+        raise RuntimeError(f"result type {_TYPE_NAMES.get(r.dtype, r.dtype)} can't be cast to the desired output "
+                           f"type {_TYPE_NAMES.get(self.dtype, self.dtype)}")
+    return r
+
+
+_TYPE_NAMES = {torch.float64: "Double", torch.float32: "Float", torch.float16: "Half", torch.bfloat16: "BFloat16",
+               torch.int64: "Long", torch.int32: "Int", torch.int16: "Short", torch.int8: "Char",
+               torch.uint8: "Byte", torch.bool: "Bool"}
+
+
 def _clamp_inplace_kernel(functional, name):
     def kernel(self, *bounds):
         r = functional(self, *bounds)  # the rewritten functional op (traced: the composite)
-        return self.copy_(r)
+        return self.copy_(_check_inplace(self, r))
 
     return kernel
 
@@ -699,8 +754,17 @@ def _b_aminmax(dev):
     return kernel
 
 
+def _on(dev, *ts):
+    """The first tensor of ``ts`` on the device ``dev`` (where the call was dispatched): a CPU 0-d first operand,
+    which torch takes with a device tensor (``maximum(torch.tensor(0.), x_hpu)``), must not place the result."""
+    for t in ts:
+        if isinstance(t, torch.Tensor) and t.device.type == dev:
+            return t
+    return ts[0]
+
+
 def _binary_out(out_op, dev, a, b):
-    out = _empty(torch.broadcast_shapes(a.shape, b.shape), torch.result_type(a, b), a)
+    out = _empty(torch.broadcast_shapes(a.shape, b.shape), torch.result_type(a, b), _on(dev, a, b))
     return native_out(out_op, dev)(a, b, out=out)
 
 
@@ -728,7 +792,8 @@ def _clamp_dtype(x, bounds):
 def _b_clamp(out_op, name, dev):
     def fixed(self, *bounds):
         ts = [b for b in bounds if isinstance(b, torch.Tensor)]
-        out = _empty(torch.broadcast_shapes(self.shape, *[b.shape for b in ts]), _clamp_dtype(self, bounds), self)
+        out = _empty(torch.broadcast_shapes(self.shape, *[b.shape for b in ts]), _clamp_dtype(self, bounds),
+                     _on(dev, self, *ts))
         native_out(out_op, dev)(self, *bounds, out=out)
         if not out.is_floating_point():
             return out
@@ -745,7 +810,7 @@ def _b_clamp_inplace(out_op, name, dev):
     functional = _b_clamp(out_op, name, dev)
 
     def kernel(self, *bounds):
-        return self.copy_(functional(self, *bounds))
+        return self.copy_(_check_inplace(self, functional(self, *bounds)))
 
     return kernel
 
@@ -856,6 +921,9 @@ OUTS = [  # (out overload, functional op, names of the out arguments)
 ]
 
 
+OUT_OPS = {out_op for out_op, _, _ in OUTS}
+
+
 def _copy_out(out, value):
     """torch's out= rules: the result cast to ``out``'s dtype where torch allows it, ``out`` resized to the result."""
     if not torch.can_cast(value.dtype, out.dtype):
@@ -879,6 +947,32 @@ def _out_kernel(out_op, functional, names):
     return kernel
 
 
+_TRACING = threading.local()  # .active while a composite below runs from _inference_traced
+
+
+def _inference_traced(device_type, composite, original):
+    """The op's ``CompositeImplicitAutograd`` Python kernel, which the tracers' ``decompose()`` call (functionalization
+    and the proxy mode, under every op) reads. Under ``torch.inference_mode()`` autograd's keys are excluded, so a
+    compiled graph never reaches the ``Autograd{}`` composites and its fake tensors never the backend layer: there
+    this runs the composite for ``device_type`` tensors, so the graph holds the NaN fix (as ``quantile``'s traced
+    kernel). Elsewhere, and for the composite's own native calls (the flag), ``NotImplemented``: the tracer records
+    the op as before. None of the family has a C++ ``CompositeImplicitAutograd`` kernel; ``original`` is called only
+    if torch gives it a Python one."""
+    has_original = not isinstance(original, functools.partial)
+
+    def kernel(*args, **kwargs):
+        if (getattr(_TRACING, "active", False) or not torch.is_inference_mode_enabled()
+                or _device(args) != device_type):
+            return original(*args, **kwargs) if has_original else NotImplemented
+        _TRACING.active = True
+        try:
+            return composite(*args, **kwargs)
+        finally:
+            _TRACING.active = False
+
+    return kernel
+
+
 def install(device_type, exact_sort=None):
     """NaN propagation of Gaudi's max/min ops on ``device_type``: the backend layer at its backend key, the traced
     composites (and the inf-norms, the whole-tensor reductions' backward, the out= overloads) at its autograd key.
@@ -887,10 +981,11 @@ def install(device_type, exact_sort=None):
     ``exact_sort`` (default: the environment's ``HPU_OPS_EXACT_SORT=1``): measured eager, it made the training steps
     of the SPD models up to 22% slower (hpu-ops' own eigh and SVD sort their eigenvalues; TensorCSPNet 205 to 250 ms),
     lazy within noise."""
-    if os.environ.get("HPU_OPS_NAN_PROPAGATION") == "0":  # opt-out, read when enable() runs (like HPU_OPS_TPC=0)
-        return lambda: None
+    nan = os.environ.get("HPU_OPS_NAN_PROPAGATION") != "0"  # opt-out, read when enable() runs (like HPU_OPS_TPC=0)
     if exact_sort is None:
         exact_sort = os.environ.get("HPU_OPS_EXACT_SORT") == "1"
+    if not (nan or exact_sort):
+        return lambda: None
     traced = []  # (op, composite): handed to torch's autograd kernel outside a tracer
     for op, name in ((aten.amax.default, "amax"), (aten.amin.default, "amin")):
         traced.append((op, _amax_kernel(op, name)))
@@ -921,16 +1016,23 @@ def install(device_type, exact_sort=None):
     k.append((aten.norm.ScalarOpt_dim, "Autograd{}", _norm_kernel(aten.norm.ScalarOpt_dim, "norm_inf", True)))
     k.append((aten.norm.Scalar, "Autograd{}", _norm_kernel(aten.norm.Scalar, "norm_inf", False)))
     k += [(out_op, "Autograd{}", _out_kernel(out_op, functional, names)) for out_op, functional, names in OUTS]
+    family = len(k)  # the sort family after these: its own switch, HPU_OPS_NAN_PROPAGATION=0 does not cancel it
     if exact_sort:
         k.append((aten.sort.default, "Autograd{}", _sort_kernel(aten.sort.default, "sort", False)))
         k.append((aten.sort.stable, "Autograd{}", _sort_kernel(aten.sort.stable, "sort", True)))
         k.append((aten.topk.default, "Autograd{}", _topk_kernel(aten.topk.default, "topk")))
         k.append((aten.kthvalue.default, "Autograd{}", _kthvalue_kernel(aten.kthvalue.default, "kthvalue")))
+    if not nan:
+        return register_kernels(device_type, k[family:])
     undo_backend = override_kernels(device_type, _backend_kernels(device_type))
     _BACKEND[device_type] = True
     undo_autograd = register_kernels(device_type, k)
+    composites = traced + [(op, kernel) for op, key, kernel in k[len(traced):family] if op not in OUT_OPS]
+    undo_traced = chain([replace_py_kernels(op, (DispatchKey.CompositeImplicitAutograd,),
+                                            functools.partial(_inference_traced, device_type, composite))
+                         for op, composite in composites])
 
     def undo_flag():
         _BACKEND.pop(device_type, None)
 
-    return chain([undo_backend, undo_flag, undo_autograd])
+    return chain([undo_backend, undo_flag, undo_autograd, undo_traced])
