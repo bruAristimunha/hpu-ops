@@ -98,3 +98,27 @@ def register_paired(device_type, groups):
             continue
         undos.append(register_kernels(device_type, group))
     return chain(undos)
+
+
+def override_kernels(device_type, kernels):
+    """Register ``kernels``, a list of ``(op, kernel)``, at ``device_type``'s backend key even where a kernel is
+    registered there (Habana's lazy kernels, the structured default in eager). The kernel replaced is not callable
+    any more: the kernels reach the device through other ops (``extrema`` through the ops' ``.out`` overloads). The
+    undo restores the kernels replaced (the dispatcher keeps them under the newer registration)."""
+    import warnings
+
+    library = torch.library.Library("aten", "IMPL")
+    key = device_type.upper()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*[Oo]verrid.*")
+        for op, kernel in kernels:
+            library.impl(op, kernel, key)
+    for op, _ in kernels:
+        op._dispatch_cache.clear()
+
+    def undo():
+        library._destroy()
+        for op, _ in kernels:
+            op._dispatch_cache.clear()
+
+    return undo

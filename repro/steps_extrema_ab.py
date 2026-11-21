@@ -1,0 +1,21 @@
+"""tests/linalg_steps.py --baseline with hpu_ops.extrema off, on without the sort family, or on (an A/B in one
+checkout, one arm per process; alternate the arms: repro/run_steps_extrema_ab.sh).
+    PT_HPU_LAZY_MODE=0|1 python3 repro/steps_extrema_ab.py off|nosort|on [linalg_steps args]
+off: HPU_OPS_NAN_PROPAGATION=0; nosort: the default (sort family off); on: also HPU_OPS_EXACT_SORT=1."""
+import os
+import pathlib
+import runpy
+import sys
+
+from hpu_ops import extrema
+
+arm = sys.argv.pop(1)
+if arm == "off":
+    os.environ["HPU_OPS_NAN_PROPAGATION"] = "0"  # the documented opt-out
+elif arm == "nosort":
+    extrema._sortable = lambda x: False
+elif arm == "on":
+    os.environ["HPU_OPS_EXACT_SORT"] = "1"  # the sort family on too
+print(f"ARM {arm}", flush=True)
+sys.argv = [sys.argv[0], "--baseline"] + sys.argv[1:]
+runpy.run_path(str(pathlib.Path(__file__).parents[1] / "tests" / "linalg_steps.py"), run_name="__main__")
