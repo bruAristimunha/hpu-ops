@@ -12,6 +12,7 @@ propagation included), not launches on the card.
 """
 import torch
 from torch._C import DispatchKey
+from torch._prims_common import suggest_memory_format
 
 from ._dispatch import count, replace_py_kernels, static
 
@@ -22,7 +23,8 @@ REDUCED = (torch.float16, torch.bfloat16)
 def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
     """``F.group_norm`` from views and reductions: the biased variance over each group's channels and inner dims, the
     statistics and affine terms in float32 for 16-bit inputs, rounded once to the input dtype (bfloat16 bit for bit
-    torch's CPU kernel; float16 within one ulp). The output is contiguous."""
+    torch's CPU kernel; float16 within one ulp), in the input's memory format. float32 inputs whose variance
+    overflows (about 1e19 and up) give a finite, wrong result where ATen's CPU kernel gives NaN."""
     dtype = torch.float32 if input.dtype in REDUCED else input.dtype
     with torch.autocast(input.device.type, enabled=False):
         x = input.reshape(input.shape[0], num_groups, -1).to(dtype)
@@ -33,7 +35,7 @@ def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
             out = out * weight.view(affine)
         if bias is not None:
             out = out + bias.view(affine)
-        return out.to(input.dtype)
+        return out.to(input.dtype).contiguous(memory_format=suggest_memory_format(input))
 
 
 def _takes(input, num_groups, weight, bias):
@@ -42,7 +44,13 @@ def _takes(input, num_groups, weight, bias):
         return False
     channels = input.shape[1]
     return (isinstance(num_groups, int) and num_groups > 0 and channels % num_groups == 0
-            and all(t is None or (t.dim() == 1 and t.numel() == channels) for t in (weight, bias)))
+            and all(t is None or (t.dim() == 1 and t.numel() == channels and _dtype_ok(input, t))
+                    for t in (weight, bias)))
+
+
+def _dtype_ok(input, param):
+    """The dtype pairs ATen's kernels take: the input's, or float32 parameters of a 16-bit input."""
+    return param.dtype == input.dtype or (input.dtype in REDUCED and param.dtype == torch.float32)
 
 
 def _group_norm_kernel(device_type, original):

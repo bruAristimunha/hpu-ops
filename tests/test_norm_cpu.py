@@ -194,3 +194,105 @@ def test_undo_restores_torchs_kernel():
 
 def test_enable_installs_it():
     assert norm.install_group_norm in hpu_ops.FIXES
+
+
+# ---- round 2 (adversarial)
+
+
+@pytest.mark.parametrize("fmt, shape", [(torch.channels_last, (3, 8, 4, 5)), (torch.channels_last_3d, (2, 4, 3, 2, 5))])
+def test_memory_format_is_kept(fmt, shape):
+    x = torch.randn(shape, dtype=torch.float64).to(memory_format=fmt)
+    f = lambda x: F.group_norm(x, 4)  # noqa: E731
+    with cpu_as_hpu(norm.install_group_norm) as calls:
+        got = compiled(f, [], dynamic=True)(x)
+    want = f(x)
+    assert calls["group_norm"] and got.stride() == want.stride()
+    assert_same([got], [want], tol=1e-12)
+
+
+@pytest.mark.parametrize("dtypes", [(torch.float32, torch.float64), (torch.float64, torch.float32),
+                                    (torch.float32, torch.bfloat16)])
+def test_mixed_dtypes_are_not_taken(dtypes):
+    """Input and weight dtypes ATen's kernel rejects reach it (and its error); the composite would promote."""
+    x, w = torch.randn(3, 4, 5, dtype=dtypes[0]), torch.ones(4, dtype=dtypes[1])
+    with cpu_as_hpu(norm.install_group_norm) as calls, pytest.raises(Exception, match="dtype"):
+        compiled(lambda x: F.group_norm(x, 2, w), [], dynamic=True)(x)
+    assert not calls["group_norm"]
+
+
+def test_16_bit_input_with_float32_parameters():
+    x = torch.randn(3, 4, 9).bfloat16()
+    w, b = torch.rand(4) + 0.5, torch.randn(4)
+    f = lambda x: F.group_norm(x, 2, w, b)  # noqa: E731
+    with cpu_as_hpu(norm.install_group_norm) as calls:
+        got = compiled(f, [], dynamic=True)(x)
+    assert calls["group_norm"] and got.dtype == torch.bfloat16
+    torch.testing.assert_close(got, f(x), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("view", [lambda x: x[1:], lambda x: x[..., 2:], lambda x: x[..., ::2],
+                                  lambda x: x[:1].expand(4, -1, -1)])
+def test_views_and_expanded_inputs(view):
+    base = torch.randn(5, 6, 12, dtype=torch.float64)
+    m = _module(3, 6)
+    f = lambda x: m(view(x))  # noqa: E731
+    with cpu_as_hpu(norm.install_group_norm) as calls:
+        got = train_step(compiled(f, [], dynamic=True), base)
+    assert_same(got, train_step(f, base), tol=1e-10)
+    assert calls["group_norm"]
+
+
+def test_weight_grad_only_with_frozen_input():
+    m = _module(2, 4)
+    x = torch.randn(3, 4, 7, dtype=torch.float64)
+    with cpu_as_hpu(norm.install_group_norm):
+        compiled(m, [], dynamic=True)(x).square().sum().backward()
+    got = [m.weight.grad.clone(), m.bias.grad.clone()]
+    m.zero_grad()
+    m(x).square().sum().backward()
+    assert_same(got, [m.weight.grad, m.bias.grad], tol=1e-10)
+
+
+def test_zero_length_inner_dim():
+    """An empty group: output and input gradient empty, as eager; the weight gradient is the sum over nothing, 0
+    (ATen's CPU kernel gives NaN there)."""
+    m = _module(4, 8)
+    x = torch.randn(3, 8, 0, dtype=torch.float64)
+    with cpu_as_hpu(norm.install_group_norm):
+        out, gx = train_step(compiled(m, [], dynamic=True), x)
+    assert out.shape == (3, 8, 0) and gx.shape == (3, 8, 0)
+    assert bool((m.weight.grad == 0).all())
+
+
+def test_symbolic_channels_train():
+    """A symbolic channel count trains (torch 2.6's native_group_norm_backward decomposition fails on it)."""
+    f = lambda x: F.group_norm(x, 2)  # noqa: E731
+    with cpu_as_hpu(norm.install_group_norm) as calls:
+        g = compiled(f, [], dynamic=True)
+        for c in (4, 6):
+            x = torch.randn(3, c, 5, dtype=torch.float64)
+            assert_same(train_step(g, x), train_step(f, x), tol=1e-10)
+    assert calls["group_norm"]
+
+
+@pytest.mark.parametrize("dynamic_dim", [0, 2])
+def test_with_every_fix_installed(dynamic_dim):
+    """conv, GroupNorm, linear upsampling and GroupNorm(C, C) with all of hpu-ops' rewrites, one dim dynamic."""
+    torch.manual_seed(0)
+    m = nn.Sequential(nn.Conv1d(3, 8, 3, padding=1), nn.GroupNorm(4, 8), nn.Upsample(scale_factor=2, mode="linear"),
+                      nn.GroupNorm(8, 8), nn.Conv1d(8, 2, 1)).double()
+    x = torch.randn(4, 3, 16, dtype=torch.float64)
+    torch._dynamo.reset()
+    undo = hpu_ops._install("cpu")
+    try:
+        hpu_ops._STATE["calls"].clear()
+        g = torch.compile(m, backend="aot_eager")
+        torch._dynamo.mark_dynamic(x, dynamic_dim)
+        g(x).square().sum().backward()
+        got = [p.grad.clone() for p in m.parameters()]
+        assert hpu_ops._STATE["calls"]["group_norm"]
+    finally:
+        undo()
+    m.zero_grad()
+    m(x).square().sum().backward()
+    assert_same(got, [p.grad for p in m.parameters()], tol=1e-10)
