@@ -63,6 +63,12 @@ def cases():
     A = torch.randn(22, 22, generator=g)
     A[:, -1] = A[:, 0]
     yield "rank_deficient_22", A
+    for sc in (1e-19, 1e-20, 1e-25):  # review of PR #44: duplicate rows whose squares flush
+        yield f"dup_tiny_rows_{sc:.0e}", torch.tensor([[1.0, 0, 0], [0, sc, sc], [0, sc, sc]])
+    for n in (16, 17, 32):
+        B = torch.randn(n, n, generator=g)
+        B[-3:] = torch.randn(3, 2, generator=g) @ torch.randn(2, n, generator=g) * 1e-21
+        yield f"rank2_block_1e-21_{n}", B
 
 
 rows, ok = [], True

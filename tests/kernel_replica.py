@@ -553,25 +553,29 @@ def jacobi_svd_kernel(A_t, compute_uv=True, full_u=False, legacy_tiny=False, leg
     else:
         done = (~(nrm_all < max(F32(1e-37), mul(F32(1e-5), np.max(nrm_all))))).astype(F32)
     diag = np.where(np.arange(32) < m, F32(1), F32(-1)).astype(F32)
-    for k in range(n):  # legacy: the done rows' room; now every row's (a zero row is 0)
-        uk = mul(w[k], done[k]) if legacy_cutoffs else np.where(np.arange(32) < m, w[k], F32(0)).astype(F32)
+    for k in range(n):  # the done rows' room
+        uk = mul(w[k], done[k])
         diag = sub(diag, mul(uk, uk))
-    for j in range(n):
-        dj = done[j]
-        cand1, cand2 = w[j].copy(), np.zeros(32, F32)
-        cand2[_first_max(diag)] = 1
-        for _ in range(2):
-            for k in range(n):
-                uk = mul(w[k], done[k])
-                d1, d2 = _red_add(mul(cand1, uk)), _red_add(mul(cand2, uk))
-                cand1, cand2 = sub(cand1, mul(d1, uk)), sub(cand2, mul(d2, uk))
-        cn1, cn2 = _red_add(mul(cand1, cand1)), _red_add(mul(cand2, cand2))
-        cand, cn = (cand1, cn1) if F32(0.25) < cn1 else (cand2, cn2)
-        cand = mul(cand, _rsqrt_newton(F32(1) if cn < F32(1e-36) else cn))
-        if dj == 0:
+    # legacy: one pass in row order; now the nonzero near-zero rows first, then the zero rows
+    order = [list(range(n))] if legacy_cutoffs else [[j for j in range(n) if nrm_all[j] != 0],
+                                                      [j for j in range(n) if nrm_all[j] == 0]]
+    for phase in order:
+        for j in phase:
+            if done[j] != 0:
+                continue
+            cand1, cand2 = w[j].copy(), np.zeros(32, F32)
+            cand2[_first_max(diag)] = 1
+            for _ in range(2):
+                for k in range(n):
+                    uk = mul(w[k], done[k])
+                    d1, d2 = _red_add(mul(cand1, uk)), _red_add(mul(cand2, uk))
+                    cand1, cand2 = sub(cand1, mul(d1, uk)), sub(cand2, mul(d2, uk))
+            cn1, cn2 = _red_add(mul(cand1, cand1)), _red_add(mul(cand2, cand2))
+            cand, cn = (cand1, cn1) if F32(0.25) < cn1 else (cand2, cn2)
+            cand = mul(cand, _rsqrt_newton(F32(1) if cn < F32(1e-36) else cn))
             w[j] = cand
             diag = sub(diag, mul(cand, cand))
-        done[j] = 1
+            done[j] = 1
     Ut = w[:, :m].copy()
     if full_u:
         rows = [np.where(np.arange(32) < m, w[j], F32(0)).astype(F32) for j in range(n)]

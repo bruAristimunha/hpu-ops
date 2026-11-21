@@ -1201,6 +1201,14 @@ def jacobi_svdvals(A, sort=True, flush=True):
     return internal_sort(S, -1, descending=True)[0] if sort else S
 
 
+def _ftz32(t):
+    """``t`` with float32 values below the smallest normal flushed to 0, as the card's arithmetic does (float64
+    unchanged)."""
+    if t.dtype != torch.float32:
+        return t
+    return torch.where(t.abs() < torch.finfo(torch.float32).tiny, 0.0, t)
+
+
 def svd_reference(A, compute_uv=True, full_matrices=False):
     """``jacobi_svd`` / ``jacobi_svdvals`` in plain torch, matching the kernel contract: the rows of A orthogonalized
     when m < n or A is square and contiguous (else the rows of A^T), 1/max|a| scaling (not of a zero matrix), the
@@ -1254,9 +1262,10 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
         for _ in range(sweeps):
             for ps, qs in rounds:
                 wp, wq = W[:, ps], W[:, qs]
-                alpha = (wp * wp).sum(-1)
-                beta = (wq * wq).sum(-1)
-                gamma = (wp * wq).sum(-1)
+                # the card flushes each product below float32's smallest normal (FTZ): so does the reference
+                alpha = _ftz32(wp * wp).sum(-1)
+                beta = _ftz32(wq * wq).sum(-1)
+                gamma = _ftz32(wp * wq).sum(-1)
                 # the kernel's JACOBI_CS: alpha, beta, gamma scaled by 1 / (alpha + beta), skip rules relative
                 ab = alpha + beta
                 scale = 1.0 / torch.where(ab == 0, 1.0, ab)

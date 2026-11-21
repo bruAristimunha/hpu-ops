@@ -193,16 +193,9 @@ def compiled(f, nodes, **options):
     def record(gm, example_inputs):
         nodes.extend(n for n in gm.graph.nodes if n.op == "call_function")
 
-        def run(*args):
-            # a device graph compiler runs the graph's ops itself, not through the dispatcher's BackendSelect layer
-            # (the topk key is not idempotent: a key's max would clamp to the float below)
-            saved = extrema._SELECT.pop("cpu", None)
-            try:
-                with torch._C._AutoDispatchBelowAutograd():
-                    return gm.forward(*args)
-            finally:
-                if saved is not None:
-                    extrema._SELECT["cpu"] = saved
+        def run(*args):  # through the dispatcher, BackendSelect included (as aot_eager runs a graph)
+            with torch._C._AutoDispatchBelowAutograd():
+                return gm.forward(*args)
 
         return make_boxed_func(run)
 
@@ -1010,3 +1003,57 @@ def test_select_key_order():
     x = torch.tensor([NAN, INF, info.max, 1.0, -0.0, -info.max, -INF])
     k = extrema._select_key(x)
     assert torch.isfinite(k).all() and bool((k[:-1] > k[1:])[[0, 1, 3, 5]].all())
+
+
+def test_quantile_keeps_its_inf_keys(card):
+    """Review of PR #44: internal_sort's nan_to_num tied quantile's +-inf keys with +-FLT_MAX: quantile([inf, max], 0)
+    gave NaN (torch 3.4028e38), nanquantile([nan, max, 1], .5) NaN (torch 1.7014e38). Quantile sorts its keys as is."""
+    from hpu_ops import quantile
+
+    M = torch.finfo(torch.float32).max
+    a, b = torch.tensor([INF, M]), torch.tensor([NAN, M, 1.0])
+    want = _reference(lambda: (torch.quantile(a, 0.0), torch.nanquantile(b, 0.5), torch.quantile(a, 1.0)))
+    with cpu_as_hpu(quantile.install):
+        got = (torch.quantile(a, 0.0), torch.nanquantile(b, 0.5), torch.quantile(a, 1.0))
+    same(got, want)
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_topk_kthvalue_compiled_through_the_dispatcher(card, backend):
+    """Review of PR #44: a compiled graph whose aten.topk re-enters BackendSelect applied the topk key twice
+    ([inf, 1, nan, max, 2] topk(2) -> [0, 2], torch [2, 0]). Traced, topk / kthvalue come from the exact sort."""
+    x = torch.tensor([[INF, 1.0, NAN, torch.finfo(torch.float32).max, 2.0]])
+    for f in (lambda t: torch.topk(t, 2, -1), lambda t: torch.kthvalue(t, 4, -1),
+              lambda t: torch.sort(t, -1, descending=True)):
+        want = _reference(f, x)
+        torch._dynamo.reset()
+        got = torch.compile(f, backend=backend)(x)
+        same(got.indices, want.indices)
+        same(got.values, want.values)
+
+
+@pytest.mark.parametrize("mode", ["grad", "no_grad", "inference"])
+def test_out_dtype_rules_and_resize_warning_as_torch(card, mode):
+    """Review of PR #44: out= with a float64 / bfloat16 values tensor, an int32 indices tensor must raise as torch;
+    a nonempty out of the wrong shape is resized with torch's warning."""
+    import contextlib
+    import warnings
+
+    x = rows(n=10, dtype=torch.float32)
+    ctx = {"grad": contextlib.nullcontext, "no_grad": torch.no_grad, "inference": torch.inference_mode}[mode]
+    bad = [lambda: torch.sort(x, -1, out=(torch.empty(0, dtype=torch.float64), torch.empty(0, dtype=torch.int64))),
+           lambda: torch.topk(x, 2, -1, out=(torch.empty(0), torch.empty(0, dtype=torch.int32))),
+           lambda: torch.kthvalue(x, 2, -1, out=(torch.empty(0, dtype=torch.bfloat16),
+                                                 torch.empty(0, dtype=torch.int64))),
+           lambda: torch.kthvalue(x, 2, -1, out=(torch.empty(0), torch.empty(0, dtype=torch.int32)))]
+    for f in bad:
+        with pytest.raises(RuntimeError) as want:
+            _reference(f)
+        with ctx():
+            with pytest.raises(RuntimeError, match=str(want.value).split(",")[0][:40].replace("(", ".")):
+                f()
+    with ctx(), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        v, i = torch.empty(5), torch.empty(5, dtype=torch.int64)
+        torch.topk(x, 2, -1, out=(v, i))
+    assert any("was resized" in str(w.message) for w in caught) and v.shape == (10, 2)

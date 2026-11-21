@@ -337,23 +337,32 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
         }
 
         // Vectorized 2-pass MGS completion for zero/near-zero rows, norms below 1e-5 of the largest (squared: 1e-10,
-        // as before), predicated by done_vec, no scalar sync: each keeps its own direction orthogonalized when that
-        // survives, else takes the basis vector of most remaining room (diag_p). diag_p starts with the room of every
-        // nonzero row, near-zero ones too (a zero row is 0 here): a zero row processed before a small row no longer
-        // takes the small row's direction (Codex review #6's [[1,0,0],[0,1e-10,0],[0,1e-10,0]] after its rotation).
+        // as before), predicated by done_vec, no scalar sync: each takes its own direction orthogonalized against the
+        // rows done so far when that survives, else the basis vector of most remaining room (diag_p, the done rows'
+        // room, as before). In two phases: the nonzero near-zero rows first, then the zero rows, so a zero row cannot
+        // take a small row's direction (Codex review #6's [[1,0,0],[0,1e-10,0],[0,1e-10,0]] after its rotation), and a
+        // row that duplicates an earlier one is re-orthogonalized against it (counting both in diag_p up front left no
+        // room: [[1,0,0],[0,s,s],[0,s,s]], s <= 1e-19, gave a zero row of Vh).
         float64 thresh = v_f32_max_b(1.0e-37f, v_f32_mul_b(1.0e-5f, max_nrm));
         float64 done_vec = v_f32_sel_less_f32_b(nrm_vec, thresh, 0.0f, 1.0f);
         done_vec = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, done_vec);
         float64 diag_p = v_f32_sel_less_u32_b(lane, (unsigned)m, 1.0f, -1.0f);
         for (int k = 0; k < n; k++)
         {
-            float64 uk = v_f32_sel_geq_u32_b(lane, (unsigned)m, 0.0f, uv[k]);
+            float64 dk = reduce_add_half32(v_f32_sel_eq_u32_b(lane_mod32, (unsigned)k, done_vec, 0.0f));
+            float64 uk = v_f32_sel_geq_u32_b(lane, (unsigned)m, 0.0f, v_f32_mul_b(uv[k], dk));
             diag_p = v_f32_sub_b(diag_p, v_f32_mul_b(uk, uk));
         }
 
+        for (int phase = 0; phase < 2; phase++)
+        {
         for (int j = 0; j < n; j++)
         {
             float64 dj = reduce_add_half32(v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, done_vec, 0.0f));
+            float64 nj = reduce_add_half32(v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, nrm_vec, 0.0f));
+            // active: not done, and nonzero in phase 0, zero in phase 1 (else 0, which leaves the row and diag_p)
+            float64 act = v_f32_sel_eq_f32_b(dj, 0.0f, 1.0f, 0.0f);
+            act = phase == 0 ? v_f32_sel_eq_f32_b(nj, 0.0f, 0.0f, act) : v_f32_sel_eq_f32_b(nj, 0.0f, act, 0.0f);
             float64 cand1 = v_f32_sel_geq_u32_b(lane, (unsigned)m, 0.0f, uv[j]);
             uint64 p_idx = v_f32_reduce_argmax(diag_p).v1;
             float64 cand2 = v_f32_sel_eq_u32_b(lane, p_idx, 1.0f, 0.0f);
@@ -378,12 +387,14 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
             cand = v_f32_mul_b(cand, rsqrt_newton(safe_cn));
 
             float64 cur_uv = uv[j];
-            float64 new_w = v_f32_sel_eq_f32_b(dj, 0.0f, cand, cur_uv);
+            float64 new_w = v_f32_sel_eq_f32_b(act, 1.0f, cand, cur_uv);
             uv[j] = v_f32_sel_geq_u32_b(lane, 32u, cur_uv, new_w);
 
-            float64 new_uk = v_f32_sel_eq_f32_b(dj, 0.0f, cand, 0.0f);
+            float64 new_uk = v_f32_sel_eq_f32_b(act, 1.0f, cand, 0.0f);
             diag_p = v_f32_sub_b(diag_p, v_f32_mul_b(new_uk, new_uk));
-            done_vec = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, 1.0f, done_vec);
+            done_vec = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, v_f32_sel_eq_f32_b(act, 1.0f, 1.0f, done_vec),
+                                          done_vec);
+        }
         }
 
         int5 cs = {0, bt, 0, 0, 0};

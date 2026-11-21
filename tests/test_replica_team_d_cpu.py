@@ -270,3 +270,28 @@ def test_codex6_through_the_public_routes(monkeypatch):
         for i, g in enumerate(got):
             w = want[(k, i)]
             assert torch.equal(g, w) if k == "rank" else torch.allclose(g, w, rtol=1e-6, atol=0), (k, i, g, w)
+
+
+@pytest.mark.parametrize("s", [1e-10, 1e-19, 1e-20, 1e-25])
+def test_codex6_round2_duplicate_tiny_rows_stay_orthonormal(s):
+    """Review of PR #44: [[1,0,0],[0,s,s],[0,s,s]] with s <= 1e-19 (squares flush, the pair never rotates): counting
+    both duplicate rows' room up front left none, and Vh got an all-zero row (orth error 1.0). The two-phase
+    completion re-orthogonalizes the duplicate against the first; the reference agrees (it flushes the products)."""
+    a = np.array([[1, 0, 0], [0, s, s], [0, s, s]], np.float32)
+    U, S, Vh = R.jacobi_svd(a)
+    assert np.abs(U.T @ U - np.eye(3)).max() < 1e-6 and np.abs(Vh @ Vh.T - np.eye(3)).max() < 1e-6
+    # below s ~ 1e-19 the pair cannot rotate (its squares flush), so S keeps [.., s sqrt2, s sqrt2] for torch's
+    # [.., 2 s, 0]: an error of the order of s, far below float32's resolution of max|A| = 1 (main: [0, 0])
+    assert np.abs((U * S) @ Vh - a).max() <= (1e-6 * s if s >= 1e-18 else 3 * s)
+    Ur, Sr, Vr = (t[0].numpy() for t in tpc.svd_reference(torch.tensor(a)[None]))
+    assert np.allclose(Sr, S, rtol=1e-6, atol=0)
+    assert np.abs(Ur.T @ Ur - np.eye(3)).max() < 1e-6 and np.abs(Vr @ Vr.T - np.eye(3)).max() < 1e-6
+
+
+@pytest.mark.parametrize("n", [16, 17, 32])
+def test_codex6_round2_rank2_block_scaled_1e21(n):
+    g = np.random.default_rng(n)
+    a = g.standard_normal((n, n)).astype(np.float32)
+    a[-3:] = (g.standard_normal((3, 2)) @ g.standard_normal((2, n)) * 1e-21).astype(np.float32)
+    U, S, Vh = R.jacobi_svd(a)
+    assert np.abs(U.T @ U - np.eye(n)).max() < 1e-4 and np.abs(Vh @ Vh.T - np.eye(n)).max() < 1e-4
