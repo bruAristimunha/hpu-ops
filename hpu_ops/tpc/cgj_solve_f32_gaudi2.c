@@ -103,16 +103,18 @@ static inline float64 lut_free_recip(float64 x)
 }
 
 // 1/sqrt(x) for x >= 0 in the normal range (here |z|^2 of a number scaled into [1, 2), so x in [1, 8), or 0): the
-// bit-level guess and three Newton steps; x = 0 gives 1 (so x * result = 0; the guess for 0 would overflow).
-static inline float64 lut_free_rsqrt(float64 x)
+// bit-level guess, two Newton steps, then one in residual form y += y/2 (1 - (x y) y), as rsqrt_fine of the Jacobi
+// kernels. Unbiased: rsqrt(1) = 1 exactly (three plain Newton steps gave 0.99999994, an ulp lost per pivot in det).
+// x = 0 gives 1 (so x * result = 0; the guess for 0 would overflow).
+static inline float64 rsqrt_fine(float64 x)
 {
     x = v_f32_sel_eq_f32_b(x, 0.0f, 1.0f, x);
     float64 y = as_float64(0x5F375A86u - v_u32_shr_b(as_uint64(x), 1));
     float64 hx = v_f32_mul_b(x, -0.5f);
     y = v_f32_mul_b(y, v_f32_mac_b(hx, v_f32_mul_b(y, y), 1.5f));
     y = v_f32_mul_b(y, v_f32_mac_b(hx, v_f32_mul_b(y, y), 1.5f));
-    y = v_f32_mul_b(y, v_f32_mac_b(hx, v_f32_mul_b(y, y), 1.5f));
-    return y;
+    float64 e = v_f32_mac_b(v_f32_sub_b(0.0f, v_f32_mul_b(x, y)), y, 1.0f);
+    return v_f32_mac_b(v_f32_mul_b(y, 0.5f), e, y);
 }
 
 // The power of two t = 2^(127 - e) for the biased exponent e of m >= 0 (m < 2^64 here): m * t in [1, 2); t = 1 for
@@ -286,11 +288,23 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
         float64 rt = v_f32_mul_b(lut_free_recip(den), t);
         float64 invr = v_f32_mul_b(tr, rt);
         float64 invi = v_f32_mul_b(v_f32_sub_b(0.0f, ti), rt);
-        float64 rs = lut_free_rsqrt(den);
-        float64 absd = v_f32_mul_b(v_f32_mul_b(v_f32_mul_b(den, rs), inv_t),
+        float64 rs = rsqrt_fine(den);
+        // |t| = den * rsqrt(den), then one residual step sq += rs/2 ((a - sq)(a + sq) + b^2), a = max(|tr|, |ti|),
+        // b = min: the residual is taken against the components, not the rounded den, so |t| = |tr| exactly when ti = 0
+        float64 ta = v_f32_abs_b(tr);
+        float64 tb = v_f32_abs_b(ti);
+        float64 tmax = v_f32_max_b(ta, tb);
+        float64 tmin = v_f32_min_b(ta, tb);
+        float64 sq = v_f32_mul_b(den, rs);
+        float64 res = v_f32_mac_b(tmin, tmin, v_f32_mul_b(v_f32_sub_b(tmax, sq), v_f32_add_b(tmax, sq)));
+        sq = v_f32_mac_b(v_f32_mul_b(rs, 0.5f), res, sq);
+        float64 absd = v_f32_mul_b(v_f32_mul_b(sq, inv_t),
                                    v_f32_sel_eq_f32_b(dscale, 1.0f, 1.0f, 0x1p64f));
+        // u = t / |t|: q = t rs, then one division residual step q += rs (t - q |t|) (u = 1 exactly for a positive pivot)
         float64 ur = v_f32_mul_b(tr, rs);
         float64 ui = v_f32_mul_b(ti, rs);
+        ur = v_f32_mac_b(v_f32_mac_b(v_f32_sub_b(0.0f, ur), sq, tr), rs, ur);
+        ui = v_f32_mac_b(v_f32_mac_b(v_f32_sub_b(0.0f, ui), sq, ti), rs, ui);
         for (int i = 0; i < n; i++)
         {
             float64 s_i = lane_bcast(dscale, i);
@@ -318,7 +332,7 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
             phr = nr;
             phi = ni;
         }
-        float64 pn = lut_free_rsqrt(v_f32_mac_b(phi, phi, v_f32_mul_b(phr, phr)));
+        float64 pn = rsqrt_fine(v_f32_mac_b(phi, phi, v_f32_mul_b(phr, phr)));
         phr = v_f32_mul_b(phr, pn);
         phi = v_f32_mul_b(phi, pn);
 

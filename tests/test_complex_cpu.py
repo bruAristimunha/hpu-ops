@@ -163,3 +163,46 @@ def test_replica_ftz_and_huge():
         _, lad = cl.slogdet(pairs(A))
         _, l128 = torch.linalg.slogdet(A.to(C128))
         assert abs(float(lad) - float(l128)) < 1e-4
+
+
+@pytest.mark.parametrize("n", [1, 2, 5, 16, 31, 32])
+def test_exact_identity(n):
+    """slogdet(I) = (1, 0) and det(I) = 1 exactly (a biased rsqrt lost an ulp per pivot: 0.9999981 at n = 32)."""
+    P = pairs(torch.eye(n, dtype=C64)[None].expand(2, n, n))
+    sign, lad = cl.slogdet(P)
+    assert sign.tolist() == [[1.0, 0.0]] * 2 and lad.tolist() == [0.0] * 2
+    assert cl.det(P).tolist() == [[1.0, 0.0]] * 2
+    X, D, S = cl.cgj_inv(P)
+    assert torch.equal(X, P) and torch.equal(D[:, 2], torch.ones(2, n)) and S[:, :2].tolist() == [[1.0, 0.0]] * 2
+
+
+@pytest.mark.parametrize("perm", [[0], [1, 0], [1, 0, 2, 3, 4], [2, 0, 1, 5, 3, 4], list(range(31, -1, -1))])
+@pytest.mark.parametrize("unit", [1, 1j, -1j, -1])
+def test_exact_unit_times_permutation(perm, unit):
+    """det(u P) = sgn(P) u^n exactly, |sign| = 1 exactly, logabsdet = 0 exactly."""
+    Z = (unit * torch.eye(len(perm))[perm]).to(C64)[None]
+    ref = torch.view_as_real(torch.linalg.det(Z.to(C128))).float()
+    sign, lad = cl.slogdet(pairs(Z))
+    assert torch.equal(sign, ref) and lad.tolist() == [0.0]
+    assert float(sign.square().sum()) == 1.0
+    assert torch.equal(cl.det(pairs(Z)), ref)
+
+
+def test_exact_small_integer():
+    """Small-integer matrices whose elimination is exact in float32: det exact, and equal to torch's complex64 det."""
+    M = torch.tensor([[[2, 1, 0], [1, 1, 0], [0, 0, 1]], [[2, 0, 0], [0, 3, 0], [0, 0, -1]],
+                      [[1, 2, 3], [0, 4, 5], [0, 0, 6]], [[0, 0, 2], [0, 3, 1], [4, 1, 1]]], dtype=C64)
+    M = torch.cat([M, 1j * M[:2], torch.diag_embed(torch.tensor([[2j, -3, 1j, 5]], dtype=C64))[:, :3, :3]])
+    exact = torch.view_as_real(torch.linalg.det(M.to(C128))).round().float()
+    d = cl.det(pairs(M))
+    assert torch.equal(d, exact), (d, exact)
+    assert torch.equal(d, torch.view_as_real(torch.linalg.det(M)))
+    sign, lad = cl.slogdet(pairs(M))
+    assert torch.equal(sign.square().sum(-1), torch.ones(len(M)))
+    assert torch.equal(lad, torch.linalg.slogdet(M.to(C128))[1].float())
+
+
+def test_sign_unit_modulus_random():
+    sign, _ = cl.slogdet(pairs(crandn(64, 12, 12, seed=40)))
+    assert float((sign.double().square().sum(-1).sqrt() - 1).abs().max()) <= 2 ** -23
+

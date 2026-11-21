@@ -15,7 +15,9 @@ the input's layout; nothing runs on the CPU.
   m, n <= ``COMPLEX_MAXN``.
 - ``solve``, ``inv``, ``slogdet``, ``det`` on top of the Gauss-Jordan kernels. The phase of the determinant is computed in the kernel as
   (-1)^swaps * prod(u_kk / |u_kk|) (torch's ``lu_det_P`` times ``sgn(diag U)``, JAX's ``_slogdet_lu``), each factor
-  normalized, the product renormalized once; logabsdet = sum(log |u_kk|) (one log and one sum on the card).
+  normalized, the product renormalized once; logabsdet = sum(log |u_kk|) (one log and one sum on the card), det =
+  phase * prod |u_kk|. The rsqrt is unbiased and |u_kk| gets one residual step, so exact inputs (the identity, i times
+  a permutation, small integers) give an exact sign, logabsdet and det.
 
 Semantics: torch's on the finite range. A singular matrix (an exactly zero pivot) gives sign 0 and logabsdet -inf,
 a zero row of X for that pivot and ``info`` = 1 + its index; any NaN or infinity in A (or B) gives NaN everywhere
@@ -181,9 +183,15 @@ def slogdet(A, layout="pairs"):
 
 
 def det(A, layout="pairs"):
-    """``torch.linalg.det`` for complex A as a ``(..., 2)`` pair: phase * exp(logabsdet)."""
-    sign, logabsdet = slogdet(A, layout)
-    return sign * logabsdet.exp()[..., None]
+    """``torch.linalg.det`` for complex A as a ``(..., 2)`` pair: phase * prod |u_kk| (as torch's product of U's
+    diagonal: exact for exact pivots, where exp(sum log |u_kk|) is not; it over/underflows where torch's does)."""
+    PA = as_pairs(A, layout)
+    _square(PA)
+    batch = PA.shape[:-3]
+    if _empty(batch):
+        return PA.new_zeros(*batch, 2)
+    _, D, S = _call(_cgj_inv_op(), _planar(PA, batch))
+    return (S[:, :2] * D[:, 2, :].prod(-1)[:, None]).reshape(*batch, 2)
 
 
 def cgj_reference(A, B=None, layout="pairs"):

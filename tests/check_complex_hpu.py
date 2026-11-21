@@ -1,7 +1,7 @@
 """On a Gaudi card: the complex64 TPC kernels of ``hpu_ops.tpc.complex_linalg`` against their float32 replicas
 (``kernel_replica``) bit for bit, their error against complex128 next to torch's complex64 CPU error, CPU fallback
 counts, and the per-call time against torch's CPU complex route (copy to the host, the complex64 op, copy back).
-    PT_HPU_LAZY_MODE=0|1 python3 tests/check_complex_hpu.py [gj|eigh|svd|all] [--time]
+    PT_HPU_LAZY_MODE=0|1 python3 tests/check_complex_hpu.py [gj|eigh|svd|adv|all] [--time]
 One ``RESULT {json}`` per case; the last line is ``SUMMARY ok`` or ``SUMMARY MISMATCH``."""
 import json
 import math
@@ -86,6 +86,16 @@ def gj_cases():
     yield "nonfinite", A
     yield "huge_3e37", crandn(2, 6, 6, seed=8) * 3e37
     yield "tiny_1e-30", crandn(2, 6, 6, seed=9) * 1e-30
+    yield "eye_32", torch.eye(32, dtype=C64)[None]
+    yield "i_perm_6", (1j * torch.eye(6)[[2, 0, 1, 5, 3, 4]]).to(C64)[None]
+    yield "int_exact", exact_int_matrices()
+
+
+def exact_int_matrices():
+    """Small-integer matrices whose elimination is exact in float32, and their determinants."""
+    M = torch.tensor([[[2, 1, 0], [1, 1, 0], [0, 0, 1]], [[2, 0, 0], [0, 3, 0], [0, 0, -1]],
+                      [[1, 2, 3], [0, 4, 5], [0, 0, 6]], [[0, 0, 2], [0, 3, 1], [4, 1, 1]]], dtype=C64)
+    return M
 
 
 def planar(Z):
@@ -292,6 +302,36 @@ def run_svd(emit, time_it):
         emit(row)
 
 
+def run_exact(emit, time_it):
+    """Exact inputs give exact results on the card: slogdet(I) = (1, 0), det(i P) = sgn(P) i^n, det of small-integer
+    matrices with exact elimination; and a NaN in a later 32-column chunk of B poisons X, D and S of its member."""
+    from hpu_ops.tpc import complex_linalg as cl
+    for n in (1, 2, 7, 32):
+        sign, lad = (t.cpu() for t in cl.slogdet(pairs(torch.eye(n, dtype=C64)[None]).to("hpu")))
+        d = cl.det(pairs(torch.eye(n, dtype=C64)[None]).to("hpu")).cpu()
+        ok = sign.tolist() == [[1.0, 0.0]] and lad.tolist() == [0.0] and d.tolist() == [[1.0, 0.0]]
+        emit({"op": "exact", "case": f"eye_{n}", "sign": sign.tolist(), "logabsdet": lad.tolist(), "ok": ok})
+    for perm in ([0], [1, 0], [1, 0, 2, 3, 4], [2, 0, 1, 5, 3, 4], list(range(31, -1, -1))):
+        P = torch.eye(len(perm))[perm]
+        Z = (1j * P).to(C64)[None]
+        sign, lad = (t.cpu() for t in cl.slogdet(pairs(Z).to("hpu")))
+        d = cl.det(pairs(Z).to("hpu")).cpu()
+        ref = torch.view_as_real(torch.linalg.det(Z.to(C128))).float()
+        ok = torch.equal(d, ref) and torch.equal(sign, ref) and lad.tolist() == [0.0]
+        emit({"op": "exact", "case": f"i_perm_{len(perm)}", "det": d.tolist(), "ref": ref.tolist(), "ok": ok})
+    M = exact_int_matrices()
+    d = cl.det(pairs(M).to("hpu")).cpu()
+    ref = torch.view_as_real(torch.linalg.det(M.to(C128))).round().float()
+    emit({"op": "exact", "case": "int_det", "det": d.tolist(), "ref": ref.tolist(),
+          "ok": torch.equal(d, ref) and torch.equal(d, torch.view_as_real(torch.linalg.det(M)))})
+    A, B = crandn(3, 6, 6, seed=70), crandn(3, 6, 70, seed=71)
+    B[1, 2, 50] = complex(math.nan, 0)  # in the second 32-column chunk
+    X, D, S = (t.cpu() for t in cl.cgj_solve(pairs(A).to("hpu"), pairs(B).to("hpu")))
+    ok = (X[1].isnan().all() and D[1].isnan().all() and S[1].isnan().all() and X[[0, 2]].isfinite().all()
+          and D[[0, 2]].isfinite().all() and S[[0, 2]].isfinite().all())
+    emit({"op": "exact", "case": "nan_in_later_chunk", "ok": bool(ok)})
+
+
 def run_adv(emit, time_it):
     """Views, unbatched, empty and odd batches, and the same call twice (lazy: two graphs in a row), on the card
     against the same call on contiguous inputs (bit equality) or the expected shapes."""
@@ -339,6 +379,7 @@ def main():
 
     if which in ("gj", "all"):
         run_gj(emit, time_it)
+        run_exact(emit, time_it)
     if which in ("eigh", "all"):
         run_eigh(emit, time_it)
     if which in ("svd", "all"):

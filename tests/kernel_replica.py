@@ -610,7 +610,7 @@ def householder_product(A, tau, legacy=False):
 
 
 # ---- complex64 kernels (planar re/im rows): cgj_solve / cgj_inv ----------------------------------------------------
-# LUT-free throughout (lut_free_recip, a bit-guess + 3 Newton rsqrt, power-of-two scaling), so these replays are
+# LUT-free throughout (lut_free_recip, rsqrt_fine, power-of-two scaling), so these replays are
 # meant to be bit-identical to the card.
 
 
@@ -631,16 +631,6 @@ def _pow2_unscale(m):
 
 def _big_scale(m):
     return np.where((_u32(m) & 0x7FFFFFFF) >= 0x5F800000, F32(2.0 ** -64), F32(1)).astype(F32)
-
-
-def lut_free_rsqrt(x):
-    """``lut_free_rsqrt``: 0 -> 1, then the guess 0x5F375A86 - bits / 2 and three Newton steps y (1.5 - x/2 y^2)."""
-    x = np.where(np.asarray(x, F32) == 0, F32(1), np.asarray(x, F32)).astype(F32)
-    y = _f32((0x5F375A86 - (_u32(x) >> 1)) & 0xFFFFFFFF)
-    hx = mul(x, F32(-0.5))
-    for _ in range(3):
-        y = mul(y, mac(hx, mul(y, y), F32(1.5)))
-    return y
 
 
 def rsqrt_fine(x):
@@ -729,9 +719,18 @@ def _cgj_solve(A, B=None):
     den = mac(ti, ti, mul(tr, tr))
     rt = mul(recip(den, zero_to_inf=False), t)
     invr, invi = mul(tr, rt), mul(sub(F32(0), ti), rt)
-    rs = lut_free_rsqrt(den)
-    absd = mul(mul(mul(den, rs), inv_t), np.where(dscale == 1, F32(1), F32(2.0 ** 64)).astype(F32))
+    rs = rsqrt_fine(den)
+    # |t| = den * rsqrt(den), then one residual step sq += rs/2 ((a - sq)(a + sq) + b^2), a = max(|tr|, |ti|),
+    # b = min: the residual is taken against the components, not the rounded den, so |t| = |tr| exactly when ti = 0
+    ta, tb = np.abs(tr).astype(F32), np.abs(ti).astype(F32)
+    ta, tb = np.maximum(ta, tb).astype(F32), np.minimum(ta, tb).astype(F32)
+    sq = mul(den, rs)
+    sq = mac(mul(rs, F32(0.5)), mac(tb, tb, mul(sub(ta, sq), add(ta, sq))), sq)
+    absd = mul(mul(sq, inv_t), np.where(dscale == 1, F32(1), F32(2.0 ** 64)).astype(F32))
+    # u = t / |t|: q = t rs, then one division residual step q += rs (t - q |t|) (u = 1 exactly for a positive pivot)
     ur, ui = mul(tr, rs), mul(ti, rs)
+    ur = mac(mac(sub(F32(0), ur), sq, tr), rs, ur)
+    ui = mac(mac(sub(F32(0), ui), sq, ti), rs, ui)
     X = np.zeros((2 * n, m), F32)
     for i in range(n):
         bsr, bsi = mul(br[i], dscale[i]), mul(bi[i], dscale[i])
@@ -740,7 +739,7 @@ def _cgj_solve(A, B=None):
     phr, phi = F32(sv), F32(0)
     for k in range(n):
         phr, phi = mac(sub(F32(0), phi), ui[k], mul(phr, ur[k])), mac(phi, ur[k], mul(phr, ui[k]))
-    pn = lut_free_rsqrt(mac(phi, phi, mul(phr, phr)))
+    pn = rsqrt_fine(mac(phi, phi, mul(phr, phr)))
     phr, phi = mul(phr, pn), mul(phi, pn)
     return X, np.stack([dvr, dvi, absd]), np.array([phr, phi, info, sv], F32)
 
@@ -760,7 +759,7 @@ def cgj_op(identity=False):
 
 # ---- complex64 Jacobi: jacobi_ceigh (two passes) and jacobi_csvd ---------------------------------------------------
 # Planar rows, two matrices per vector (lanes 0-31 and 32-63) on the card; one matrix at a time here (the halves never
-# mix: every reduction is the 32-lane butterfly ``_red_add``). LUT-free: lut_free_rsqrt / lut_free_recip.
+# mix: every reduction is the 32-lane butterfly ``_red_add``). LUT-free: rsqrt_fine / lut_free_recip.
 
 
 def _rr_rounds(n):
