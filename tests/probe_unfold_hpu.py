@@ -1,8 +1,10 @@
-"""On a Gaudi card: ``Tensor.unfold`` with hpu_ops' rewrite, adversarial cases, eager and lazy.
+"""On a Gaudi card: ``Tensor.unfold`` and its gradient ``unfold_backward`` with hpu_ops' rewrites, adversarial cases,
+eager and lazy.
     PT_HPU_LAZY_MODE=0|1 python3 tests/probe_unfold_hpu.py
 Each case: values against the CPU, sizes/strides/offset against the CPU's view, a write into the input seen through
 the view, input gradient (and second order) against the CPU, and the bridge's CPU-fallback ops it made. Prints one
-``CASE`` line per case and a ``SUMMARY``; exits 1 if any case is wrong or ``aten::unfold`` fell back."""
+``CASE`` line per case and a ``SUMMARY``; exits 1 if any case is wrong or ``aten::unfold`` or ``aten::unfold_backward``
+fell back (or the compiled backward did, eager mode)."""
 import os
 import sys
 
@@ -109,6 +111,47 @@ def write_case(name, write, card_want=None):
     return row
 
 
+OP_CASES = [  # aten.unfold_backward called directly: dtypes autograd never passes, buffers > 5-D, both skews
+    (dtype, shape, dim, size, step, transposed)
+    for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.bool)
+    for shape, dim, size, step, transposed in [
+        ((16, 52, 64), 1, 8, 1, False), ((16, 64), -1, 4, 4, False), ((4, 12), -1, 3, 5, False),
+        ((2, 40, 3), 1, 30, 1, False), ((2, 3, 10, 2, 3, 2), 2, 3, 3, False), ((2, 3, 9, 2, 3, 2), -4, 5, 2, True)]
+    if dtype in (torch.float32, torch.int32, torch.bool) or shape == (16, 52, 64)
+]
+
+
+def op_case(dtype, shape, dim, size, step, transposed):
+    """``aten.unfold_backward`` on the card against the CPU's (float64 for floats: 16-bit within 2e-2), fallbacks."""
+    f0 = fb()
+    row = {}
+    torch.manual_seed(3)
+    windows = torch.empty(shape).unfold(dim, size, step).shape
+    g = torch.randn(windows, dtype=torch.float64)
+    g = g > 0 if dtype == torch.bool else (g * 5).round().to(dtype) if dtype == torch.int32 else g.to(dtype)
+    try:
+        gh = g.to("hpu")
+        if transposed:
+            g, gh = g.mT.contiguous().mT, gh.mT.contiguous().mT
+        want = torch.ops.aten.unfold_backward(g.double() if g.is_floating_point() else g, list(shape), dim, size, step)
+        got = torch.ops.aten.unfold_backward(gh, list(shape), dim, size, step)
+        mark()
+        row["dtype"] = got.dtype == dtype
+        if dtype.is_floating_point:
+            row["values"] = close(got, want, "values16" if dtype in (torch.float16, torch.bfloat16) else "values")
+        else:
+            row["values"] = got.shape == want.shape and torch.equal(got.cpu(), want)
+    except Exception as e:  # noqa: BLE001
+        row["error"] = repr(e)[:200]
+    mark()
+    d = fb()
+    row["fallbacks"] = {k: d[k] - f0.get(k, 0) for k in d if d[k] - f0.get(k, 0)}
+    print("CASE op", str(dtype)[6:], shape, dim, size, step, "transposed" * transposed, row, "rel_err",
+          dict(ERRORS), flush=True)
+    ERRORS.clear()
+    return row
+
+
 def make_on_hpu(x, name):
     """The same layout on the card: the CPU input's base moved, then the same view of it."""
     base = x._base if x._base is not None else x
@@ -137,8 +180,18 @@ def main():
         ("twice (conv2d patches)", lambda: b.clone(), lambda t: t.unfold(1, 3, 1).unfold(2, 8, 4)),
         ("bfloat16", lambda: b.clone().bfloat16(), lambda t: t.unfold(2, 4, 3)),
         ("int32", lambda: torch.arange(40, dtype=torch.int32).reshape(4, 10), lambda t: t.unfold(1, 3, 2)),
+        # #43's four shapes (unfold_backward), and gaps
+        ("#43 (16,52,64) 1,8,1", lambda: torch.randn(16, 52, 64), lambda t: t.unfold(1, 8, 1)),
+        ("#43 (16,52,64) 1,4,4", lambda: torch.randn(16, 52, 64), lambda t: t.unfold(1, 4, 4)),
+        ("#43 (16,8,64) -1,4,2", lambda: torch.randn(16, 8, 64), lambda t: t.unfold(-1, 4, 2)),
+        ("#43 (32,128) 1,16,8", lambda: torch.randn(32, 128), lambda t: t.unfold(1, 16, 8)),
+        ("step>size tail 12,3,5", lambda: torch.randn(4, 12), lambda t: t.unfold(-1, 3, 5)),
+        ("size%step 18,5,3", lambda: torch.randn(3, 18, 2), lambda t: t.unfold(1, 5, 3)),
+        ("size 0", lambda: b.clone(), lambda t: t.unfold(2, 0, 2)),
+        ("bfloat16 overlapping", lambda: b.clone().bfloat16(), lambda t: t.unfold(1, 3, 1)),
     ]
     rows = [case(*c) for c in cases]
+    rows += [op_case(*c) for c in OP_CASES]
 
     # writes THROUGH the view (and a view of it): base and view against the CPU's
     writes = [
@@ -180,14 +233,26 @@ def main():
     if LAZY:
         print("CASE compiled unavailable in lazy mode", flush=True)
         return summary(rows)
+    f0 = fb()
     try:
         f = torch.compile(lambda t: (t.unfold(2, 4, 3) * 2).sum(-1), backend="hpu_backend")
         xh = b.to("hpu")
         got = [f(xh) for _ in range(2)]
         mark()
         row = {"values": all(close(o, (b.unfold(2, 4, 3) * 2).sum(-1)) for o in got)}
+        b_ = b.clone().requires_grad_()  # the CPU reference gradient
+        b_.unfold(1, 3, 1).sin().square().sum().backward()
+        fg = torch.compile(lambda t: t.unfold(1, 3, 1).sin().square().sum(), backend="hpu_backend")
+        xhg = b.to("hpu").requires_grad_()
+        for _ in range(2):
+            xhg.grad = None
+            fg(xhg).backward()
+        mark()
+        row["grad"] = close(xhg.grad, b_.grad, "grad")
     except Exception as e:  # noqa: BLE001
         row = {"error": repr(e)[:200]}
+    d = fb()
+    row["fallbacks"] = {k: d[k] - f0.get(k, 0) for k in d if d[k] - f0.get(k, 0)}
     print("CASE compiled", row, flush=True)
     rows.append(row)
     return summary(rows)
@@ -198,9 +263,13 @@ def summary(rows):
     rows.append({"rewrite_calls_as_expected": calls > 0 if LAZY else calls == 0})
     print("CASE rewrite calls", calls, "expected", ">0 (lazy)" if LAZY else "0 (eager: Habana's kernel)",
           rows[-1], flush=True)
+    calls = hpu_ops._STATE["calls"]["unfold_backward"]
+    rows.append({"unfold_backward_rewrite_ran": calls > 0})
+    print("CASE unfold_backward rewrite calls", calls, "expected >0", rows[-1], flush=True)
     def is_bad(r):
         wrong = not all(v for v in r.values() if isinstance(v, bool))
-        return "error" in r or wrong or "aten::unfold" in r.get("fallbacks", {})
+        fell_back = {"aten::unfold", "aten::unfold_backward"} & set(r.get("fallbacks", {}))
+        return "error" in r or wrong or bool(fell_back)
 
     bad = [r for r in rows if is_bad(r)]
     print(f"SUMMARY {len(rows)} cases, {len(bad)} bad", flush=True)

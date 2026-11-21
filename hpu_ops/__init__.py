@@ -119,8 +119,8 @@ __all__ = ["enable"]
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
-         composite.install_embedding, composite.install_roll, composite.install_unfold, indexing.install_index,
-         indexing.install_mask_fill, im2col.install,
+         composite.install_embedding, composite.install_roll, composite.install_unfold,
+         composite.install_unfold_backward, indexing.install_index, indexing.install_mask_fill, im2col.install,
          linalg.install_solve_triangular, linalg.install_cholesky_solve,
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,

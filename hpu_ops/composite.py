@@ -1,13 +1,16 @@
-"""HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``), is missing (``renorm``, and
-``Tensor.unfold`` in lazy mode) or is wrong (``embedding_dense_backward`` of a 0-d index, ``roll`` of a strided input by
-a multiple of the size).
+"""HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``), is missing (``renorm``,
+``Tensor.unfold`` in lazy mode, ``unfold_backward``) or is wrong (``embedding_dense_backward`` of a 0-d index, ``roll`` of
+a strided input by a multiple of the size).
 
 Each is registered at ``AutogradHPU``, so eager calls and traced graphs both use it and autograd differentiates the
-composite; ``renorm`` is also registered at ``HPU`` for calls below autograd (inference mode). Cases a composite does
+composite; ``renorm`` is also registered at ``HPU`` for calls below autograd (inference mode). ``unfold`` and
+``unfold_backward`` are registered at ``HPU`` only, below torch's own autograd kernels, which keep their formulas. Cases a composite does
 not take (odd ``glu`` halves, invalid ``renorm`` arguments) go to the op's own kernel, which raises its usual error;
 so do embedding gradients of indices with dimensions, which Gaudi gets right. The composites run with autocast off and
 return the input dtype, as the native ops do.
 """
+import math
+
 import torch
 from torch._C import DispatchKey
 
@@ -92,6 +95,70 @@ def unfold(input, dimension, size, step):
     return input.as_strided(view.shape, view.stride(), input.storage_offset())
 
 
+def _pad_dims(t, pads):
+    """``t`` with ``pads[d]`` zeros after its end along each dim ``d`` (one ``constant_pad_nd``: a contiguous copy)."""
+    first = min(pads)
+    pad = []
+    for d in range(t.dim() - 1, first - 1, -1):
+        pad += [0, pads.get(d, 0)]
+    return aten.constant_pad_nd.default(t, pad, 0)
+
+
+def unfold_backward(grad, input_sizes, dim, size, step):
+    """The gradient of ``Tensor.unfold`` (``aten.unfold_backward``) as one or two pads and one sum, no index ops.
+
+    Window ``i``, offset ``j`` goes to position ``i * step + j``. Overlaps are added by a skew: a padded buffer,
+    flattened and read again with rows one shift shorter, so each row lands shifted, then one sum over the rows. Two
+    skews, whichever buffer is smaller (both about the gradient's size at #43's shapes):
+
+    - over the ``k = ceil(size / step)`` blocks of ``step`` offsets in a window (``j = q * step + r`` goes to block
+      ``i + q``): the windows padded to ``k * step`` offsets, moved next to their blocks, padded from ``n`` to ``n +
+      k + e`` blocks (``e`` reaches an uncovered tail); buffer ``k * (n + k + e) * step``, large when ``n << k``;
+    - over the ``n`` windows: each padded to ``L + step`` and read again in rows of ``L``, so window ``i`` lands
+      shifted by ``i * step``; buffer ``n * (L + step)``, large when ``L >> size``.
+
+    Non-overlapping windows (``step >= size``) need no sum: one pad of each window to ``step`` and of the tail. The
+    dims before and after ``dim`` are merged, so every pad, copy and sum sees at most 5 dims (Gaudi's lazy
+    ``constant_pad_nd`` falls back above 5); a non-contiguous gradient is copied at its own rank first. The result is
+    a new contiguous tensor, as ATen's; booleans add as ``or``, as ATen's CPU kernel. ``dim`` is checked as ATen
+    does; ``step`` must be positive (``Tensor.unfold`` rejects 0, so autograd never passes it). The derivative stays
+    torch's autograd formula (``unfold``)."""
+    ndim = len(input_sizes)
+    dim = torch._prims_common.canonicalize_dim(ndim, dim)  # ATen's IndexError
+    if step <= 0:
+        raise RuntimeError(f"unfold_backward: step is {step} but must be > 0")
+    if ndim == 0:  # a 0-d input unfolds to (size,) with size 0 or 1
+        return grad.any().reshape(()) if grad.dtype == torch.bool else grad.sum(dtype=grad.dtype).reshape(())
+    length = input_sizes[dim]
+    if size == 0 or grad.numel() == 0:
+        return grad.new_zeros(input_sizes)
+    n, k = grad.shape[dim], -(-size // step)
+    outer, inner = math.prod(input_sizes[:dim]), math.prod(input_sizes[dim + 1:])
+    g = grad.reshape(outer, n, inner, size).transpose(2, 3)  # (outer, n, size, inner), a view of a contiguous grad
+    blocks = max(-(-length // step) - (n + k - 1), 0)  # e: zero blocks up to the input's end
+    if k == 1:
+        if blocks or step > size:
+            g = _pad_dims(g, {1: blocks, 2: step - size})
+        else:  # step == size and no tail: only a copy, never a view of ``grad``
+            g = g.clone(memory_format=torch.contiguous_format)
+        g = g.reshape(outer, (n + blocks) * step, inner).narrow(1, 0, length).contiguous()
+        return g.reshape(input_sizes)
+    rows = n + k - 1 + blocks
+    if k * (rows + 1) * step <= n * (length + step):  # skew over the blocks
+        if size < k * step:
+            g = _pad_dims(g, {2: k * step - size})
+        g = g.reshape(outer, n, k, step, inner).transpose(1, 2)  # (outer, k, n, step, inner), a view
+        g = _pad_dims(g, {2: k + blocks})  # (outer, k, rows + 1, step, inner)
+        g = g.reshape(outer, k * (rows + 1) * step * inner).narrow(1, 0, k * rows * step * inner)
+        g = g.reshape(outer, k, rows * step, inner).narrow(2, 0, length)  # row q shifted by q blocks
+    else:  # skew over the windows
+        g = _pad_dims(g, {2: length + step - size})  # (outer, n, length + step, inner)
+        g = g.reshape(outer, n * (length + step) * inner).narrow(1, 0, n * length * inner)
+        g = g.reshape(outer, n, length, inner)  # window i shifted by i * step
+    g = g.any(1) if g.dtype == torch.bool else g.sum(1, dtype=g.dtype)
+    return g.reshape(input_sizes)
+
+
 def _kernel(op, name, composite, takes, fallback):
     """``composite`` for the arguments ``takes`` accepts, else ``op``'s kernel at the ``fallback`` key."""
 
@@ -145,5 +212,18 @@ def install_unfold(device_type):
     def kernel(input, dimension, size, step):
         count("unfold")
         return unfold(input, dimension, size, step)
+
+    return register_kernels(device_type, [(op, "{}", kernel)])
+
+
+def install_unfold_backward(device_type):
+    """``aten.unfold_backward`` (the gradient of ``Tensor.unfold``) on ``device_type`` as pads, reshapes and one sum
+    (``unfold_backward`` above), at the backend key, below torch's autograd kernel (whose derivative is ``unfold``).
+    No Habana stack registers a kernel there: every call ran on the CPU, eager and lazy (#43). Returns an undo."""
+    op = aten.unfold_backward.default
+
+    def kernel(grad_in, input_sizes, dim, size, step):
+        count("unfold_backward")
+        return unfold_backward(grad_in, input_sizes, dim, size, step)
 
     return register_kernels(device_type, [(op, "{}", kernel)])
