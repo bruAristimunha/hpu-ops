@@ -208,6 +208,7 @@ def test_traced_q_outside_the_range_raises_at_run_time():
     assert calls["quantile"] > 0
 
 
+@pytest.mark.skipif(not quantile._length_limited(), reason="this torch has no 2**24 quantile limit")
 def test_reduction_length_guard_raises_aten_error():
     for call in (lambda: torch.quantile(torch.zeros(2 ** 24 + 1), 0.5),
                  lambda: torch.nanquantile(torch.zeros(2, 2 ** 24 + 1), 0.5, dim=1)):
@@ -279,3 +280,15 @@ def test_traced_q_outside_the_range_is_nan_where_the_device_has_no_assert(monkey
         assert c(x, torch.tensor(0.25)).item() == 2.0
         assert torch.isnan(c(x, torch.tensor(1.1))).all()
     assert "aten._assert_async.msg" not in ops(nodes)
+
+
+def test_rank_precision_follows_the_installed_torch():
+    """torch 2.15 computes a float32 input's ranks in float64 (nearest of 0.7 over 6 values: index 3), 2.6-2.8 in
+    float32 (index 4); the rewrite reads which from ATen and matches it."""
+    x = torch.arange(6.0)
+    for q in (0.1, 0.7, torch.tensor([0.1, 0.7])):
+        for interp in INTERP:
+            want = torch.quantile(x, q, interpolation=interp)
+            with cpu_as_hpu(quantile.install):
+                got = torch.quantile(x, q, interpolation=interp)
+            torch.testing.assert_close(got, want, rtol=0, atol=0)

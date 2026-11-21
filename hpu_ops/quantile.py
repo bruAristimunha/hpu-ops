@@ -91,12 +91,13 @@ def quantile_of(self, q, dim=None, keepdim=False, interpolation="linear", ignore
     x, out_shape = _reduce_view(self, dim, keepdim)
     n = x.shape[-1]
     at, n_valid = _sorted_positions(x)
-    qv = qt.reshape(-1).to(x.dtype)  # (nq,), broadcast against (lead..., 1) to (lead..., nq) as in ATen
+    rank_dtype = torch.float64 if x.dtype == torch.float32 and _ranks_in_float64() else x.dtype
+    qv = qt.reshape(-1).to(rank_dtype)  # (nq,), broadcast against (lead..., 1) to (lead..., nq) as in ATen
     if ignore_nan:
-        ranks = qv * (n_valid - 1).to(x.dtype)  # an all-NaN slice: rank 0, which is a NaN
+        ranks = qv * (n_valid - 1).to(rank_dtype)  # an all-NaN slice: rank 0, which is a NaN
         ranks = torch.where(ranks < 0, torch.zeros_like(ranks), ranks)
     else:
-        last = torch.full((), n - 1, dtype=x.dtype, device=x.device)
+        last = torch.full((), n - 1, dtype=rank_dtype, device=x.device)
         has_nan = n_valid < n
         ranks = torch.where(has_nan, last, qv * (n - 1))  # a slice with a NaN: the last rank, a NaN
     if interpolation in ("linear", "midpoint"):
@@ -104,7 +105,7 @@ def quantile_of(self, q, dim=None, keepdim=False, interpolation="linear", ignore
         weights = ranks - below if interpolation == "linear" else torch.full_like(ranks, 0.5)
         lo = x.gather(-1, at(below.long()))
         hi = x.gather(-1, at(ranks.ceil().long()))
-        values = torch.lerp(lo, hi, weights)
+        values = torch.lerp(lo, hi, weights.to(x.dtype))
     else:
         pick = {"lower": torch.floor, "higher": torch.ceil, "nearest": torch.round}[interpolation](ranks)
         values = x.gather(-1, at(pick.long()))
@@ -112,6 +113,32 @@ def quantile_of(self, q, dim=None, keepdim=False, interpolation="linear", ignore
     if qt.dim() == 0:
         return values.squeeze(-1)
     return values.unsqueeze(0).transpose(0, -1).squeeze(-1)  # ATen's layout: the q dim is the fastest
+
+
+@functools.lru_cache(maxsize=None)
+def _ranks_in_float64():
+    """Whether the installed torch computes a float32 input's ranks ``q * (n - 1)`` and linear weights in float64
+    (torch 2.15.0; 2.6 to 2.8 compute them in float32). Read from torch's own CPU quantile once: float32 0.7 * 5 is
+    3.4999998 in float64, so nearest picks index 3, and 3.5 in float32, which rounds half to even to 4."""
+    probe = aten.quantile.scalar._op_dk(DispatchKey.CompositeImplicitAutograd, torch.arange(6.0), 0.7, None, False,
+                                        interpolation="nearest")  # ATen's own composite: never a rewrite
+    return probe.item() == 3.0
+
+
+@functools.lru_cache(maxsize=None)
+def _length_limited():
+    """Whether the installed torch rejects a slice longer than 2**24 (2.6 to 2.8; 2.15.0 does not). Read from ATen's
+    composite on a meta tensor, which checks the size without computing."""
+    try:
+        aten.quantile.scalar._op_dk(DispatchKey.CompositeImplicitAutograd, torch.empty(MAX_LENGTH + 1, device="meta"),
+                                    0.5, None, False, interpolation="linear")
+    except RuntimeError:
+        return True
+    return False
+
+
+_ranks_in_float64()  # read now, on the CPU, outside any tracer
+_length_limited()
 
 
 def _takes(self, q, dim=None, keepdim=False, interpolation="linear"):
@@ -137,7 +164,7 @@ def _length(self, dim):
 
 
 def _compute(name, ignore_nan, self, q, dim, keepdim, interpolation):
-    if _length(self, dim) > MAX_LENGTH:
+    if _length(self, dim) > MAX_LENGTH and _length_limited():
         raise RuntimeError("quantile() input tensor is too large")
     check = isinstance(q, torch.Tensor) and q.numel() and not _concrete(q)
     if check and _asserts_on(self.device.type):
