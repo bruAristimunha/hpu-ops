@@ -43,15 +43,19 @@ wrong (bridge 1.21.4).
 ``index_put_`` with integer indices keeps the native kernels, and so do lazy-mode calls below autograd (inference
 mode), where Habana's ``HPU`` kernel of ``index`` is registered.
 """
+import contextlib
+
 import torch
 from torch._C import DispatchKey
 
+from . import _strict
 from ._dispatch import count, register_kernels
 
 aten = torch.ops.aten
 INTEGER = (torch.int64, torch.int32)
 MASKS = (torch.bool, torch.uint8)  # uint8: ATen's deprecated byte masks, which it still takes
 VALID = INTEGER + MASKS
+HOST_INDEX = "index: CPU index tensors checked and linearized on the host"
 
 
 def _positions(indices):
@@ -66,8 +70,11 @@ def _in_range(t, size):
     if t.numel() == 0:
         return True
     try:
-        t = t.long()  # an int32 index of a dim past 2**31 compares in int64
-        return bool(((t >= -size) & (t < size)).all())
+        with _strict.route(HOST_INDEX, t, detail="CPU index tensors: range checked on the CPU"):
+            t = t.long()  # an int32 index of a dim past 2**31 compares in int64
+            return bool(((t >= -size) & (t < size)).all())
+    except _strict.CPUExecutionError:
+        raise
     except Exception:  # noqa: BLE001  (data-dependent under tracing)
         return None
 
@@ -145,33 +152,38 @@ def index_select_flat(self, indices, checked=True):
     mids = [d for d in range(start, end + 1) if indices[d] is None]  # slices between two indices
     on_host = not _tracing(self) and all(indices[i].device.type == "cpu" for i in pos)
     device = torch.device("cpu") if on_host else self.device
+    host = _strict.route(HOST_INDEX, leaves=[indices[i] for i in pos],
+                         detail="CPU index tensors: the linear index is computed on the CPU, then copied to the card") \
+        if on_host and self.device.type != "cpu" else contextlib.nullcontext()
     shape = tuple(bshape) + tuple(self.shape[d] for d in mids)
     # dims of an expanded input (stride 0) hold one value: select from one element of them, not from a copy of all
     sizes = tuple(self.shape)
     flat_dims = [d for d in range(start, end + 1) if sizes[d] > 1 and self.stride(d) == 0]
     if flat_dims:
         self = self[tuple(slice(0, 1) if d in flat_dims else slice(None) for d in range(self.dim()))]
-    lin = ok = None
-    for d in range(start, end + 1):
-        size = sizes[d]
-        if d in mids:
-            j = mids.index(d)
-            term = torch.zeros(size, device=device, dtype=torch.int64) if d in flat_dims else torch.arange(
-                size, device=device)
-            term = term.reshape((size,) + (1,) * (len(mids) - 1 - j))
-        else:
-            t = indices[d].to(device=device, dtype=torch.int64)
-            if not checked:
-                valid = (t >= -size) & (t < size)
-                ok = valid if ok is None else ok & valid
-            t = torch.zeros_like(t) if d in flat_dims else torch.where(t < 0, t + size, t)
-            term = t.reshape(tuple(t.shape) + (1,) * len(mids))
-        lin = term if lin is None else lin * self.shape[d] + term
-    if ok is not None:
-        lin = torch.where(ok.reshape(tuple(ok.shape) + (1,) * len(mids)), lin, -1)
-    lin = torch.broadcast_to(lin, shape)
+    with host:
+        lin = ok = None
+        for d in range(start, end + 1):
+            size = sizes[d]
+            if d in mids:
+                j = mids.index(d)
+                term = torch.zeros(size, device=device, dtype=torch.int64) if d in flat_dims else torch.arange(
+                    size, device=device)
+                term = term.reshape((size,) + (1,) * (len(mids) - 1 - j))
+            else:
+                t = indices[d].to(device=device, dtype=torch.int64)
+                if not checked:
+                    valid = (t >= -size) & (t < size)
+                    ok = valid if ok is None else ok & valid
+                t = torch.zeros_like(t) if d in flat_dims else torch.where(t < 0, t + size, t)
+                term = t.reshape(tuple(t.shape) + (1,) * len(mids))
+            lin = term if lin is None else lin * self.shape[d] + term
+        if ok is not None:
+            lin = torch.where(ok.reshape(tuple(ok.shape) + (1,) * len(mids)), lin, -1)
+        lin = torch.broadcast_to(lin, shape)
+        lin_flat = lin.reshape(-1).to(self.device)
     flat = self.flatten(start, end) if end > start else self
-    out = flat.index_select(start, lin.reshape(-1).to(self.device))
+    out = flat.index_select(start, lin_flat)
     if lin.dim() == 0:
         return out.squeeze(start)  # 0-d indices (direct aten calls): the indexed dims go away
     out = out.unflatten(start, shape) if lin.dim() != 1 else out
@@ -193,19 +205,32 @@ def _expand_masks(indices):
     return out
 
 
+def _host_index_route(self, indices):
+    """Strict mode's one route per call of a device tensor indexed by CPU index tensors: checked, linearized,
+    masked or moved on the host (hpu_ops' choice: no device sync). A no-op when strict mode is off."""
+    if not _strict._ACTIVE["n"] or self.device.type == "cpu" or _tracing(self):
+        return contextlib.nullcontext()
+    host = [t for t in indices if t is not None and t.device.type == "cpu"]
+    if not host:
+        return contextlib.nullcontext()
+    return _strict.route(HOST_INDEX, *host,
+                         detail="CPU index tensors: checked, linearized or masked on the host, then copied to the card")
+
+
 def _index_kernel(device_type, fallback):
     op = aten.index.Tensor
 
     def kernel(self, indices):
-        plan = _plan(self, indices) if self.device.type == device_type else None
-        if plan is None:
-            return op._op_dk(fallback, self, indices)
-        count("index")
-        if plan == "move":
-            return op._op_dk(fallback, self, [t if t is None else t.to(self.device) for t in indices])
-        if plan == "mask":
-            return index_select_flat(self, _expand_masks(indices))
-        return index_select_flat(self, indices, checked=plan == "int")
+        with _host_index_route(self, indices):
+            plan = _plan(self, indices) if self.device.type == device_type else None
+            if plan is None:
+                return op._op_dk(fallback, self, indices)
+            count("index")
+            if plan == "move":
+                return op._op_dk(fallback, self, [t if t is None else t.to(self.device) for t in indices])
+            if plan == "mask":
+                return index_select_flat(self, _expand_masks(indices))
+            return index_select_flat(self, indices, checked=plan == "int")
 
     return kernel
 
