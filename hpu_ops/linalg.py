@@ -45,11 +45,6 @@ _TRI = None
 # CPU tests: True sends n > tpc.MAXN through ``tpc.gj_inv`` / ``tpc.large_factors`` (with ``tpc._large_op`` replaced by
 # the kernel's float32 replica), so the Python side of the in-place kernel path runs on the CPU too.
 _LARGE_ON_CPU = False
-# Past tpc.MAXN the in-place kernel's inverse is kept for a matrix only when its Frobenius condition estimate
-# ||A||_F ||A^-1||_F lies in [1 / sqrt(2), LARGE_COND_MAX] (see ``_large_untrusted``); the others are redone on the CPU.
-# The check reads one flag on the host per call; HPU_OPS_LARGE_CHECK=0 (read when hpu_ops is imported) skips it.
-LARGE_COND_MAX = 1e5
-LARGE_CHECK = os.environ.get("HPU_OPS_LARGE_CHECK") != "0"
 # The Jacobi SVD hook ``(A, compute_uv) -> (U, S, Vh)`` for CPU tests; None means ``tpc.jacobi_svd`` /
 # ``tpc.jacobi_svdvals`` on HPU, or ``tpc.svd_reference`` on CPU when unset.
 _SVD = None
@@ -633,44 +628,6 @@ def _is_vector_rhs(A, B):
     return B.dim() == 1 or (B.dim() == A.dim() - 1 and B.shape == A.shape[:-1])
 
 
-def _large_untrusted(A, Ainv):
-    """True for each matrix of ``A[..., n, n]`` (n > ``tpc.MAXN``) whose in-place kernel inverse ``Ainv`` is not kept:
-    ``c = ||A||_F ||Ainv||_F`` (a condition estimate, >= 1 for a true inverse) outside [1 / sqrt(2),
-    ``LARGE_COND_MAX``], or not finite. Codex review #3: ``A = 2^127 I`` has the subnormal inverse 2^-127 I, which
-    the kernel's last division flushes to 0 (c = 0); entries past 2^64 overflow ``A * A`` (c = inf), so a matrix
-    whose inverse could hold flushed subnormals is never kept. Codex review #18: the solve is a product with the
-    inverse and one residual step in float32; its error grows as c * eps (measured on the kernel's replica:
-    ``0.25 [[7, s], [0, 0.9 s]]`` in ``eye(65)``, error 1.2e-4 at c = 2.7e5, 1.6e-2 at c = 2.7e7, where LAPACK is
-    exact), and the float32 residual cannot see it. At 1e5 the error stays below about 4e-5; random Gaussian matrices
-    rarely pass it (n = 512: median 1.9e4, maximum of 32 3.9e5). NaN and Inf inputs are redone too: LAPACK's ``info``
-    then is torch's."""
-    c2 = (A * A).sum((-2, -1)) * (Ainv * Ainv).sum((-2, -1))
-    return ~((c2 >= 0.5) & (c2 <= LARGE_COND_MAX ** 2))
-
-
-def _redo_on_cpu(bad, A, result, info, solve=None):
-    """``result`` and ``info`` with the matrices ``bad`` (A's batch) recomputed by torch on the CPU: the inverse, or with
-    ``solve = (B, left)`` the solve (``result`` carries the broadcast batch of A and B). One host read (the mask)."""
-    if result.dim() == 2:  # one matrix: as a batch of one
-        B = None if solve is None else solve[0][None]
-        X, i = _redo_on_cpu(bad[None], A[None], result[None], info[None], None if solve is None else (B, solve[1]))
-        return X[0], i[0]
-    batch = result.shape[:-2]
-    picked = bad.expand(batch).nonzero(as_tuple=True)
-    A_cpu = A.expand(*batch, *A.shape[-2:])[picked].cpu()
-    cpu = DispatchKey.CPU  # torch's CPU kernels (LAPACK), below any rewrite
-    if solve is None:
-        X_cpu = aten.linalg_inv_ex.default._op_dk(cpu, A_cpu)[0]
-    else:
-        B, left = solve
-        X_cpu = aten._linalg_solve_ex.default._op_dk(cpu, A_cpu, B.expand(*batch, *B.shape[-2:])[picked].cpu(),
-                                                    left=left)[0]
-    result = result.index_put(picked, X_cpu.to(result.device))
-    own = bad.nonzero(as_tuple=True)
-    info_cpu = aten.linalg_lu_factor_ex.default._op_dk(cpu, A[own].cpu())[2]
-    return result, info.index_put(own, info_cpu.to(info.device))
-
-
 def _inv_solve(A, B, Ainv, left):
     """``A^-1 B`` (``B A^-1`` if not ``left``) from the inverse, with one residual step ``X += A^-1 (B - A X)``: on the
     in-place kernel's float32 replica (n = 220) the forward error then matches LAPACK's from condition 1 to 1e7 (the
@@ -729,15 +686,10 @@ class SolveEx(torch.autograd.Function):
                 Ac = A.contiguous()
                 Ainv, _, S = _gj_inv(Ac, sign=False)
                 result = _inv_solve(Ac, rhs, Ainv, left)
-                info = _gj_info(S, A.shape[:-2])
-                bad = _large_untrusted(Ac, Ainv) if LARGE_CHECK else None
-                if bad is not None and bool(bad.any()):  # one host read per call (eager only: the large route is)
-                    result, info = _redo_on_cpu(bad, Ac, result, info, (rhs, left))
-                    Ainv = None  # the backward solves again (and redoes these on the CPU too)
             else:
                 result, _, S = _gj_solve(A, rhs, left)
-                info = _gj_info(S, A.shape[:-2])
             LU, pivots = _unused_factors(A)
+            info = _gj_info(S, A.shape[:-2])
             if check_errors:
                 torch.ops.aten._linalg_check_errors(info, "torch.linalg.solve_ex", is_matrix=A.dim() == 2)
         else:
@@ -814,10 +766,6 @@ class InvEx(torch.autograd.Function):
         if _use_tpc(A):
             X, _, S = _gj_inv(A, sign=False)
             info = _gj_info(S, A.shape[:-2])
-            if A.shape[-1] > tpc.MAXN and LARGE_CHECK:
-                bad = _large_untrusted(A, X)
-                if bool(bad.any()):  # one host read per call (eager only: the large route is)
-                    X, info = _redo_on_cpu(bad, A, X, info)
         else:
             LU, pivots = lu(A)
             info = lu_info(LU)
