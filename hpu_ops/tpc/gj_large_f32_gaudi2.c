@@ -4,19 +4,21 @@
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
  *   A [n, n, batch]   f32
- *   R [w, n, batch]   f32, w = 64 * ceil(n / 64): the in-place result, A^-1 = R[P, :][:, Q] (lanes >= n are 0)
+ *   R [w, n, batch]   f32, w = 64 * ceil(n / 64): the in-place result, A^-1 = (R[P, :] / D[:, None])[:, Q] (lanes
+ *                     >= n are 0); the caller does the gathers and the division by the pivots
  *   P [n, batch]      f32: p_k, the row taken as the k-th pivot (exact integers)
  *   Q [n, batch]      f32: the inverse permutation, Q[p_k] = k
  *   D [n, batch]      f32: the k-th pivot (U's diagonal of P A = L U)
  *   S [2, batch]      f32: lane 0 unused (0; the caller takes the sign from P), lane 1 = info (1 + first zero pivot)
- * Pivoting is implicit (no row moves): step k takes the unused row p of largest |column k| (the first among ties),
- * stores 1 / pivot at (p, k), scales the row by 1 / pivot, and for every other row i stores -R[i][k] / pivot at (i, k)
- * and subtracts R[i][k] times the pivot row elsewhere. So column k of the storage ends up holding column p_k of the
- * transform T with T A = (rows p_k = e_k), and A^-1 = R[P, :][:, Q]. The pivot row of step k + 1 is found and copied to
- * local memory during the pass of step k, so each step is one read-modify-write pass over the rows. A zero pivot
- * zeroes its row (its elimination is a no-op), as in gj_solve. One ASO per pass: a vector load after a vector store
- * to the same address is not coherent without it. LUT-free (lane broadcast, Newton reciprocal), so local memory stays
- * in its 80 KB mode.
+ * Pivoting is implicit (no row moves): step k takes the unused row p of largest |column k| (the first among ties; a
+ * NaN counts as 0, so the order stays a permutation), stores 1 at (p, k) and leaves the rest of row p unnormalized;
+ * every other row i gets q_i = -R[i][k] / pivot at (i, k) and q_i times the pivot row added elsewhere (LU-style, as
+ * gj_solve: nothing is scaled by 1 / pivot, small quotients are carried scaled by 2^64, huge pivots scaled by 2^-64).
+ * So column k of the storage ends up holding column p_k of the transform T with T A = diag(D) in rows p_k. The pivot
+ * row of step k + 1 is found and copied to local memory during the pass of step k, so each step is one
+ * read-modify-write pass over the rows. A zero pivot makes its step a no-op (info set). One ASO per pass: a vector
+ * load after a vector store to the same address is not coherent without it. LUT-free (lane broadcast, Newton
+ * reciprocal), so local memory stays in its 80 KB mode.
  */
 #ifndef VA
 #define VA 4  // 64-lane vectors per row, ceil(n / 64): one build per VA in 2..8, so every loop over a row unrolls
@@ -31,6 +33,7 @@
 __local__ float64 cache[CACHE];  // row i < RC, vector v at cache[i * VA + v]
 __local__ float64 nwl[VA];       // the next pivot row, spilled once per step for its lanes k, k + 1
 __local__ float64 pwl[VA];
+__local__ float64 pwsl[VA];
 __local__ float64 used[VA];      // lane i % 64 of used[i / 64]: 1 once row i was a pivot
 __local__ float64 dvv[VA];
 __local__ float64 pvv[VA];
@@ -86,6 +89,19 @@ static inline float64 lut_free_recip(float64 x)
     return as_float64(res);
 }
 
+// q = -col / pivot rounded (Markstein: one FMA residual correction), and qs = q * 2^64 where q flushed (else 0)
+static inline void multipliers(float64 col, float64 scale, float64 pks, float64 ninv, float64 up, float64* q,
+                               float64* qs)
+{
+    float64 cs = v_f32_mul_b(col, scale);
+    float64 t = v_f32_mul_b(cs, ninv);
+    float64 r = v_f32_mac_b(t, pks, cs);
+    // no correction when 1/pivot is 0 (an infinite or zero pivot): 0 * inf in r would make q NaN
+    t = v_f32_sel_eq_f32_b(ninv, 0.0f, t, v_f32_mac_b(r, ninv, t));
+    *q = t;
+    *qs = v_f32_sel_eq_f32_b(t, 0.0f, v_f32_mul_b(v_f32_mul_b(col, up), ninv), 0.0f);
+}
+
 void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
 {
     const int n = get_dim_size(A, 0);
@@ -125,6 +141,7 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
             }
             x[VA - 1] = v_f32_sel_geq_u32_b(lane, (unsigned)last, 0.0f, x[VA - 1]);
             float64 cand = v_f32_abs_b(lane_bcast(x[0], 0));
+            cand = v_f32_sel_eq_f32_b(cand, cand, cand, 0.0f);  // NaN counts as 0: the order stays a permutation
             const float64 prev = best;
             bidx = v_f32_sel_grt_f32_b(cand, prev, (float)i, bidx);
             best = v_f32_sel_grt_f32_b(cand, prev, cand, prev);
@@ -169,11 +186,18 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
             dvv[vk] = v_f32_sel_eq_u32_b(lane, (unsigned)lk, pk, dvv[vk]);
             pvv[vk] = v_f32_sel_eq_u32_b(lane, (unsigned)lk, p, pvv[vk]);
             infov = v_f32_sel_eq_f32_b(pk, 0.0f, v_f32_sel_eq_f32_b(infov, 0.0f, (float)(k + 1), infov), infov);
-            // |pivot| >= 2^64: scale by 2^-64 (exact) first so recip(pivot) is never subnormal (see gj_solve)
-            float64 scale = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(pk), 0x7FFFFFFFu), 0x5F800000u,
-                                                0x1p-64f, 1.0f);
-            float64 inv = v_f32_mul_b(lut_free_recip(v_f32_mul_b(pk, scale)), scale);
+            // LU-style, as gj_solve: the pivot row is never scaled by 1/pivot (entries / pivot below 2^-126 would
+            // flush); row i gets q_i = -a_ik / pivot (one FMA correction) times the pivot row, the stored pivot row has
+            // 1 at column k, and the caller divides row p_k by the k-th pivot at the end. |pivot| >= 2^64: column and
+            // pivot scaled by 2^-64 (exact) so recip is never subnormal. |q| < 2^-126 flushes, so those rows also
+            // take qs = q * 2^64 against the pivot row * 2^-64. A zero pivot gives q = qs = 0: a no-op step.
+            const float64 scale = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(pk), 0x7FFFFFFFu), 0x5F800000u,
+                                                      0x1p-64f, 1.0f);
+            const float64 pks = v_f32_mul_b(pk, scale);
+            const float64 ninv = v_f32_sub_b(0.0f, lut_free_recip(pks));
+            const float64 up = v_f32_sel_eq_f32_b(scale, 1.0f, 0x1p64f, 1.0f);
             unsigned zl[VA];  // lane of vector v zeroed in every non-pivot row: lk in vector vk, none elsewhere
+            float64 pws[VA];
 #pragma unroll
             for (int v = 0; v < VA; v++)
             {
@@ -181,10 +205,14 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                 used[v] = v_f32_sel_eq_f32_b(rowid, p, 1.0f, used[v]);
                 qvv[v] = v_f32_sel_eq_f32_b(rowid, p, (float)k, qvv[v]);
                 zl[v] = v == vk ? (unsigned)lk : 64u;
-                pw[v] = v_f32_mul_b(v_f32_sel_eq_u32_b(lane, zl[v], 1.0f, nw[v]), inv);
+                pw[v] = v_f32_sel_eq_u32_b(lane, zl[v], 1.0f, nw[v]);
+                pws[v] = v_f32_sel_less_u32_b(v_u32_and_b(as_uint64(pw[v]), 0x7FFFFFFFu), 0x7F800000u,
+                                              v_f32_mul_b(pw[v], 0x1p-64f), 0.0f);
                 pwl[v] = pw[v];
+                pwsl[v] = pws[v];
             }
             const float64 pkn = lane_bcast(pwl[vkn], lkn);  // the pivot row at column k + 1
+            const float64 pksn = lane_bcast(pwsl[vkn], lkn);
             best = -1.0f;
             bidx = 0.0f;
 
@@ -194,7 +222,7 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
             for (int i = 0; i < RC; i += NR)
             {
                 const int ii[2] = {i, i + 1 < RC ? i + 1 : i};  // ii[1] unused when NR = 1
-                float64 x[NR][VA], cand[NR], nf[NR];
+                float64 x[NR][VA], cand[NR], q[NR], qs[NR];
 #pragma unroll
                 for (int r = 0; r < NR; r++)
                 {
@@ -204,9 +232,10 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                     {
                         x[r][v] = cache[base + v];
                     }
-                    nf[r] = v_f32_sub_b(0.0f, lane_bcast(cache[base + vk], lk));
-                    // candidate for step k + 1: the new value at column k + 1 of an unused row (same fused op as below)
-                    float64 cd = v_f32_abs_b(v_f32_mac_b(pkn, nf[r], lane_bcast(cache[base + vkn], lkn)));
+                    multipliers(lane_bcast(cache[base + vk], lk), scale, pks, ninv, up, &q[r], &qs[r]);
+                    // candidate for step k + 1: the new value at column k + 1 of an unused row (same fused ops as below)
+                    float64 cd = v_f32_abs_b(v_f32_mac_b(pksn, qs[r], v_f32_mac_b(pkn, q[r], lane_bcast(cache[base + vkn], lkn))));
+                    cd = v_f32_sel_eq_f32_b(cd, cd, cd, 0.0f);  // NaN counts as 0
                     cd = v_f32_sel_eq_f32_b(lane_bcast(used[ii[r] / 64], ii[r] % 64), 1.0f, -1.0f, cd);
                     cand[r] = more ? cd : -1.0f;
                 }
@@ -222,7 +251,8 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                     for (int v = 0; v < VA; v++)
                     {
                         float64 y = v_f32_sel_eq_u32_b(lane, zl[v], 0.0f, x[r][v]);
-                        y = v_f32_sel_eq_f32_b(p, fi, pw[v], v_f32_mac_b(pw[v], nf[r], y));
+                        y = v_f32_mac_b(pws[v], qs[r], v_f32_mac_b(pw[v], q[r], y));
+                        y = v_f32_sel_eq_f32_b(p, fi, pw[v], y);
                         cache[base + v] = y;
                         nw[v] = v_f32_sel_grt_f32_b(cand[r], prev, y, nw[v]);
                     }
@@ -233,7 +263,7 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
             for (int i = RC; i < n; i += NR)
             {
                 const int ii[2] = {i, i + 1 < n ? i + 1 : i};  // ii[1] unused when NR = 1
-                float64 x[NR][VA], cand[NR], nf[NR];
+                float64 x[NR][VA], cand[NR], q[NR], qs[NR];
 #pragma unroll
                 for (int r = 0; r < NR; r++)
                 {
@@ -248,8 +278,9 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                     float64 xk = v_f32_ld_tnsr_b(c, R);
                     c[0] = 64 * vkn;
                     float64 xkn = v_f32_ld_tnsr_b(c, R);
-                    nf[r] = v_f32_sub_b(0.0f, lane_bcast(xk, lk));
-                    float64 cd = v_f32_abs_b(v_f32_mac_b(pkn, nf[r], lane_bcast(xkn, lkn)));
+                    multipliers(lane_bcast(xk, lk), scale, pks, ninv, up, &q[r], &qs[r]);
+                    float64 cd = v_f32_abs_b(v_f32_mac_b(pksn, qs[r], v_f32_mac_b(pkn, q[r], lane_bcast(xkn, lkn))));
+                    cd = v_f32_sel_eq_f32_b(cd, cd, cd, 0.0f);  // NaN counts as 0
                     cd = v_f32_sel_eq_f32_b(lane_bcast(used[ii[r] / 64], ii[r] % 64), 1.0f, -1.0f, cd);
                     cand[r] = more ? cd : -1.0f;
                 }
@@ -265,7 +296,8 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                     for (int v = 0; v < VA; v++)
                     {
                         float64 y = v_f32_sel_eq_u32_b(lane, zl[v], 0.0f, x[r][v]);
-                        y = v_f32_sel_eq_f32_b(p, fi, pw[v], v_f32_mac_b(pw[v], nf[r], y));
+                        y = v_f32_mac_b(pws[v], qs[r], v_f32_mac_b(pw[v], q[r], y));
+                        y = v_f32_sel_eq_f32_b(p, fi, pw[v], y);
                         c[0] = 64 * v;
                         v_f32_st_tnsr(c, R, y);
                         nw[v] = v_f32_sel_grt_f32_b(cand[r], prev, y, nw[v]);

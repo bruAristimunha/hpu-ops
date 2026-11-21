@@ -21,6 +21,7 @@ kernel, or past ``MAXN`` (``LARGE_MAXN`` for solve, inv, det and slogdet), the c
 through hpu-ops' own CPU route (``_on_cpu``), which is not Habana's fallback. The composites stay the path of the
 CPU stand-in.
 """
+import math
 import warnings
 
 import torch
@@ -40,6 +41,9 @@ _WARNED = set()
 # ready; the CPU tests set them to ``tpc.gj_solve_reference`` / ``tpc.tri_solve_reference`` to exercise the wiring.
 _GJ = None
 _TRI = None
+# CPU tests: True sends n > tpc.MAXN through ``tpc.gj_inv`` / ``tpc.large_factors`` (with ``tpc._large_op`` replaced by
+# the kernel's float32 replica), so the Python side of the in-place kernel path runs on the CPU too.
+_LARGE_ON_CPU = False
 
 
 def _bind(op, args, kwargs):
@@ -93,7 +97,11 @@ def _tpc_takes(device_type, takes, matrix_at=0, large=False):
             return True
         A = args[matrix_at]
         n = A.shape[-1]
-        fits = n <= tpc.MAXN or (large and tpc.large_pays(n, A.numel() // (n * n)))
+        batch = A.shape[:-2]
+        if large and len(args) > 1 and isinstance(args[1], torch.Tensor):  # solve: B's batch broadcasts A's
+            B = args[1]
+            batch = torch.broadcast_shapes(batch, B.shape[:-1] if _is_vector_rhs(A, B) else B.shape[:-2])
+        fits = n <= tpc.MAXN or (large and tpc.large_pays(n, math.prod(batch)))
         return fits and tpc.ready()
 
     return tpc_takes
@@ -103,8 +111,11 @@ def _use_tpc(A):
     """Whether ``A`` goes through the Gauss-Jordan kernels: n <= ``tpc.LARGE_MAXN`` (n <= ``tpc.MAXN``: rows in local
     memory; past it the in-place inverse kernel, ``tpc.gj_solve`` multiplying by it) and, on HPU, float32 with the
     kernel ready; or, with the ``_GJ`` hook set (CPU tests), any dtype."""
-    if A.shape[-1] > tpc.LARGE_MAXN:
+    n = A.shape[-1]
+    if n > tpc.LARGE_MAXN:
         return False
+    if _LARGE_ON_CPU and n > tpc.MAXN:
+        return True
     return _GJ is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
 
 
@@ -119,9 +130,16 @@ def _gj(A, B):
 
 def _gj_inv(A):
     """``(A^-1, D, S)``: the kernel with the identity as right-hand side, built in the kernel."""
-    if _GJ is not None:
+    if _GJ is not None and not (_LARGE_ON_CPU and A.shape[-1] > tpc.MAXN):
         return _gj(A, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
     return tpc.gj_inv(A)
+
+
+def _gj_factors(A):
+    """``(D, S)`` alone, for det and slogdet: past ``tpc.MAXN`` the in-place kernel without forming the inverse."""
+    if A.shape[-1] > tpc.MAXN and (_GJ is None or _LARGE_ON_CPU):
+        return tpc.large_factors(A)
+    return _gj_inv(A)[1:]
 
 
 def _gj_solve(A, B, left=True):
@@ -552,6 +570,15 @@ def _is_vector_rhs(A, B):
     return B.dim() == 1 or (B.dim() == A.dim() - 1 and B.shape == A.shape[:-1])
 
 
+def _inv_solve(A, B, Ainv, left):
+    """``A^-1 B`` (``B A^-1`` if not ``left``) from the inverse, with one residual step ``X += A^-1 (B - A X)``: on the
+    in-place kernel's float32 replica (n = 220) the forward error then matches LAPACK's from condition 1 to 1e7 (the
+    product with the inverse alone was up to 1.5x worse). A non-finite correction (Inf in A) is dropped."""
+    X = Ainv @ B if left else B @ Ainv
+    C = Ainv @ (B - A @ X) if left else (B - X @ A) @ Ainv
+    return X + torch.where(torch.isfinite(C), C, 0.0)
+
+
 class _InvSolve(torch.autograd.Function):
     """``A^-1 B`` (``B A^-1`` if not ``left``) as a matmul with ``Ainv``, the inverse of ``A`` the forward already
     computed (n > ``tpc.MAXN``: the in-place kernel's), so the backward of a large solve launches no kernel. ``Ainv``
@@ -559,7 +586,7 @@ class _InvSolve(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A, B, Ainv, left):
-        X = Ainv @ B if left else B @ Ainv
+        X = _inv_solve(A, B, Ainv, left)
         ctx.save_for_backward(A, X, Ainv)
         ctx.left = left
         ctx.B_shape = B.shape
@@ -596,7 +623,7 @@ class SolveEx(torch.autograd.Function):
         if _use_tpc(A):
             if A.shape[-1] > tpc.MAXN:
                 Ainv, _, S = _gj_inv(A)
-                result = Ainv @ rhs if left else rhs @ Ainv
+                result = _inv_solve(A, rhs, Ainv, left)
             else:
                 result, _, S = _gj_solve(A, rhs, left)
             LU, pivots = _unused_factors(A)
@@ -709,7 +736,7 @@ class Det(torch.autograd.Function):
     @staticmethod
     def compute(A):
         if _use_tpc(A):
-            _, D, S = _gj_inv(A)
+            D, S = _gj_factors(A)
             return S[..., 0] * D.prod(-1), *_unused_factors(A)
         LU, pivots = lu(A)
         diag = torch.diagonal(LU, dim1=-2, dim2=-1)
@@ -762,7 +789,7 @@ class Slogdet(torch.autograd.Function):
     @staticmethod
     def compute(A):
         if _use_tpc(A):
-            _, D, S = _gj_inv(A)
+            D, S = _gj_factors(A)
             return (S[..., 0] * D.sign().prod(-1), D.abs().log().sum(-1), *_unused_factors(A))
         LU, pivots = lu(A)
         diag = torch.diagonal(LU, dim1=-2, dim2=-1)

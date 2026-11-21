@@ -832,70 +832,6 @@ def test_gj_not_used_past_large_maxn(monkeypatch, gj_hook):
     assert gj_hook == []
 
 
-# ---- the in-place kernel for 64 < n <= LARGE_MAXN, through its torch reference
-
-
-def permuted(b, n, seed=0):
-    """Near-identity rows in a random order: pivoting across the whole height is needed, both det signs occur."""
-    g = torch.Generator().manual_seed(seed)
-    M = torch.eye(n) + 0.05 * torch.randn(b, n, n, generator=g) / n ** 0.5
-    perm = torch.stack([torch.randperm(n, generator=g) for _ in range(b)])
-    return M.gather(1, perm[..., None].expand(b, n, n))
-
-
-@pytest.fixture
-def large_reference(monkeypatch):
-    calls = []
-
-    def fake(A):
-        calls.append(tuple(A.shape))
-        return tpc.gj_large_reference(A)
-
-    monkeypatch.setattr(tpc, "_large_op", lambda: fake)
-    return calls
-
-
-@pytest.mark.parametrize("n", [65, 100, 130])
-def test_large_reference_contract(n, large_reference):
-    A = permuted(3, n).double()
-    R, P, Q, D, S = tpc.gj_large_reference(A)
-    assert R.shape == (3, n, 64 * ((n + 63) // 64)) and torch.all(R[..., n:] == 0)
-    inv = R[..., :n].gather(1, P.long()[..., None].expand(3, n, n)).gather(2, Q.long()[:, None, :].expand(3, n, n))
-    torch.testing.assert_close(inv, torch.linalg.inv(A))
-    torch.testing.assert_close(D.prod(-1).abs(), torch.linalg.det(A).abs())
-    assert torch.equal(Q.long(), P.long().argsort(-1)) and torch.equal(S[:, 1], torch.zeros(3, dtype=A.dtype))
-
-
-@pytest.mark.parametrize("batch", [(), (2,), (2, 3)])
-def test_large_gj_inv_and_solve(batch, large_reference):
-    n = 70
-    A = permuted(int(torch.tensor(batch).prod()) if batch else 1, n).reshape(*batch, n, n)
-    B = torch.randn(*batch, n, 5, dtype=A.dtype)
-    X, D, S = tpc.gj_inv(A)
-    torch.testing.assert_close(X, torch.linalg.inv(A), rtol=1e-4, atol=1e-4)
-    sign, logabsdet = torch.linalg.slogdet(A)
-    torch.testing.assert_close(S[..., 0], sign)
-    torch.testing.assert_close(D.abs().log().sum(-1), logabsdet, rtol=1e-4, atol=1e-4)
-    Y, _, _ = tpc.gj_solve(A, B)
-    torch.testing.assert_close(Y, torch.linalg.solve(A, B), rtol=1e-4, atol=1e-4)
-    assert large_reference and all(shape[-1] == n for shape in large_reference)
-
-
-def test_large_signs_both_occur(large_reference):
-    A = permuted(16, 66)
-    _, _, S = tpc.gj_inv(A)
-    want = torch.linalg.slogdet(A).sign
-    assert torch.equal(S[:, 0], want) and bool((want > 0).any()) and bool((want < 0).any())
-
-
-def test_large_singular_info(large_reference):
-    A = permuted(3, 70)
-    A[1, :, 7] = 0  # a zero column: no pivot at step 7
-    _, D, S = tpc.gj_inv(A)
-    assert S[1, 1] == 8 and D[1].prod() == 0
-    assert torch.equal(S[[0, 2], 1], torch.zeros(2))
-
-
 DOUBLE_BACKWARD = {
     "solve": (linalg.install_solve, lambda a, b: torch.linalg.solve(a, b),
               lambda: (general(n=4), torch.randn(4, 2, dtype=torch.float64))),
@@ -1699,22 +1635,3 @@ def test_large_solve_backward_reuses_the_inverse(case, monkeypatch, gj_hook):
         assert len(gj_hook) == before, "the backward of a large solve called the kernel"
         assert torch.autograd.gradgradcheck(f, inputs, atol=1e-5, rtol=1e-4)
 
-
-def test_large_nan_in_A_gives_nan(large_reference):
-    A = permuted(3, 70)
-    A[1, 0, 0] = float("nan")
-    X, D, _ = tpc.gj_inv(A)
-    assert X[1].isnan().all() and D[1].isnan().all()
-    assert torch.isfinite(X[[0, 2]]).all() and torch.isfinite(D[[0, 2]]).all()
-    Y, _, _ = tpc.gj_solve(A, torch.randn(3, 70, 2))
-    assert Y[1].isnan().all() and torch.isfinite(Y[[0, 2]]).all()
-
-
-def test_large_inf_in_A_keeps_the_kernel_result(large_reference):
-    A = permuted(2, 70)
-    A[0, 0, 0] = float("inf")
-    X, _, _ = tpc.gj_inv(A)
-    R, P, Q, _, _ = tpc.gj_large_reference(A)
-    raw = R[..., :70].gather(1, P.long()[..., None].expand_as(A)).gather(2, Q.long()[:, None, :].expand_as(A))
-    torch.testing.assert_close(X[0], raw[0], equal_nan=True)
-    torch.testing.assert_close(X[1], torch.linalg.inv(A[1]), rtol=1e-4, atol=1e-4)

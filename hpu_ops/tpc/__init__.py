@@ -603,28 +603,45 @@ def _rows(X, index):
     return X.gather(-2, index.long()[..., None].expand(*index.shape, X.shape[-1]))
 
 
+def _large_raw(A):
+    """The kernel's ``(R, P, Q, D, S)`` for ``A[b, n, n]``, ``S[:, 0]`` set to the sign of the pivot order and a
+    matrix with a NaN given NaN pivots (LAPACK's results are NaN there; the kernel's need not be)."""
+    R, P, Q, D, S = _call(_large_op(), A)
+    nan = A.isnan().any(-1).any(-1)
+    D = D.masked_fill(nan[..., None], float("nan"))
+    return R, P, Q, D, torch.stack([_parity(P), S[..., 1]], -1), nan
+
+
+def large_factors(A):
+    """``(D, S)`` of the in-place kernel for ``A[..., n, n]`` (64 < n <= ``LARGE_MAXN``), for ``det`` and
+    ``slogdet``: the pivots and (sign, info), without forming the inverse."""
+    n = A.shape[-1]
+    _check(A, n, limit=LARGE_MAXN)
+    batch = A.shape[:-2]
+    _, _, _, D, S, _ = _large_raw(_flat(A, batch, n, n))
+    return _unflatten(D, batch, n), _unflatten(S, batch, 2)
+
+
 def _large(A, B=None):
     """``(X, D, S)`` of the in-place Gauss-Jordan kernel for ``A[b, n, n]`` (64 < n <= ``LARGE_MAXN``): ``X =
-    A^-1`` (``B`` None; refined by one Newton step) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel leaves ``R`` with ``A^-1 =
-    R[P, :][:, Q]``, so ``A^-1 B = (R @ B[Q^-1 order])[P]``: with ``Q = P^-1``, ``R[:, Q] @ B = R @ B[P]``."""
+    A^-1`` (``B`` None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. The kernel
+    leaves the pivot rows unnormalized: ``A^-1 = (R[P, :] / D[:, None])[:, Q]``, and ``A^-1 B = (R @ B[P])[P] /
+    D[:, None]`` (with ``Q = P^-1``, ``R[:, Q] @ B = R @ B[P]``). The division is torch's, so a pivot near the float32
+    range's ends is never inverted in the kernel; a zero pivot gives a zero row (info is set)."""
     n = A.shape[-1]
-    R, P, Q, D, S = _call(_large_op(), A)
+    R, P, Q, D, S, nan = _large_raw(A)
     R = R[..., :n]
+    zero = D == 0
+    Y = _rows(R, P) if B is None else _rows(R @ _rows(B, P), P)
+    Y = (Y / torch.where(zero, 1.0, D)[..., None]).masked_fill(zero[..., None], 0.0)
     if B is None:
-        X = _rows(R, P).gather(-1, Q.long()[..., None, :].expand(*Q.shape[:-1], n, n))
-        # One Newton step on the MME, X + X (I - A X): Gauss-Jordan's inverse is about 2x LAPACK's error (the kernel
-        # equals the same algorithm on the CPU); measured on Gaudi2 at n = 220, 1.7e-6 to 8.7e-7 (CPU float32 7.0e-7)
-        # (a non-finite correction, from an Inf in A, is dropped: the kernel's result keeps LAPACK's pattern there)
-        C = X @ (torch.eye(n, dtype=X.dtype, device=X.device) - A @ X)
-        X = X + torch.where(torch.isfinite(C), C, 0.0)
+        # no Newton step: on the kernel's float32 replica it gained little at condition <= 1e4 and lost past 1e6
+        # (n = 220, condition 1e7: 6.8e-2 against 4.5e-2 without, LAPACK 4.7e-2)
+        X = Y.gather(-1, Q.long()[..., None, :].expand(*Q.shape[:-1], n, n))
     else:
-        X = _rows(R @ _rows(B, P), P)
-    # A NaN in A: LAPACK's results are NaN; the kernel's are not always (measured on Gaudi2: a NaN at (0, 0) of a
-    # 70 x 70 matrix left R finite), so a matrix with a NaN gets NaN outputs here
-    nan = A.isnan().any(-1).any(-1)
+        X = Y
     X = X.masked_fill(nan[..., None, None], float("nan"))
-    D = D.masked_fill(nan[..., None], float("nan"))
-    return X, D, torch.stack([_parity(P), S[..., 1]], -1)
+    return X, D, S
 
 
 def gj_solve(A, B):
@@ -718,34 +735,6 @@ def eigh_reference(A, upper):
 
     w, V = np.linalg.eigh(A.detach().cpu().numpy(), UPLO="U" if upper else "L")
     return torch.from_numpy(w).to(A.device), torch.from_numpy(V).to(A.device)
-
-
-def gj_large_reference(A):
-    """``torch.ops.linalg_tpc.gj_large`` in plain torch, the contract of the in-place kernel, for ``A[b, n, n]``:
-    ``(R, P, Q, D, S)`` with ``R`` padded to whole 64-lane vectors and ``A^-1 = R[P, :][:, Q]``. Implicit partial
-    pivoting (the first unused row of largest |column k|), a zero pivot zeroes its row. For the CPU tests."""
-    A = A.detach()
-    b, n = A.shape[0], A.shape[-1]
-    rows = torch.arange(b)
-    R = A.clone()
-    used = torch.zeros(b, n, dtype=torch.bool)
-    P, D, info = A.new_zeros(b, n), A.new_zeros(b, n), A.new_zeros(b)
-    for k in range(n):
-        p = R[:, :, k].abs().masked_fill(used, -1.0).argmax(-1)
-        pivot = R[rows, p, k]
-        P[:, k], D[:, k] = p.to(A.dtype), pivot
-        info = torch.where((pivot == 0) & (info == 0), float(k + 1), info)
-        used[rows, p] = True
-        prow = R[rows, p].clone()
-        prow[:, k] = 1.0
-        prow = prow * torch.where(pivot == 0, 0.0, 1.0 / torch.where(pivot == 0, 1.0, pivot))[:, None]
-        f = R[:, :, k].clone()
-        R[:, :, k] = 0.0
-        R = R - f[:, :, None] * prow[:, None, :]
-        R[rows, p] = prow
-    Q = P.argsort(-1).to(A.dtype)
-    R = torch.nn.functional.pad(R, (0, 64 * ((n + 63) // 64) - n))
-    return R, P, Q, D, torch.stack([torch.zeros_like(info), info], -1)
 
 
 def gj_solve_reference(A, B):
