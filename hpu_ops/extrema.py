@@ -27,15 +27,23 @@ Each op here runs Gaudi's own kernel and then puts NaN where torch has it, with 
   Gaudi difference, left as is), and its backward reads them: the fixed indices go to Gaudi's own backward, which then
   sends a NaN window's gradient to that NaN, as torch.
 
+- With ``HPU_OPS_EXACT_SORT=1`` (off by default, see ``install``): ``sort`` / ``argsort`` / ``msort`` / ``topk`` /
+  ``kthvalue`` with NaN above +inf, as torch: a stable sort of the values with NaN as +inf, then a stable sort of the
+  NaN mask. Gaudi's sort returns NaN as +inf with out-of-range indices, and its non-stable sort of 1000+ elements
+  with infs returns out-of-range indices even without NaN; its stable sort is right. Eager and lazy only:
+  traced by ``torch.compile`` the native op stays (compiled on the card, two of the rewritten sorts came out wrong).
+
 Registered at ``Autograd{}`` only: ``torch.inference_mode()`` calls, below autograd, keep Gaudi's kernels. Integer
 and bool dtypes keep the native op (they have no NaN), and so do ``out=`` calls. The native kernels run first, so
 their argument errors (empty dims, bad dims) are raised as usual.
 """
 import functools
 import math
+import os
 
 import torch
 from torch._C import DispatchKey
+from torch._subclasses.fake_tensor import is_fake
 
 from ._dispatch import count, register_kernels
 
@@ -443,8 +451,82 @@ def _pool_kernel(op, backward_op, name, nd):
     return kernel
 
 
-def install(device_type):
-    """NaN propagation of Gaudi's max/min ops on ``device_type``, at its autograd key. Returns an undo."""
+# ---- sort / topk / kthvalue: NaN greatest, as torch
+
+
+def _sorted(x, d, descending):
+    """``x`` sorted along ``d`` with NaN above +inf (torch's order), and the indices. Gaudi's sort returns NaN as
+    +inf with an out-of-range index, and its non-stable sort of 1000+ elements with infs returns out-of-range indices
+    (measured, also without NaN); its stable sort is right. So: a stable sort of the values with NaN as +inf, then a
+    stable sort of the NaN mask, which puts the NaNs after the infs (before them when descending) and keeps the rest
+    in order."""
+    sort = native(aten.sort.stable)
+    with torch.no_grad():
+        nan = torch.isnan(x)
+        _, i = sort(torch.where(nan, float("inf"), x), stable=True, dim=d, descending=descending)
+        # gather of float data: Gaudi's graph compile of a bool (and int64) gather fails ("Can not compile graph")
+        _, j = sort(nan.to(torch.float32).gather(d, i), stable=True, dim=d, descending=descending)
+        i = i.to(torch.float32).gather(d, j).to(torch.int64)  # float data again; indices < 2**24 are exact
+    return x.gather(d, i), i  # autograd: the gradient to the index, torch's backward of sort
+
+
+def _concrete(t):
+    """True for a real tensor outside any tracer."""
+    return not is_fake(t) and torch._guards.detect_fake_mode() is None and not torch._is_functional_tensor(t)
+
+
+def _sortable(x):
+    # not under torch.compile: compiled on the card, sort(dim=0, descending) and msort came out wrong (measured)
+    return _floating(x) and x.dim() > 0 and x.numel() > 0 and max(x.shape) < POOL_PLANE_MAX and _concrete(x)
+
+
+def _sort_kernel(op, name, overload_stable):
+    def kernel(self, *args, **kwargs):
+        if overload_stable:
+            dim, descending = kwargs.get("dim", -1), kwargs.get("descending", False)
+        else:
+            dim = args[0] if len(args) > 0 else kwargs.get("dim", -1)
+            descending = args[1] if len(args) > 1 else kwargs.get("descending", False)
+        if not _sortable(self):
+            return native(op)(self, *args, **kwargs)
+        count(name)
+        return _sorted(self, _dims(self, dim)[0], descending)
+
+    return kernel
+
+
+def _topk_kernel(op, name):
+    def kernel(self, k, dim=-1, largest=True, sorted=True):
+        if not _sortable(self) or not 0 <= k <= self.shape[_dims(self, dim)[0]]:
+            return native(op)(self, k, dim, largest, sorted)  # its own error for a k out of range
+        count(name)
+        d = _dims(self, dim)[0]
+        values, i = _sorted(self, d, largest)
+        return values.narrow(d, 0, k), i.narrow(d, 0, k)
+
+    return kernel
+
+
+def _kthvalue_kernel(op, name):
+    def kernel(self, k, dim=-1, keepdim=False):
+        if not _sortable(self) or not 1 <= k <= self.shape[_dims(self, dim)[0]]:
+            return native(op)(self, k, dim, keepdim)
+        count(name)
+        d = _dims(self, dim)[0]
+        values, i = _sorted(self, d, False)
+        values, i = values.narrow(d, k - 1, 1), i.narrow(d, k - 1, 1)
+        return (values, i) if keepdim else (values.squeeze(d), i.squeeze(d))
+
+    return kernel
+
+
+def install(device_type, exact_sort=None):
+    """NaN propagation of Gaudi's max/min ops on ``device_type``, at its autograd key. Returns an undo. The sort
+    family (``sort``, ``argsort``, ``msort``, ``topk``, ``kthvalue``) only with ``exact_sort`` (default: the
+    environment's ``HPU_OPS_EXACT_SORT=1``): measured eager, it made the training steps of the SPD models up to 22%
+    slower (hpu-ops' own eigh and SVD sort their eigenvalues; TensorCSPNet 205 to 250 ms), lazy within noise."""
+    if exact_sort is None:
+        exact_sort = os.environ.get("HPU_OPS_EXACT_SORT") == "1"
     k = []
     for op, name in ((aten.amax.default, "amax"), (aten.amin.default, "amin")):
         k.append((op, "Autograd{}", _amax_kernel(op, name)))
@@ -468,4 +550,9 @@ def install(device_type):
     for op, bwd, nd in ((aten.max_pool2d_with_indices.default, aten.max_pool2d_with_indices_backward.default, 2),
                         (aten.max_pool3d_with_indices.default, aten.max_pool3d_with_indices_backward.default, 3)):
         k.append((op, "Autograd{}", _pool_kernel(op, bwd, f"max_pool{nd}d", nd)))
+    if exact_sort:
+        k.append((aten.sort.default, "Autograd{}", _sort_kernel(aten.sort.default, "sort", False)))
+        k.append((aten.sort.stable, "Autograd{}", _sort_kernel(aten.sort.stable, "sort", True)))
+        k.append((aten.topk.default, "Autograd{}", _topk_kernel(aten.topk.default, "topk")))
+        k.append((aten.kthvalue.default, "Autograd{}", _kthvalue_kernel(aten.kthvalue.default, "kthvalue")))
     return register_kernels(device_type, k)

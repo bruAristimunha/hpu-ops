@@ -82,6 +82,9 @@ def gaudi(op):
         if op in POOL_BACKWARDS:  # reads window-local indices
             grad, x, *rest, local = args
             return op(grad, x, *rest, to_global(local, x, rest, POOL_BACKWARDS[op]))
+        if op in (aten.sort.default, aten.sort.stable) and x.is_floating_point():  # NaN read as +-inf
+            desc = kwargs.get("descending", rest[1] if len(rest) > 1 else False)
+            return real(drop(x, -INF if desc else INF), *rest, **kwargs)
         if op in LARGEST or op in SMALLEST:
             fill = -INF if op in LARGEST else INF
             out = real(drop(x, fill), *rest, **kwargs)
@@ -135,7 +138,7 @@ def card(monkeypatch):
     """extrema installed for "cpu", over the NaN-dropping stand-in of Gaudi's kernels; yields the call counts."""
     monkeypatch.setattr(extrema, "native", gaudi)
     monkeypatch.setattr(extrema, "native_backward", gaudi)
-    _CURRENT["undo"] = extrema.install("cpu")
+    _CURRENT["undo"] = extrema.install("cpu", exact_sort=True)
     hpu_ops._STATE["calls"].clear()
     try:
         yield hpu_ops._STATE["calls"]
@@ -149,7 +152,7 @@ def _reference(f, *args):
     try:
         return f(*args)
     finally:
-        _CURRENT["undo"] = extrema.install("cpu")
+        _CURRENT["undo"] = extrema.install("cpu", exact_sort=True)
 
 
 def rows(n=7, dtype=torch.float64, seed=0):
@@ -542,3 +545,109 @@ def test_a_graph_run_through_the_rewrite_again_gives_the_same():
         assert sum(calls.values()) > 0
     for got, want in zip(gots, wants):
         same(got, want)
+
+
+# ---- sort / topk / kthvalue
+
+
+SORTS = {
+    "sort": lambda x: tuple(x.sort(-1)), "sort_desc": lambda x: tuple(x.sort(-1, descending=True)),
+    "sort_stable": lambda x: tuple(x.sort(dim=-1, stable=True)),
+    "sort_stable_desc_dim0": lambda x: tuple(x.sort(dim=0, stable=True, descending=True)),
+    "argsort": lambda x: x.argsort(-1),
+    "argsort_stable_desc": lambda x: x.argsort(dim=-1, descending=True, stable=True),
+    "msort": lambda x: x.msort(),
+    "topk3": lambda x: tuple(x.topk(3, -1)), "topk3_small": lambda x: tuple(x.topk(3, -1, largest=False)),
+    "topk_all": lambda x: tuple(x.topk(x.shape[-1], -1)), "topk0": lambda x: tuple(x.topk(0, -1)),
+    "topk2_dim0": lambda x: tuple(x.topk(2, 0)),
+    "kthvalue2": lambda x: tuple(x.kthvalue(2, -1)), "kthvalue_last_keep": lambda x: tuple(
+        x.kthvalue(x.shape[-1], -1, keepdim=True)),
+}
+STABLE = {"sort_stable", "sort_stable_desc_dim0", "argsort_stable_desc"}
+
+
+def same_selection(got, want, x, dim, exact_index):
+    """Values exactly torch's; indices torch's when the sort is stable, else pointing to those values."""
+    if not isinstance(want, tuple) and want.is_floating_point():  # values only (msort)
+        same(got, want)
+        return
+    got = got if isinstance(got, tuple) else (None, got)
+    want = want if isinstance(want, tuple) else (None, want)
+    if want[0] is not None:
+        same(got[0], want[0])
+    if exact_index:
+        same(got[1], want[1])
+    else:
+        assert got[1].dtype == torch.int64 and got[1].shape == want[1].shape
+        gi, wi = (got[1], want[1]) if got[1].dim() == x.dim() else (got[1].unsqueeze(dim), want[1].unsqueeze(dim))
+        same(x.gather(dim, gi), x.gather(dim, wi))
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+@pytest.mark.parametrize("name", sorted(SORTS))
+def test_sorts_order_nan_as_torch(card, name, dtype):
+    x = rows(dtype=dtype)
+    x[6, 2] = INF  # a real +inf next to NaNs
+    x[6, 0] = NAN
+    f = SORTS[name]
+    dim = 0 if "dim0" in name else -1
+    if name == "msort":
+        dim = 0
+    same_selection(f(x), _reference(f, x), x, dim, name in STABLE)
+    assert card["sort"] + card["topk"] + card["kthvalue"] > 0
+
+
+@pytest.mark.parametrize("name", sorted(set(SORTS) - {"argsort", "argsort_stable_desc"}))
+def test_sort_gradients_are_torch_s(card, name):
+    x = rows()
+    x[6, 2], x[6, 0] = INF, NAN
+    f = lambda t: SORTS[name](t)[0] if name != "msort" else SORTS[name](t)  # noqa: E731
+    got, want = grads(f, x), _reference(grads, f, x)
+    same(got[0], want[0])
+    if name in STABLE or name.startswith("sort") or name == "msort":
+        same(got[1], want[1])
+
+
+def test_sort_without_nan_matches_including_ties_and_infs(card):
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(4, 1200, generator=g)
+    x[:, ::7], x[:, 3::11], x[:, 5::13] = INF, -INF, 0.5
+    x[:, 6::17] = -0.0
+    same_selection(tuple(x.sort(-1)), _reference(lambda t: tuple(t.sort(-1)), x), x, -1, False)
+    same(tuple(x.sort(dim=-1, stable=True)), _reference(lambda t: tuple(t.sort(dim=-1, stable=True)), x))
+
+
+@pytest.mark.parametrize("f", [lambda t: t.topk(11, -1), lambda t: t.topk(-1, -1), lambda t: t.kthvalue(0, -1),
+                               lambda t: t.kthvalue(11, -1), lambda t: t.sort(2), lambda t: t.topk(2, 3)])
+def test_sort_arguments_torch_rejects_raise(card, f):
+    x = rows()
+    with pytest.raises(Exception) as want:
+        _reference(f, x)
+    with pytest.raises(type(want.value)):
+        f(x)
+
+
+def test_sorts_of_integers_scalars_and_empty_keep_the_native_op(card):
+    for x in (torch.tensor([3, 1, 2]), torch.tensor(2.0), torch.empty(0), torch.empty(3, 0)):
+        for f in (lambda t: tuple(t.sort(-1)), lambda t: tuple(t.topk(0, -1)), lambda t: t.argsort(-1)):
+            same(f(x), _reference(f, x))
+    assert card["sort"] == card["topk"] == 0
+
+
+def test_the_sort_family_is_opt_in(monkeypatch):
+    monkeypatch.delenv("HPU_OPS_EXACT_SORT", raising=False)
+    x = rows()
+    with cpu_as_hpu(extrema.install) as calls:
+        x.sort(-1), x.topk(2, -1), x.amax(-1)
+    assert calls["amax"] and not calls["sort"] and not calls["topk"]
+    monkeypatch.setenv("HPU_OPS_EXACT_SORT", "1")
+    with cpu_as_hpu(extrema.install) as calls:
+        x.sort(-1)
+    assert calls["sort"]
+
+
+def test_the_sort_family_keeps_the_native_op_under_compile(card):
+    nodes = []
+    f = lambda t: t.sort(-1).values  # noqa: E731
+    compiled(f, nodes, dynamic=False)(rows(dtype=torch.float32))
+    assert "aten.sort.stable" not in ops(nodes) and card["sort"] == 0
