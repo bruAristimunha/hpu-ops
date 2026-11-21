@@ -8,9 +8,10 @@ static shape, float64 off ``hpu`` only.
 
 On Gaudi2 the composite loses to Habana's CPU fallback (760-7600 ms per call against 2.8-35 ms, batch 32, n = 16-128,
 and a Synapse critical device error in lazy mode at n = 64), so float32 matrices of n <= ``tpc.EIGH_MAXN`` go through
-the TPC one-sided Jacobi kernel of ``hpu_ops.tpc`` (n = 22, batch 32, eager: 1.27 ms against about 3.7 ms for the
-fallback). Without the kernel, or past ``EIGH_MAXN``, the call on ``hpu`` is declined and runs through hpu-ops' own
-CPU route (``linalg._on_cpu``), which is not Habana's fallback. The composite stays the path of the CPU stand-in.
+the TPC one-sided Jacobi kernel of ``hpu_ops.tpc`` (n = 22, batch 32, lazy: 0.54 / 1.0 ms in two processes against
+2.4 / 2.7 for the fallback; eager varies more, see ``tests/linalg_percall.py``). Without the kernel, or past
+``EIGH_MAXN``, the call on ``hpu`` is declined and runs through hpu-ops' own CPU route
+(``linalg._on_cpu``), which is not Habana's fallback. The composite stays the path of the CPU stand-in.
 """
 import torch
 import torch.nn.functional as F
