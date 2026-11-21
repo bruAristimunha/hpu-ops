@@ -10,14 +10,21 @@ so do embedding gradients of indices with dimensions, which Gaudi gets right. Th
 return the input dtype, as the native ops do.
 """
 import math
+import threading
 
 import torch
 from torch._C import DispatchKey
 
+from . import _strict
 from ._dispatch import count, register_kernels, static
 
 aten = torch.ops.aten
 REDUCED = (torch.float16, torch.bfloat16)
+# the most elements of any tensor unfold_backward's rewrite makes or takes on the card: a pad of 1.1e9 x 2 elements
+# stopped Gaudi2 ("Synapse detected a device critical error", 3 of 3 runs; 1.0e9 x 2 was right); larger calls run
+# ATen's kernel on a CPU copy
+UNFOLD_BACKWARD_MAX_ELEMENTS = 2**31 - 1
+_ROUTE = threading.local()
 
 
 def _opmath(dtype):
@@ -106,6 +113,36 @@ def _pad_dims(t, pads):
     return aten.constant_pad_nd.default(t, pad, 0)
 
 
+def _unfold_backward_plan(n, input_sizes, dim, size, step):
+    """How ``unfold_backward`` sums ``n`` windows of ``size`` at ``step`` along ``input_sizes[dim]`` (``dim`` >= 0,
+    ``size`` > 0): ``(branch, step, blocks, rows, elements)``, with ``branch`` "pad" (no overlap), "blocks" or
+    "windows" (the two skews, the smaller buffer), the step it uses, the zero blocks of an uncovered tail, the rows of
+    the block skew, and the most elements of any tensor the branch makes (the gradient and the result included)."""
+    length = input_sizes[dim]
+    outer, inner = math.prod(input_sizes[:dim]), math.prod(input_sizes[dim + 1:])
+    k = -(-size // step)
+    blocks = max(-(-length // step) - (n + k - 1), 0)  # e: zero blocks up to the input's end
+    base = max(outer * n * size * inner, outer * length * inner)
+    if k == 1:
+        step = min(step, length)  # step > length: one window (n == 1), padded to the input's end only
+        return "pad", step, blocks, 0, max(base, outer * (n + blocks) * step * inner)
+    rows = n + k - 1 + blocks
+    by_blocks, by_windows = k * (rows + 1) * step, n * (length + step)
+    if by_blocks <= by_windows:
+        return "blocks", step, blocks, rows, max(base, outer * by_blocks * inner)
+    return "windows", step, blocks, rows, max(base, outer * by_windows * inner)
+
+
+def unfold_backward_elements(grad, input_sizes, dim, size, step):
+    """The most elements of any tensor ``unfold_backward`` makes or takes for these arguments (0 where it makes none
+    beyond the gradient and result: 0-d inputs, size 0, empty gradients, invalid arguments, which it handles or
+    raises itself)."""
+    ndim = len(input_sizes)
+    if ndim == 0 or size <= 0 or step <= 0 or grad.numel() == 0 or not -ndim <= dim < ndim:
+        return 0
+    return _unfold_backward_plan(grad.shape[dim % ndim], input_sizes, dim % ndim, size, step)[-1]
+
+
 def unfold_backward(grad, input_sizes, dim, size, step):
     """The gradient of ``Tensor.unfold`` (``aten.unfold_backward``) as one or two pads and one sum, no index ops.
 
@@ -134,20 +171,19 @@ def unfold_backward(grad, input_sizes, dim, size, step):
     length = input_sizes[dim]
     if size == 0 or grad.numel() == 0:
         return grad.new_zeros(input_sizes)
-    n, k = grad.shape[dim], -(-size // step)
+    n = grad.shape[dim]
+    branch, step, blocks, rows, _ = _unfold_backward_plan(n, input_sizes, dim, size, step)
+    k = -(-size // step)
     outer, inner = math.prod(input_sizes[:dim]), math.prod(input_sizes[dim + 1:])
     g = grad.reshape(outer, n, inner, size).transpose(2, 3)  # (outer, n, size, inner), a view of a contiguous grad
-    blocks = max(-(-length // step) - (n + k - 1), 0)  # e: zero blocks up to the input's end
-    if k == 1:
-        step = min(step, length)  # step > length: one window (n == 1), padded to the input's end only
+    if branch == "pad":
         if blocks or step > size:
             g = _pad_dims(g, {1: blocks, 2: step - size})
         else:  # step == size and no tail: only a copy, never a view of ``grad``
             g = g.clone(memory_format=torch.contiguous_format)
         g = g.reshape(outer, (n + blocks) * step, inner).narrow(1, 0, length).contiguous()
         return g.reshape(input_sizes)
-    rows = n + k - 1 + blocks
-    if k * (rows + 1) * step <= n * (length + step):  # skew over the blocks
+    if branch == "blocks":  # skew over the blocks
         if size < k * step:
             g = _pad_dims(g, {2: k * step - size})
         g = g.reshape(outer, n, k, step, inner).transpose(1, 2)  # (outer, k, n, step, inner), a view
@@ -219,13 +255,30 @@ def install_unfold(device_type):
     return register_kernels(device_type, [(op, "{}", kernel)])
 
 
+def _unfold_backward_on_cpu(op, grad, input_sizes, dim, size, step):
+    """ATen's kernel on a CPU copy of ``grad``, the result moved back (a named hpu-ops CPU route). On the CPU stand-in
+    the CPU key is the rewrite itself: inside the route it computes instead of routing again."""
+    with _strict.route(op, grad, detail="unfold_backward above 2^31 - 1 elements on a CPU copy"):
+        _ROUTE.depth = getattr(_ROUTE, "depth", 0) + 1
+        try:
+            return op(grad.cpu(), input_sizes, dim, size, step).to(grad.device)
+        finally:
+            _ROUTE.depth -= 1
+
+
 def install_unfold_backward(device_type):
     """``aten.unfold_backward`` (the gradient of ``Tensor.unfold``) on ``device_type`` as pads, reshapes and one sum
     (``unfold_backward`` above), at the backend key, below torch's autograd kernel (whose derivative is ``unfold``).
-    No Habana stack registers a kernel there: every call ran on the CPU, eager and lazy (#43). Returns an undo."""
+    No Habana stack registers a kernel there: every call ran on the CPU, eager and lazy (#43). Calls whose gradient,
+    result or buffer would pass ``UNFOLD_BACKWARD_MAX_ELEMENTS`` run ATen's kernel on a CPU copy instead (a named CPU
+    route, reported by strict mode). Returns an undo."""
     op = aten.unfold_backward.default
 
     def kernel(grad_in, input_sizes, dim, size, step):
+        if getattr(_ROUTE, "depth", 0) == 0 and unfold_backward_elements(
+                grad_in, input_sizes, dim, size, step) > UNFOLD_BACKWARD_MAX_ELEMENTS:
+            count("unfold_backward_cpu")
+            return _unfold_backward_on_cpu(op, grad_in, input_sizes, dim, size, step)
         count("unfold_backward")
         return unfold_backward(grad_in, input_sizes, dim, size, step)
 

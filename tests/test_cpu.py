@@ -2233,6 +2233,36 @@ def test_unfold_backward_compiled_dynamic_sees_concrete_shapes(unfold_backward_k
     assert not counters["graph_break"]
 
 
+def test_unfold_backward_above_the_element_limit_runs_aten_on_a_cpu_copy(unfold_backward_key_free, monkeypatch):
+    """A gradient, result or buffer above ``UNFOLD_BACKWARD_MAX_ELEMENTS`` (2^31 - 1: a pad of 1.1e9 x 2 elements
+    stopped Gaudi2) takes ATen's kernel on a CPU copy, a named route strict mode reports; at the limit the rewrite runs.
+    The limit is lowered here (the stand-in's CPU key is the rewrite, which computes inside the route)."""
+    grad = torch.randn(3, 9, 4, dtype=torch.float64)  # (3, 12) unfolded at size 4, step 1: block-skew buffer 3 * 4 * 13
+    want = torch.ops.aten.unfold_backward(grad, [3, 12], 1, 4, 1)
+    elements = composite.unfold_backward_elements(grad, [3, 12], 1, 4, 1)
+    assert elements == 3 * 4 * (9 + 3 + 1)  # outer * k * (rows + 1) * step * inner
+    with cpu_as_hpu(composite.install_unfold_backward) as calls:
+        monkeypatch.setattr(composite, "UNFOLD_BACKWARD_MAX_ELEMENTS", elements)
+        at_limit = torch.ops.aten.unfold_backward(grad, [3, 12], 1, 4, 1)
+        assert calls["unfold_backward"] == 1 and not calls["unfold_backward_cpu"]
+        monkeypatch.setattr(composite, "UNFOLD_BACKWARD_MAX_ELEMENTS", elements - 1)
+        with hpu_ops.strict("report", watch_cpu_ops=False):
+            routed = torch.ops.aten.unfold_backward(grad, [3, 12], 1, 4, 1)
+            rows = hpu_ops.strict_report()
+    assert calls["unfold_backward_cpu"] == 1 and calls["unfold_backward"] == 2  # the route's inner call computes
+    assert [(r[0], r[1]) for r in rows] == [("hpu_ops route", "aten::unfold_backward")], rows
+    assert_same([at_limit, routed], [want, want])
+
+
+@pytest.mark.parametrize("length,routed", [(10**9, False), (11 * 10**8, True)])
+def test_unfold_backward_element_limit_at_the_crash_on_gaudi(length, routed):
+    """The review's measured case, ``(1, L - 1, 2)`` into ``[1, L]`` at size 2, step 1: its pad of ``2 * (L + 1)``
+    elements was right on Gaudi2 at L = 1.0e9 and stopped the card at 1.1e9 (3 of 3 runs). Shapes only, no tensor."""
+    plan = composite._unfold_backward_plan(length - 1, [1, length], 1, 2, 1)
+    assert plan[0] == "blocks" and plan[-1] == 2 * (length + 1)
+    assert (plan[-1] > composite.UNFOLD_BACKWARD_MAX_ELEMENTS) == routed
+
+
 def test_unfold_backward_elsewhere_keeps_the_native_kernel():
     """Where the backend key has a kernel (the CPU here) nothing is registered."""
     x = torch.randn(3, 8, requires_grad=True)

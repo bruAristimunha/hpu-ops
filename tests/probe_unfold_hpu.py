@@ -171,6 +171,33 @@ def op_case(dtype, shape, dim, size, step, layout):
     return row
 
 
+def routed_case():
+    """Above ``UNFOLD_BACKWARD_MAX_ELEMENTS`` (lowered here: the real 2^31 - 1 case stops the card) the call runs
+    ATen's kernel on a CPU copy: the values, the route's count, and no bridge fallback."""
+    f0 = fb()
+    row = {}
+    limit = composite.UNFOLD_BACKWARD_MAX_ELEMENTS
+    before = hpu_ops._STATE["calls"]["unfold_backward_cpu"]
+    try:
+        g = torch.randn(16, 45, 64, 8)
+        want = torch.ops.aten.unfold_backward(g.double(), [16, 52, 64], 1, 8, 1)
+        composite.UNFOLD_BACKWARD_MAX_ELEMENTS = 1000
+        got = torch.ops.aten.unfold_backward(g.to("hpu"), [16, 52, 64], 1, 8, 1)
+        mark()
+        row["values"] = close(got, want, "routed") and got.device.type == "hpu"
+        row["routed"] = hpu_ops._STATE["calls"]["unfold_backward_cpu"] == before + 1
+    except Exception as e:  # noqa: BLE001
+        row["error"] = repr(e)[:200]
+    finally:
+        composite.UNFOLD_BACKWARD_MAX_ELEMENTS = limit
+    mark()
+    d = fb()
+    row["fallbacks"] = {k: d[k] - f0.get(k, 0) for k in d if d[k] - f0.get(k, 0)}
+    print("CASE routed above the element limit", row, "rel_err", dict(ERRORS), flush=True)
+    ERRORS.clear()
+    return row
+
+
 def pad_layout_case():
     """The layout Gaudi's ``constant_pad_nd`` gives the skew's transposed input (the CPU's keeps it channels-last, so
     the next reshape copies): informational, never a failure."""
@@ -221,6 +248,7 @@ def main():
     rows = [case(*c) for c in cases]
     rows += [op_case(*c) for c in OP_CASES]
     pad_layout_case()
+    rows.append(routed_case())
 
     # writes THROUGH the view (and a view of it): base and view against the CPU's
     writes = [
