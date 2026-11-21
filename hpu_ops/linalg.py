@@ -13,9 +13,9 @@ Composites contain no host sync: loops run over Python ints from static shapes.
 
 On Gaudi2 these composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
 with the TPC Gauss-Jordan kernel of ``hpu_ops.tpc`` loaded, float32 matrices of n <= ``tpc.MAXN`` go through it
-instead (solve, inv, det, slogdet). The triangular solves (``solve_triangular``, ``cholesky_solve``) are not installed
-by default: pivoted Gauss-Jordan on a triangle loses accuracy and ``cholesky_solve`` squares the condition number;
-a substitution kernel is coming. Their code and tests stay. Without the kernel, or past ``MAXN``, the call on
+instead (solve, inv, det, slogdet), and the triangular solves (``solve_triangular``, ``cholesky_solve``) through
+its substitution kernel (``tpc.tri_solve``): no pivoting, so no accuracy is lost on ill-conditioned triangles, and
+``cholesky_solve`` is two substitutions, never L L^H. Without the kernel, or past ``MAXN``, the call on
 ``hpu`` is declined and runs through hpu-ops' own CPU route (``_on_cpu``), which is not Habana's fallback. The
 composites stay the path of the CPU stand-in.
 """
@@ -35,10 +35,11 @@ aten = torch.ops.aten
 FLOAT64_WARNING = ("hpu_ops: {name} of float64 HPU tensors runs on the CPU: Gaudi2 computes float64 at float32 "
                    "precision (bruAristimunha/hpu-ops#16).")
 _WARNED = set()
-# The Gauss-Jordan solver ``(A, B) -> (X, D, S)`` the Functions call for float32 n <= tpc.MAXN. None means
-# ``tpc.gj_solve`` on HPU with the kernel ready; the CPU tests set it to ``tpc.gj_solve_reference`` to exercise the
-# wiring.
+# The Gauss-Jordan solver ``(A, B) -> (X, D, S)`` and triangular solver ``(A, B, upper, left, unitriangular) -> X``
+# the Functions call for float32 n <= tpc.MAXN. None means ``tpc.gj_solve`` / ``tpc.tri_solve`` on HPU with the kernel
+# ready; the CPU tests set them to ``tpc.gj_solve_reference`` / ``tpc.tri_solve_reference`` to exercise the wiring.
 _GJ = None
+_TRI = None
 # The Jacobi SVD hook ``(A, compute_uv) -> (U, S, Vh)`` for CPU tests; None means ``tpc.jacobi_svd`` /
 # ``tpc.jacobi_svdvals`` on HPU, or ``tpc.svd_reference`` on CPU when unset.
 _SVD = None
@@ -99,21 +100,24 @@ def _takes(device_type, name, matrix_at=0):
         tensors = [x for x in (*args, *kwargs.values()) if isinstance(x, torch.Tensor)]
         if not _takes_tensors(device_type, name, tensors):
             return False
+        if len({t.device for t in tensors}) > 1:  # torch's own kernel raises its device error
+            return False
         matrix = args[matrix_at]
         return matrix.dim() >= 2 and matrix.shape[-1] == matrix.shape[-2]
 
     return takes
 
 
-def _tpc_takes(device_type, takes, matrix_at=0):
-    """``takes``, and on ``hpu`` also: n <= ``tpc.MAXN`` and the TPC kernel ready (path installed, Gaudi2, extension
+def _tpc_takes(device_type, takes, matrix_at=0, maxn=None):
+    """``takes``, and on ``hpu`` also: n <= ``maxn`` (default ``tpc.MAXN``) and the TPC kernel ready (path installed, Gaudi2, extension
     built). Otherwise the call is declined and takes hpu-ops' own CPU route (``_on_cpu``), which beats the composites
     on Gaudi2."""
 
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
             return False
-        return device_type != "hpu" or (args[matrix_at].shape[-1] <= tpc.MAXN and tpc.ready())
+        limit = tpc.MAXN if maxn is None else maxn
+        return device_type != "hpu" or (args[matrix_at].shape[-1] <= limit and tpc.ready())
 
     return tpc_takes
 
@@ -150,6 +154,20 @@ def _gj_solve(A, B, left=True):
     return X.mT, D, S
 
 
+def _use_tri(A):
+    """Whether ``A`` goes through the triangular substitution kernel: n <= ``tpc.MAXN`` and, on HPU, float32 with the
+    kernel ready; or, with the ``_TRI`` hook set (CPU tests), any dtype."""
+    if A.shape[-1] > tpc.MAXN:
+        return False
+    return _TRI is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
+
+
+def _tri(A, B, upper=False, left=True, unitriangular=False):
+    """Triangular substitution via ``tpc.tri_solve`` (or ``_TRI`` in CPU tests)."""
+    solver = tpc.tri_solve if _TRI is None else _TRI
+    return solver(A, B, upper, left, unitriangular)
+
+
 def _gj_info(S, batch):
     """The ``info`` (int32; the index follows the kernel's elimination order, can differ from LAPACK's, and is nonzero
     exactly when a pivot is exactly zero) from the kernel's ``S``, shaped like the batch of ``A`` (``S`` carries the
@@ -159,20 +177,6 @@ def _gj_info(S, batch):
         info = info[(0,) * (info.dim() - len(batch))]
         info = info[tuple(slice(0, 1) if a == 1 else slice(None) for a in batch)]
     return info.contiguous()  # a slice of the broadcast batch is strided; _linalg_check_errors asserts contiguity
-
-
-def _bad_matrix(S, diagonal):
-    """``[...]`` bool: the kernel's info (``S[..., 1]``) is nonzero, or ``diagonal`` (the one torch's triangular solve
-    reads, ``None`` if none) has a zero. Partial pivoting rarely makes a singular triangle's pivot exactly zero, so
-    the info alone misses most of them. Broadcast to the batch of ``S``; no host sync."""
-    bad = S[..., 1] != 0
-    return bad if diagonal is None else bad | (diagonal == 0).any(-1)
-
-
-def _nan_if_singular(X, S, diagonal=None):
-    """``X`` with NaN for the matrices ``_bad_matrix`` flags, as torch's triangular solves give non-finite values for
-    a zero diagonal: the kernel zeroes a zero pivot's row, which would leave finite garbage."""
-    return torch.where(_bad_matrix(S, diagonal)[..., None, None], float("nan"), X)
 
 
 def _unused_factors(A):
@@ -185,12 +189,39 @@ def _unused_factors(A):
     return A.new_zeros(()).expand(A.shape), pivots.expand(*A.shape[:-1])
 
 
+def _device(args, kwargs):
+    """The one device of the tensors in ``args`` and ``kwargs``; torch's error when they are on several (the CPU copy
+    would otherwise hide a mismatch torch rejects)."""
+    devices = list(dict.fromkeys(x.device for x in pytree.tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor)))
+    if len(devices) > 1:
+        raise RuntimeError(f"Expected all tensors to be on the same device, but found at least two devices, "
+                           f"{devices[0]} and {devices[1]}!")
+    return devices[0]
+
+
 def _on_cpu(op, args, kwargs):
-    """``op`` on CPU copies of the tensors; the outputs on the first tensor's device."""
-    device = next(x.device for x in pytree.tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor))
+    """``op`` on CPU copies of the tensors; the outputs on the tensors' device (all on one device, else torch's
+    error)."""
+    device = _device(args, kwargs)
     to_cpu = lambda x: x.cpu() if isinstance(x, torch.Tensor) else x  # noqa: E731
     out = op(*pytree.tree_map(to_cpu, args), **pytree.tree_map(to_cpu, kwargs))
     return pytree.tree_map(lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, out)
+
+
+def _out_on_cpu(op, args, kwargs, outs):
+    """The out= overload ``op`` on CPU copies of the inputs, with CPU destinations of the dtype, shape and strides of
+    ``outs`` (a dict of the out= arguments), so torch's own checks run (dtype, resize warning, layout); each result is
+    then written into its destination with the layout torch gave it. Returns the destinations (one, or a tuple)."""
+    _device(args, {**kwargs, **outs})
+    to_cpu = lambda x: x.cpu() if isinstance(x, torch.Tensor) else x  # noqa: E731
+    cpu_outs = {k: torch.empty_strided(v.shape, v.stride(), dtype=v.dtype) for k, v in outs.items()}
+    op(*pytree.tree_map(to_cpu, args), **pytree.tree_map(to_cpu, kwargs), **cpu_outs)
+    for k, v in outs.items():
+        if v.shape != cpu_outs[k].shape or v.stride() != cpu_outs[k].stride():
+            v.resize_(cpu_outs[k].numel()).as_strided_(cpu_outs[k].shape, cpu_outs[k].stride())
+        v.copy_(cpu_outs[k])
+    values = tuple(outs.values())
+    return values[0] if len(values) == 1 else values
 
 
 def _kernels(device_type, op, name, function, takes, backend=True):
@@ -250,22 +281,14 @@ def solve_triangular(A, B, upper, left=True, unitriangular=False):
     return X @ B if left else B @ X
 
 
-def _triangle(A, upper, unitriangular):
-    """The triangle of ``A`` that ``linalg.solve_triangular`` reads, as a full matrix: the other triangle zero, the
-    diagonal 1 with ``unitriangular``."""
-    k = int(unitriangular)
-    T = torch.triu(A, k) if upper else torch.tril(A, -k)
-    return T + torch.eye(A.shape[-1], dtype=A.dtype, device=A.device) if unitriangular else T
-
-
 class SolveTriangular(torch.autograd.Function):
-    """``linalg.solve_triangular`` with torch's backward (``linalg_solve_triangular_backward``) over the composite."""
+    """``linalg.solve_triangular`` with torch's backward (``linalg_solve_triangular_backward``). On HPU, float32 with
+    n <= ``tpc.MAXN`` runs the TPC substitution kernel (``tpc.tri_solve``); otherwise the composite (CPU stand-in)."""
 
     @staticmethod
     def compute(A, B, upper, left, unitriangular):
-        if _use_tpc(A):
-            X, _, S = _gj_solve(_triangle(A, upper, unitriangular), B, left)
-            return _nan_if_singular(X, S, None if unitriangular else A.diagonal(dim1=-2, dim2=-1))
+        if _use_tri(A):
+            return _tri(A, B, upper, left, unitriangular)
         return solve_triangular(A, B, upper, left, unitriangular)
 
     @staticmethod
@@ -290,10 +313,143 @@ class SolveTriangular(torch.autograd.Function):
 
 
 def install_solve_triangular(device_type):
-    """``linalg.solve_triangular`` on ``device_type`` as a matmul with the block-recursive inverse. Returns an undo."""
+    """``linalg.solve_triangular`` on ``device_type``: on HPU, float32 with n <= ``tpc.MAXN`` through the TPC
+    substitution kernel (``tpc.tri_solve``), other calls through hpu-ops' CPU route; on the CPU stand-in, the
+    composite (a matmul with the block-recursive inverse). Returns an undo."""
     op = aten.linalg_solve_triangular.default
-    takes = _tpc_takes(device_type, _takes(device_type, "solve_triangular"))
-    return register_paired(device_type, [_kernels(device_type, op, "solve_triangular", SolveTriangular, takes)])
+    base = _takes(device_type, "solve_triangular")
+
+    def shapes_ok(A, B, upper=False, left=True, unitriangular=False):
+        return base(A, B) and B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
+
+    takes = _tpc_takes(device_type, shapes_ok)
+    groups = [_kernels(device_type, op, "solve_triangular", SolveTriangular, takes),
+              _solve_triangular_out_kernels(device_type, takes), _triangular_solve_kernels(device_type, takes)]
+    return register_paired(device_type, groups)
+
+
+RESIZE_WARNING = ("An output with one or more elements was resized since it had shape {old}, which does not match the "
+                  "required output shape {new}. This behavior is deprecated, and in a future PyTorch release outputs "
+                  "will not be resized unless they have zero elements. You can explicitly reuse an out tensor t by "
+                  "resizing it, inplace, to zero elements with t.resize_(0).")
+
+
+def _into(out, X):
+    """``X`` written into ``out``; returns ``out``. As torch's linalg out= ops: a destination of another dtype raises,
+    one of another shape is resized (with torch's warning unless it was empty) to the column-major layout of the
+    matrices (strides ``(..., 1, rows)``), one of the right shape keeps its layout."""
+    if out.dtype != X.dtype:
+        raise RuntimeError(f"Expected out tensor to have dtype {X.dtype}, but got {out.dtype} instead")
+    if out.shape != X.shape:
+        if out.numel() != 0:
+            warnings.warn(RESIZE_WARNING.format(old=list(out.shape), new=list(X.shape)), stacklevel=3)
+        out.resize_(X.mT.shape).transpose_(-2, -1)
+    return out.copy_(X)
+
+
+def _solve_triangular_out_kernels(device_type, takes):
+    """``linalg.solve_triangular(..., out=)`` (``aten.linalg_solve_triangular.out``): the same route as the functional
+    op, written into ``out``. out= ops do not differentiate, so a call with an input that requires grad keeps the
+    op's own autograd kernel (which raises, as in torch)."""
+    op = aten.linalg_solve_triangular.out
+
+    def ours(A, B, *, upper, left=True, unitriangular=False, out):
+        return out.dtype == A.dtype and out.device == A.device and takes(A, B, upper, left, unitriangular)
+
+    def autograd_kernel(*args, **kwargs):
+        # out= ops do not differentiate: an input or the destination that requires grad raises in torch's own kernel
+        grads = torch.is_grad_enabled() and any(t.requires_grad for t in _bind(op, args, kwargs)
+                                                if isinstance(t, torch.Tensor))
+        if not grads and ours(*args, **kwargs):
+            count("solve_triangular")
+            A, B, upper, left, unitriangular, out = _bind(op, args, kwargs)
+            return _into(out, SolveTriangular.compute(A, B, upper, left, unitriangular))
+        return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
+
+    def backend_kernel(*args, **kwargs):
+        A, B, upper, left, unitriangular, out = _bind(op, args, kwargs)
+        if ours(*args, **kwargs):
+            count("solve_triangular")
+            return _into(out, SolveTriangular.compute(A, B, upper, left, unitriangular))
+        return _out_on_cpu(op, (A, B), dict(upper=upper, left=left, unitriangular=unitriangular), dict(out=out))
+
+    return [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
+
+
+class ClonedCoefficient(torch.autograd.Function):
+    """The ``cloned_coefficient`` of the legacy ``triangular_solve``: ``A`` broadcast to the batch and copied. As in
+    torch it is an output of the op, so it requires grad when ``B`` does, and its gradient to ``B`` is zero."""
+
+    @staticmethod
+    def forward(ctx, A, B, batch):
+        ctx.A_shape, ctx.B_shape = A.shape, B.shape
+        return A.expand(*batch, *A.shape[-2:]).clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        gA = grad.sum_to_size(ctx.A_shape) if ctx.needs_input_grad[0] else None
+        gB = grad.new_zeros(ctx.B_shape) if ctx.needs_input_grad[1] else None
+        return gA, gB, None
+
+
+def _triangular_solve_kernels(device_type, takes):
+    """The legacy ``torch.triangular_solve(B, A, upper, transpose, unitriangular)`` (``aten.triangular_solve``, and
+    its out= overload ``.X``): ``solution`` through the same route as ``linalg.solve_triangular`` (``transpose``
+    solves with ``A^T``), and ``cloned_coefficient`` a copy of ``A`` broadcast to the batch, as torch returns it."""
+    op = aten.triangular_solve.default
+    op_out = aten.triangular_solve.X
+
+    def outputs(differentiable, B, A, upper, transpose, unitriangular):
+        solve = SolveTriangular.apply if differentiable else SolveTriangular.compute
+        X = solve(A.mT if transpose else A, B, upper != transpose, True, unitriangular)
+        batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+        if differentiable:
+            return X, ClonedCoefficient.apply(A, B, batch)
+        return X, A.expand(*batch, *A.shape[-2:]).clone()
+
+    def ours(B, A, upper, transpose, unitriangular):
+        return takes(A.mT if transpose else A, B, upper != transpose, True, unitriangular)
+
+    def autograd_kernel(*args, **kwargs):
+        bound = _bind(op, args, kwargs)
+        if ours(*bound):
+            count("solve_triangular")
+            return outputs(True, *bound)
+        return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
+
+    def backend_kernel(*args, **kwargs):
+        bound = _bind(op, args, kwargs)
+        if ours(*bound):
+            count("solve_triangular")
+            return outputs(False, *bound)
+        return _on_cpu(op, args, kwargs)
+
+    def ours_out(B, A, upper, transpose, unitriangular, X, M):
+        same = all(t.dtype == A.dtype and t.device == A.device for t in (X, M))
+        return same and ours(B, A, upper, transpose, unitriangular)
+
+    def write(bound):
+        B, A, upper, transpose, unitriangular, X, M = bound
+        count("solve_triangular")
+        solution, coefficient = outputs(False, B, A, upper, transpose, unitriangular)
+        return _into(X, solution), _into(M, coefficient)
+
+    def autograd_kernel_out(*args, **kwargs):
+        bound = _bind(op_out, args, kwargs)
+        grads = torch.is_grad_enabled() and any(t.requires_grad for t in bound if isinstance(t, torch.Tensor))
+        if not grads and ours_out(*bound):
+            return write(bound)
+        return op_out._op_dk(DispatchKey.Autograd, *args, **kwargs)
+
+    def backend_kernel_out(*args, **kwargs):
+        bound = _bind(op_out, args, kwargs)
+        if ours_out(*bound):
+            return write(bound)
+        B, A, upper, transpose, unitriangular, X, M = bound
+        return _out_on_cpu(op_out, (B, A, upper, transpose, unitriangular), {}, dict(X=X, M=M))
+
+    return [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel),
+            (op_out, "Autograd{}", autograd_kernel_out), (op_out, "{}", backend_kernel_out)]
 
 
 def cholesky_solve(B, L, upper=False):
@@ -303,14 +459,14 @@ def cholesky_solve(B, L, upper=False):
 
 
 class CholeskySolve(torch.autograd.Function):
-    """``cholesky_solve`` with torch's backward (``cholesky_solve_backward``) over the composite."""
+    """``cholesky_solve`` with torch's backward (``cholesky_solve_backward``). On HPU, float32 with n <= ``tpc.MAXN``
+    runs two TPC substitutions (``tpc.tri_solve``, L then L^H); otherwise the composite (CPU stand-in)."""
 
     @staticmethod
     def compute(B, L, upper):
-        if _use_tpc(L):
-            L = torch.triu(L) if upper else torch.tril(L)
-            X, _, S = _gj(L.mH @ L if upper else L @ L.mH, B)
-            return _nan_if_singular(X, S, L.diagonal(dim1=-2, dim2=-1))
+        if _use_tri(L):
+            Y = _tri(L.mH if upper else L, B, False, True, False)
+            return _tri(L if upper else L.mH, Y, True, True, False)
         return cholesky_solve(B, L, upper)
 
     @staticmethod
@@ -335,8 +491,15 @@ class CholeskySolve(torch.autograd.Function):
 
 
 def install_cholesky_solve(device_type):
-    """``cholesky_solve`` on ``device_type`` as two matmuls with the block-recursive inverse. Returns an undo."""
-    takes = _tpc_takes(device_type, _takes(device_type, "cholesky_solve", matrix_at=1), matrix_at=1)
+    """``cholesky_solve`` on ``device_type``: on HPU, float32 with n <= ``tpc.MAXN`` as two TPC substitutions
+    (``tpc.tri_solve``), other calls through hpu-ops' CPU route; on the CPU stand-in, the composite (two matmuls with
+    the block-recursive inverse). Returns an undo."""
+    base = _takes(device_type, "cholesky_solve", matrix_at=1)
+
+    def shapes_ok(B, L, upper=False):
+        return base(B, L) and B.dim() >= 2 and B.shape[-2] == L.shape[-1]
+
+    takes = _tpc_takes(device_type, shapes_ok, matrix_at=1)
     autograd = _kernels(device_type, aten.cholesky_solve.default, "cholesky_solve", CholeskySolve, takes)[0]
     # The other two entries are dropped: the helper is the backend key of the same op, so each key gets one kernel.
     backend = _kernels(device_type, aten._cholesky_solve_helper.default, "cholesky_solve", CholeskySolve, takes)[1]
@@ -520,10 +683,11 @@ class InvEx(torch.autograd.Function):
 class Det(torch.autograd.Function):
     """``aten._linalg_det`` as the signed product of U's diagonal, with torch's backward (``g det A^-H``), the inverse
     recomputed from A, so double backward works. A singular matrix has det 0, and on Gaudi2 its gradient
-    equals torch's (measured). ``LU`` and
+    equals torch's (measured), also with ``create_graph``. ``LU`` and
     ``pivots`` are not differentiable; they are those of A (native's CPU kernel returns those of A^T). Through the TPC
-    kernel D and S come from the identity kernel (``_gj_inv``), X discarded; the kernel zeroes the pivot row so later
-    pivots stay finite."""
+    kernel D and S come from the identity kernel (``_gj_inv``), X discarded; a zero pivot leaves later pivots finite.
+    In grad mode (double backward) a singular A (|det| < 100 eps) takes torch's SVD formula instead of ``det A^-H``,
+    which is 0 there (one host sync per such backward)."""
 
     @staticmethod
     def compute(A):
@@ -544,13 +708,38 @@ class Det(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad, *_):
         A, det = ctx.saved_tensors
-        return (grad * det)[..., None, None] * InvEx.apply(A, False)[0].mH
+        cofactor = (grad * det)[..., None, None] * InvEx.apply(A, False)[0].mH
+        if torch.is_grad_enabled():
+            # torch's derivative in grad mode (double backward): the SVD formula for |det| < 100 eps, whose cofactor
+            # is right on a singular matrix, where det * A^-H is 0. The check is a host sync, in grad mode only.
+            singular = det.abs() < 100 * torch.finfo(A.dtype).eps
+            if bool(singular.any()):
+                return torch.where(singular[..., None, None], _det_grad_singular(A, grad), cofactor)
+        return cofactor
+
+
+def _det_grad_singular(A, grad):
+    """torch's ``linalg_det_backward`` for singular ``A`` in grad mode: with ``A = U S V^H``, ``det(U) det(V^H) U
+    diag(g prod_{j != i} s_j) V^H``, the products without a division (exclusive cumulative products). Gaudi has no
+    SVD kernel, so on HPU the SVD runs on a CPU copy (differentiable ``.cpu()``/``.to()``): a host round trip, only
+    for a singular matrix differentiated with ``create_graph``."""
+    if A.device.type == "hpu":
+        U, S, Vh = (t.to(A.device) for t in torch.linalg.svd(A.cpu()))
+    else:
+        U, S, Vh = torch.linalg.svd(A)
+    alpha = torch.linalg.det(U) * torch.linalg.det(Vh)
+    ones = torch.ones_like(S[..., :1])
+    before = torch.cumprod(torch.cat([ones, S[..., :-1]], -1), -1)
+    after = torch.cumprod(torch.cat([ones, S.flip(-1)[..., :-1]], -1), -1).flip(-1)
+    D = (grad * alpha)[..., None] * before * after
+    return (U * D[..., None, :]) @ Vh
 
 
 class Slogdet(torch.autograd.Function):
     """``aten._linalg_slogdet`` as the sign and log of U's diagonal, with torch's backward (``g A^-H``) for
-    ``logabsdet``, the inverse recomputed from A, so double backward works. ``sign``, ``LU`` and ``pivots`` are
-    not differentiable; ``LU`` and ``pivots`` are those of A (native's CPU kernel returns those of A^T). On Gaudi2
+    ``logabsdet``, the inverse recomputed from A, so double backward works. ``sign`` is differentiable as in torch
+    (its gradient is none for real input: ``sign.backward()`` leaves ``A.grad`` unset); ``LU`` and ``pivots`` are
+    not; ``LU`` and ``pivots`` are those of A (native's CPU kernel returns those of A^T). On Gaudi2
     a singular matrix gives ``logabsdet = -inf`` as in torch, but a finite gradient where torch's is non-finite."""
 
     @staticmethod
@@ -567,11 +756,14 @@ class Slogdet(torch.autograd.Function):
     def forward(ctx, A):
         sign, logabsdet, LU, pivots = Slogdet.compute(A)
         ctx.save_for_backward(A)
-        ctx.mark_non_differentiable(sign, LU, pivots)
+        ctx.mark_non_differentiable(LU, pivots)
+        ctx.set_materialize_grads(False)
         return sign, logabsdet, LU, pivots
 
     @staticmethod
     def backward(ctx, _sign, grad, *_):
+        if grad is None:  # only sign was used: real sign has no gradient
+            return None
         (A,) = ctx.saved_tensors
         return grad[..., None, None] * InvEx.apply(A, False)[0].mH
 
@@ -608,7 +800,7 @@ def _svd_takes(device_type, name="svd"):
             return False
         if driver is not None or not _takes_tensors(device_type, name, [A]):
             return False
-        if A.dim() < 2 or A.shape[-2] > tpc.MAXN or A.shape[-1] > tpc.MAXN:
+        if A.dim() < 2 or A.shape[-2] > tpc.SMALL_MAXN or A.shape[-1] > tpc.SMALL_MAXN:
             return False
         return device_type != "hpu" or tpc.ready()
 
@@ -621,7 +813,7 @@ def _pinv_takes(device_type, name="pinv"):
             return False
         if hermitian or not _takes_tensors(device_type, name, [A]):
             return False
-        if A.dim() < 2 or A.shape[-2] > tpc.MAXN or A.shape[-1] > tpc.MAXN:
+        if A.dim() < 2 or A.shape[-2] > tpc.SMALL_MAXN or A.shape[-1] > tpc.SMALL_MAXN:
             return False
         if device_type == "hpu" and not tpc.ready():
             return False
@@ -643,7 +835,7 @@ def _lstsq_takes(device_type, name="lstsq"):
             return False
         if not _takes_tensors(device_type, name, [A, B]) or A.dtype != B.dtype:
             return False
-        if A.dim() < 2 or A.shape[-2] > tpc.MAXN or A.shape[-1] > tpc.MAXN:
+        if A.dim() < 2 or A.shape[-2] > tpc.SMALL_MAXN or A.shape[-1] > tpc.SMALL_MAXN:
             return False
         if device_type == "hpu" and not tpc.ready():
             return False
@@ -811,7 +1003,7 @@ def install_svd(device_type):
                 A, ord_, dim, keepdim, dtype = _bind(op_, args, kwargs)
                 dims = _norm_dims(A, dim) if dtype is None and pred_(ord_) else None
                 if dims is not None and not _transformed() and _takes_tensors(device_type, "svd", [A]) and \
-                        A.shape[dims[0]] <= tpc.MAXN and A.shape[dims[1]] <= tpc.MAXN and \
+                        A.shape[dims[0]] <= tpc.SMALL_MAXN and A.shape[dims[1]] <= tpc.SMALL_MAXN and \
                         (device_type != "hpu" or tpc.ready()):
                     return _norm_run(A, ord_, dims[0], dims[1], keepdim)
                 return op_._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
@@ -1208,7 +1400,7 @@ def _matrix_exp_frechet_torch(A, gY):
 
 
 class MatrixExp(torch.autograd.Function):
-    """``aten.linalg_matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.MAXN``), with differentiable Padé-13
+    """``aten.linalg_matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.SMALL_MAXN``), with differentiable Padé-13
     Fréchet backward for double backward and ``torch.compile``."""
 
     @staticmethod
@@ -1240,10 +1432,10 @@ class MatrixExp(torch.autograd.Function):
 
 
 def install_matrix_exp(device_type):
-    """``linalg.matrix_exp`` / ``torch.matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.MAXN``).
+    """``linalg.matrix_exp`` / ``torch.matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.SMALL_MAXN``).
     Returns an undo."""
     op = aten.linalg_matrix_exp.default
-    takes = _tpc_takes(device_type, _takes(device_type, "matrix_exp"))
+    takes = _tpc_takes(device_type, _takes(device_type, "matrix_exp"), maxn=tpc.SMALL_MAXN)
 
     def expm_ag(A):
         if takes(A):
@@ -1440,7 +1632,7 @@ def install_householder_product(device_type):
 
 def _lu_kernel(A):
     """Whether ``A`` goes through the TPC LU kernel (or the ``_LU`` hook in the CPU tests)."""
-    if A.shape[-1] > tpc.MAXN:
+    if A.shape[-1] > tpc.SMALL_MAXN:
         return False
     return _LU is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
 
@@ -1467,7 +1659,7 @@ _LU_SOLVE = None
 
 def _lu_perm(pivots, dtype):
     """The row permutation of LAPACK's ``pivots`` in ``dtype``: one TPC launch on HPU, else ``pivots_to_perm``."""
-    if pivots.shape[-1] <= tpc.MAXN and _LU_PERM_MODE in ("auto", "kernel"):
+    if pivots.shape[-1] <= tpc.SMALL_MAXN and _LU_PERM_MODE in ("auto", "kernel"):
         if _LU_PERM is not None:
             return _LU_PERM(pivots).to(dtype)
         if pivots.device.type == "hpu" and tpc.ready():
@@ -1571,7 +1763,7 @@ class LuSolve(torch.autograd.Function):
     @staticmethod
     def compute(LU, pivots, B, left=True, adjoint=False):
         mode = _LU_SOLVE_MODE
-        if mode in ("auto", "kernel") and left and not adjoint and LU.shape[-1] <= tpc.MAXN:
+        if mode in ("auto", "kernel") and left and not adjoint and LU.shape[-1] <= tpc.SMALL_MAXN:
             if _LU_SOLVE is not None:
                 return _LU_SOLVE(LU, pivots, B)
             if LU.device.type == "hpu" and LU.dtype == torch.float32 and tpc.ready():
@@ -1657,12 +1849,12 @@ def _lu_wanted(device_type, op_name):
 
 def install_lu(device_type):
     """``linalg.lu_factor`` / ``lu_factor_ex``, ``lu_solve``, ``lu_unpack`` and ``linalg.lu`` on ``device_type`` for
-    square float32 matrices of n <= ``tpc.MAXN``, through the TPC LU kernel. On HPU only the ops measured faster than
+    square float32 matrices of n <= ``tpc.SMALL_MAXN``, through the TPC LU kernel. On HPU only the ops measured faster than
     the fallback, unless ``HPU_OPS_LU_SLOW=1`` (see ``LU_SLOW``). Returns an undo."""
-    factor_base = _tpc_takes(device_type, _takes(device_type, "lu_factor"))
-    lu_base = _tpc_takes(device_type, _takes(device_type, "lu"))
-    solve_base = _tpc_takes(device_type, _takes(device_type, "lu_solve"))
-    unpack_base = _tpc_takes(device_type, _takes(device_type, "lu_unpack"))
+    factor_base = _tpc_takes(device_type, _takes(device_type, "lu_factor"), maxn=tpc.SMALL_MAXN)
+    lu_base = _tpc_takes(device_type, _takes(device_type, "lu"), maxn=tpc.SMALL_MAXN)
+    solve_base = _tpc_takes(device_type, _takes(device_type, "lu_solve"), maxn=tpc.SMALL_MAXN)
+    unpack_base = _tpc_takes(device_type, _takes(device_type, "lu_unpack"), maxn=tpc.SMALL_MAXN)
 
     def factor_takes(A, pivot=True, check_errors=False):
         return pivot is True and factor_base(A)

@@ -1,5 +1,5 @@
 """On a Gaudi card: one train step (forward, backward, Adam) of the SPD models that use the linalg composites.
-    PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_steps.py [--baseline] [--with-eigh]
+    PT_HPU_LAZY_MODE=0|1 python3 tests/linalg_steps.py [--baseline] [--with-eigh] [--models TSMNet,EEGSPDNet]
 SPDNet, TSMNet, TensorCSPNet, EEGSPDNet and GBWAtt on a real batch of 32 at BNCI2014_001's width (22 channels):
 five warm-up steps, then the mean ms of 20 steps and the CPU-fallback ops per step (bridge ``cpu_fallback`` metric).
 A model fails when its step errors or when one of the ops of the linalg composites falls back: solve_triangular,
@@ -122,6 +122,8 @@ def main():
                              "(the A/B is the hpu_ops on PYTHONPATH)")
     parser.add_argument("--with-eigh", action="store_true",
                         help="also fail a model whose step makes eigh fall back (installs eigh if enable() did not)")
+    parser.add_argument("--models", default=",".join(MODEL_NAMES),
+                        help="comma-separated subset of " + ", ".join(MODEL_NAMES))
     args = parser.parse_args()
     baseline = args.baseline
     import hpu_complex
@@ -149,7 +151,7 @@ def main():
     X = X / X.std()
     y = torch.as_tensor(sd.y[:BATCH]).long()
     results = []
-    for name in MODEL_NAMES:
+    for name in args.models.split(","):
         try:
             name = resolve(name, MODELS)
         except KeyError as e:
