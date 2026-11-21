@@ -286,8 +286,10 @@ def _value(self, values):
     from torch._subclasses.fake_tensor import unset_fake_temporarily
 
     try:
-        with unset_fake_temporarily():  # while tracing a fake full() would not check
-            torch.full((), values.item(), dtype=self.dtype)  # ATen's checked cast, for its errors only
+        with unset_fake_temporarily():  # while tracing a fake fill would not check
+            # ATen's checked cast, for its errors only: a one-element masked_fill_, ATen's own put of one value
+            # (``full`` stopped checking: torch 2.15 gives inf for float16 1e6, where the put raises)
+            torch.zeros(1, dtype=self.dtype).masked_fill_(torch.ones(1, dtype=torch.bool), values.item())
     except Exception:  # noqa: BLE001  (ATen's overflow error, or no value while tracing)
         return None
     return (values.real if values.is_complex() else values).to(self.dtype)
