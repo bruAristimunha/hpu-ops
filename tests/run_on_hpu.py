@@ -172,6 +172,15 @@ check("Conv2d kernel (4, 1089) over width 1500",
       per_device(torch.nn.Conv2d(4, 8, (4, 1089))), (torch.randn(2, 4, 4, 1500),), atol=1e-3, modes=("eager",))
 expect("large-kernel convolutions took split_conv", calls["large_conv"] > 0, f"{calls['large_conv']} times")
 
+# ---- quantile (#17): no resized out= tensor (lazy FATAL), NaN slices read from the input (Gaudi's sort gives +inf)
+calls.clear()
+x_q = torch.randn(8, 300)
+x_q[2, 5] = float("nan")
+check("torch.quantile q (0.1, 0.9) dim=1", lambda x: torch.quantile(x, torch.tensor([0.1, 0.9], device=x.device),
+                                                                    dim=1).nan_to_num(-7.0), (x_q,), atol=1e-5)
+check("torch.nanquantile 0.5 dim=1", lambda x: torch.nanquantile(x, 0.5, dim=1), (x_q,), atol=1e-5)
+expect("quantile took the rewrite", calls["quantile"] > 0 and calls["nanquantile"] > 0, dict(calls))
+
 # ---- glu (BrainModule: a convolution, then a gated linear unit over the channels)
 calls.clear()
 check("Conv1d > F.glu (BrainModule)", per_device(torch.nn.Conv1d(8, 640, 3, padding=1), lambda m, x: F.glu(m(x), 1)),

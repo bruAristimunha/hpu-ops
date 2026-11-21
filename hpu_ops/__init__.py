@@ -26,6 +26,8 @@ at the tensor's pickling:
 - Boolean-mask scalar ``index_put_`` / ``index_put`` via ``torch.where`` and trailing 2-D integer ``index.Tensor`` via
   ``index_select`` (``composite``): ``aten::_index_put_impl_`` has no HPU kernel, so a mid-backward mask assignment
   flushes the lazy DSD ``index`` backward graph and triggers ``synStatus 30`` in ``GBWAtt``.
+- ``quantile`` / ``nanquantile`` as sort, gather and lerp (``quantile``): ATen's composite resizes an empty ``out``
+  tensor, which aborts lazy mode ("Trying to resize tensor with non-existing TensorImpl").
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -46,7 +48,7 @@ import warnings
 
 import torch
 
-from . import composite, conv, serialization, upsample
+from . import composite, conv, quantile, serialization, upsample
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -55,7 +57,7 @@ BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_grou
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
          composite.install_embedding, composite.install_roll, composite.install_index_put, composite.install_index_2d,
-         serialization.install)
+         quantile.install, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
