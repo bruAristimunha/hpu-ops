@@ -106,7 +106,19 @@ def quantile_of(self, q, dim=None, keepdim=False, interpolation="linear", ignore
         weights = ranks - below if interpolation == "linear" else torch.full_like(ranks, 0.5)
         lo = x.gather(-1, at(below.long()))
         hi = x.gather(-1, at(ranks.ceil().long()))
-        values = torch.lerp(lo, hi, weights.to(x.dtype))
+        # next to an infinity, torch's two-branch lerp (ATen: a + w (b - a) for |w| < 0.5, else b - (b - a) (1 - w)):
+        # Gaudi's lerp takes one form for every w, and quantile([inf, max], .5) gave inf (torch nan),
+        # quantile([max, inf, -inf, -max], .3) nan (torch -inf). Finite ends keep lerp (its rounding and gradient).
+        # Each side sees zeros where the other is taken, so neither's gradient (inf * 0) leaks through the where.
+        w = weights.to(x.dtype)
+        finite = torch.isfinite(lo) & torch.isfinite(hi)
+        lo_f, hi_f = torch.where(finite, lo, 0.0), torch.where(finite, hi, 0.0)
+        lo_i, hi_i = torch.where(finite, 0.0, lo), torch.where(finite, 0.0, hi)
+        small = w.abs() < 0.5
+        lo_a, hi_a = torch.where(small, lo_i, 0.0), torch.where(small, hi_i, 0.0)
+        lo_b, hi_b = torch.where(small, 0.0, lo_i), torch.where(small, 0.0, hi_i)
+        branches = torch.where(small, lo_a + w * (hi_a - lo_a), hi_b - (hi_b - lo_b) * (1 - w))
+        values = torch.where(finite, torch.lerp(lo_f, hi_f, w), branches)
     else:
         pick = {"lower": torch.floor, "higher": torch.ceil, "nearest": torch.round}[interpolation](ranks)
         values = x.gather(-1, at(pick.long()))

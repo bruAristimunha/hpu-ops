@@ -800,20 +800,20 @@ def _meta(x):
     return torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device="meta")
 
 
-_C10_NAMES = {torch.float32: "float", torch.float64: "double", torch.bfloat16: "c10::BFloat16",
-              torch.float16: "c10::Half", torch.int64: "long long", torch.int32: "int", torch.int16: "short",
-              torch.int8: "signed char", torch.uint8: "unsigned char", torch.bool: "bool"}
-
-
 def _out_dtypes(x, values, indices, kth=False):
-    """torch's dtype errors for the sort family's ``out=`` (its CPU kernels check them; the meta kernels do not)."""
-    name = lambda d: _C10_NAMES.get(d, str(d))  # noqa: E731
-    if values.dtype != x.dtype:
-        raise RuntimeError("output values must be of same type as input" if kth else
-                           f"Expected out tensor to have dtype {name(x.dtype)}, but got {name(values.dtype)} instead")
-    if indices.dtype != torch.int64:
-        raise RuntimeError("output indices must be of scalar type Long" if kth else
-                           f"Expected out tensor to have dtype long long, but got {name(indices.dtype)} instead")
+    """torch's dtype errors for the sort family's ``out=`` (its CPU kernels check them; the meta kernels do not):
+    on a mismatch, the same call on one-element CPU tensors of these dtypes, so the message is torch's own on this
+    platform (int64 prints as "long long" on macOS, "long int" on Linux)."""
+    if values.dtype == x.dtype and indices.dtype == torch.int64:
+        return
+    one = torch.zeros(1, dtype=x.dtype)
+    v, i = torch.empty(0, dtype=values.dtype), torch.empty(0, dtype=indices.dtype)
+    if kth:
+        aten.kthvalue.values._op_dk(DispatchKey.CPU, one, 1, -1, False, values=v, indices=i)
+    else:
+        aten.sort.values_stable._op_dk(DispatchKey.CPU, one, stable=False, dim=-1, descending=False,
+                                       values=v, indices=i)
+    raise RuntimeError(f"out= of dtypes {values.dtype} / {indices.dtype} for a {x.dtype} input")
 
 
 def _select_kernels(device_type):

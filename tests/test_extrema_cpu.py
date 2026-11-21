@@ -1057,3 +1057,27 @@ def test_out_dtype_rules_and_resize_warning_as_torch(card, mode):
         v, i = torch.empty(5), torch.empty(5, dtype=torch.int64)
         torch.topk(x, 2, -1, out=(v, i))
     assert any("was resized" in str(w.message) for w in caught) and v.shape == (10, 2)
+
+
+def test_quantile_lerp_next_to_an_infinity_is_torch_s(card):
+    """torch's lerp has two branches (w < 0.5 from a, else from b): quantile([inf, max], .5) is nan and
+    quantile([max, inf, -inf, -max], .3) is -inf there; Gaudi's one-form lerp gave inf and nan."""
+    from hpu_ops import quantile
+
+    M = torch.finfo(torch.float32).max
+    cases = [(torch.tensor([INF, M]), 0.5), (torch.tensor([M, INF, -INF, -M]), 0.3), (torch.tensor([1.0, 2.0]), 0.25),
+             (torch.tensor([1.0, 2.0, 4.0]), 0.75)]
+    want = [_reference(lambda: torch.quantile(a, q)) for a, q in cases]
+    with cpu_as_hpu(quantile.install):
+        got = [torch.quantile(a, q) for a, q in cases]
+    same(got, want)
+
+
+def test_out_dtype_messages_are_torch_s_on_this_platform(card):
+    """The out= dtype errors come from torch's own CPU kernels (int64 is "long long" on macOS, "long int" on Linux)."""
+    x = torch.randn(3, 5)
+    with pytest.raises(RuntimeError) as want:
+        _reference(lambda: torch.sort(x, -1, out=(torch.empty(0), torch.empty(0, dtype=torch.int32))))
+    with pytest.raises(RuntimeError) as got:
+        torch.sort(x, -1, out=(torch.empty(0), torch.empty(0, dtype=torch.int32)))
+    assert str(got.value).splitlines()[0] == str(want.value).splitlines()[0]
