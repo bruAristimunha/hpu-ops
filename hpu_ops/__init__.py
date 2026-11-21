@@ -19,6 +19,19 @@ at the tensor's pickling:
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
   roll wrongly (EMG2QwertyNet's input gradient).
+- ``Tensor.unfold`` as ``as_strided`` with ATen's sizes and strides (``composite``): in lazy mode it had no HPU kernel,
+  ran on the CPU and returned a copy, not a view. hpu-ops' own one-channel conv weight gradient uses it (TensorCSPNet:
+  2 fallbacks per lazy step). Eager keeps Habana's kernel.
+- Advanced indexing by integer tensors, ``X[..., rows, cols]``, as one ``index_select`` of the indexed dims
+  flattened (``indexing``): with CPU index tensors Gaudi's eager kernel ran on the CPU, and in lazy mode its
+  backward, the accumulating ``_index_put_impl_`` with indices that do not lead, returns wrong sums from batch 2 to
+  8 on; ``index_select``'s backward is right (spd_learn's ``vech`` and ``vec_to_sym``: in lazy mode every gradient
+  before them was wrong in 9 SPD models). ``X[:, mask]`` through its ``nonzero`` into the same ``index_select``.
+  A boolean-mask put of one value as ``where`` (``indexing``): in lazy mode, in one graph with index puts and
+  reads, Habana's launch fails (SPNN).
+- ``F.unfold`` and ``F.fold`` (``im2col``): ``aten::im2col`` and ``aten::col2im`` have no HPU kernel and ran on the
+  CPU, eager and lazy (SSGCNet, MAtt, GyroAtt, SPDMetaFormer, CorAtt). Non-overlapping 4-D patches as reshapes,
+  others as ``index_select`` and ``index_add``.
 - ``linalg.solve_triangular`` and ``cholesky_solve`` of float32 matrices with n <= 64 run through a TPC substitution
   kernel (``tpc.tri_solve``, two substitutions for ``cholesky_solve``): they have no HPU kernel and ran on the CPU.
   Substitution keeps CPU float32's accuracy on ill-conditioned triangles. Cholesky's and QR's backward use them.
@@ -63,7 +76,7 @@ import warnings
 
 import torch
 
-from . import composite, conv, eigh, linalg, serialization, tpc, upsample  # noqa: F401
+from . import composite, conv, eigh, im2col, indexing, linalg, serialization, tpc, upsample  # noqa: F401
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -71,8 +84,11 @@ __all__ = ["enable"]
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, composite.install_glu, composite.install_renorm, composite.install_embedding,
-         composite.install_roll, linalg.install_solve_triangular, linalg.install_cholesky_solve,
-         linalg.install_solve, linalg.install_inv_det, eigh.install_eigh, serialization.install)
+         composite.install_roll, composite.install_unfold, indexing.install_index, indexing.install_mask_fill, im2col.install,
+         linalg.install_solve_triangular, linalg.install_cholesky_solve,
+         linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
+         linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
+         linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "

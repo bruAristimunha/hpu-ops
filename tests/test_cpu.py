@@ -16,7 +16,7 @@ from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 
 import hpu_ops
-from hpu_ops import autocast, composite, conv, serialization, upsample
+from hpu_ops import autocast, composite, conv, im2col, indexing, serialization, upsample
 
 
 @contextlib.contextmanager
@@ -28,6 +28,36 @@ def cpu_as_hpu(install):
         yield hpu_ops._STATE["calls"]
     finally:
         undo()
+
+
+def _scalar_mask_put_reaches_index_put():
+    """True when ``x[mask] = <Python number>`` reaches ``aten.index_put_``, the op install_mask_fill rewrites (torch 2.6
+    to 2.14, the Gaudi bridges' 2.6 among them). From torch 2.15.0 Python indexing sends it to
+    ``aten.masked_fill_.Scalar`` instead (any single bool mask, leading, middle or trailing), which hpu-ops leaves
+    native: Habana's launch failure was measured on the ``index_put_`` form only. A tensor value still reaches
+    ``index_put_``."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Ops(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            seen.add(func)
+            return func(*args, **(kwargs or {}))
+
+    seen = set()
+    x = torch.zeros(2, 2)
+    with Ops():
+        x[..., torch.tensor([True, False])] = 1.0
+    return torch.ops.aten.index_put_.default in seen
+
+
+# mask_fill count of one Python-number mask put: 1 where it reaches index_put_, 0 from torch 2.15 (masked_fill_)
+SCALAR_MASK_PUT = int(_scalar_mask_put_reaches_index_put())
+
+
+@pytest.fixture
+def cpu_indices_off_device(monkeypatch):
+    """Index tensors count as off the device, as CPU index tensors of HPU tensors are (the case that falls back)."""
+    monkeypatch.setattr(indexing, "_off_device", lambda self, t: True)
 
 
 def compiled(f, nodes, **options):
@@ -792,6 +822,601 @@ def test_autocast_files_hold_torchs_cuda_lists():
     assert autocast.exports() == [f"export {name}={shlex.quote(path)}" for name, path in files.items()]
 
 
+# ---- indexing whose indexed dims do not lead: one index_select; a boolean-mask put of one value: where
+
+
+def _vech(x):
+    rows, cols = torch.triu_indices(x.shape[-1], x.shape[-1])
+    return x[..., rows, cols]
+
+
+def _vech_scaled(x):  # spd_learn's sym_to_upper: an index, then a boolean-mask put of sqrt(2)
+    rows, cols = torch.triu_indices(x.shape[-1], x.shape[-1])
+    v = x[..., rows, cols]
+    m = torch.ones_like(v)
+    m[..., rows != cols] = 2 ** 0.5
+    return v * m
+
+
+def _vec_to_sym(v):  # spd_learn's vec_to_sym: index puts into zeros and index reads of them
+    n = int(((1 + 8 * v.shape[-1]) ** 0.5 - 1) / 2)
+    ixs = torch.triu_indices(n, n)
+    od = ixs[0] != ixs[1]
+    x = torch.zeros((*v.shape[:-1], n, n), dtype=v.dtype)
+    x[..., ixs[0], ixs[1]] = v
+    x[..., ixs[0, od], ixs[1, od]] /= 2 ** 0.5
+    x[..., ixs[1, od], ixs[0, od]] = x[..., ixs[0, od], ixs[1, od]]
+    return x
+
+
+INDEXINGS = {
+    "vech": _vech,
+    "middle dim": lambda x: x[:, torch.tensor([2, 0, 2, 1])],
+    "last dim, 2-d index": lambda x: x[..., torch.tensor([[0, 3], [3, 3]])],
+    "two adjacent, broadcast": lambda x: x[:, torch.tensor([[0], [2]]), torch.tensor([1, 3, 1])],
+    "separated by a slice": lambda x: x[torch.tensor([0, 1, 1]), :, torch.tensor([3, 0, 3])],
+    "separated, not first": lambda x: x[:, torch.tensor([0, 2]), :, torch.tensor([1, 1])],
+    "negative indices": lambda x: x[..., torch.tensor([-1, 0, -4]), torch.tensor([2, -2, 1])],
+    "int32 index": lambda x: x[..., torch.tensor([1, 1, 0], dtype=torch.int32)],
+    "empty index": lambda x: x[..., torch.tensor([], dtype=torch.long)],
+    "non-contiguous input": lambda x: x.transpose(0, 2)[:, torch.tensor([0, 0, 3])],
+}
+
+
+@pytest.mark.usefixtures("cpu_indices_off_device")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+@pytest.mark.parametrize("name", sorted(INDEXINGS))
+def test_index_goes_through_index_select(name, dtype):
+    torch.manual_seed(0)
+    x = torch.randn(3, 4, 4, 4, dtype=dtype) if name == "separated, not first" else torch.randn(5, 4, 4, dtype=dtype)
+    f = INDEXINGS[name]
+    want = train_step(f, x)
+    with cpu_as_hpu(indexing.install_index) as calls:
+        got = train_step(f, x)
+        out = f(x)
+    assert calls["index"] == 2
+    assert_same(got, want, tol=0)
+    if name != "non-contiguous input":  # ATen's result follows the input's layout; index_select's is contiguous
+        assert out.stride() == f(x).stride()
+
+
+def test_only_the_patterns_gaudi_gets_wrong_are_rewritten(monkeypatch):
+    """On the device: indices that do not lead (lazy backward and launch) and a mask after a slice (lazy transpose).
+    Leading indices keep the native op, unless an index tensor is on the CPU (eager fallback)."""
+    x = torch.randn(5, 4, 4)
+    rewritten = [lambda x: x[:, torch.tensor([0, 3])], lambda x: x[torch.tensor([0, 1]), :, torch.tensor([3, 3])],
+                 lambda x: x[:, x[0, 0] > 0]]
+    native = [lambda x: x[torch.tensor([0, 4, 4])], lambda x: x[torch.tensor([0, 1]), torch.tensor([3, 3])],
+              lambda x: x[x > 0], lambda x: x[x[:, 0, 0] > 0], lambda x: x[:, 1:3], lambda x: x[..., 2]]
+    for f in rewritten + native:
+        want = train_step(f, x)
+        with cpu_as_hpu(indexing.install_index) as calls:
+            got = train_step(f, x)
+            f(x)  # no gradient: rewritten too
+        assert calls["index"] == 2 * (f in rewritten), calls
+        assert_same(got, want, tol=0)
+    monkeypatch.setattr(indexing, "_off_device", lambda self, t: True)
+    for f in native[:2]:
+        with cpu_as_hpu(indexing.install_index) as calls:
+            got = f(x)
+        assert calls["index"] == 1 and torch.equal(got, f(x))
+
+
+def test_index_errors_reach_the_native_op():
+    x = torch.randn(5, 4, 4)
+    with cpu_as_hpu(indexing.install_index) as calls:
+        for f in (lambda: x[:, torch.tensor([4])], lambda: x[..., torch.tensor([0, 1]), torch.tensor([-5])],
+                  lambda: x[:, torch.tensor([0, 1]), torch.tensor([0, 1, 2])]):
+            with pytest.raises((IndexError, RuntimeError)):
+                f()
+    assert not calls["index"]
+
+
+def test_index_under_no_grad_and_inference_mode():
+    x = torch.randn(5, 4, 4)
+    with cpu_as_hpu(indexing.install_index) as calls:
+        with torch.no_grad():
+            a = _vech(x)
+        with torch.inference_mode():
+            b = _vech(x)
+    assert calls["index"] == 1  # inference mode skips the autograd key
+    assert_same([a, b], [_vech(x)] * 2, tol=0)
+
+
+def test_index_compiled():
+    x = torch.randn(5, 6, 6)
+    want = train_step(_vech_scaled, x)
+    nodes = []
+    with cpu_as_hpu(hpu_ops._install):
+        got = train_step(compiled(_vech_scaled, nodes), x)
+    assert_same(got, want, tol=0)
+    # CPU index tensors are fake while tracing: the graph gets the rewrite with the range turned into -1 in the graph
+    assert {"aten.index_select.default", "aten.where.self"} <= ops(nodes)
+    assert not ops(nodes) & {"aten.index.Tensor", "aten.index_put.default"}
+
+
+@pytest.mark.parametrize("make", [
+    lambda: torch.randn(1, 1, 1),  # n = 1
+    lambda: torch.randn(1, 7, 7),  # batch 1
+    lambda: torch.randn(6, 5, 5)[2:],  # an offset view
+    lambda: torch.randn(5, 5)[None].expand(3, 5, 5),  # a stride-0 batch
+    lambda: torch.randn(2, 3, 6, 6, dtype=torch.float64).transpose(-1, -2),  # 4-d, transposed
+])
+def test_vech_adversarial_shapes_and_layouts(make):
+    torch.manual_seed(0)
+    x = make()
+    want = train_step(_vech_scaled, x)
+    with cpu_as_hpu(hpu_ops._install) as calls:
+        got = train_step(_vech_scaled, x)
+    assert calls["index"] == 1 and calls["mask_fill"] == SCALAR_MASK_PUT
+    assert_same(got, want, tol=0)
+
+
+def test_index_twice_in_a_row_and_extreme_values():
+    x = torch.tensor([[[1e30, -1e-30], [float("inf"), 3.0]]]).repeat(4, 1, 1)
+    with cpu_as_hpu(indexing.install_index):
+        a, b = _vech(x), _vech(x)
+    assert torch.equal(a, _vech(x)) and torch.equal(b, a)
+
+
+def test_index_compiled_with_the_index_as_an_input():
+    x, rows = torch.randn(5, 6, 6), torch.tensor([0, 5, 2])
+    f = lambda x, rows: x[:, rows, rows.flip(0)]  # noqa: E731
+    want = train_step(lambda x: f(x, rows), x)
+    nodes = []
+    with cpu_as_hpu(indexing.install_index):
+        got = train_step(lambda x: compiled(f, nodes)(x, rows), x)
+    assert_same(got, want, tol=0)
+    assert "aten.index_select.default" in ops(nodes)
+    assert not ops(nodes) & {"aten.index.Tensor", "aten.index_put.default"}
+
+
+@pytest.mark.parametrize("idx", [
+    lambda: [None, torch.tensor(1)],  # one 0-d index after a slice
+    lambda: [None, torch.tensor(1), torch.tensor(-2)],  # two adjacent 0-d indices
+    lambda: [torch.tensor(2), None, torch.tensor(0)],  # 0-d indices separated by a slice
+])
+def test_index_of_0d_indices_called_directly(idx):
+    x = torch.randn(3, 4, 5, dtype=torch.float64, requires_grad=True)
+    want = torch.ops.aten.index.Tensor(x, idx())
+    with cpu_as_hpu(indexing.install_index) as calls:
+        got = torch.ops.aten.index.Tensor(x, idx())
+        torch.autograd.gradcheck(lambda x: torch.ops.aten.index.Tensor(x, idx()), (x,))
+    assert calls["index"] >= 1
+    assert got.shape == want.shape and torch.equal(got, want)
+
+
+def test_index_double_backward():
+    x = torch.randn(5, 4, 4, dtype=torch.float64, requires_grad=True)
+    f = lambda x: (_vech(x) ** 3).sum()  # noqa: E731
+    with cpu_as_hpu(indexing.install_index):
+        assert torch.autograd.gradgradcheck(f, (x,))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_vech_and_vec_to_sym_as_in_spd_learn(dtype):
+    torch.manual_seed(0)
+    v = torch.randn(8, 21, dtype=dtype)
+    f = lambda v: _vech_scaled(_vec_to_sym(v))  # noqa: E731
+    want = train_step(f, v)
+    with cpu_as_hpu(hpu_ops._install) as calls:
+        got = train_step(f, v)
+    assert calls["mask_fill"] == SCALAR_MASK_PUT and calls["index"] >= 3
+    assert_same(got, want, tol=0)
+
+
+MASK_PUTS = {
+    "trailing mask": lambda m, x: m.__setitem__((Ellipsis, x[0] > 0), 2.5),
+    "middle mask": lambda m, x: m.__setitem__((slice(None), x[0, :, 0] > 0), -1.0),
+    "full mask": lambda m, x: m.__setitem__(x > 0, 0.5),
+    "0-d tensor value": lambda m, x: m.__setitem__((Ellipsis, x[0] > 0), torch.tensor(3.0)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(MASK_PUTS))
+def test_mask_put_of_one_value_is_where(name):
+    torch.manual_seed(0)
+    x = torch.randn(5, 4, 4)
+    want = torch.ones(5, 4, 4)
+    MASK_PUTS[name](want, x)
+    got = torch.ones(5, 4, 4)
+    with cpu_as_hpu(indexing.install_mask_fill) as calls:
+        MASK_PUTS[name](got, x)
+    assert calls["mask_fill"] == (1 if "tensor" in name else SCALAR_MASK_PUT)
+    assert_same([got], [want], tol=0)
+
+
+def test_mask_put_gradient_and_other_puts_keep_the_native_op():
+    torch.manual_seed(0)
+    x = torch.randn(5, 4, 4)
+
+    def f(x):
+        y = x * 1
+        y[..., x[0] > 0] = 0.0
+        return y
+
+    want = train_step(f, x)
+    with cpu_as_hpu(indexing.install_mask_fill) as calls:
+        got = train_step(f, x)
+    assert calls["mask_fill"] == SCALAR_MASK_PUT
+    assert_same(got, want, tol=0)
+    with cpu_as_hpu(indexing.install_mask_fill) as calls:
+        y, z = torch.zeros(5, 4, 4), torch.zeros(5, 4, 4)
+        y[..., x[0] > 0] = torch.arange(float((x[0] > 0).sum()))  # several values
+        y[:, torch.tensor([0, 2])] = 1.0  # integer index
+        y.index_put_((torch.tensor([0, 0]),), torch.tensor(1.0), accumulate=True)
+    assert not calls["mask_fill"]
+    z[..., x[0] > 0] = torch.arange(float((x[0] > 0).sum()))
+    z[:, torch.tensor([0, 2])] = 1.0
+    z.index_put_((torch.tensor([0, 0]),), torch.tensor(1.0), accumulate=True)
+    assert_same([y], [z], tol=0)
+
+# ---- advanced indexing (aten::index.Tensor) as index_select / device-moved indexing
+
+
+@pytest.mark.usefixtures("cpu_indices_off_device")
+@pytest.mark.parametrize("mode", ["eager", "compiled"])
+def test_index_contiguous_triu_matches_torch_and_compiles(mode):
+    """SPDNet / sym_to_upper pattern: (32, 22, 22) indexed at trailing [..., i0, i1]."""
+    torch.manual_seed(0)
+    ix = torch.triu_indices(22, 22)
+    f = lambda x: x[..., ix[0], ix[1]]  # noqa: E731
+    x = torch.randn(32, 22, 22, dtype=torch.float64)
+    x2 = torch.randn(5, 22, 22, dtype=torch.float64)
+    want, want2, nodes = train_step(f, x), train_step(f, x2), []  # native: before the rewrite is installed
+    with cpu_as_hpu(indexing.install_index) as calls:
+        g = f if mode == "eager" else compiled(f, nodes, fullgraph=True, dynamic=True)
+        got = train_step(g, x)
+        if mode == "compiled":
+            assert_same(train_step(g, x2), want2)
+    assert_same(got, want)
+    assert calls["index"] > 0
+    if mode == "compiled":
+        assert "aten.index_select.default" in ops(nodes)
+        assert not any("aten.index." in op for op in ops(nodes)), ops(nodes)
+
+
+@pytest.mark.usefixtures("cpu_indices_off_device")
+@pytest.mark.parametrize("shape, make_call", [
+    ((3, 4, 5, 6), lambda: (lambda t: t[:, torch.tensor([0, 2, -1]), torch.tensor([1, -2, 3]), :])),
+    ((3, 4, 5), lambda: (lambda t: torch.ops.aten.index.Tensor(t, [None, torch.tensor(2), None]))),
+    ((4, 5), lambda: (lambda t: torch.ops.aten.index.Tensor(t, [torch.tensor(1), torch.tensor(-1)]))),
+    ((3, 4, 5), lambda: (lambda t: t[:, torch.tensor([0, -1]), torch.tensor(2)])),
+    ((3, 4, 5), lambda: (lambda t: t[:, torch.tensor([[0], [-1]]), torch.tensor([1, 2, -3])])),
+    ((3, 4, 5), lambda: (lambda t: t[:, torch.tensor([1, 1, 3, 1], dtype=torch.int32)])),
+    ((3, 4, 5), lambda: (lambda t: t[:, torch.empty(0, dtype=torch.long)])),
+    ((0, 4, 5), lambda: (lambda t: t[:, torch.tensor([0, 2])])),
+    ((3, 4, 0), lambda: (lambda t: t[:, torch.tensor([0, 2])])),
+    ((3, 0, 5), lambda: (lambda t: t[:, torch.empty(0, dtype=torch.long)])),
+    ((4, 5, 6), lambda: (lambda t: t[torch.tensor([-1, 0, 2, -1]), :, torch.tensor([1, -2, 4, 1])])),
+    ((2, 3, 4, 5), lambda: (lambda t: t[:, torch.tensor([[0, 1], [1, -1]]), :, torch.tensor([1, -3])])),
+])
+def test_index_integer_patterns_eager_and_grad(shape, make_call):
+    torch.manual_seed(0)
+    x = torch.randn(*shape, dtype=torch.float64)
+    f = make_call()
+    want = train_step(f, x)
+    with cpu_as_hpu(indexing.install_index) as calls:
+        got = train_step(f, x)
+    assert_same(got, want)
+    assert calls["index"] == 1
+
+
+@pytest.mark.usefixtures("cpu_indices_off_device")
+def test_index_non_contiguous_self_and_compiled_non_contiguous_indices():
+    torch.manual_seed(0)
+    x = torch.randn(5, 3, 6, dtype=torch.float64).permute(1, 2, 0)
+    i0 = torch.tensor([-1, 0, 1, 0])
+    i1 = torch.tensor([2, -1, 0, 2])
+    f = lambda t: t[i0, :, i1]  # noqa: E731
+    want, nodes = train_step(f, x), []
+    with cpu_as_hpu(indexing.install_index) as calls:
+        eager = train_step(f, x)
+        got = train_step(compiled(f, nodes, fullgraph=True, dynamic=True), x)
+    assert_same(eager, want)
+    assert_same(got, want)
+    assert calls["index"] >= 2
+    assert not any("aten.index." in op for op in ops(nodes)), ops(nodes)
+
+
+@pytest.mark.usefixtures("cpu_indices_off_device")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16, torch.float16, torch.int64, torch.bool])
+def test_index_dtypes_and_autocast(dtype):
+    torch.manual_seed(0)
+    if dtype.is_floating_point:
+        x = torch.randn(4, 5, 5, dtype=dtype)
+    elif dtype == torch.int64:
+        x = torch.arange(100, dtype=dtype).reshape(4, 5, 5)
+    else:
+        x = torch.arange(100).reshape(4, 5, 5) % 2 == 0
+    ix = torch.triu_indices(5, 5)
+    want = x[..., ix[0], ix[1]]
+    with cpu_as_hpu(indexing.install_index) as calls:
+        got = x[..., ix[0], ix[1]]
+        if dtype == torch.float32:
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                auto = x[..., ix[0], ix[1]]
+            assert auto.dtype == torch.float32 and torch.equal(auto, want)
+    assert got.dtype == want.dtype and torch.equal(got, want) and calls["index"] >= 1
+
+
+def test_index_bool_masks_and_backend_kernel():
+    torch.manual_seed(0)
+    x = torch.randn(6, 5, 5, dtype=torch.float64)
+    mask2d = torch.ones(5, 5, dtype=torch.bool).triu()
+    empty_mask = torch.zeros(5, 5, dtype=torch.bool)
+    mask1d = torch.tensor([True, False, True, False, True, False])
+    want_2d = train_step(lambda t: t[:, mask2d], x)
+    want_empty = train_step(lambda t: t[:, empty_mask], x)
+    want_1d = train_step(lambda t: t[mask1d], x)
+    with cpu_as_hpu(indexing.install_index) as calls:
+        got_2d = train_step(lambda t: t[:, mask2d], x)
+        got_empty = train_step(lambda t: t[:, empty_mask], x)
+        assert calls["index"] == 2
+        got_1d = train_step(lambda t: t[mask1d], x)
+        assert calls["index"] == 2  # same-device bool mask without leading None keeps native op
+    assert_same(got_2d, want_2d)
+    assert_same(got_empty, want_empty)
+    assert_same(got_1d, want_1d)
+
+    # Below-autograd (inference_mode) kernel and off-device classification
+    op = torch.ops.aten.index.Tensor
+    backend = indexing._index_kernel("cpu", torch._C.DispatchKey.CompositeExplicitAutogradNonFunctional)
+    ix = torch.triu_indices(5, 5)
+    with torch.inference_mode():
+        torch.testing.assert_close(backend(x, [None, ix[0], ix[1]]), op(x, [None, ix[0], ix[1]]), atol=0, rtol=0)
+    xm = x.to("meta")  # meta in the role of the device, the CPU masks off it
+    assert indexing._plan(xm, [torch.ones(6, dtype=torch.bool)]) == "move"
+    assert indexing._plan(xm, [None, torch.tensor(True)]) == "move"
+
+
+@pytest.mark.usefixtures("cpu_indices_off_device")
+@pytest.mark.parametrize("bad_idx", [
+    lambda: (torch.tensor([0.0, 1.0]),),
+    lambda: (torch.tensor([0, 1], dtype=torch.int8),),
+    lambda: (torch.tensor([0, 1], dtype=torch.int16),),
+    lambda: (slice(None), torch.tensor([0, 1]), torch.tensor([0, 1, 2])),
+    lambda: (torch.tensor([0]), torch.tensor([0]), torch.tensor([0]), torch.tensor([0])),
+    lambda: (slice(None), torch.ones(2, 2, dtype=torch.bool)),
+])
+def test_index_invalid_inputs_reach_aten(bad_idx):
+    x = torch.randn(3, 4, 5)
+    idx = bad_idx()
+    with pytest.raises(Exception) as want:
+        x[idx]
+    with cpu_as_hpu(indexing.install_index) as calls, pytest.raises(type(want.value)):
+        x[idx]
+    assert not calls["index"]
+
+
+@pytest.mark.usefixtures("cpu_indices_off_device")
+def test_index_elsewhere_stays_native():
+    x = torch.randn(4, 5, 5)
+    ix = torch.triu_indices(5, 5)
+    nodes = []
+    with cpu_as_hpu(lambda device: indexing.install_index("hpu")) as calls:
+        train_step(compiled(lambda t: t[..., ix[0], ix[1]], nodes), x)
+    assert "aten.index.Tensor" in ops(nodes) and not calls["index"]
+
+
+# ---- im2col / col2im (F.unfold / F.fold): 4-D non-overlapping fast path and index_select / index_add general path
+
+
+SPD_PATCH_SHAPES = [
+    ((32, 16, 513, 1), (128, 1), (128, 1)),  # SSGCNet (513 % 128 = 1 remainder)
+    ((32, 20, 514, 1), (257, 1), (257, 1)),  # MAtt (514 % 257 = 0 exact)
+    ((32, 20, 513, 1), (85, 1), (85, 1)),    # GyroAtt / SPDMetaFormer / CorAtt (513 % 85 = 3 remainder)
+]
+
+
+@pytest.mark.parametrize("shape, kernel_size, stride", SPD_PATCH_SHAPES)
+def test_im2col_col2im_spd_model_shapes_tier1(shape, kernel_size, stride):
+    """All 5 affected SPD model PatchEmbeddingLayer shapes hit Tier 1 and match F.unfold / F.fold fwd+bwd."""
+    torch.manual_seed(0)
+    x = torch.randn(*shape, dtype=torch.float64)
+    unfold_fn = lambda t: F.unfold(t, kernel_size, stride=stride)  # noqa: E731
+    want_unfold = train_step(unfold_fn, x)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_unfold = train_step(unfold_fn, x)
+        assert calls["im2col"] == 1
+        out_shape = want_unfold[0].shape
+    assert_same(got_unfold, want_unfold)
+
+    y = torch.randn(*out_shape, dtype=torch.float64)
+    fold_fn = lambda t: F.fold(t, shape[-2:], kernel_size, stride=stride)  # noqa: E731
+    want_fold = train_step(fold_fn, y)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_fold = train_step(fold_fn, y)
+        assert calls["col2im"] == 1
+    assert_same(got_fold, want_fold)
+
+
+@pytest.mark.parametrize("shape, kernel_size, dilation, padding, stride", [
+    ((2, 3, 1, 17), (1, 5), (1, 1), (0, 0), (1, 5)),   # Tier 1 horizontal (H==1, kh==1, non-divisible)
+    ((2, 3, 1, 12), (1, 4), (1, 1), (0, 0), (1, 4)),   # Tier 1 horizontal exact
+    ((4, 3, 10, 12), (3, 5), (1, 1), (0, 0), (1, 1)),  # Tier 2 overlapping Issue #14 pattern
+    ((2, 4, 15, 19), (3, 4), (2, 2), (1, 2), (2, 3)),  # Tier 2 dilation + asymmetric pad + stride
+    ((2, 3, 11, 13), (3, 5), (1, 1), (1, 1), (4, 4)),  # Tier 2 non-divisible stride
+    ((2, 3, 5, 6), (2, 3), (1, 1), (3, 4), (1, 1)),    # Tier 2 padding >= kernel_size
+    ((0, 3, 7, 9), (3, 4), (1, 1), (1, 1), (2, 2)),    # zero batch size N=0 (Tier 2)
+    ((0, 3, 9, 1), (4, 1), (1, 1), (0, 0), (4, 1)),    # zero batch size N=0 (Tier 1)
+])
+def test_im2col_col2im_general_shapes_and_orientations(shape, kernel_size, dilation, padding, stride):
+    torch.manual_seed(0)
+    x = torch.randn(*shape, dtype=torch.float64)
+    kw_args = dict(kernel_size=kernel_size, dilation=dilation, padding=padding, stride=stride)
+    unfold_fn = lambda t: F.unfold(t, **kw_args)  # noqa: E731
+    want_u = train_step(unfold_fn, x)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_u = train_step(unfold_fn, x)
+        assert calls["im2col"] == 1
+    assert_same(got_u, want_u)
+
+    y = torch.randn(*want_u[0].shape, dtype=torch.float64)
+    fold_fn = lambda t: F.fold(t, shape[-2:], **kw_args)  # noqa: E731
+    want_f = train_step(fold_fn, y)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_f = train_step(fold_fn, y)
+        assert calls["col2im"] == 1
+    assert_same(got_f, want_f)
+
+
+def test_im2col_3d_col2im_2d_and_non_contiguous():
+    torch.manual_seed(0)
+    x3d = torch.randn(3, 8, 6, dtype=torch.float64).transpose(1, 2)  # non-contiguous 3D
+    y2d = torch.randn(12, 12, dtype=torch.float64).t()               # non-contiguous 2D (3*2*2, 3*4)
+    im_op = lambda t: torch.ops.aten.im2col.default(t, [2, 2], [1, 1], [0, 0], [2, 2])  # noqa: E731
+    col_op = lambda t: torch.ops.aten.col2im.default(t, [6, 8], [2, 2], [1, 1], [0, 0], [2, 2])  # noqa: E731
+    want_im, want_col = train_step(im_op, x3d), train_step(col_op, y2d)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_im, got_col = train_step(im_op, x3d), train_step(col_op, y2d)
+        assert calls["im2col"] == 1 and calls["col2im"] == 1
+    assert_same(got_im, want_im)
+    assert_same(got_col, want_col)
+
+    # Non-contiguous 4D Tier 1
+    x4d = torch.randn(2, 1, 11, 4, dtype=torch.float64).permute(0, 3, 2, 1)  # (2, 4, 11, 1) non-contiguous
+    u4 = lambda t: F.unfold(t, (5, 1), stride=(5, 1))  # noqa: E731
+    want_u4 = train_step(u4, x4d)
+    with cpu_as_hpu(im2col.install) as calls:
+        got_u4 = train_step(u4, x4d)
+        assert calls["im2col"] == 1
+    assert_same(got_u4, want_u4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16, torch.float16, torch.bool,
+                                   torch.complex64])
+def test_im2col_col2im_dtypes_and_autocast(dtype):
+    torch.manual_seed(0)
+    if dtype == torch.bool:
+        x = torch.randint(0, 2, (2, 3, 7, 9), dtype=dtype)
+        y = torch.randint(0, 2, (2, 3 * 6, 24), dtype=dtype)
+    else:
+        x = torch.randn(2, 3, 7, 9, dtype=dtype)
+        y = torch.randn(2, 3 * 6, 24, dtype=dtype)
+    # Tier 2
+    want_im = torch.ops.aten.im2col.default(x, [2, 3], [1, 1], [0, 0], [1, 2])
+    want_col = torch.ops.aten.col2im.default(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2])
+    with cpu_as_hpu(im2col.install) as calls:
+        got_im = torch.ops.aten.im2col.default(x, [2, 3], [1, 1], [0, 0], [1, 2])
+        got_col = torch.ops.aten.col2im.default(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2])
+        if dtype == torch.float32:
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                auto_im = F.unfold(x, (2, 3), stride=(1, 2))
+                auto_col = F.fold(y, (7, 9), (2, 3), stride=(1, 2))
+            assert auto_im.dtype == torch.float32 and auto_col.dtype == torch.float32
+            torch.testing.assert_close(auto_im, want_im, atol=0, rtol=0)
+            torch.testing.assert_close(auto_col, want_col, atol=1e-5, rtol=1e-5)
+    assert got_im.dtype == dtype and got_col.dtype == dtype
+    assert calls["im2col"] >= 1 and calls["col2im"] >= 1
+    tol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else (1e-5 if dtype in (torch.float32, torch.complex64) else 0)
+    torch.testing.assert_close(got_im, want_im, atol=tol, rtol=tol)
+    torch.testing.assert_close(got_col, want_col, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("tier, shape, kernel, stride", [
+    ("tier1", (4, 16, 513, 1), (128, 1), (128, 1)),
+    ("tier2", (4, 4, 10, 12), (3, 5), (1, 1)),
+])
+def test_im2col_col2im_compiled_fullgraph_dynamic(tier, shape, kernel, stride):
+    torch.manual_seed(0)
+    unfold_fn = lambda t: F.unfold(t, kernel, stride=stride)  # noqa: E731
+    fold_fn = lambda t: F.fold(t, shape[-2:], kernel, stride=stride)  # noqa: E731
+
+    x1 = torch.randn(*shape, dtype=torch.float64)
+    x2 = torch.randn(8, *shape[1:], dtype=torch.float64)
+    y_shape = unfold_fn(x1).shape
+    y1 = torch.randn(*y_shape, dtype=torch.float64)
+    y2 = torch.randn(8, *y_shape[1:], dtype=torch.float64)
+
+    want_u1, want_u2 = train_step(unfold_fn, x1), train_step(unfold_fn, x2)
+    want_f1, want_f2 = train_step(fold_fn, y1), train_step(fold_fn, y2)
+
+    nodes_u, nodes_f = [], []
+    with cpu_as_hpu(im2col.install) as calls:
+        gu = compiled(unfold_fn, nodes_u, fullgraph=True, dynamic=True)
+        gf = compiled(fold_fn, nodes_f, fullgraph=True, dynamic=True)
+        got_u1, got_u2 = train_step(gu, x1), train_step(gu, x2)
+        got_f1, got_f2 = train_step(gf, y1), train_step(gf, y2)
+        assert calls["im2col"] >= 1 and calls["col2im"] >= 1
+    assert_same(got_u1, want_u1)
+    assert_same(got_u2, want_u2)
+    assert_same(got_f1, want_f1)
+    assert_same(got_f2, want_f2)
+    assert not any("im2col" in op or "col2im" in op for op in ops(nodes_u)), ops(nodes_u)
+    assert not any("im2col" in op or "col2im" in op for op in ops(nodes_f)), ops(nodes_f)
+
+
+def test_im2col_col2im_backend_and_out_kernels_below_autograd():
+    """Backend (.default) and .out kernels (inference_mode / below autograd on HPU), tested directly on CPU."""
+    im_def, im_out = torch.ops.aten.im2col.default, torch.ops.aten.im2col.out
+    col_def, col_out = torch.ops.aten.col2im.default, torch.ops.aten.col2im.out
+    im_be = im2col._im2col_kernel("cpu", im_def)
+    im_out_be = im2col._im2col_out_kernel("cpu", im_out)
+    col_be = im2col._col2im_kernel("cpu", col_def)
+    col_out_be = im2col._col2im_out_kernel("cpu", col_out)
+
+    x = torch.randn(2, 3, 7, 9, dtype=torch.float64)
+    y = torch.randn(2, 18, 24, dtype=torch.float64)
+    with torch.inference_mode():
+        want_im = im_def(x, [2, 3], [1, 1], [0, 0], [1, 2])
+        torch.testing.assert_close(im_be(x, [2, 3], [1, 1], [0, 0], [1, 2]), want_im, atol=0, rtol=0)
+        out_buf = torch.empty(1, dtype=torch.float64)
+        ret = im_out_be(x, [2, 3], [1, 1], [0, 0], [1, 2], out=out_buf)
+        assert ret is out_buf and out_buf.shape == want_im.shape
+        torch.testing.assert_close(out_buf, want_im, atol=0, rtol=0)
+
+        want_col = col_def(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2])
+        torch.testing.assert_close(col_be(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2]), want_col, atol=0, rtol=0)
+        out_col = torch.empty(1, dtype=torch.float64)
+        ret_c = col_out_be(y, [7, 9], [2, 3], [1, 1], [0, 0], [1, 2], out=out_col)
+        assert ret_c is out_col and out_col.shape == want_col.shape
+        torch.testing.assert_close(out_col, want_col, atol=0, rtol=0)
+
+        # Fallback path inside .out when dtype mismatches
+        with pytest.raises(RuntimeError):
+            im_out_be(x, [2, 3], [1, 1], [0, 0], [1, 2], out=torch.empty(1, dtype=torch.float32))
+        with pytest.raises(RuntimeError):
+            im_be(x.int(), [2, 3], [1, 1], [0, 0], [1, 2])
+
+
+@pytest.mark.parametrize("bad_call", [
+    lambda: F.unfold(torch.randint(0, 5, (2, 3, 6, 6), dtype=torch.int32), (3, 3)),
+    lambda: F.unfold(torch.randint(0, 5, (2, 3, 6, 6), dtype=torch.int64), (3, 3)),
+    lambda: F.fold(torch.randint(0, 5, (2, 27, 16), dtype=torch.int32), (6, 6), (3, 3)),
+    lambda: F.unfold(torch.randn(4, 6), (2, 2)),
+    lambda: torch.ops.aten.im2col.default(torch.randn(4, 6), [2, 2], [1, 1], [0, 0], [1, 1]),
+    lambda: F.fold(torch.randn(12), (4, 4), (2, 2)),
+    lambda: F.unfold(torch.randn(2, 3, 6, 6), (0, 3)),
+    lambda: F.unfold(torch.randn(2, 3, 6, 6), (3, 3), padding=(-1, 0)),
+    lambda: F.unfold(torch.randn(2, 3, 6, 6), (3, 3), dilation=(0, 1)),
+    lambda: F.unfold(torch.randn(2, 3, 6, 6), (3, 3), stride=(1, 0)),
+    lambda: F.unfold(torch.randn(2, 0, 6, 6), (3, 3)),
+    lambda: F.unfold(torch.randn(2, 3, 2, 2), (3, 3)),
+    lambda: F.fold(torch.randn(2, 27, 15), (6, 6), (3, 3)),   # mismatched L (15 != 16)
+    lambda: F.fold(torch.randn(2, 26, 16), (6, 6), (3, 3)),   # non-divisible C*kh*kw
+    lambda: F.fold(torch.randn(2, 0, 16), (6, 6), (3, 3)),    # C == 0
+    lambda: F.fold(torch.randn(2, 27, 16), (2, 2), (3, 3)),   # oh <= 0
+])
+def test_im2col_col2im_invalid_inputs_reach_aten(bad_call):
+    with pytest.raises(Exception) as want:
+        bad_call()
+    with cpu_as_hpu(im2col.install) as calls, pytest.raises(type(want.value)):
+        bad_call()
+    assert not calls["im2col"] and not calls["col2im"]
+
+
+def test_im2col_col2im_elsewhere_stays_native():
+    x = torch.randn(2, 3, 7, 9)
+    y = torch.randn(2, 12, 48)
+    nodes = []
+    with cpu_as_hpu(lambda device: im2col.install("hpu")) as calls:
+        train_step(compiled(lambda t: F.unfold(t, (2, 2)), nodes), x)
+        train_step(compiled(lambda t: F.fold(t, (7, 9), (2, 2)), nodes), y)
+    assert {"aten.im2col.default", "aten.col2im.default"} <= ops(nodes)
+    assert not calls["im2col"] and not calls["col2im"]
+
+
 # ---- installing and undoing
 
 
@@ -809,8 +1434,34 @@ def test_undo_restores_torch():
     assert torch.Tensor._reduce_ex_internal is reduce
     for name in ("aten::glu", "aten::renorm", "aten::upsample_nearest1d", "aten::_upsample_nearest_exact1d",
                  "aten::embedding_dense_backward", "aten::convolution_backward", "aten::roll",
-                 "aten::upsample_linear1d"):
+                 "aten::upsample_linear1d", "aten::index.Tensor", "aten::index_put_", "aten::im2col",
+                 "aten::col2im"):
         assert not torch._C._dispatch_has_kernel_for_dispatch_key(name, "AutogradCPU")
+
+
+def test_no_two_fixes_register_the_same_op_and_key(monkeypatch):
+    """``register_kernels`` leaves a taken key alone, so a second fix of the same op and key would silently do nothing.
+    Each fix is installed alone (then undone) and the keys it asks for are recorded."""
+    asked, current = {}, [None]
+    impl, py_impl = torch.library.Library.impl, torch._ops.OpOverload.py_impl
+
+    def record_impl(self, op, fn, key="", **kwargs):
+        name = op if isinstance(op, str) else op.name()
+        asked.setdefault((name, key), []).append(current[0])
+        return impl(self, op, fn, key, **kwargs)
+
+    def record_py_impl(self, key):
+        asked.setdefault((self.name(), str(key)), []).append(current[0])
+        return py_impl(self, key)
+
+    monkeypatch.setattr(torch.library.Library, "impl", record_impl)
+    monkeypatch.setattr(torch._ops.OpOverload, "py_impl", record_py_impl)
+    for fix in hpu_ops.FIXES:
+        current[0] = f"{fix.__module__}.{fix.__name__}"
+        fix("hpu")()  # "hpu" is not a CPU tensor's device: every key is free, nothing runs
+    duplicates = {k: v for k, v in asked.items() if len(set(v)) > 1}
+    assert not duplicates, duplicates
+    assert ("aten::index.Tensor", "AutogradHPU") in asked and ("aten::index.Tensor", "HPU") in asked
 
 
 @pytest.mark.parametrize("op", ["scaled_dot_product_attention", "_scaled_dot_product_fused_attention_overrideable"])
@@ -847,3 +1498,157 @@ def test_logsumexp_keeps_aten_gradient_with_every_fix_in_lazy_mode(monkeypatch, 
         (got,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
     assert not calls.get("logsumexp")
     torch.testing.assert_close(got, want, equal_nan=True)
+
+
+# ---- Tensor.unfold: as_strided with ATen's sizes and strides (lazy mode has no HPU kernel; the CPU stands in)
+
+
+@pytest.fixture
+def unfold_key_free(monkeypatch):
+    """The CPU key of ``aten::unfold`` counts as free, as the HPU key is in Habana's lazy mode, so ``register_kernels``
+    puts the rewrite there (over the CPU kernel, restored by the undo)."""
+    has = torch._C._dispatch_has_kernel_for_dispatch_key
+    monkeypatch.setattr(torch._C, "_dispatch_has_kernel_for_dispatch_key",
+                        lambda op, key: False if (op, key) == ("aten::unfold", "CPU") else has(op, key))
+
+
+def _unfold_cases():
+    base = torch.randn(4, 7, 13, dtype=torch.float64)
+    return [
+        ("contiguous", lambda: base.clone(), 2, 4, 3),
+        ("step > size", lambda: base.clone(), 2, 3, 5),
+        ("size == dim", lambda: base.clone(), 1, 7, 1),
+        ("size 1", lambda: base.clone(), 0, 1, 1),
+        ("negative dim", lambda: base.clone(), -1, 5, 2),
+        ("negative dim -3", lambda: base.clone(), -3, 2, 2),
+        ("non-contiguous", lambda: base.clone().transpose(0, 2), 1, 3, 2),
+        ("offset view", lambda: base.clone()[1:, 2:, 3:], 2, 4, 3),
+        ("strided slice", lambda: base.clone()[:, ::2, 1::3], 1, 2, 1),
+        ("broadcast stride 0", lambda: torch.randn(1, 5, dtype=torch.float64).expand(3, 5), 0, 2, 1),
+        ("1-d", lambda: torch.arange(11.0, dtype=torch.float64), 0, 4, 4),
+        ("0-d", lambda: torch.tensor(3.0, dtype=torch.float64), 0, 1, 1),
+        ("0-d dim -1", lambda: torch.tensor(3.0, dtype=torch.float64), -1, 0, 2),
+        ("empty dim", lambda: torch.randn(3, 0, 4, dtype=torch.float64), 2, 2, 1),
+        ("unfold twice", lambda: base.clone().unfold(1, 3, 2), 2, 4, 3),
+    ]
+
+
+@pytest.mark.parametrize("name,make,dim,size,step", _unfold_cases(), ids=[c[0] for c in _unfold_cases()])
+def test_unfold_is_the_same_view(unfold_key_free, name, make, dim, size, step):
+    """Sizes, strides, storage offset, values and aliasing equal ATen's; a write into the input shows in the view."""
+    x = make()
+    want = x.unfold(dim, size, step)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        got = x.unfold(dim, size, step)
+    assert calls["unfold"] == 1
+    assert (got.shape, got.stride(), got.storage_offset()) == (want.shape, want.stride(), want.storage_offset())
+    assert torch._C._is_alias_of(got, x) and got._base is (x._base if x._base is not None else x)
+    assert torch.equal(got, want)
+    if x.numel() and not (x.stride() and 0 in x.stride()):
+        x.add_(1)
+        assert torch.equal(got, x.unfold(dim, size, step))
+
+
+@pytest.mark.parametrize("dim,size,step,match", [
+    (3, 2, 1, "out of range"), (2, 14, 1, "maximum size for tensor at dimension 2 is 13 but size is 14"),
+    (2, 2, 0, "step is 0 but must be > 0"), (2, -1, 1, "size is -1 but must be >= 0"),
+])
+def test_unfold_raises_aten_errors(unfold_key_free, dim, size, step, match):
+    x = torch.randn(4, 7, 13)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        with pytest.raises((RuntimeError, IndexError), match=match):
+            x.unfold(dim, size, step)
+    assert calls["unfold"] == 1  # the error is ATen's, raised from the rewrite's meta call
+
+
+def _write_through(t, overlapping=True):
+    """Writes through a view of an unfold of ``t`` (scaled first, so the graph input is not written): a copy instead
+    of a view would leave ``c`` unchanged and the output and its gradient would differ from ATen's."""
+    c = t * 1
+    c.unfold(-1, 3, 3).select(-1, 0).mul_(3)
+    if overlapping:  # torch.compile's functionalization bans this write, with ATen's kernel too
+        c.unfold(-1, 3, 1)[..., 1].add_(c.detach()[..., :1])
+    return c.sin()
+
+
+def test_unfold_writes_through_the_view_in_training(unfold_key_free):
+    x = torch.randn(3, 4, 11, dtype=torch.float64)
+    want = train_step(_write_through, x)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        got = train_step(_write_through, x)
+    assert calls["unfold"] == 2
+    assert_same(got, want)
+    assert not torch.equal(want[0], x.sin())  # the writes changed the output
+
+
+def test_unfold_gradients_and_double_backward(unfold_key_free):
+    """Torch's autograd kernel stays above the rewrite: gradients (unfold_backward), second order, and gradcheck."""
+    x = torch.randn(3, 10, 9, dtype=torch.float64)
+    f = lambda t: t.unfold(1, 4, 3).unfold(2, 2, 1).sin()  # noqa: E731  (overlapping windows: a gradient sum)
+    want = train_step(f, x)
+    xg = x.clone().requires_grad_()
+    (g,) = torch.autograd.grad(f(xg).square().sum(), xg, create_graph=True)
+    (want_gg,) = torch.autograd.grad(g.square().sum(), xg)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        got = train_step(f, x)
+        xg = x.clone().requires_grad_()
+        (g,) = torch.autograd.grad(f(xg).square().sum(), xg, create_graph=True)
+        (got_gg,) = torch.autograd.grad(g.square().sum(), xg)
+        assert torch.autograd.gradcheck(lambda t: t.unfold(-1, 3, 2), (torch.randn(2, 7, dtype=torch.float64,
+                                                                                    requires_grad=True),))
+    assert calls["unfold"] > 0
+    assert_same(got, want)
+    assert_same([got_gg], [want_gg])
+
+
+def test_unfold_in_place_through_the_view_and_inference_mode(unfold_key_free):
+    x = torch.zeros(2, 12)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        x.unfold(1, 3, 3).select(-1, 0).fill_(1)  # non-overlapping windows: writes reach the input
+        with torch.inference_mode():
+            y = torch.arange(10.0)
+            u = y.unfold(0, 2, 2)
+        a = torch.randn(5, 6, requires_grad=True)
+        v = a.clone().unfold(1, 2, 2)
+        v.mul_(2)  # an in-place op on the view of a graph tensor: autograd rebases it, as for ATen's view
+        v.sum().backward()
+    assert calls["unfold"] == 3
+    assert torch.equal(x[:, ::3], torch.ones(2, 4)) and x.sum() == 8
+    assert torch.equal(u, torch.arange(10.0).reshape(5, 2)) and torch._C._is_alias_of(u, y)
+    assert torch.equal(a.grad, torch.full((5, 6), 2.0))
+
+
+def test_unfold_compiles(unfold_key_free):
+    """Under torch.compile the tracers see unfold's meta kernel; the CPU stand-in's aot graph then runs the rewrite.
+    The compiled results and gradients equal eager's, also with writes through the view."""
+    f = lambda t: (t.unfold(2, 4, 3) * 2).sum(-1)  # noqa: E731
+    x = torch.randn(2, 3, 17, dtype=torch.float64)
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        got = train_step(compiled(f, [], fullgraph=True), x)
+        # 18 = 6 windows of 3: torch 2.6's functionalization replays a write through an unfold with unfold_backward,
+        # which zeroes the elements no window covers (with ATen's kernel too), so the compiled write needs full cover
+        x18 = torch.randn(2, 3, 18, dtype=torch.float64)
+        written = train_step(compiled(lambda t: _write_through(t, False), [], fullgraph=True), x18)
+    assert calls["unfold"] > 0  # the CPU aot graph runs aten ops, so the rewrite (in hpu_backend's place) runs
+    assert_same(got, train_step(f, x))
+    assert_same(written, train_step(lambda t: _write_through(t, False), x18))
+
+
+def test_one_channel_conv_weight_grad_takes_the_unfold_rewrite(unfold_key_free):
+    """TensorCSPNet's temporal block (Conv2d(1, c, (k, w * d^2), stride (1, d^2))): its weight gradient from hpu-ops'
+    contraction runs both of its unfolds through the rewrite, and equals the CPU's."""
+    conv2d = nn.Conv2d(1, 4, (3, 2 * 9), stride=(1, 9)).double()
+    x = torch.randn(5, 1, 3, 9 * 6, dtype=torch.float64)
+    (want,) = torch.autograd.grad(conv2d(x).square().sum(), conv2d.weight)
+    with cpu_as_hpu(lambda d: hpu_ops._dispatch.chain([conv.install_weight_grad(d), composite.install_unfold(d)])) \
+            as calls:
+        (got,) = torch.autograd.grad(conv2d(x).square().sum(), conv2d.weight)
+    assert calls["conv_weight_grad"] == 1 and calls["unfold"] == 2
+    assert_same([got], [want])
+
+
+def test_unfold_elsewhere_and_eager_hpu_keep_the_native_kernel():
+    """Where the backend key has a kernel (the CPU here, Habana's eager stack on Gaudi) nothing is registered."""
+    with cpu_as_hpu(composite.install_unfold) as calls:
+        torch.randn(3, 8).unfold(1, 2, 2)
+    assert not calls.get("unfold")

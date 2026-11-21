@@ -1017,6 +1017,966 @@ def test_tpc_flushes_the_lazy_graph_before_the_op(monkeypatch, lazy, flushes):
     assert len(marks) == flushes
 
 
+# ---- SVD family (#9): jacobi_svd, svd, svdvals, pinv, lstsq, matrix_norm, matrix_rank
+
+
+@pytest.fixture
+def svd_hook(monkeypatch):
+    """``linalg._SVD`` set to ``svd_reference``; collects ``(shape, compute_uv)`` per call."""
+    calls = []
+
+    def hook(A, compute_uv):
+        calls.append((tuple(A.shape), compute_uv))
+        return tpc.svd_reference(A.detach(), compute_uv=compute_uv)
+
+    monkeypatch.setattr(linalg, "_SVD", hook)
+    return calls
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (3, 3), (7, 3), (3, 7), (22, 22), (32, 17), (17, 32)])
+def test_tpc_svd_reference_contract(shape):
+    torch.manual_seed(0)
+    m, n = shape
+    k = min(m, n)
+    A = torch.randn(4, m, n)
+    U, S, Vh = tpc.svd_reference(A, compute_uv=True)
+    assert U.shape == (4, m, k) and S.shape == (4, k) and Vh.shape == (4, k, n)
+    assert (S[:, :-1] >= S[:, 1:]).all() and (S >= 0).all()
+    eye = torch.eye(k).expand(4, k, k)
+    torch.testing.assert_close(U.mT @ U, eye, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(Vh @ Vh.mT, eye, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close((U * S.unsqueeze(-2)) @ Vh, A, rtol=1e-4, atol=1e-4)
+    _, S_only, _ = tpc.svd_reference(A, compute_uv=False)
+    torch.testing.assert_close(S_only, S, rtol=1e-5, atol=1e-5)
+
+
+def test_tpc_svd_flattens_batch_and_makes_contiguous(monkeypatch):
+    torch.manual_seed(0)
+    seen, seen_vals = [], []
+
+    def fake_svd(A_t):
+        seen.append((tuple(A_t.shape), A_t.is_contiguous(), A_t.dtype))
+        U, S, Vh = tpc.svd_reference(A_t.mT, compute_uv=True)
+        return U.mT.contiguous(), S, Vh
+
+    def fake_svdvals(A_t):
+        seen_vals.append((tuple(A_t.shape), A_t.is_contiguous(), A_t.dtype))
+        return tpc.svd_reference(A_t.mT, compute_uv=False)[1]
+
+    monkeypatch.setattr(tpc, "_svd_op", lambda: fake_svd)
+    monkeypatch.setattr(tpc, "_svdvals_op", lambda: fake_svdvals)
+
+    for shape in ((2, 3, 5, 4), (2, 3, 4, 5)):
+        A = torch.randn(*shape[:-2], shape[-1], shape[-2], dtype=torch.float64).mT  # non-contiguous
+        m, n = A.shape[-2], A.shape[-1]
+        k = min(m, n)
+        U, S, Vh = tpc.jacobi_svd(A)
+        assert U.shape == (2, 3, m, k) and S.shape == (2, 3, k) and Vh.shape == (2, 3, k, n)
+        torch.testing.assert_close((U * S.unsqueeze(-2)) @ Vh, A.float(), rtol=1e-4, atol=1e-4)
+        S_only = tpc.jacobi_svdvals(A)
+        torch.testing.assert_close(S_only, S, rtol=1e-5, atol=1e-5)
+
+    assert seen == [((6, 4, 5), True, torch.float32), ((6, 4, 5), True, torch.float32)]
+    assert seen_vals == [((6, 4, 5), True, torch.float32), ((6, 4, 5), True, torch.float32)]
+
+
+@pytest.mark.parametrize("lazy, flushes", [("1", 1), ("0", 0)])
+def test_tpc_svd_flushes_lazy_graph(monkeypatch, lazy, flushes):
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    torch_mod = types.SimpleNamespace(core=core)
+    hf = types.SimpleNamespace(torch=torch_mod)
+    for name, mod in (("habana_frameworks", hf), ("habana_frameworks.torch", torch_mod),
+                      ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", lazy)
+    monkeypatch.setattr(tpc, "_svd_op", lambda: lambda A_t: (
+        tpc.svd_reference(A_t.mT)[0].mT, tpc.svd_reference(A_t.mT)[1], tpc.svd_reference(A_t.mT)[2]))
+    monkeypatch.setattr(tpc, "_svdvals_op", lambda: lambda A_t: tpc.svd_reference(A_t.mT, compute_uv=False)[1])
+    tpc.jacobi_svd(torch.randn(2, 5, 4))
+    assert len(marks) == flushes
+    marks.clear()
+    tpc.jacobi_svdvals(torch.randn(2, 5, 4))
+    assert len(marks) == flushes
+
+
+@pytest.mark.parametrize("lazy, flushes", [("1", 1), ("0", 0)])
+def test_tpc_expm_and_householder_flush_before_the_op(monkeypatch, lazy, flushes):
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    torch_mod = types.SimpleNamespace(core=core)
+    for name, mod in (("habana_frameworks", types.SimpleNamespace(torch=torch_mod)),
+                      ("habana_frameworks.torch", torch_mod), ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", lazy)
+    monkeypatch.setattr(tpc, "_expm_op", lambda: torch.linalg.matrix_exp)
+    monkeypatch.setattr(tpc, "_expm_frechet_op", lambda: lambda a, g: g)
+    monkeypatch.setattr(tpc, "_hh_op", lambda: lambda a_t, t: a_t)
+    A = torch.randn(2, 4, 4)
+    for call in (lambda: tpc.matrix_exp(A), lambda: tpc.matrix_exp_frechet(A, A),
+                 lambda: tpc.householder_product(torch.randn(2, 5, 3), torch.randn(2, 3))):
+        marks.clear()
+        call()
+        assert len(marks) == flushes
+
+
+def test_svd_declined_past_maxn_and_without_kernel(monkeypatch, svd_hook):
+    A = torch.randn(2, 4, 4)
+    takes = linalg._svd_takes("hpu")
+    monkeypatch.setattr(tpc, "ready", lambda: False)
+    assert takes(A) is False
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    assert takes(A) is True
+    assert takes(torch.randn(tpc.SMALL_MAXN + 1, 4)) is False
+    assert takes(torch.randn(4, tpc.SMALL_MAXN + 1)) is False
+    assert takes(torch.randn(tpc.SMALL_MAXN, tpc.SMALL_MAXN)) is True
+    assert takes(A, driver="gesvd") is False
+
+    with cpu_as_hpu(linalg.install_svd):
+        torch.linalg.svd(torch.randn(2, tpc.SMALL_MAXN + 1, 4))
+    assert svd_hook == []
+
+
+def test_svd_family_float64_warns_once_on_hpu():
+    linalg._WARNED.clear()
+    A = torch.randn(4, 3, dtype=torch.float64)
+    B = torch.randn(4, 2, dtype=torch.float64)
+    for name, fn, args in (("svd", linalg._svd_takes("hpu"), (A,)),
+                           ("pinv", linalg._pinv_takes("hpu"), (A,)),
+                           ("lstsq", linalg._lstsq_takes("hpu"), (A, B))):
+        with pytest.warns(UserWarning, match="hpu-ops#16"):
+            assert fn(*args) is False
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert fn(*args) is False
+
+    # pinv allows float64 atol/rtol tensors when A is float32 (PyTorch emits float64 0-D tensors)
+    assert linalg._pinv_takes("cpu")(
+        torch.randn(4, 3), atol=torch.tensor(1e-4, dtype=torch.float64), rtol=torch.tensor(0.0, dtype=torch.float64))
+
+    for bad in (torch.randn(3, 3, dtype=torch.complex64), torch.ones(3, 3, dtype=torch.int64),
+                torch.randn(3, 3, dtype=torch.float16), torch.randn(3, 3, dtype=torch.bfloat16),
+                torch.randn(0, 3, 3), torch.randn(3)):
+        assert linalg._svd_takes("cpu")(bad) is False
+        assert linalg._pinv_takes("cpu")(bad) is False
+
+
+def _svd_sign_invariant(full_matrices=False):
+    def f(a):
+        U, S, Vh = torch.linalg.svd(a, full_matrices=full_matrices)
+        k = S.shape[-1]
+        Uk, Vhk = U[..., :k], Vh[..., :k, :]
+        rec = (Uk * S.exp().unsqueeze(-2)) @ Vhk
+        if full_matrices:
+            return S, rec, Uk.mT @ Uk, Vhk @ Vhk.mT, U @ U.mT, Vh.mT @ Vh
+        return S, rec, U.mT @ U, Vh @ Vh.mT
+
+    return f
+
+
+@pytest.mark.parametrize("full_matrices", [False, True])
+@pytest.mark.parametrize("shape", [(1, 1), (4, 4), (7, 3), (3, 7), (2, 3, 6, 4), (2, 3, 4, 6)])
+def test_svd_matches_torch(shape, full_matrices, svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(*shape, dtype=torch.float64)
+    compare(_svd_sign_invariant(full_matrices), linalg.install_svd, A, name="svd", rtol=1e-6, atol=1e-6)
+    assert svd_hook
+
+
+def test_svd_noncontiguous_expanded_and_float32(svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(3, 5, 4, dtype=torch.float32).mT
+    compare(_svd_sign_invariant(False), linalg.install_svd, A, name="svd", rtol=2e-3, atol=2e-3)
+
+    base = torch.randn(1, 5, 4, dtype=torch.float64)
+    compare(lambda x: _svd_sign_invariant(True)(x.expand(3, 5, 4)), linalg.install_svd, base, name="svd",
+            rtol=1e-6, atol=1e-6)
+
+
+def test_svd_double_backward(svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(2, 5, 3, dtype=torch.float64, requires_grad=True)
+    with cpu_as_hpu(linalg.install_svd) as calls:
+        assert torch.autograd.gradgradcheck(lambda x: torch.linalg.svd(x, full_matrices=False)[1], (A,))
+        assert torch.autograd.gradgradcheck(
+            lambda x: (lambda u, s, vh: (u * s.unsqueeze(-2)) @ vh)(*torch.linalg.svd(x, full_matrices=False)),
+            (A,), atol=1e-5, rtol=1e-4)
+        assert calls["svd"] >= 1 and svd_hook
+
+
+@pytest.mark.parametrize("A_fn", [lambda: torch.zeros(4, 3, dtype=torch.float64),
+                                   lambda: torch.diag(torch.tensor([3.0, 3.0, 1.0], dtype=torch.float64))],
+                         ids=["zeros", "repeated"])
+def test_svd_zero_and_repeated_s_backward_is_finite(A_fn, svd_hook):
+    A_ref = A_fn().requires_grad_()
+    torch.linalg.svd(A_ref, full_matrices=False).S.sum().backward()
+    A_got = A_fn().requires_grad_()
+    with cpu_as_hpu(linalg.install_svd) as calls:
+        torch.linalg.svd(A_got, full_matrices=False).S.sum().backward()
+        assert calls["svd"] >= 1
+    assert torch.isfinite(A_got.grad).all()
+    torch.testing.assert_close(A_got.grad, A_ref.grad)
+
+
+def test_svd_out_and_legacy_alias(svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(5, 3, dtype=torch.float64)
+    want_U, want_S, want_Vh = torch.linalg.svd(A, full_matrices=False)
+    U, S, Vh = torch.empty_like(want_U), torch.empty_like(want_S), torch.empty_like(want_Vh)
+    with cpu_as_hpu(linalg.install_svd):
+        torch.linalg.svd(A, full_matrices=False, out=(U, S, Vh))
+    torch.testing.assert_close(S, want_S)
+    torch.testing.assert_close((U * S.unsqueeze(-2)) @ Vh, A)
+    compare(lambda x: (torch.svd(x).S, torch.svd(x).U @ torch.diag_embed(torch.svd(x).S) @ torch.svd(x).V.mT),
+            linalg.install_svd, A, name="svd", rtol=1e-6, atol=1e-6)
+
+
+def test_svdvals_grad_and_no_grad(svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(2, 6, 4, dtype=torch.float64)
+    with cpu_as_hpu(linalg.install_svd) as calls, torch.no_grad():
+        got = torch.linalg.svdvals(A)
+        assert calls["svd"] >= 1
+    torch.testing.assert_close(got, torch.linalg.svdvals(A))
+    assert svd_hook[-1] == ((2, 6, 4), False)
+
+    svd_hook.clear()
+    compare(torch.linalg.svdvals, linalg.install_svd, A, name="svd", rtol=1e-6, atol=1e-6)
+    assert any(cuv for _, cuv in svd_hook)
+
+
+def test_svd_and_svdvals_compiled(svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(2, 5, 4, dtype=torch.float64)
+    nodes = []
+    with cpu_as_hpu(linalg.install_svd):
+        got = compiled(lambda x: torch.linalg.svdvals(x), nodes)(A)
+    torch.testing.assert_close(got, torch.linalg.svdvals(A))
+    assert "aten._linalg_svd.default" not in ops(nodes), ops(nodes)
+
+    nodes_big = []
+    big = torch.randn(tpc.SMALL_MAXN + 1, 4, dtype=torch.float64)
+    with cpu_as_hpu(linalg.install_svd):
+        got_big = compiled(lambda x: torch.linalg.svdvals(x), nodes_big)(big)
+    torch.testing.assert_close(got_big, torch.linalg.svdvals(big))
+    assert "aten._linalg_svd.default" in ops(nodes_big), ops(nodes_big)
+
+
+@pytest.mark.parametrize("shape", [(4, 4), (7, 4), (4, 7), (2, 3, 5, 4)])
+def test_pinv_matches_torch_and_rank_deficient(shape, svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(*shape, dtype=torch.float64)
+    compare(torch.linalg.pinv, linalg.install_pinv, A, name="pinv", rtol=1e-6, atol=1e-6)
+    compare(torch.pinverse, linalg.install_pinv, A, name="pinv", rtol=1e-6, atol=1e-6)
+
+    # Rank-deficient + atol/rtol variants (including non-contiguous .mT)
+    U_r = torch.randn(4, 2, dtype=torch.float64)
+    V_r = torch.randn(2, 5, dtype=torch.float64)
+    R = (U_r @ V_r).mT.contiguous().mT
+    compare(lambda x: torch.linalg.pinv(x, atol=1e-3, rtol=1e-3), linalg.install_pinv, R, name="pinv",
+            rtol=1e-6, atol=1e-6)
+    compare(lambda x: torch.linalg.pinv(x, rtol=1e-2), linalg.install_pinv, R, name="pinv", rtol=1e-6, atol=1e-6)
+
+
+def test_pinv_eye_grad_and_double_backward(svd_hook):
+    torch.manual_seed(0)
+    eye = torch.eye(4, dtype=torch.float64)
+    compare(torch.linalg.pinv, linalg.install_pinv, eye, name="pinv", rtol=1e-6, atol=1e-6)
+    A = torch.randn(2, 4, 3, dtype=torch.float64, requires_grad=True)
+    with cpu_as_hpu(linalg.install_pinv) as calls:
+        assert torch.autograd.gradgradcheck(torch.linalg.pinv, (A,))
+        assert calls["pinv"] >= 1
+
+
+def test_pinv_declines_hermitian_and_inference_mode_without_recursion(svd_hook):
+    torch.manual_seed(0)
+    S = spd(2, n=4)
+    want = torch.linalg.pinv(S, hermitian=True)
+    with cpu_as_hpu(linalg.install_pinv) as calls:
+        got = torch.linalg.pinv(S, hermitian=True)
+        assert calls["pinv"] == 0
+    torch.testing.assert_close(got, want)
+
+    A = torch.randn(3, 4, 4, dtype=torch.float64)
+    want_inf = torch.linalg.pinv(A)
+    with cpu_as_hpu(linalg.install_pinv) as calls, torch.inference_mode():
+        got_inf = torch.linalg.pinv(A)
+        assert calls["pinv"] == 0
+    torch.testing.assert_close(got_inf, want_inf)
+
+
+def test_pinv_compiled_has_no_native_op(svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(2, 5, 4, dtype=torch.float64)
+    nodes = []
+    with cpu_as_hpu(linalg.install_pinv):
+        got = compiled(torch.linalg.pinv, nodes)(A)
+    torch.testing.assert_close(got, torch.linalg.pinv(A))
+    assert "aten.linalg_pinv.atol_rtol_tensor" not in ops(nodes), ops(nodes)
+    assert "aten._linalg_svd.default" not in ops(nodes), ops(nodes)
+
+
+@pytest.mark.parametrize("driver", [None, "gels", "gelsy", "gelsd", "gelss"])
+@pytest.mark.parametrize("a_shape, b_shape", [((4, 4), (4, 2)), ((6, 4), (6, 2)), ((4, 6), (4, 2)),
+                                              ((2, 5, 3), (2, 5)), ((3, 1, 5, 3), (1, 4, 5, 2))])
+def test_lstsq_matches_torch_full_rank(a_shape, b_shape, driver, svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(*a_shape, dtype=torch.float64)
+    B = torch.randn(*b_shape, dtype=torch.float64)
+    calls = compare(lambda a, b: torch.linalg.lstsq(a, b, driver=driver).solution,
+                    linalg.install_lstsq, A, B, name="lstsq", rtol=1e-6, atol=1e-6)
+    assert calls["lstsq"] >= 1
+    want = torch.linalg.lstsq(A, B, driver=driver)
+    with cpu_as_hpu(linalg.install_lstsq):
+        got = torch.linalg.lstsq(A, B, driver=driver)
+    assert got.residuals.shape == want.residuals.shape
+    assert got.rank.dtype == want.rank.dtype and torch.equal(got.rank, want.rank)
+    assert got.singular_values.shape == want.singular_values.shape
+    torch.testing.assert_close(got.residuals, want.residuals)
+    torch.testing.assert_close(got.singular_values, want.singular_values)
+
+
+def test_lstsq_declines_rank_deficient_and_double_backward(svd_hook, monkeypatch):
+    torch.manual_seed(0)
+    A_rd = torch.randn(5, 2, dtype=torch.float64) @ torch.randn(2, 4, dtype=torch.float64)
+    B_rd = torch.randn(5, 2, dtype=torch.float64)
+    want_rd = torch.linalg.lstsq(A_rd, B_rd).solution
+    with cpu_as_hpu(linalg.install_lstsq) as calls:
+        got_rd = torch.linalg.lstsq(A_rd, B_rd).solution
+        assert calls["lstsq"] == 0
+    torch.testing.assert_close(got_rd, want_rd)
+
+    A = torch.randn(5, 3, dtype=torch.float64, requires_grad=True)
+    B = torch.randn(5, 2, dtype=torch.float64, requires_grad=True)
+    with cpu_as_hpu(linalg.install_lstsq) as calls:
+        assert torch.autograd.gradgradcheck(lambda a, b: torch.linalg.lstsq(a, b).solution, (A, B))
+        assert calls["lstsq"] >= 1
+
+    # compiled: the rank-revealing default driver is declined while tracing (rank and residuals need the values),
+    # gels is taken; both match torch. svd_reference branches on values (its MGS repair) and cannot be traced, the
+    # device kernel can, so a traceable SVD stands in under fake tensors: otherwise tracing stops and whether the
+    # kernel then runs depends on how the torch version falls back to eager. A taken call leaves that SVD in the
+    # graph; a declined one leaves torch's lstsq, which graph-breaks (data-dependent output shape).
+    def traceable_svd(A_, compute_uv):
+        if not linalg._is_fake(A_):
+            return tpc.svd_reference(A_, compute_uv=compute_uv)
+        if not compute_uv:
+            return A_.new_empty(0), torch.linalg.svdvals(A_), A_.new_empty(0)
+        return torch.linalg.svd(A_, full_matrices=False)
+
+    monkeypatch.setattr(linalg, "_SVD", traceable_svd)
+    for driver, taken in ((None, False), ("gels", True)):
+        nodes = []
+        with cpu_as_hpu(linalg.install_lstsq) as calls:
+            got_c = compiled(lambda a, b: torch.linalg.lstsq(a, b, driver=driver).solution, nodes)(A.detach(), B.detach())
+            assert (calls["lstsq"] >= 1) == taken
+        assert ("aten._linalg_svd.default" in ops(nodes)) == taken, ops(nodes)
+        torch.testing.assert_close(got_c, torch.linalg.lstsq(A.detach(), B.detach(), driver=driver).solution)
+
+
+@pytest.mark.parametrize("ord_", [2, -2, "nuc"])
+@pytest.mark.parametrize("shape", [(4, 4), (7, 3), (3, 7), (2, 3, 5, 4)])
+def test_matrix_norm_routes_through_svd(shape, ord_, svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(*shape, dtype=torch.float64)
+    compare(lambda x: torch.linalg.matrix_norm(x, ord=ord_), linalg.install_svd, A, name="svd", rtol=1e-6, atol=1e-6)
+    nodes = []
+    with cpu_as_hpu(linalg.install_svd):
+        got = compiled(lambda x: torch.linalg.matrix_norm(x, ord=ord_), nodes)(A)
+    torch.testing.assert_close(got, torch.linalg.matrix_norm(A, ord=ord_))
+    assert "aten._linalg_svd.default" not in ops(nodes), ops(nodes)
+
+    with cpu_as_hpu(linalg.install_svd) as calls:
+        torch.linalg.matrix_norm(A, ord="fro")
+        assert calls["svd"] == 0
+
+
+def test_matrix_rank_routes_through_svd(svd_hook):
+    torch.manual_seed(0)
+    A_full = torch.randn(2, 6, 4, dtype=torch.float32)
+    A_rd = torch.randn(2, 6, 2, dtype=torch.float32) @ torch.randn(2, 2, 4, dtype=torch.float32)
+    A_zero = torch.zeros(2, 4, 4, dtype=torch.float32)
+    for A in (A_full, A_rd, A_zero):
+        for fn in (lambda x: torch.linalg.matrix_rank(x),
+                   lambda x: torch.linalg.matrix_rank(x, 1e-3),
+                   lambda x: torch.linalg.matrix_rank(x, torch.tensor(1e-3)),
+                   lambda x: torch.linalg.matrix_rank(x, atol=1e-3, rtol=1e-3),
+                   lambda x: torch.linalg.matrix_rank(x, atol=torch.tensor(1e-3))):
+            want = fn(A)
+            with cpu_as_hpu(linalg.install_matrix_rank) as calls:
+                got = fn(A)
+                assert calls["svd"] >= 1
+            assert got.dtype == torch.int64 and torch.equal(got, want)
+
+    S = spd(2, n=4, dtype=torch.float32)
+    with cpu_as_hpu(linalg.install_matrix_rank) as calls:
+        got_h = torch.linalg.matrix_rank(S, hermitian=True)
+        assert calls["svd"] == 0
+    assert torch.equal(got_h, torch.linalg.matrix_rank(S, hermitian=True))
+
+    nodes = []
+    with cpu_as_hpu(linalg.install_matrix_rank) as calls:
+        got_c = compiled(torch.linalg.matrix_rank, nodes)(A_full)
+        assert calls["svd"] >= 1
+    assert torch.equal(got_c, torch.linalg.matrix_rank(A_full))
+    assert "aten._linalg_svd.default" not in ops(nodes), ops(nodes)
+
+
+def _tiny_singular_value_matrix():
+    """A batch with singular values (1, 1, 1, 1e-3, 1e-9): the last is below eps * max(m, n) * smax in float32."""
+    torch.manual_seed(0)
+    Q1 = torch.linalg.qr(torch.randn(3, 5, 5, dtype=torch.float64))[0]
+    Q2 = torch.linalg.qr(torch.randn(3, 5, 5, dtype=torch.float64))[0]
+    d = torch.tensor([1.0, 1.0, 1.0, 1e-3, 1e-9], dtype=torch.float64)
+    return ((Q1 * d) @ Q2.mT).float()
+
+
+ZERO_ATOL_FNS = {
+    "rank atol=0.": lambda x: torch.linalg.matrix_rank(x, atol=0.0),
+    "rank atol=-1.": lambda x: torch.linalg.matrix_rank(x, atol=-1.0),
+    "rank atol=tensor(0.)": lambda x: torch.linalg.matrix_rank(x, atol=torch.tensor(0.0)),
+    "rank atol=tensor([0., 1e-6, 0.])": lambda x: torch.linalg.matrix_rank(x, atol=torch.tensor([0.0, 1e-6, 0.0])),
+    "rank atol=1e-6": lambda x: torch.linalg.matrix_rank(x, atol=1e-6),
+}
+
+
+@pytest.mark.parametrize("fn", list(ZERO_ATOL_FNS))
+def test_matrix_rank_atol_without_rtol_keeps_default_rtol_unless_positive(fn, svd_hook):
+    """torch's get_atol_rtol: a given atol zeroes the default rtol only where atol > 0."""
+    A = _tiny_singular_value_matrix()
+    want = ZERO_ATOL_FNS[fn](A)
+    with cpu_as_hpu(linalg.install_matrix_rank) as calls:
+        got = ZERO_ATOL_FNS[fn](A)
+        assert calls["svd"] >= 1
+    assert torch.equal(got, want), (got, want)
+
+
+@pytest.mark.parametrize("atol", [0.0, torch.tensor(0.0), torch.tensor([0.0, 1e-6, 0.0])])
+def test_pinv_atol_zero_keeps_default_rtol(atol, svd_hook):
+    A = _tiny_singular_value_matrix()
+    want = torch.linalg.pinv(A, atol=atol)
+    with cpu_as_hpu(linalg.install_pinv) as calls:
+        got = torch.linalg.pinv(A, atol=atol)
+        assert calls["pinv"] >= 1
+    torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-3)
+    assert got.abs().max() < 1e4  # the 1e-9 value is dropped, not inverted
+
+
+@pytest.fixture
+def cia_backends(monkeypatch):
+    """The CompositeImplicitAutograd ops' backend kernels registered on the CPU stand-in; collects ``_on_cpu`` calls."""
+    monkeypatch.setattr(linalg, "_CIA_BACKENDS_ON_CPU", True)
+    seen = []
+    original = linalg._on_cpu
+
+    def spy(op, args, kwargs):
+        seen.append(str(op))
+        return original(op, args, kwargs)
+
+    monkeypatch.setattr(linalg, "_on_cpu", spy)
+    return seen
+
+
+INFERENCE_DECLINED = {
+    "matrix_norm fro": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, "fro")),
+    "matrix_norm 1": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, 1)),
+    "matrix_norm inf": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, float("inf"))),
+    "matrix_norm -1": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, -1)),
+    "matrix_norm 2 dtype": (linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, 2, dtype=torch.float64)),
+    "matrix_rank hermitian": (linalg.install_matrix_rank, lambda x: torch.linalg.matrix_rank(x, hermitian=True)),
+    "matrix_rank hermitian tol": (linalg.install_matrix_rank,
+                                  lambda x: torch.linalg.matrix_rank(x, 1e-3, hermitian=True)),
+    "matrix_rank hermitian atol": (linalg.install_matrix_rank,
+                                   lambda x: torch.linalg.matrix_rank(x, atol=torch.tensor(1e-3), hermitian=True)),
+}
+
+
+@pytest.mark.parametrize("case", list(INFERENCE_DECLINED))
+def test_declined_cia_calls_decompose_under_inference_mode(case, cia_backends, svd_hook):
+    """A declined call of a CompositeImplicitAutograd op below autograd decomposes on the device (as before hpu-ops),
+    never through hpu-ops' CPU route."""
+    install, fn = INFERENCE_DECLINED[case]
+    S = spd(2, n=5, dtype=torch.float32)
+    want = fn(S)
+    with cpu_as_hpu(install), torch.inference_mode():
+        got = fn(S)
+    assert cia_backends == [], cia_backends
+    torch.testing.assert_close(got, want)
+
+
+def test_taken_cia_calls_use_the_kernel_under_inference_mode(cia_backends, svd_hook):
+    A = torch.randn(2, 5, 4)
+    for install, fn, name in ((linalg.install_svd, lambda x: torch.linalg.matrix_norm(x, "nuc"), "svd"),
+                              (linalg.install_svd, torch.linalg.svdvals, "svd"),
+                              (linalg.install_matrix_rank, torch.linalg.matrix_rank, "svd")):
+        want = fn(A)
+        with cpu_as_hpu(install) as calls, torch.inference_mode():
+            got = fn(A)
+            assert calls[name] >= 1
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+    assert cia_backends == []
+
+
+@pytest.mark.parametrize("shape", [(6, 4), (4, 6), (4, 4)])
+def test_tpc_svd_full_matrices_and_unsorted(monkeypatch, shape):
+    torch.manual_seed(0)
+    m, n = shape
+    k = min(m, n)
+
+    def fake_svd(A_t):
+        U, S, Vh = tpc.svd_reference(A_t.mT, compute_uv=True, full_matrices=False)
+        return U.mT.contiguous(), S, Vh
+
+    def fake_svd_full(A_t):
+        U, S, Vh = tpc.svd_reference(A_t.mT, compute_uv=True, full_matrices=True)
+        return U.mT.contiguous(), S, Vh
+
+    monkeypatch.setattr(tpc, "_svd_op", lambda: fake_svd)
+    monkeypatch.setattr(tpc, "_svd_full_op", lambda: fake_svd_full)
+
+    A = torch.randn(2, m, n, dtype=torch.float64).mT.contiguous().mT  # non-contiguous when square/rect
+    A_zero = torch.zeros(2, m, n, dtype=torch.float32)
+    A_rd = torch.randn(2, m, 1, dtype=torch.float32) @ torch.randn(2, 1, n, dtype=torch.float32)
+    for mat in (A, A_zero, A_rd):
+        U, S, Vh = tpc.jacobi_svd(mat, full_matrices=True)
+        assert U.shape == (2, m, m) and S.shape == (2, k) and Vh.shape == (2, n, n)
+        assert (S[:, :-1] >= S[:, 1:]).all()
+        eye_m = torch.eye(m).expand(2, m, m)
+        eye_n = torch.eye(n).expand(2, n, n)
+        torch.testing.assert_close(U.mT @ U, eye_m, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(U @ U.mT, eye_m, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(Vh @ Vh.mT, eye_n, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(Vh.mT @ Vh, eye_n, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close((U[..., :k] * S.unsqueeze(-2)) @ Vh[..., :k, :], mat.float(), rtol=1e-4, atol=1e-4)
+
+    Uu, Su, Vhu = tpc.jacobi_svd(A, full_matrices=True, sort=False)
+    torch.testing.assert_close((Uu[..., :k] * Su.unsqueeze(-2)) @ Vhu[..., :k, :], A.float(), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(Su.sort(-1, descending=True).values, tpc.jacobi_svd(A)[1], rtol=1e-5, atol=1e-5)
+
+
+def test_svd_u_backend_takes_and_decline_copy_back(monkeypatch, svd_hook):
+    captured = []
+    monkeypatch.setattr(linalg, "register_kernels", lambda _dev, entries: captured.extend(entries))
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    linalg.install_svd("hpu")
+    svd_u = next(fn for op, key, fn in captured if op == torch.ops.aten._linalg_svd.U and key == "{}")
+
+    def fake_on_cpu(op, args, kwargs):
+        out = op(*(x.clone() if isinstance(x, torch.Tensor) else x for x in args),
+                 **{k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in kwargs.items()})
+        return tuple(t.clone() for t in out)
+
+    monkeypatch.setattr(linalg, "_on_cpu", fake_on_cpu)
+
+    # Accept path
+    torch.manual_seed(0)
+    A = torch.randn(2, 5, 4, dtype=torch.float32)
+    U, S, Vh = torch.zeros(2, 5, 4), torch.zeros(2, 4), torch.zeros(2, 4, 4)
+    rU, rS, rVh = svd_u(A, False, True, U=U, S=S, Vh=Vh)
+    assert rU is U and rS is S and rVh is Vh and svd_hook
+    want_U, want_S, want_Vh = torch.linalg.svd(A, full_matrices=False)
+    torch.testing.assert_close(S, want_S, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close((U * S.unsqueeze(-2)) @ Vh, A, rtol=1e-4, atol=1e-4)
+
+    # Decline path: n > MAXN, float64, and compute_uv=False (driver != None is also declined by takes)
+    assert not linalg._svd_takes("hpu")(A, driver="gesvd")
+    for mat, cuv in (
+        (torch.randn(2, 4, tpc.SMALL_MAXN + 1, dtype=torch.float32), True),
+        (torch.randn(2, 4, 3, dtype=torch.float64), True),
+        (torch.randn(2, 4, tpc.SMALL_MAXN + 1, dtype=torch.float32), False),
+    ):
+        m, n = mat.shape[-2], mat.shape[-1]
+        k = min(m, n)
+        u_out = torch.zeros(2, m, k, dtype=mat.dtype) if cuv else mat.new_empty(0)
+        s_out = torch.zeros(2, k, dtype=mat.dtype)
+        vh_out = torch.zeros(2, k, n, dtype=mat.dtype) if cuv else mat.new_empty(0)
+        ru, rs, rvh = svd_u(mat, False, cuv, U=u_out, S=s_out, Vh=vh_out)
+        assert ru is u_out and rs is s_out and rvh is vh_out
+        if cuv:
+            wu, ws, wvh = torch.linalg.svd(mat, full_matrices=False)
+            torch.testing.assert_close(s_out, ws)
+            torch.testing.assert_close((u_out * s_out.unsqueeze(-2)) @ vh_out, mat)
+        else:
+            torch.testing.assert_close(s_out, torch.linalg.svdvals(mat))
+
+
+@pytest.mark.parametrize("scale", [1e-20, 1e20])
+@pytest.mark.parametrize("full_matrices", [False, True])
+def test_svd_extreme_scale_backward_is_finite(scale, full_matrices, svd_hook):
+    torch.manual_seed(0)
+    A_base = torch.randn(3, 5, 4, dtype=torch.float32) * scale
+    A_ref = A_base.clone().requires_grad_()
+    Ur, Sr, Vhr = torch.linalg.svd(A_ref, full_matrices=full_matrices)
+    ((Ur[..., :4] * Sr.unsqueeze(-2)) @ Vhr[..., :4, :]).sum().backward()
+
+    A_got = A_base.clone().requires_grad_()
+    with cpu_as_hpu(linalg.install_svd) as calls:
+        Ug, Sg, Vhg = torch.linalg.svd(A_got, full_matrices=full_matrices)
+        ((Ug[..., :4] * Sg.unsqueeze(-2)) @ Vhg[..., :4, :]).sum().backward()
+        assert calls["svd"] >= 1
+    assert torch.isfinite(A_got.grad).all()
+    if torch.isfinite(A_ref.grad).all():
+        torch.testing.assert_close(A_got.grad, A_ref.grad, rtol=1e-3, atol=1e-4)
+
+
+def test_svdvals_and_matrix_norm_gradgradcheck_and_dims(svd_hook):
+    torch.manual_seed(0)
+    A = torch.randn(2, 5, 4, dtype=torch.float64, requires_grad=True)
+    with cpu_as_hpu(linalg.install_svd) as calls:
+        assert torch.autograd.gradgradcheck(torch.linalg.svdvals, (A,))
+        for ord_ in (2, -2, "nuc"):
+            assert torch.autograd.gradgradcheck(lambda x: torch.linalg.matrix_norm(x, ord=ord_), (A,))
+        assert calls["svd"] >= 1
+
+    B = torch.randn(2, 5, 3, 4, dtype=torch.float64)
+    for dim in ((1, 3), (3, 1)):
+        for keepdim in (False, True):
+            for ord_ in (2, -2, "nuc"):
+                compare(lambda x: torch.linalg.matrix_norm(x, ord=ord_, dim=dim, keepdim=keepdim),
+                        linalg.install_svd, B, name="svd", rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("driver", [None, "gelsy", "gelsd", "gelss"])
+@pytest.mark.parametrize("rcond", [None, -1.0, 0.0])
+def test_lstsq_rcond_zero_vs_negative(driver, rcond, svd_hook):
+    torch.manual_seed(0)
+    eps = torch.finfo(torch.float32).eps
+    B = torch.randn(6, 2)
+    # A = [diag(S); 0] has exactly the singular values S (max 1), each at least 1.4x away from the threshold, so the
+    # expected rank and minimum-norm solution follow from torch's documented rule (rank = #{s > rcond * s_max},
+    # rcond = None -> eps * max(m, n)), not from one LAPACK's. A declined call is torch's own kernel: its rank on these
+    # inputs is backend-dependent (Linux gelsy returned 3, 2 and 1 for the same s_min = 0.7 eps), so only the routing
+    # is checked there.
+    m, n = 6, 4
+    thresh = max(m, n) * eps if (rcond is None or rcond < 0) else (0.5 * eps if driver == "gelsd" else 0.0)
+    for s_min in (1e-3, 10.0 * eps, 3.0 * eps, 0.7 * eps, 0.2 * eps, 0.0):
+        S = torch.tensor([1.0, 1.0, 1.0, s_min], dtype=torch.float32)
+        A = torch.cat([torch.diag(S), torch.zeros(m - n, n)])
+        with cpu_as_hpu(linalg.install_lstsq) as calls:
+            got = torch.linalg.lstsq(A, B, rcond=rcond, driver=driver)
+        kept = S > thresh * S.max()
+        accept = bool(kept.all())
+        assert (calls["lstsq"] >= 1) == accept
+        if not accept:
+            continue
+        assert got.rank.dtype == torch.int64 and torch.equal(got.rank, kept.sum())
+        want_solution = (B[:n].double() / S.double().unsqueeze(-1)).float()
+        assert torch.isfinite(got.solution).all()
+        torch.testing.assert_close(got.solution, want_solution, rtol=1e-4, atol=1e-4)
+
+
+# ---- matrix_exp & householder_product (#13)
+
+
+@pytest.fixture
+def expm_hook(monkeypatch):
+    """``linalg._MATRIX_EXP`` / ``linalg._MATRIX_EXP_FRECHET`` set to reference functions."""
+    calls = []
+
+    def fwd(A):
+        calls.append(("fwd", tuple(A.shape)))
+        return tpc.matrix_exp_reference(A)
+
+    def bwd(A, G):
+        calls.append(("bwd", tuple(A.shape)))
+        return tpc.matrix_exp_frechet_reference(A, G)
+
+    monkeypatch.setattr(linalg, "_MATRIX_EXP", fwd)
+    monkeypatch.setattr(linalg, "_MATRIX_EXP_FRECHET", bwd)
+    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
+    return calls
+
+
+@pytest.fixture
+def hh_hook(monkeypatch):
+    """``linalg._HOUSEHOLDER`` set to ``tpc.householder_product_reference``."""
+    calls = []
+
+    def hook(A, tau):
+        calls.append((tuple(A.shape), tuple(tau.shape)))
+        return tpc.householder_product_reference(A, tau)
+
+    monkeypatch.setattr(linalg, "_HOUSEHOLDER", hook)
+    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
+    return calls
+
+
+@pytest.mark.parametrize("kind", ["unit", "skew", "large", "zeros", "n1", "transposed", "expanded"])
+def test_matrix_exp_matches_torch(kind, expm_hook):
+    torch.manual_seed(0)
+    if kind == "unit":
+        A = torch.randn(2, 3, 22, 22, dtype=torch.float64) * 0.4
+    elif kind == "skew":
+        x = torch.randn(3, 22, 22, dtype=torch.float64)
+        A = 0.1 * (x - x.mT)
+    elif kind == "large":
+        A = 5.0 * torch.randn(2, 16, 16, dtype=torch.float64)
+    elif kind == "zeros":
+        A = torch.zeros(3, 22, 22, dtype=torch.float64)
+    elif kind == "n1":
+        A = torch.randn(4, 1, 1, dtype=torch.float64)
+    elif kind == "transposed":
+        A = (0.3 * torch.randn(22, 22, dtype=torch.float64)).mT
+    else:
+        base = 0.3 * torch.randn(1, 6, 6, dtype=torch.float64)
+        calls = compare(lambda x: torch.linalg.matrix_exp(x.expand(3, 6, 6)),
+                        linalg.install_matrix_exp, base, name="matrix_exp", rtol=1e-10, atol=1e-10)
+        assert calls["matrix_exp"] >= 1 and expm_hook
+        return
+    rtol = 1e-9 if kind == "large" else 1e-11
+    calls = compare(torch.linalg.matrix_exp, linalg.install_matrix_exp, A, name="matrix_exp", rtol=rtol, atol=rtol)
+    assert calls["matrix_exp"] >= 1 and expm_hook
+    compare(torch.matrix_exp, linalg.install_matrix_exp, A, name="matrix_exp", rtol=rtol, atol=rtol)
+
+
+def test_matrix_exp_float32_and_double_backward(expm_hook):
+    torch.manual_seed(0)
+    for A in (0.1 * (lambda x: x - x.mT)(torch.randn(2, 22, 22)), 5.0 * torch.randn(2, 22, 22)):
+        Ad = A.double().requires_grad_()
+        ref = torch.linalg.matrix_exp(Ad)
+        ref.sum().backward()
+        Ac = A.clone().requires_grad_()
+        want = torch.linalg.matrix_exp(Ac)
+        want.sum().backward()
+        Ag = A.clone().requires_grad_()
+        with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+            got = torch.linalg.matrix_exp(Ag)
+            got.sum().backward()
+            assert calls["matrix_exp"] >= 1
+        e_got = (got.double() - ref).abs().max() / ref.abs().max()
+        e_want = (want.double() - ref).abs().max() / ref.abs().max()
+        ge_got = (Ag.grad.double() - Ad.grad).abs().max() / Ad.grad.abs().max()
+        ge_want = (Ac.grad.double() - Ad.grad).abs().max() / Ad.grad.abs().max()
+        assert e_got <= max(1e-6, 10 * e_want)
+        assert ge_got <= max(1e-6, 10 * ge_want)
+
+    A_dbl = torch.randn(2, 5, 5, dtype=torch.float64, requires_grad=True)
+    A_big = (4.0 * torch.randn(4, 4, dtype=torch.float64)).detach().requires_grad_()
+    with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+        assert torch.autograd.gradcheck(torch.linalg.matrix_exp, (A_dbl,))
+        assert torch.autograd.gradgradcheck(torch.linalg.matrix_exp, (A_dbl,))
+        assert torch.autograd.gradgradcheck(torch.matrix_exp, (A_big,))
+        assert calls["matrix_exp"] >= 1 and expm_hook
+
+
+def test_matrix_exp_compiled_and_out_and_declines(monkeypatch, expm_hook):
+    torch.manual_seed(0)
+    A = torch.randn(2, 8, 8, dtype=torch.float64, requires_grad=True)
+    nodes = []
+    with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+        got = compiled(torch.linalg.matrix_exp, nodes, fullgraph=True)(A)
+        got.sum().backward()
+        assert calls["matrix_exp"] >= 1
+    assert "aten.linalg_matrix_exp.default" not in ops(nodes), ops(nodes)
+    want = torch.linalg.matrix_exp(A.detach())
+    torch.testing.assert_close(got.detach(), want)
+
+    # Declines: float64 warns once on hpu, oversize, empty, invalid shape raises
+    linalg._WARNED.clear()
+    takes_hpu = linalg._tpc_takes("hpu", linalg._takes("hpu", "matrix_exp"))
+    with pytest.warns(UserWarning, match="hpu-ops#16"):
+        assert takes_hpu(torch.randn(4, 4, dtype=torch.float64)) is False
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert takes_hpu(torch.randn(4, 4, dtype=torch.float64)) is False
+    assert takes_hpu(torch.randn(tpc.SMALL_MAXN + 1, tpc.SMALL_MAXN + 1)) is False
+    assert takes_hpu(torch.randn(0, 4, 4)) is False
+
+    for empty_shape in ((0, 0), (2, 0, 0), (0, 3, 3)):
+        Ae = torch.empty(empty_shape, dtype=torch.float64, requires_grad=True)
+        with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+            ge = torch.linalg.matrix_exp(Ae)
+            ge.sum().backward()
+            assert calls["matrix_exp"] == 0
+        assert ge.shape == empty_shape
+
+    with cpu_as_hpu(linalg.install_matrix_exp):
+        with pytest.raises(RuntimeError):
+            torch.linalg.matrix_exp(torch.randn(3, 4))
+        with pytest.raises(RuntimeError):
+            torch.linalg.matrix_exp(torch.randn(4))
+
+    # out= overload (both accepted and declined on cpu_as_hpu and mocked HPU backend)
+    out = torch.empty(0, dtype=torch.float64)
+    with cpu_as_hpu(linalg.install_matrix_exp) as calls:
+        r = torch.ops.aten.linalg_matrix_exp.out(A.detach(), out=out)
+        assert r is out and calls["matrix_exp"] >= 1
+    torch.testing.assert_close(out, want)
+
+    captured = []
+    monkeypatch.setattr(linalg, "register_kernels", lambda _d, e: captured.extend(e))
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    linalg.install_matrix_exp("hpu")
+    out_be = next(fn for op, key, fn in captured if op == torch.ops.aten.linalg_matrix_exp.out and key == "{}")
+    monkeypatch.setattr(linalg, "_on_cpu", lambda op, args, kw: op(*(x.clone() for x in args), **kw))
+    out_acc = torch.empty(0, dtype=torch.float32)
+    A32 = torch.randn(2, 6, 6, dtype=torch.float32)
+    assert out_be(A32, out=out_acc) is out_acc
+    torch.testing.assert_close(out_acc, torch.linalg.matrix_exp(A32), rtol=1e-5, atol=1e-5)
+    out_dec = torch.empty(0, dtype=torch.float32)
+    A_big = torch.randn(2, tpc.SMALL_MAXN + 1, tpc.SMALL_MAXN + 1, dtype=torch.float32)
+    assert out_be(A_big, out=out_dec) is out_dec
+    torch.testing.assert_close(out_dec, torch.linalg.matrix_exp(A_big))
+
+
+@pytest.mark.parametrize("fmode", ["tpc", "wy"])
+@pytest.mark.parametrize("m, n, k", [
+    (1, 1, 1),
+    (4, 4, 4),
+    (6, 4, 4),
+    (22, 22, 22),
+    (22, 22, 21),
+    (22, 10, 10),
+    (22, 10, 6),
+    (64, 32, 32),
+])
+def test_householder_product_matches_torch(m, n, k, fmode, hh_hook, monkeypatch):
+    torch.manual_seed(0)
+    monkeypatch.setattr(linalg, "_HH_FORWARD", fmode)
+    A = torch.randn(2, m, n, dtype=torch.float64)
+    tau = 2.0 / (1.0 + (A.tril(-1)[..., :k] ** 2).sum(-2))
+    calls = compare(torch.linalg.householder_product, linalg.install_householder_product, A, tau,
+                    name="householder_product", rtol=1e-10, atol=1e-10)
+    assert calls["householder_product"] >= 1
+    if fmode == "tpc":
+        assert hh_hook
+    compare(torch.orgqr, linalg.install_householder_product, A, tau,
+            name="householder_product", rtol=1e-10, atol=1e-10)
+
+
+def test_householder_product_noncontig_oversize_and_arbitrary_tau(hh_hook):
+    torch.manual_seed(0)
+    # Non-contiguous A.mT and strided tau, arbitrary non-unitary tau, batched 4D
+    A = torch.randn(2, 3, 4, 6, dtype=torch.float64).mT
+    tau = (2.0 * torch.rand(2, 3, 6, dtype=torch.float64))[..., ::2]
+    compare(torch.linalg.householder_product, linalg.install_householder_product, A, tau,
+            name="householder_product", rtol=1e-9, atol=1e-9)
+
+    # m > MAXHH (68 > 64) falls through to Compact-WY cleanly
+    A_big = torch.randn(2, 68, 32, dtype=torch.float64)
+    tau_big = 2.0 / (1.0 + (A_big.tril(-1) ** 2).sum(-2))
+    compare(torch.linalg.householder_product, linalg.install_householder_product, A_big, tau_big,
+            name="householder_product", rtol=1e-10, atol=1e-10)
+
+    # Singular H_0 (tau[0] = 1/||v_0||^2) and tau[1] = 0: native returns NaN, ours stays finite and matches gradcheck!
+    A_s = torch.randn(2, 8, 5, dtype=torch.float64)
+    v0 = torch.cat([torch.ones(2, 1, dtype=torch.float64), A_s[:, 1:, 0]], -1)
+    tau_s = 2.0 / (1.0 + (A_s.tril(-1) ** 2).sum(-2))
+    tau_s[:, 0] = 1.0 / (v0 * v0).sum(-1)
+    tau_s[:, 1] = 0.0
+    A_req = A_s.clone().requires_grad_()
+    tau_req = tau_s.clone().requires_grad_()
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        assert torch.autograd.gradcheck(torch.linalg.householder_product, (A_req, tau_req))
+        assert torch.autograd.gradgradcheck(torch.linalg.householder_product, (A_req, tau_req))
+        assert calls["householder_product"] >= 1
+
+
+def test_householder_product_k0_empty_gradgrad_compiled_and_declines(monkeypatch, hh_hook):
+    torch.manual_seed(0)
+    # k = 0 accepted with zero fallbacks; forward == eye(m, n), backward == (None, None)
+    A0 = torch.randn(2, 22, 10, dtype=torch.float64, requires_grad=True)
+    tau0 = torch.empty(2, 0, dtype=torch.float64, requires_grad=True)
+    want0 = torch.linalg.householder_product(A0, tau0)
+    want0.sum().backward()
+    assert A0.grad is None and tau0.grad is None
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        got0 = torch.linalg.householder_product(A0, tau0)
+        got0.sum().backward()
+        assert calls["householder_product"] >= 1
+    torch.testing.assert_close(got0, want0)
+    assert A0.grad is None and tau0.grad is None
+    assert linalg._householder_takes("hpu")(A0.float(), tau0.float()) is True
+
+    # Double backward (k < n)
+    A = torch.randn(2, 5, 3, dtype=torch.float64, requires_grad=True)
+    t = (2.0 * torch.rand(2, 2, dtype=torch.float64)).detach().requires_grad_()
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        assert torch.autograd.gradgradcheck(torch.linalg.householder_product, (A, t))
+        assert calls["householder_product"] >= 1
+
+    # compiled(fullgraph=True)
+    nodes = []
+    with cpu_as_hpu(linalg.install_householder_product) as calls:
+        got_c = compiled(torch.linalg.householder_product, nodes, fullgraph=True)(A.detach(), t.detach())
+        assert calls["householder_product"] >= 1
+    assert "aten.linalg_householder_product.default" not in ops(nodes), ops(nodes)
+    torch.testing.assert_close(got_c, torch.linalg.householder_product(A.detach(), t.detach()))
+
+    # Declines and native errors
+    A32, t32 = torch.randn(2, 8, 5), torch.rand(2, 4)
+    A64, t64 = A32.double(), t32.double()
+    linalg._WARNED.clear()
+    takes_hpu = linalg._householder_takes("hpu")
+    with pytest.warns(UserWarning, match="hpu-ops#16"):
+        assert takes_hpu(A64, t64) is False
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert takes_hpu(A64, t64) is False
+
+    for empty_a, empty_t in ((torch.empty(0, 0), torch.empty(0)),
+                             (torch.empty(5, 0), torch.empty(0)),
+                             (torch.empty(0, 5, 4), torch.empty(0, 4))):
+        with cpu_as_hpu(linalg.install_householder_product) as calls:
+            ge = torch.linalg.householder_product(empty_a, empty_t)
+            assert calls["householder_product"] == 0
+        assert torch.equal(ge, torch.linalg.householder_product(empty_a, empty_t))
+
+    with cpu_as_hpu(linalg.install_householder_product):
+        with pytest.raises(RuntimeError):
+            torch.linalg.householder_product(torch.randn(4, 6), torch.rand(4))
+        with pytest.raises(RuntimeError):
+            torch.linalg.householder_product(torch.randn(6, 4), torch.rand(5))
+        with pytest.raises(RuntimeError):
+            torch.linalg.householder_product(torch.randn(2, 6, 4), torch.rand(3, 4))
+
+    # out= backend overload (accept and decline)
+    captured = []
+    monkeypatch.setattr(linalg, "register_kernels", lambda _d, e: captured.extend(e))
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    linalg.install_householder_product("hpu")
+    hh_out = next(fn for op, key, fn in captured if op == torch.ops.aten.linalg_householder_product.out and key == "{}")
+    monkeypatch.setattr(linalg, "_on_cpu", lambda op, args, kw: op(*(x.clone() for x in args), **kw))
+    out_acc = torch.empty(0)
+    assert hh_out(A32, t32, out=out_acc) is out_acc
+    torch.testing.assert_close(out_acc, torch.linalg.householder_product(A32, t32), rtol=1e-5, atol=1e-5)
+    out_dec = torch.empty(0, dtype=torch.float64)
+    assert hh_out(A64, t64, out=out_dec) is out_dec
+    torch.testing.assert_close(out_dec, torch.linalg.householder_product(A64, t64))
+
+
+@pytest.mark.parametrize("omap", ["matrix_exp", "householder"])
+@pytest.mark.parametrize("shape", [(22, 22), (22, 10), (10, 22)])
+def test_orthogonal_matrix_exp_and_householder(omap, shape, expm_hook, hh_hook):
+    from torch.nn.utils.parametrizations import orthogonal
+
+    rows, cols = shape
+    x = torch.randn(4, cols, dtype=torch.float64)
+
+    def run():
+        torch.manual_seed(0)
+        layer = orthogonal(torch.nn.Linear(cols, rows, bias=False).double(),
+                           orthogonal_map=omap, use_trivialization=False)
+        out = layer(x)
+        out.sum().backward()
+        w = layer.weight.detach()
+        return out, w, [p.grad for p in layer.parameters()]
+
+    want_out, want_w, want_grads = run()
+    install = linalg.install_matrix_exp if omap == "matrix_exp" else linalg.install_householder_product
+    key = "matrix_exp" if omap == "matrix_exp" else "householder_product"
+    with cpu_as_hpu(install) as calls:
+        got_out, got_w, got_grads = run()
+        assert calls[key] >= 1
+    torch.testing.assert_close(got_out, want_out, rtol=1e-9, atol=1e-9)
+    torch.testing.assert_close(got_w, want_w, rtol=1e-9, atol=1e-9)
+    for g, wg in zip(got_grads, want_grads, strict=True):
+        torch.testing.assert_close(g, wg, rtol=1e-9, atol=1e-9)
+    k = min(rows, cols)
+    gram = got_w.mT @ got_w if rows >= cols else got_w @ got_w.mT
+    torch.testing.assert_close(gram, torch.eye(k, dtype=torch.float64), rtol=1e-10, atol=1e-10)
+
+
 def test_flush_comes_before_the_op_only(monkeypatch):
     order = []
     core = types.SimpleNamespace(mark_step=lambda: order.append("flush"))
@@ -1635,3 +2595,262 @@ def test_large_solve_backward_reuses_the_inverse(case, monkeypatch, gj_hook):
         assert len(gj_hook) == before, "the backward of a large solve called the kernel"
         assert torch.autograd.gradgradcheck(f, inputs, atol=1e-5, rtol=1e-4)
 
+# ---- standalone LU (#10): lu_factor / lu_factor_ex, lu_solve, lu_unpack, linalg.lu
+
+
+@pytest.fixture
+def lu_hook(monkeypatch):
+    """``linalg._LU`` and ``_LU_PERM`` set to the kernel's contract in plain torch; collects the shapes per call."""
+    calls = []
+
+    def factor(A):
+        calls.append(("factor", tuple(A.shape)))
+        return tpc.lu_factor_reference(A)
+
+    def perm(pivots):
+        calls.append(("perm", tuple(pivots.shape)))
+        return linalg.pivots_to_perm(pivots.detach()).to(torch.float32)
+
+    def solve(LU, pivots, B):
+        calls.append(("solve", tuple(B.shape)))
+        batch = torch.broadcast_shapes(LU.shape[:-2], B.shape[:-2])
+        return linalg.lu_solve(LU.detach().expand(*batch, *LU.shape[-2:]), pivots.expand(*batch, LU.shape[-1]),
+                               B.detach(), True)
+
+    monkeypatch.setattr(linalg, "_LU", factor)
+    monkeypatch.setattr(linalg, "_LU_PERM", perm)
+    monkeypatch.setattr(linalg, "_LU_SOLVE", solve)
+    return calls
+
+
+def _pivoting(*shape, dtype=torch.float64):
+    g = torch.Generator().manual_seed(3)
+    return torch.randn(*shape, generator=g, dtype=dtype) + 0.5 * torch.eye(shape[-1], dtype=dtype)
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (3, 3), (4, 22, 22), (2, 3, 7, 7), (32, 32)])
+def test_lu_factor_matches_torch(shape, lu_hook):
+    A = _pivoting(*shape)
+    compare(lambda a: torch.linalg.lu_factor(a)[0], linalg.install_lu, A, name="lu_factor", rtol=1e-8, atol=1e-8)
+    want = torch.linalg.lu_factor_ex(A)
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        got = torch.linalg.lu_factor_ex(A)
+        assert calls["lu_factor"] >= 1
+    assert got.pivots.dtype == torch.int32 and torch.equal(got.pivots, want.pivots)
+    assert got.info.dtype == torch.int32 and torch.equal(got.info, want.info)
+    assert ("factor", tuple(shape)) in lu_hook
+
+
+def test_lu_factor_singular_info_and_check_errors(lu_hook):
+    A = _pivoting(3, 5, 5)
+    A[1] = 0.0
+    A[2, :, 2] = 0.0
+    want = torch.linalg.lu_factor_ex(A)
+    with cpu_as_hpu(linalg.install_lu):
+        got = torch.linalg.lu_factor_ex(A)
+        assert torch.equal(got.info, want.info)
+        with pytest.raises(RuntimeError):
+            torch.linalg.lu_factor_ex(A, check_errors=True)
+        with pytest.raises(RuntimeError):
+            torch.linalg.lu_factor(A)
+
+
+def test_lu_factor_double_backward(lu_hook):
+    A = _pivoting(2, 4, 4).requires_grad_()
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        assert torch.autograd.gradcheck(lambda a: torch.linalg.lu_factor(a)[0], (A,))
+        assert torch.autograd.gradgradcheck(lambda a: torch.linalg.lu_factor(a)[0], (A,))
+        assert calls["lu_factor"] >= 1
+
+
+@pytest.mark.parametrize("left", [True, False])
+@pytest.mark.parametrize("adjoint", [False, True])
+@pytest.mark.parametrize("a_shape, b_cols", [((5, 5), 3), ((2, 6, 6), 1), ((2, 1, 4, 4), 40)])
+def test_lu_solve_matches_torch(a_shape, b_cols, left, adjoint, lu_hook, gj_hook):
+    A = _pivoting(*a_shape)
+    n = a_shape[-1]
+    LU, pivots = torch.linalg.lu_factor(A)
+    batch = (1, 3) if len(a_shape) == 4 else a_shape[:-2]  # (2, 1) against (1, 3): broadcast batch
+    B = torch.randn(*batch, *((n, b_cols) if left else (b_cols, n)), dtype=torch.float64)
+    compare(lambda lu_, b: torch.linalg.lu_solve(lu_, pivots, b, left=left, adjoint=adjoint), linalg.install_lu,
+            LU, B, name="lu_solve", rtol=1e-7, atol=1e-7)
+    # the getrs kernel for left, not adjoint (also the backward of left adjoint), else A = P L U and Gauss-Jordan
+    assert any(c[0] == "solve" for c in lu_hook) == left
+    assert any(c[0] == "perm" for c in lu_hook) and gj_hook  # one direction of every pair runs Gauss-Jordan
+
+
+def test_lu_solve_double_backward_and_legacy(lu_hook):
+    A = _pivoting(2, 4, 4)
+    LU, pivots = torch.linalg.lu_factor(A)
+    LU = LU.requires_grad_()
+    B = torch.randn(2, 4, 3, dtype=torch.float64, requires_grad=True)
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        assert torch.autograd.gradgradcheck(lambda lu_, b: torch.linalg.lu_solve(lu_, pivots, b), (LU, B))
+        got = torch.lu_solve(B, LU, pivots)
+        assert calls["lu_solve"] >= 1
+    torch.testing.assert_close(got, torch.linalg.solve(A, B))
+
+
+@pytest.mark.parametrize("unpack_data, unpack_pivots", [(True, True), (False, True), (True, False), (False, False)])
+def test_lu_unpack_matches_torch(unpack_data, unpack_pivots, lu_hook):
+    A = _pivoting(2, 3, 6, 6)
+    LU, pivots = torch.linalg.lu_factor(A)
+    want = torch.lu_unpack(LU, pivots, unpack_data, unpack_pivots)
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        got = torch.lu_unpack(LU, pivots, unpack_data, unpack_pivots)
+        assert calls["lu_unpack"] == 1
+    for g, w in zip(got, want, strict=True):
+        assert g.shape == w.shape and g.dtype == w.dtype
+        torch.testing.assert_close(g, w)
+    if unpack_data:
+        compare(lambda lu_: torch.lu_unpack(lu_, pivots, unpack_data, unpack_pivots)[1:], linalg.install_lu, LU,
+                name="lu_unpack")
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (5, 5), (2, 3, 7, 7)])
+def test_linalg_lu_matches_torch(shape, lu_hook):
+    A = _pivoting(*shape)
+    compare(lambda a: torch.linalg.lu(a), linalg.install_lu, A, name="lu", rtol=1e-8, atol=1e-8)
+    with cpu_as_hpu(linalg.install_lu):
+        A2 = A.clone().requires_grad_()
+        assert torch.autograd.gradgradcheck(lambda a: torch.linalg.lu(a)[1:], (A2,))
+
+
+def test_lu_declines_what_the_kernel_does_not_take(monkeypatch, lu_hook):
+    with cpu_as_hpu(linalg.install_lu) as calls:
+        torch.linalg.lu_factor(torch.randn(4, 6, dtype=torch.float64))  # not square
+        torch.linalg.lu(torch.randn(3, 3, dtype=torch.complex128))
+        assert calls["lu_factor"] == 0 and calls["lu"] == 0
+    monkeypatch.setattr(tpc, "ready", lambda: False)
+    assert linalg._lu_kernel(torch.randn(tpc.SMALL_MAXN + 1, tpc.SMALL_MAXN + 1)) is False
+    monkeypatch.setattr(linalg, "_LU", None)
+    assert linalg._lu_kernel(torch.randn(4, 4)) is False  # CPU without the hook: the composite
+    assert linalg.install_lu  # pivot=False: torch's own kernel (the CPU raises; on HPU Habana's)
+    takes = linalg._tpc_takes("cpu", linalg._takes("cpu", "lu_factor"))
+    assert takes(torch.randn(4, 4, dtype=torch.float64))
+
+
+def test_lu_float64_warns_once_on_hpu():
+    linalg._WARNED.discard("lu_factor")
+    takes = linalg._tpc_takes("hpu", linalg._takes("hpu", "lu_factor"))
+    with pytest.warns(UserWarning, match="hpu-ops#16"):
+        assert takes(torch.randn(3, 3, dtype=torch.float64)) is False
+
+
+def test_tpc_lu_flushes_before_the_op_and_casts(monkeypatch):
+    marks = []
+    core = types.SimpleNamespace(mark_step=lambda: marks.append(1))
+    torch_mod = types.SimpleNamespace(core=core)
+    for name, mod in (("habana_frameworks", types.SimpleNamespace(torch=torch_mod)),
+                      ("habana_frameworks.torch", torch_mod), ("habana_frameworks.torch.core", core)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+
+    def fake_lu(A):
+        LU, piv, perm, info = tpc.lu_factor_reference(A)
+        pv = torch.zeros(A.shape[0], 3, A.shape[-1])
+        pv[:, 0], pv[:, 1], pv[:, 2, 0] = piv.float(), perm.float(), info.float()
+        return LU, pv
+
+    monkeypatch.setattr(tpc, "_lu_op", lambda: fake_lu)
+    monkeypatch.setattr(tpc, "_lu_perm_op", lambda: lambda p: linalg.pivots_to_perm(p.int()).float())
+    A = _pivoting(2, 3, 5, 5, dtype=torch.float32)
+    LU, pivots, perm, info = tpc.lu_factor(A)
+    assert len(marks) == 1
+    want_LU, want_piv, want_info = torch.linalg.lu_factor_ex(A)
+    torch.testing.assert_close(LU, want_LU)
+    assert pivots.dtype == torch.int32 and torch.equal(pivots, want_piv)
+    assert info.dtype == torch.int32 and info.shape == (2, 3) and torch.equal(info, want_info)
+    assert perm.dtype == torch.float32 and perm.shape == (2, 3, 5)
+    torch.testing.assert_close(A.gather(-2, perm.long()[..., None].expand_as(A)),
+                               torch.tril(LU, -1) @ torch.triu(LU) + torch.triu(LU), rtol=1e-5, atol=1e-5)
+    marks.clear()
+    p = tpc.lu_perm(pivots)
+    assert len(marks) == 1 and torch.equal(p, perm)
+
+
+@pytest.mark.parametrize("perm_mode", ["kernel", "torch"])
+@pytest.mark.parametrize("solve_mode", ["kernel", "gj", "tri"])
+@pytest.mark.parametrize("left", [True, False])
+def test_lu_solve_and_unpack_modes(perm_mode, solve_mode, left, monkeypatch, lu_hook, gj_hook):
+    monkeypatch.setattr(linalg, "_LU_PERM_MODE", perm_mode)
+    monkeypatch.setattr(linalg, "_LU_SOLVE_MODE", solve_mode)
+    A = _pivoting(3, 6, 6)
+    LU, pivots = torch.linalg.lu_factor(A)
+    B = torch.randn(3, *((6, 2) if left else (2, 6)), dtype=torch.float64)
+    compare(lambda lu_, b: torch.linalg.lu_solve(lu_, pivots, b, left=left), linalg.install_lu, LU, B,
+            name="lu_solve", rtol=1e-7, atol=1e-7)
+    compare(lambda lu_: torch.lu_unpack(lu_, pivots), linalg.install_lu, LU, name="lu_unpack")
+    assert any(c[0] == "perm" for c in lu_hook) == (perm_mode == "kernel")
+
+
+LU_OPS = ("linalg_lu_factor_ex", "linalg_lu", "linalg_lu_solve", "lu_unpack")
+
+
+@pytest.mark.parametrize("lazy, knob, installed", [
+    ("1", None, ()), (None, None, ("linalg_lu_factor_ex", "linalg_lu_solve", "lu_unpack")), ("1", "0", ()), ("1", "1", LU_OPS), ("0", "1", LU_OPS),
+    ("0", None, ("linalg_lu_factor_ex", "linalg_lu_solve", "lu_unpack"))])
+def test_lu_ops_installed_only_where_measured_faster(monkeypatch, lazy, knob, installed):
+    """Lazy-mode LU, and linalg.lu in both modes, were measured at parity or slower than Habana's fallback: on HPU they
+    are installed only with HPU_OPS_LU_SLOW=1."""
+    for name, value in (("PT_HPU_LAZY_MODE", lazy), (linalg.LU_SLOW, knob)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    def present():
+        return {op for op in LU_OPS if torch._C._dispatch_has_kernel_for_dispatch_key(f"aten::{op}", "AutogradHPU")}
+
+    assert present() == set()
+    undo = linalg.install_lu("hpu")
+    try:
+        assert present() == set(installed)
+    finally:
+        undo()
+    assert present() == set()
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    monkeypatch.delenv(linalg.LU_SLOW, raising=False)
+    assert all(linalg._lu_wanted("cpu", name) for name in ("lu", "lu_factor"))  # the CPU stand-in always installs
+
+
+def _graded_singular_values(dtype=torch.float32):
+    """S = (1, 1, 1, 1e-3, 1e-14) with random orthogonal factors, built in float64."""
+    g = torch.Generator().manual_seed(11)
+    Q1, _ = torch.linalg.qr(torch.randn(5, 5, generator=g, dtype=torch.float64))
+    Q2, _ = torch.linalg.qr(torch.randn(5, 5, generator=g, dtype=torch.float64))
+    S = torch.tensor([1.0, 1.0, 1.0, 1e-3, 1e-14], dtype=torch.float64)
+    return ((Q1 * S) @ Q2.mT).to(dtype)
+
+
+def test_matrix_rank_and_pinv_positive_atol_drops_the_default_rtol(svd_hook):
+    """atol > 0 with rtol unset: torch's rtol becomes 0, so the tolerance is atol alone (1e-16 here) and the smallest
+    singular value (1e-14, float32 rounding noise ~1e-7 on the card's input) is kept: rank 5 and its inverse in pinv.
+    The default rtol (eps * 5 = 6e-7) would have dropped it."""
+    A = _graded_singular_values()
+    want_rank = torch.linalg.matrix_rank(A, atol=1e-16)
+    want_pinv = torch.linalg.pinv(A, atol=1e-16)
+    assert int(want_rank) == 5 and int(torch.linalg.matrix_rank(A)) == 4
+    with cpu_as_hpu(linalg.install_matrix_rank) as calls:
+        got_rank = torch.linalg.matrix_rank(A, atol=1e-16)
+        assert calls["svd"] >= 1
+    assert torch.equal(got_rank, want_rank)
+    with cpu_as_hpu(linalg.install_pinv) as calls:
+        got_pinv = torch.linalg.pinv(A, atol=1e-16)
+        got_default = torch.linalg.pinv(A)
+        assert calls["pinv"] >= 2
+    assert got_pinv.abs().max() > 1e5 and want_pinv.abs().max() > 1e5  # 1/S_min is in both
+    torch.testing.assert_close(got_default, torch.linalg.pinv(A), rtol=1e-3, atol=1e-3)
+
+
+def test_lstsq_rank_is_a_fresh_tensor(svd_hook):
+    """The rank of a batched lstsq was ``new_full((), k).expand(batch)``: stride 0, so an in-place update of it
+    raised and its elements aliased one value. torch returns an ordinary tensor."""
+    A = torch.randn(3, 5, 4, dtype=torch.float32, generator=torch.Generator().manual_seed(0))
+    B = torch.randn(3, 5, 2, dtype=torch.float32, generator=torch.Generator().manual_seed(1))
+    with cpu_as_hpu(linalg.install_lstsq) as calls:
+        rank = torch.linalg.lstsq(A, B, driver="gelsd").rank
+        assert calls["lstsq"] >= 1
+    assert rank.shape == (3,) and 0 not in rank.stride() and rank._base is None
+    rank[0] += 1  # writable without touching the other entries
+    assert rank.tolist() == [5, 4, 4]
