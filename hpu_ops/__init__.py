@@ -80,6 +80,9 @@ at the tensor's pickling:
 - ``bincount`` of 1-D integer inputs of 65536 to 2**24 elements with at most 4096 bins and no weights through one
   ``aminmax`` read and ``histc`` in chunks of 256 bins (``small``, #21): Gaudi's kernel took 4.7-427 ms at 409600
   elements (64 to 4096 bins), 2-43x longer.
+- Warnings for the 8-byte dtypes in eager mode (``wide``), at the copy to the card: float64 views with a storage
+  offset read and write at twice the offset, int64 values past int32 are computed on their low 32 bits. Neither is
+  fixable at the dispatcher at a cost a model would accept (see the README, "float64").
 - ``torch.save`` through a tensor-level host copy (``serialization``): Habana's storage copy fails on conv weights
   that an optimizer step left in a permuted layout. torch pickles XLA tensors this way, and Habana HPU tensors in
   lazy mode.
@@ -101,7 +104,7 @@ import warnings
 import torch
 
 from . import (composite, conv, eigh, extrema, im2col, indexing, linalg, quantile, serialization, small,  # noqa: F401
-               tpc, upsample)
+               tpc, upsample, wide)
 from ._dispatch import _STATE, chain
 
 __all__ = ["enable"]
@@ -116,7 +119,7 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
          linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, quantile.install,
          extrema.install, small.install_bincount, small.install_histc,
-         serialization.install)
+         wide.install_copy_checks, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
                   "the setting for your bridge before Python starts: PT_HPU_USE_OVERRIDE_ATEN_SDPA=1 (1.21) or "
