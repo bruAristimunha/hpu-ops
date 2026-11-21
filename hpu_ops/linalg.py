@@ -5,7 +5,7 @@ Each is a ``torch.autograd.Function`` registered at ``Autograd{}``: its backward
 composites, so gradients match torch's. Its forward is also registered at the backend key, for calls below autograd
 (inference mode, the tracers' decompositions), except for solve_ex, det and slogdet, whose backend call reaches Habana's
 own kernel (its real LU factors feed torch's derivative when a compiled graph keeps it). Real float32 matrices of static shape are taken; float64 on ``hpu`` is
-not: Gaudi2 computes float64 at float32 precision (hpu-ops#16), so those inputs keep the native kernel at ``Autograd{}``
+not: a float64 tensor on Gaudi2 holds float32 values (hpu-ops#16, ``tests/probe_float64.py``), so those inputs keep the native kernel at ``Autograd{}``
 and run on the CPU below it, with one warning per op. Complex, empty, non-square and symbolic-shape inputs go to the
 op's own kernel, which raises its usual error.
 
@@ -30,8 +30,8 @@ from . import tpc
 from ._dispatch import count, register_paired, static
 
 aten = torch.ops.aten
-FLOAT64_WARNING = ("hpu_ops: {name} of float64 HPU tensors runs on the CPU: Gaudi2 computes float64 at float32 "
-                   "precision (bruAristimunha/hpu-ops#16).")
+FLOAT64_WARNING = ("hpu_ops: {name} of float64 HPU tensors runs on the CPU: Gaudi2 stores float64 as float32, so "
+                   "the input and the result hold float32 precision (bruAristimunha/hpu-ops#16).")
 _WARNED = set()
 # The Gauss-Jordan solver ``(A, B) -> (X, D, S)`` and triangular solver ``(A, B, upper, left, unitriangular) -> X``
 # the Functions call for float32 n <= tpc.MAXN. None means ``tpc.gj_solve`` / ``tpc.tri_solve`` on HPU with the kernel
