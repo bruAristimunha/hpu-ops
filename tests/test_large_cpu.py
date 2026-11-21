@@ -659,3 +659,18 @@ def test_blocked_extreme_scales(large_on_cpu, monkeypatch):
     for k in (-100, -70, 70, 100):
         X, D, _ = linalg._gj_inv(A * 2.0 ** k)
         assert torch.equal(X * 2.0 ** k, X0) and torch.equal(D * 2.0 ** -k, D0), k
+
+
+def test_backend_kernels_ignore_an_enclosing_transform(monkeypatch):
+    """Below autograd the tensors are plain: a backend kernel takes the call even under forward-mode AD (it declined
+    to hpu-ops' CPU route before, measured under jvp on Gaudi2); the autograd kernel still declines."""
+    import torch.autograd.forward_ad as fwAD
+
+    seen = []
+    k = linalg._wrap("hpu", torch.ops.aten.linalg_inv_ex.default, "{}", lambda *a: seen.append(linalg._transformed()))
+    ka = linalg._wrap("hpu", torch.ops.aten.linalg_inv_ex.default, "Autograd{}",
+                      lambda *a: seen.append(linalg._transformed()))
+    with fwAD.dual_level():
+        k(torch.eye(2))
+        ka(torch.eye(2))
+    assert seen == [False, True] and linalg._transformed() is False

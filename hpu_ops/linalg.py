@@ -25,6 +25,7 @@ card too, in float32 precision (``_float64_kernel``).
 """
 import math
 import os
+import threading
 import warnings
 
 import torch
@@ -106,15 +107,41 @@ def _float64_kernel(device_type, op, kernel):
     return wrapped
 
 
+# Set while a backend-key kernel runs: below autograd the tensors are plain (functorch's layers and forward-mode AD's
+# duals are unwrapped above), so a transform active around the call does not concern the kernel (``_transformed``).
+_BELOW = threading.local()
+
+
+def _backend(kernel):
+    """``kernel`` (a backend-key kernel) run with ``_transformed`` false: measured on Gaudi2 (bridge 1.21.4,
+    tests/probe_functorch.py), under jvp and forward-mode AD every declined call's primal otherwise took hpu-ops' CPU
+    route, where the kernel computes it on the card."""
+
+    def wrapped(*args, **kwargs):
+        before = getattr(_BELOW, "on", False)
+        _BELOW.on = True
+        try:
+            return kernel(*args, **kwargs)
+        finally:
+            _BELOW.on = before
+
+    return wrapped
+
+
+def _wrap(device_type, op, key, kernel):
+    kernel = _float64_kernel(device_type, op, kernel)
+    return kernel if key.startswith("Autograd") else _backend(kernel)
+
+
 def register_kernels(device_type, entries):
-    """``_dispatch.register_kernels`` with each kernel taking the float64 opt-in (``_float64_kernel``)."""
-    return _dispatch.register_kernels(device_type, [(op, key, _float64_kernel(device_type, op, k))
-                                                    for op, key, k in entries])
+    """``_dispatch.register_kernels`` with each kernel taking the float64 opt-in (``_float64_kernel``) and the backend
+    kernels ignoring an enclosing transform (``_backend``)."""
+    return _dispatch.register_kernels(device_type, [(op, key, _wrap(device_type, op, key, k)) for op, key, k in entries])
 
 
 def register_paired(device_type, groups):
-    """``_dispatch.register_paired`` with each kernel taking the float64 opt-in (``_float64_kernel``)."""
-    return _dispatch.register_paired(device_type, [[(op, key, _float64_kernel(device_type, op, k)) for op, key, k in g]
+    """``_dispatch.register_paired`` with each kernel wrapped as in ``register_kernels``."""
+    return _dispatch.register_paired(device_type, [[(op, key, _wrap(device_type, op, key, k)) for op, key, k in g]
                                                    for g in groups])
 
 
@@ -154,6 +181,8 @@ def _takes_tensors(device_type, name, tensors):
 def _transformed():
     """Whether a functorch transform (vmap, grad, jvp, jacrev, ...) or forward-mode AD is active. The Functions here
     define no ``setup_context`` and no jvp, so those calls keep the op's own kernel."""
+    if getattr(_BELOW, "on", False):  # a backend kernel: plain tensors (see _BELOW)
+        return False
     forward_ad = getattr(torch.autograd.forward_ad, "_current_level", -1) >= 0
     return torch._C._functorch.peek_interpreter_stack() is not None or forward_ad
 
