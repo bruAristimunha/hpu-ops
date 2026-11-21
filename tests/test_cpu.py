@@ -30,6 +30,30 @@ def cpu_as_hpu(install):
         undo()
 
 
+def _scalar_mask_put_reaches_index_put():
+    """True when ``x[mask] = <Python number>`` reaches ``aten.index_put_``, the op install_mask_fill rewrites (torch 2.6
+    to 2.14, the Gaudi bridges' 2.6 among them). From torch 2.15.0 Python indexing sends it to
+    ``aten.masked_fill_.Scalar`` instead (any single bool mask, leading, middle or trailing), which hpu-ops leaves
+    native: Habana's launch failure was measured on the ``index_put_`` form only. A tensor value still reaches
+    ``index_put_``."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Ops(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            seen.add(func)
+            return func(*args, **(kwargs or {}))
+
+    seen = set()
+    x = torch.zeros(2, 2)
+    with Ops():
+        x[..., torch.tensor([True, False])] = 1.0
+    return torch.ops.aten.index_put_.default in seen
+
+
+# mask_fill count of one Python-number mask put: 1 where it reaches index_put_, 0 from torch 2.15 (masked_fill_)
+SCALAR_MASK_PUT = int(_scalar_mask_put_reaches_index_put())
+
+
 @pytest.fixture
 def cpu_indices_off_device(monkeypatch):
     """Index tensors count as off the device, as CPU index tensors of HPU tensors are (the case that falls back)."""
@@ -924,7 +948,7 @@ def test_vech_adversarial_shapes_and_layouts(make):
     want = train_step(_vech_scaled, x)
     with cpu_as_hpu(hpu_ops._install) as calls:
         got = train_step(_vech_scaled, x)
-    assert calls["index"] == 1 and calls["mask_fill"] == 1
+    assert calls["index"] == 1 and calls["mask_fill"] == SCALAR_MASK_PUT
     assert_same(got, want, tol=0)
 
 
@@ -977,7 +1001,7 @@ def test_vech_and_vec_to_sym_as_in_spd_learn(dtype):
     want = train_step(f, v)
     with cpu_as_hpu(hpu_ops._install) as calls:
         got = train_step(f, v)
-    assert calls["mask_fill"] == 1 and calls["index"] >= 3
+    assert calls["mask_fill"] == SCALAR_MASK_PUT and calls["index"] >= 3
     assert_same(got, want, tol=0)
 
 
@@ -998,7 +1022,7 @@ def test_mask_put_of_one_value_is_where(name):
     got = torch.ones(5, 4, 4)
     with cpu_as_hpu(indexing.install_mask_fill) as calls:
         MASK_PUTS[name](got, x)
-    assert calls["mask_fill"] == 1
+    assert calls["mask_fill"] == (1 if "tensor" in name else SCALAR_MASK_PUT)
     assert_same([got], [want], tol=0)
 
 
@@ -1014,7 +1038,7 @@ def test_mask_put_gradient_and_other_puts_keep_the_native_op():
     want = train_step(f, x)
     with cpu_as_hpu(indexing.install_mask_fill) as calls:
         got = train_step(f, x)
-    assert calls["mask_fill"] == 1
+    assert calls["mask_fill"] == SCALAR_MASK_PUT
     assert_same(got, want, tol=0)
     with cpu_as_hpu(indexing.install_mask_fill) as calls:
         y, z = torch.zeros(5, 4, 4), torch.zeros(5, 4, 4)
