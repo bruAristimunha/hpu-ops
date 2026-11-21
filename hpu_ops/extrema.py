@@ -34,7 +34,12 @@ tensors never reach a backend kernel), the same fixes as a composite; outside a 
 torch's autograd kernel, so nothing is fixed twice. ``max()`` / ``min()`` / ``median()`` keep their own backward
 (torch's reads the NaN flag on the host, a sync per call) and the inf-norms theirs (torch's formula with Gaudi's
 ``sign(NaN) = NaN`` gives NaN where torch gives 0). ``out=`` calls are computed as the functional op and copied
-out (with autograd on; in inference mode Gaudi's ``.out`` kernels run). Integer and bool dtypes keep the native
+out (with autograd on; in inference mode Gaudi's ``.out`` kernels run). A graph traced under ``inference_mode()``
+(autograd's keys excluded, so neither layer sees it) gets the composites through each op's
+``CompositeImplicitAutograd`` Python kernel, which the tracers' ``decompose()`` reads (``_inference_traced``). The
+whole-tensor reductions and inf-norms define a ``jvp`` (forward-mode AD); under ``torch.func`` transforms torch's
+autograd kernel runs over the fixed result. A CPU 0-d operand with a device tensor (``maximum(torch.tensor(0.),
+x)``) is moved to the device first. Integer and bool dtypes keep the native
 result. A NaN scalar bound of ``clamp``
 (``clamp(x, min=nan)``) is not rewritten: Gaudi gives FLT_MAX / inf (torch: ``x`` for one NaN bound, NaN for two).
 
