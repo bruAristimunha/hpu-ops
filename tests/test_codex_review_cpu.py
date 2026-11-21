@@ -161,7 +161,10 @@ def test_replica_scaled_pivots(n):
     assert S[0] * np.prod(D.astype(np.float64)) == 2  # Codex's doubled determinant
     X, D, S = replica_gj(A, B)
     assert S[0] * np.prod(D.astype(np.float64)) == 1
-    np.testing.assert_array_equal(X, torch.linalg.solve(A, B).numpy())
+    want = torch.linalg.solve(A, B).numpy()
+    # the stored pivot row 2^64 is scaled down by 2^-64 (the used-row growth fix): its entry 2^-128 flushes on the
+    # card, so X[0] = -2^-64 becomes 0, a 3e-39 error next to X[1] = 2^64 (CPU float32 keeps the subnormal)
+    np.testing.assert_allclose(X, want, rtol=0, atol=1e-6 * np.abs(want).max())
 
 
 @pytest.mark.parametrize("n", [2, 33])
@@ -421,12 +424,11 @@ def test_probe_fails_on_cpu_route(probe, capsys):
 def test_fresh_copies_inference_offset_view(monkeypatch):
     seen = []
 
-    def fake(A, B):
-        for t in (A, B):
-            seen.append((t.storage_offset(), t.untyped_storage().nbytes() == t.numel() * t.element_size()))
-        return tpc.gj_solve_reference(A, B)
+    def fake(A):  # the identity kernel on A^T (tpc._small_inv): B never reaches a kernel
+        seen.append((A.storage_offset(), A.untyped_storage().nbytes() == A.numel() * A.element_size()))
+        return tpc.gj_solve_reference(A, torch.eye(A.shape[-1]).expand_as(A))
 
-    monkeypatch.setattr(tpc, "_op", lambda: fake)
+    monkeypatch.setattr(tpc, "_inv_op", lambda: fake)
     n = 33
     with torch.inference_mode():
         big = torch.stack([torch.eye(n), 2 * torch.eye(n)])
@@ -434,7 +436,7 @@ def test_fresh_copies_inference_offset_view(monkeypatch):
         assert big[1:2]._base is None  # why ``_base`` alone does not see the alias
         X, _, _ = tpc.gj_solve(big[1:2], rhs[1:2])
         tpc.gj_solve(big[0:1], rhs[0:1])  # offset 0, but a prefix of a larger storage
-    assert seen == [(0, True)] * 4
+    assert seen == [(0, True)] * 2
     torch.testing.assert_close(X, torch.full((1, n, 1), 0.5))
 
 

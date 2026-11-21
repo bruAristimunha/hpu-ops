@@ -21,17 +21,20 @@ reject their operands, and solve, lu_solve and lstsq returned bfloat16). The Fun
 
 On Gaudi2 these composites were measured 3-25x slower per call than Habana's CPU fallback (one launch per op), so
 with the TPC Gauss-Jordan kernel of ``hpu_ops.tpc`` loaded, float32 matrices of n <= ``tpc.MAXN`` go through it
-instead (solve, inv, det, slogdet), those of ``tpc.MAXN`` < n <= ``tpc.LARGE_MAXN`` through its in-place inverse
-kernel (``solve`` a matmul with the inverse, which its backward reuses), and the triangular solves
-(``solve_triangular``, ``cholesky_solve``) through its substitution kernel (``tpc.tri_solve``): no pivoting, so no
+instead (solve, inv, det, slogdet), larger ones through its in-place inverse kernel (``solve`` a matmul with the
+inverse, which its backward reuses; det and slogdet keep the forward's inverse for theirs): one square call, or the
+blocked route (tall panels with partial pivoting over the whole height, matmul updates) past ``tpc.LARGE_MAXN`` or
+for a batch too small to fill the card, in eager and lazy mode. The triangular solves (``solve_triangular``,
+``cholesky_solve``) go through its substitution kernel (``tpc.tri_solve``, blocked past ``MAXN``): no pivoting, so no
 accuracy is lost on ill-conditioned triangles, and ``cholesky_solve`` is two substitutions, never L L^H. Without the
-kernel, or past ``MAXN`` (``LARGE_MAXN`` for solve, inv, det and slogdet), the call on ``hpu`` is declined and runs
-through hpu-ops' own CPU route (``_on_cpu``), which is not Habana's fallback. The composites stay the path of the
-CPU stand-in.
+kernel the call on ``hpu`` is declined and runs through hpu-ops' own CPU route (``_on_cpu``), which is not Habana's
+fallback. The composites stay the path of the CPU stand-in. ``HPU_OPS_FLOAT64=card`` runs float64 HPU tensors on the
+card too, in float32 precision (``_float64_kernel``).
 """
 import functools
 import math
 import os
+import threading
 import warnings
 
 import torch
@@ -45,6 +48,13 @@ from ._dispatch import count, static
 aten = torch.ops.aten
 FLOAT64_WARNING = ("hpu_ops: {name} of float64 HPU tensors runs on the CPU: Gaudi2 stores float64 as float32, so "
                    "the input and the result hold float32 precision (bruAristimunha/hpu-ops#16).")
+# Opt-in (read when a call is made): ``HPU_OPS_FLOAT64=card`` runs the linalg ops of float64 HPU tensors on the card,
+# through the same float32 kernels, the inputs cast to float32 (exact: the card holds float32 values in them) and the
+# floating outputs cast back to float64. Unset, float64 keeps the default above (the CPU, one warning per op).
+FLOAT64_ENV = "HPU_OPS_FLOAT64"
+FLOAT64_CARD_WARNING = ("hpu_ops: HPU_OPS_FLOAT64=card: float64 linalg on HPU runs on the card in float32 precision "
+                        "(about 7 significant digits, not float64's 16; Gaudi2 stores float64 as float32 anyway, "
+                        "bruAristimunha/hpu-ops#16).")
 _WARNED = set()
 # The Gauss-Jordan solver ``(A, B) -> (X, D, S)`` and triangular solver ``(A, B, upper, left, unitriangular) -> X``
 # the Functions call for float32 n <= tpc.MAXN. None means ``tpc.gj_solve`` / ``tpc.tri_solve`` on HPU with the kernel
@@ -84,16 +94,80 @@ def _autocast_off(device_type, fn):
     return run
 
 
-def register_kernels(device_type, kernels):
-    """``_dispatch.register_kernels`` with each kernel run with autocast off (see the module docstring)."""
-    return _dispatch.register_kernels(device_type, [(op, key, _autocast_off(device_type, kernel))
-                                                    for op, key, kernel in kernels])
+def _float64_on_card(device_type, args, kwargs):
+    """Whether this call takes the float64 opt-in: ``HPU_OPS_FLOAT64=card``, on ``hpu``, a float64 tensor among the
+    arguments. Warns once per process, naming the precision."""
+    if device_type != "hpu" or os.environ.get(FLOAT64_ENV) != "card":
+        return False
+    if not any(isinstance(x, torch.Tensor) and x.dtype == torch.float64 for x in pytree.tree_leaves((args, kwargs))):
+        return False
+    if "float64-card" not in _WARNED:
+        _WARNED.add("float64-card")
+        warnings.warn(FLOAT64_CARD_WARNING, stacklevel=4)
+    return True
+
+
+def _writes(op):
+    """Whether ``op`` writes into an argument (an out= overload or an in-place op): those keep the default."""
+    return any(a.alias_info is not None and a.alias_info.is_write for a in op._schema.arguments)
+
+
+def _float64_kernel(device_type, op, kernel):
+    """``kernel`` with the float64 opt-in: float64 tensor arguments cast to float32 (differentiable casts, so autograd
+    sees a float64 leaf), the kernel run on them, its float32 outputs cast back to float64."""
+    if _writes(op):
+        return kernel
+
+    def wrapped(*args, **kwargs):
+        if not _float64_on_card(device_type, args, kwargs):
+            return kernel(*args, **kwargs)
+        down = lambda x: x.to(torch.float32) if isinstance(x, torch.Tensor) and x.dtype == torch.float64 else x  # noqa: E731
+        out = kernel(*pytree.tree_map(down, args), **pytree.tree_map(down, kwargs))
+        up = lambda y: y.to(torch.float64) if isinstance(y, torch.Tensor) and y.dtype == torch.float32 else y  # noqa: E731
+        return pytree.tree_map(up, out)
+
+    return wrapped
+
+
+# Set while a backend-key kernel runs: below autograd the tensors are plain (functorch's layers and forward-mode AD's
+# duals are unwrapped above), so a transform active around the call does not concern the kernel (``_transformed``).
+_BELOW = threading.local()
+
+
+def _backend(kernel):
+    """``kernel`` (a backend-key kernel) run with ``_transformed`` false: measured on Gaudi2 (bridge 1.21.4,
+    tests/probe_functorch.py), under jvp and forward-mode AD every declined call's primal otherwise took hpu-ops' CPU
+    route, where the kernel computes it on the card."""
+
+    def wrapped(*args, **kwargs):
+        before = getattr(_BELOW, "on", False)
+        _BELOW.on = True
+        try:
+            return kernel(*args, **kwargs)
+        finally:
+            _BELOW.on = before
+
+    return wrapped
+
+
+def _wrap(device_type, op, key, kernel):
+    """``kernel`` with autocast off (``_autocast_off``), the float64 opt-in (``_float64_kernel``) and, at a backend
+    key, an enclosing transform ignored (``_backend``)."""
+    kernel = _float64_kernel(device_type, op, kernel)
+    kernel = kernel if key.startswith("Autograd") else _backend(kernel)
+    return _autocast_off(device_type, kernel)
+
+
+def register_kernels(device_type, entries):
+    """``_dispatch.register_kernels`` with each kernel wrapped by ``_wrap``: autocast off (see the module docstring),
+    the float64 opt-in and, at a backend key, an enclosing transform ignored."""
+    return _dispatch.register_kernels(device_type, [(op, key, _wrap(device_type, op, key, k)) for op, key, k in entries])
 
 
 def register_paired(device_type, groups):
-    """``_dispatch.register_paired`` with each kernel run with autocast off (see the module docstring)."""
-    return _dispatch.register_paired(device_type, [[(op, key, _autocast_off(device_type, kernel))
-                                                    for op, key, kernel in group] for group in groups])
+    """``_dispatch.register_paired`` with each kernel wrapped as in ``register_kernels``."""
+    return _dispatch.register_paired(device_type, [[(op, key, _wrap(device_type, op, key, k)) for op, key, k in g]
+                                                   for g in groups])
 
 
 def _function(cls):
@@ -179,6 +253,8 @@ def _takes_tensors(device_type, name, tensors):
 def _transformed():
     """Whether a functorch transform (vmap, grad, jvp, jacrev, ...) or forward-mode AD is active. The Functions here
     define no ``setup_context`` and no jvp, so those calls keep the op's own kernel."""
+    if getattr(_BELOW, "on", False):  # a backend kernel: plain tensors (see _BELOW)
+        return False
     forward_ad = getattr(torch.autograd.forward_ad, "_current_level", -1) >= 0
     return torch._C._functorch.peek_interpreter_stack() is not None or forward_ad
 
@@ -204,9 +280,9 @@ def _takes(device_type, name, matrix_at=0):
 
 def _tpc_takes(device_type, takes, matrix_at=0, maxn=None, large=False):
     """``takes``, and on ``hpu`` also: n <= ``maxn`` (default ``tpc.MAXN``), or with ``large`` (solve, inv, det,
-    slogdet) n <= ``tpc.LARGE_MAXN`` where the in-place kernel pays (``tpc.large_pays``: eager mode, a batch, A's and B's
-    broadcast, large enough), and the TPC kernel ready (path installed, Gaudi2, extension built). Otherwise the call is
-    declined and takes hpu-ops' own CPU route (``_on_cpu``), which beats the composites on Gaudi2."""
+    slogdet) any n (``tpc.large_pays``: every size and batch, eager and lazy, not while tracing), and the TPC kernel
+    ready (path installed, Gaudi2, extension built). Otherwise the call is declined and takes hpu-ops' own CPU route
+    (``_on_cpu``), which beats the composites on Gaudi2."""
 
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
@@ -221,19 +297,17 @@ def _tpc_takes(device_type, takes, matrix_at=0, maxn=None, large=False):
         if large and len(args) > 1 and isinstance(args[1], torch.Tensor):  # solve: B's batch broadcasts A's
             B = args[1]
             batch = torch.broadcast_shapes(batch, B.shape[:-1] if _is_vector_rhs(A, B) else B.shape[:-2])
-        # eager only (tpc.large_pays): a traced graph (compile, AOT, make_fx) keeps main's route (codex review #19)
+        # not traced (tpc.large_pays): a traced graph (compile, AOT, make_fx) keeps main's route (codex review #19)
         return large and not _tracing(A) and tpc.large_pays(n, math.prod(batch)) and tpc.ready()
 
     return tpc_takes
 
 
 def _use_tpc(A):
-    """Whether ``A`` goes through the Gauss-Jordan kernels: n <= ``tpc.LARGE_MAXN`` (n <= ``tpc.MAXN``: rows in local
-    memory; past it the in-place inverse kernel, ``tpc.gj_solve`` multiplying by it) and, on HPU, float32 with the
-    kernel ready; or, with the ``_GJ`` hook set (CPU tests), any dtype."""
+    """Whether ``A`` goes through the Gauss-Jordan kernels (n <= ``tpc.MAXN``: rows in local memory; past it the
+    in-place inverse kernels, ``tpc.gj_solve`` multiplying by the inverse): on HPU, float32 with the kernel ready; or,
+    with the ``_GJ`` hook set (CPU tests), any dtype."""
     n = A.shape[-1]
-    if n > tpc.LARGE_MAXN:
-        return False
     if _LARGE_ON_CPU and n > tpc.MAXN:
         return True
     return _GJ is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
@@ -248,18 +322,50 @@ def _gj(A, B):
     return solver(A.expand(*batch, *A.shape[-2:]), B.expand(*batch, *B.shape[-2:]))
 
 
-def _gj_inv(A, sign=True):
-    """``(A^-1, D, S)``: the kernel with the identity as right-hand side, built in the kernel (``sign=False``: the
-    in-place kernel's ``S[..., 0]`` is not computed)."""
+def _equilibrate(A):
+    """``(A s, s)`` past ``tpc.MAXN``, ``s = 2^-e`` per matrix (``[..., 1, 1]``, a constant, from ``|A|`` detached): for
+    a matrix whose nonzero entries all lie past 2^64 (or all below 2^-64), e the exponent of the one nearest 1,
+    clamped to [-126, 126] (``s`` stays normal); otherwise, for a zero or non-finite maximum and for n <= ``tpc.MAXN``,
+    ``s = 1`` (n <= ``tpc.MAXN``: the Python float 1). A power of two: exact, the kernels' results
+    scale with it bit for bit, but where a value would fall out of float32's normal range: ``2^127 I``'s inverse
+    ``2^-127 I`` flushed to zero on the card, so its solve returned 0 with info 0 (Codex review of #34, #3); on ``A
+    s = 2 I`` the solve is exact. (Entries below ``2^-126 / s`` flush: a range past 2^126 within one matrix.)"""
+    if A.shape[-1] <= tpc.MAXN:
+        return A, 1.0
+    a = A.detach().abs()
+    amax = a.amax((-2, -1), keepdim=True)
+    amin = torch.where(a > 0, a, float("inf")).amin((-2, -1), keepdim=True)  # the smallest nonzero entry
+    hi, lo = torch.floor(torch.log2(amax)), torch.floor(torch.log2(amin))
+    # only a matrix whose every nonzero entry is past 2^+-64 is scaled, by its nearest entry's exponent: one with a
+    # wide range (Codex's huge-pivot and tiny-multiplier matrices: 1e38 beside 1, 1e30 beside 1e-9) keeps s = 1, where
+    # the kernels' own scaling is measured; scaling it would push its small entries to the edge of the normal range
+    e = torch.where(lo >= 64, lo, torch.where(hi <= -64, hi, 0.0)).clamp(-126, 126)
+    s = torch.where(torch.isfinite(amax) & (amax > 0), torch.exp2(-e), 1.0)
+    return A * s, s
+
+
+def _gj_inv(A, sign=True, scaled=False, det=False):
+    """``(A^-1, D, S)``: the kernel with the identity as right-hand side, built in the kernel, on ``A^T`` as torch's
+    CPU kernels (``tpc._small_inv``; the ``_GJ`` hook of the CPU tests gets ``A^T`` too), on ``A`` equilibrated by a
+    power of two past ``tpc.MAXN`` (``_equilibrate``). With ``scaled``: ``((A s)^-1, D, S, s)``, for a solve that
+    stays in the scaled system. ``sign=False``: the in-place kernel's ``S[..., 0]`` is not computed."""
+    As, s = _equilibrate(A)
     if _GJ is not None and not (_LARGE_ON_CPU and A.shape[-1] > tpc.MAXN):
-        return _gj(A, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
-    return tpc.gj_inv(A, sign=sign)
+        X, D, S = _gj(As.mT, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
+        X = X.mT
+    else:
+        X, D, S = tpc.gj_inv(As, sign=sign, det=det)
+    D = D if isinstance(s, float) else D / s[..., 0]
+    return (X, D, S, s) if scaled else (X if isinstance(s, float) else X * s, D, S)
 
 
 def _gj_factors(A):
-    """``(D, S)`` alone, for det and slogdet: past ``tpc.MAXN`` the in-place kernel without forming the inverse."""
+    """``(D, S)`` alone, for det and slogdet: past ``tpc.MAXN`` the in-place kernel (on ``A`` equilibrated) without
+    forming the inverse."""
     if A.shape[-1] > tpc.MAXN and (_GJ is None or _LARGE_ON_CPU):
-        return tpc.large_factors(A)
+        As, s = _equilibrate(A)
+        D, S = tpc.large_factors(As)
+        return D / s[..., 0], S
     return _gj_inv(A)[1:]
 
 
@@ -272,10 +378,8 @@ def _gj_solve(A, B, left=True):
 
 
 def _use_tri(A):
-    """Whether ``A`` goes through the triangular substitution kernel: n <= ``tpc.MAXN`` and, on HPU, float32 with the
-    kernel ready; or, with the ``_TRI`` hook set (CPU tests), any dtype."""
-    if A.shape[-1] > tpc.MAXN:
-        return False
+    """Whether ``A`` goes through the triangular substitution kernel (past ``tpc.MAXN`` blocked, ``tpc.tri_solve``):
+    on HPU, float32 with the kernel ready; or, with the ``_TRI`` hook set (CPU tests), any dtype."""
     return _TRI is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
 
 
@@ -464,7 +568,7 @@ def install_solve_triangular(device_type):
     def shapes_ok(A, B, upper=False, left=True, unitriangular=False):
         return base(A, B) and B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
-    takes = _tpc_takes(device_type, shapes_ok)
+    takes = _tpc_takes(device_type, shapes_ok, maxn=math.inf)  # past tpc.MAXN the blocked substitution
     groups = [_kernels(device_type, op, "solve_triangular", SolveTriangular, takes),
               _solve_triangular_out_kernels(device_type, takes), _triangular_solve_kernels(device_type, takes)]
     return register_paired(device_type, groups)
@@ -643,11 +747,18 @@ def install_cholesky_solve(device_type):
     def shapes_ok(B, L, upper=False):
         return base(B, L) and B.dim() >= 2 and B.shape[-2] == L.shape[-1]
 
-    takes = _tpc_takes(device_type, shapes_ok, matrix_at=1)
+    takes = _tpc_takes(device_type, shapes_ok, matrix_at=1, maxn=math.inf)  # past tpc.MAXN blocked substitutions
     autograd = _kernels(device_type, aten.cholesky_solve.default, "cholesky_solve", CholeskySolve, takes)[0]
     # The other two entries are dropped: the helper is the backend key of the same op, so each key gets one kernel.
     backend = _kernels(device_type, aten._cholesky_solve_helper.default, "cholesky_solve", CholeskySolve, takes)[1]
     return register_paired(device_type, [[autograd, backend]])
+
+
+# Measured on Gaudi2 (bridge 1.21.4, lazy mode, tests/probe_lazy_cases.py): the n-step LU composite in one lazy graph
+# (n = 64, batch 8 and 32) returned wrong factors on its first execution (relative error 3e7; the next calls right),
+# and the matrix_exp composite at batch 32 failed to compile (synStatus 26). A graph boundary (``tpc._flush``, lazy
+# mode only) every LAZY_CHUNK steps keeps each graph small.
+LAZY_CHUNK = 8
 
 
 def lu(A):
@@ -656,19 +767,23 @@ def lu(A):
     tensors under masks, so each step has one shape and no step indexes by a boolean mask. A zero pivot divides by 1,
     so singular input gives finite factors."""
     n = A.shape[-1]
-    rows = torch.arange(n, device=A.device)
+    # the row indices as float (exact): on Gaudi2 (bridge 1.21.4, lazy mode) the composite with int64 index arithmetic
+    # returned wrong factors on its first execution (tests/probe_lazy_cases.py); int64 only for the gather's index
+    rows = torch.arange(n, device=A.device, dtype=torch.float32)
     LU, piv = A, []
     for k in range(n):
         col = LU[..., :, k].abs().masked_fill(rows < k, -1.0)  # rows above k never pivot
-        p = col.argmax(-1)  # [...]
-        swap = torch.where(rows == k, p[..., None], torch.where(rows == p[..., None], k, rows))
-        LU = LU.gather(-2, swap[..., None].expand_as(LU))
+        p = col.argmax(-1).to(torch.float32)  # [...]
+        swap = torch.where(rows == k, p[..., None], torch.where(rows == p[..., None], float(k), rows))
+        LU = LU.gather(-2, swap.long()[..., None].expand_as(LU))
         pivot = LU[..., k:k + 1, k:k + 1]
         l = torch.where((rows > k)[:, None], LU[..., :, k:k + 1] / torch.where(pivot == 0, 1.0, pivot), 0.0)
         LU = LU - l * torch.where((rows > k)[None, :], LU[..., k:k + 1, :], 0.0)
         LU = torch.where(((rows > k)[:, None]) & (rows == k)[None, :], l, LU)
         piv.append(p)
-    return LU, (torch.stack(piv, -1) + 1).to(torch.int32)
+        if A.device.type == "hpu" and (k + 1) % LAZY_CHUNK == 0:
+            tpc._flush()  # lazy mode: a graph boundary every LAZY_CHUNK steps (see LAZY_CHUNK)
+    return LU, (torch.stack(piv, -1) + 1).to(torch.int32)  # exact: n < 2^24
 
 
 def pivots_to_perm(pivots):
@@ -678,10 +793,13 @@ def pivots_to_perm(pivots):
     rows = torch.arange(n, device=pivots.device)
     # int64 gather does not compile on Gaudi2 (bridge 1.21): carry perm as float32 (exact below 2**24), cast at the end
     perm = rows.float().expand(pivots.shape)
+    rows = rows.float()  # float index arithmetic, int64 only for the gather's index (see ``lu``)
     for k in range(n):
-        p = (pivots[..., k] - 1).long()
-        swap = torch.where(rows == k, p[..., None], torch.where(rows == p[..., None], k, rows))
-        perm = perm.gather(-1, swap)
+        p = (pivots[..., k] - 1).float()
+        swap = torch.where(rows == k, p[..., None], torch.where(rows == p[..., None], float(k), rows))
+        perm = perm.gather(-1, swap.long())
+        if pivots.device.type == "hpu" and (k + 1) % LAZY_CHUNK == 0:
+            tpc._flush()
     return perm.long()
 
 
@@ -691,9 +809,13 @@ def lu_info(LU):
 
 
 def lu_info_of_diagonal(diagonal):
-    """``lu_info`` from the diagonal of U (the pivots) alone."""
-    zero = diagonal == 0
-    return torch.where(zero.any(-1), zero.int().argmax(-1) + 1, 0).to(torch.int32)
+    """``lu_info`` from the diagonal of U (the pivots) alone, by float arithmetic (exact below 2^24): on Gaudi2 (bridge
+    1.21.4, lazy mode, linalg_on_hpu's lu_factor_ex at n = 64 and 128) the int32 argmax / where gave a garbage info
+    (3e8) on the first execution of the graph."""
+    n = diagonal.shape[-1]
+    index = torch.arange(1, n + 1, dtype=torch.float32, device=diagonal.device)
+    first = torch.where(diagonal == 0, index, float(n + 1)).amin(-1)
+    return torch.where(first > n, 0.0, first).to(torch.int32)
 
 
 def lu_solve(LU, pivots, B, left=True):
@@ -767,19 +889,22 @@ class SolveEx(torch.autograd.Function):
 
     @staticmethod
     def compute_with_inverse(A, B, left, check_errors):
-        """``compute``'s outputs and ``A^-1`` (None unless n > ``tpc.MAXN`` on the kernel path)."""
+        """``compute``'s outputs and ``A^-1`` (None off the kernel path)."""
         vector = _is_vector_rhs(A, B)
         rhs = B.unsqueeze(-1) if vector else B
         Ainv = None
         if _use_tpc(A):
-            if A.shape[-1] > tpc.MAXN:
-                # one contiguous copy for the kernel and the residual: under torch.compile on Gaudi2 the residual's
-                # A @ X with A a strided view of a graph input beside the kernel's copy gave 7e-2 error at n = 150
-                Ac = A.contiguous()
-                Ainv, _, S = _gj_inv(Ac, sign=False)
-                result = _inv_solve(Ac, rhs, Ainv, left)
-            else:
-                result, _, S = _gj_solve(A, rhs, left)
+            # every n: the inverse of A^T's elimination (torch's pivot order, tpc._small_inv), a matmul with one
+            # residual step, and the inverse kept for the backward (which then launches no kernel). One contiguous
+            # copy for the kernel and the residual: under torch.compile on Gaudi2 the residual's A @ X with A a
+            # strided view of a graph input beside the kernel's copy gave 7e-2 error at n = 150
+            Ac = A.contiguous()
+            Xs, _, S, s = _gj_inv(Ac, sign=False, scaled=True)
+            Xs = Xs.to(A.dtype)  # the CPU tests' float64 stand-in: the kernel replicas compute in float32
+            if isinstance(s, float):
+                result, Ainv = _inv_solve(Ac, rhs, Xs, left), Xs
+            else:  # the equilibrated system (A s) X = B s (_equilibrate; Codex #3: 2^127 I)
+                result, Ainv = _inv_solve(Ac * s, rhs * s, Xs, left), Xs * s
             LU, pivots = _unused_factors(A)
             info = _gj_info(S, A.shape[:-2])
             if check_errors:
@@ -894,22 +1019,51 @@ class Det(torch.autograd.Function):
     def compute(A):
         if _use_tpc(A):
             D, S = _gj_factors(A)
-            return S[..., 0] * D.prod(-1), *_unused_factors(A)
+            return S[..., 0] * _tree(D, torch.mul), *_unused_factors(A)
         LU, pivots = lu(A)
         diag = torch.diagonal(LU, dim1=-2, dim2=-1)
         return _parity(pivots).to(A.dtype) * diag.prod(-1), LU, pivots
 
     @staticmethod
     def forward(ctx, A):
-        det, LU, pivots = Det.compute(A)
-        ctx.save_for_backward(A, det)
+        X = None
+        if ctx.needs_input_grad[0] and _use_tpc(A):
+            # the kernel's inverse comes with its pivots: kept for the backward, which then launches no kernel
+            X, D, S = _gj_inv(A, det=True)
+            det, LU, pivots = S[..., 0] * _tree(D, torch.mul), *_unused_factors(A)
+        else:
+            det, LU, pivots = Det.compute(A)
+        ctx.save_for_backward(A, det, X)
         ctx.mark_non_differentiable(LU, pivots)
         return det, LU, pivots
 
     @staticmethod
     def backward(ctx, grad, *_):
-        A, det = ctx.saved_tensors
-        return _det_backward(A, det, grad, lambda M: InvEx.apply(M, False)[0])
+        A, det, X = ctx.saved_tensors
+        return _det_backward(A, det, grad, _saved_or_inverse(X))
+
+
+def _saved_or_inverse(X):
+    """The inverse for a backward: ``X`` saved by the forward (a constant: first-order backward only), or, in grad mode
+    (double backward) or without it, ``InvEx`` on the matrix, differentiable."""
+    if X is not None and not torch.is_grad_enabled():
+        return lambda M: X
+    return lambda M: InvEx.apply(M, False)[0]
+
+
+def _tree(x, op):
+    """``x`` reduced over its last dim by ``op`` (add, mul) pairwise, a binary tree of log2(n) levels: on Gaudi2 the
+    reduction of a long row accumulated as a chain, and slogdet's sum of n = 384 and 1100 pivots' logs was 10x CPU
+    float32's error on near-identity matrices (1.8e-6 against 1.5e-7; torch's CPU sum is pairwise). n <= 64 keeps the
+    plain reduction (its error is already CPU float32's)."""
+    n = x.shape[-1]
+    if n <= 64:
+        return x.prod(-1) if op is torch.mul else x.sum(-1)
+    m = 1 << (n - 1).bit_length()
+    x = F.pad(x, (0, m - n), value=1.0 if op is torch.mul else 0.0)
+    while x.shape[-1] > 1:
+        x = op(x[..., 0::2], x[..., 1::2])
+    return x[..., 0]
 
 
 def _det_backward(A, det, grad, inverse):
@@ -939,14 +1093,9 @@ def _det_backward(A, det, grad, inverse):
 
 def _det_grad_singular(A, grad):
     """torch's ``linalg_det_backward`` for singular ``A`` in grad mode: with ``A = U S V^H``, ``det(U) det(V^H) U
-    diag(g prod_{j != i} s_j) V^H``, the products without a division (exclusive cumulative products). Gaudi has no
-    SVD kernel, so on HPU the SVD runs on a CPU copy (differentiable ``.cpu()``/``.to()``): a host round trip, only
-    for a singular matrix differentiated with ``create_graph``."""
-    if A.device.type == "hpu":
-        with _strict.route("linalg_det double backward: SVD of a singular matrix", A):
-            U, S, Vh = (t.to(A.device) for t in torch.linalg.svd(A.cpu()))
-    else:
-        U, S, Vh = torch.linalg.svd(A)
+    diag(g prod_{j != i} s_j) V^H``, the products without a division (exclusive cumulative products). The SVD is
+    the public op, so on HPU it is hpu-ops' own (``install_svd``: the Jacobi kernel, differentiable), on the card."""
+    U, S, Vh = torch.linalg.svd(A)
     alpha = torch.linalg.det(U) * torch.linalg.det(Vh)
     ones = torch.ones_like(S[..., :1])
     before = torch.cumprod(torch.cat([ones, S[..., :-1]], -1), -1)
@@ -967,7 +1116,7 @@ class Slogdet(torch.autograd.Function):
     def compute(A):
         if _use_tpc(A):
             D, S = _gj_factors(A)
-            return (S[..., 0] * D.sign().prod(-1), D.abs().log().sum(-1), *_unused_factors(A))
+            return (S[..., 0] * D.sign().prod(-1), _tree(D.abs().log(), torch.add), *_unused_factors(A))
         LU, pivots = lu(A)
         diag = torch.diagonal(LU, dim1=-2, dim2=-1)
         sign = _parity(pivots).to(A.dtype) * diag.sign().prod(-1)
@@ -975,8 +1124,13 @@ class Slogdet(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
-        sign, logabsdet, LU, pivots = Slogdet.compute(A)
-        ctx.save_for_backward(A)
+        X = None
+        if ctx.needs_input_grad[0] and _use_tpc(A):
+            X, D, S = _gj_inv(A, det=True)  # kept for the backward, as in Det
+            sign, logabsdet, LU, pivots = (S[..., 0] * D.sign().prod(-1), _tree(D.abs().log(), torch.add), *_unused_factors(A))
+        else:
+            sign, logabsdet, LU, pivots = Slogdet.compute(A)
+        ctx.save_for_backward(A, X)
         ctx.mark_non_differentiable(LU, pivots)
         ctx.set_materialize_grads(False)
         return sign, logabsdet, LU, pivots
@@ -985,8 +1139,8 @@ class Slogdet(torch.autograd.Function):
     def backward(ctx, _sign, grad, *_):
         if grad is None:  # only sign was used: real sign has no gradient
             return None
-        (A,) = ctx.saved_tensors
-        return grad[..., None, None] * InvEx.apply(A, False)[0].mH
+        A, X = ctx.saved_tensors
+        return grad[..., None, None] * _saved_or_inverse(X)(A).mH
 
 
 def _below_autograd(op, *args, **kwargs):
@@ -1099,8 +1253,10 @@ def _svd_takes(device_type, name="svd"):
             return False
         if driver is not None or not _takes_tensors(device_type, name, [A]):
             return False
-        if A.dim() < 2 or A.shape[-2] > tpc.SMALL_MAXN or A.shape[-1] > tpc.SMALL_MAXN:
+        if A.dim() < 2:
             return False
+        if device_type != "hpu" and _BLOCK_EIGH is None and max(A.shape[-2:]) > tpc.SMALL_MAXN:
+            return False  # the CPU stand-in keeps torch's own past the kernel's sizes; on HPU the block Jacobi SVD
         return device_type != "hpu" or tpc.ready()
 
     return takes
@@ -1112,8 +1268,10 @@ def _pinv_takes(device_type, name="pinv"):
             return False
         if hermitian or not _takes_tensors(device_type, name, [A]):
             return False
-        if A.dim() < 2 or A.shape[-2] > tpc.SMALL_MAXN or A.shape[-1] > tpc.SMALL_MAXN:
+        if A.dim() < 2:
             return False
+        if device_type != "hpu" and _BLOCK_EIGH is None and max(A.shape[-2:]) > tpc.SMALL_MAXN:
+            return False  # the CPU stand-in keeps torch's own past the kernel's sizes; on HPU the block Jacobi SVD
         if device_type == "hpu" and not tpc.ready():
             return False
         for tol in (atol, rtol):
@@ -1136,8 +1294,10 @@ def _lstsq_takes(device_type, name="lstsq"):
             return False
         if not _takes_tensors(device_type, name, [A, B]) or A.dtype != B.dtype:
             return False
-        if A.dim() < 2 or A.shape[-2] > tpc.SMALL_MAXN or A.shape[-1] > tpc.SMALL_MAXN:
+        if A.dim() < 2:
             return False
+        if device_type != "hpu" and _BLOCK_EIGH is None and max(A.shape[-2:]) > tpc.SMALL_MAXN:
+            return False  # the CPU stand-in keeps torch's own past the kernel's sizes; on HPU the block Jacobi SVD
         if device_type == "hpu" and not tpc.ready():
             return False
         if B.dim() == A.dim() - 1:
@@ -1153,7 +1313,27 @@ def _lstsq_takes(device_type, name="lstsq"):
     return takes
 
 
+# The block Jacobi hook for the CPU tests: ``(A[B, 32, 32]) -> (w, V)``, the eigh the block SVD and eigh call past the
+# kernels' sizes. None means ``tpc.eigh`` on HPU.
+_BLOCK_EIGH = None
+
+
+def _block_eigh_solver(device):
+    if _BLOCK_EIGH is not None:
+        return _BLOCK_EIGH
+    return lambda X: tpc.eigh(X, False)
+
+
 def _run_svd(A, compute_uv, full_matrices=False, sort=True, flush=True):
+    big = A.shape[-2] > tpc.SMALL_MAXN or A.shape[-1] > tpc.SMALL_MAXN
+    if big and (_BLOCK_EIGH is not None or A.device.type == "hpu"):
+        # past the Jacobi SVD kernel: one-sided block Jacobi on the card (its column pairs' Gram matrices through
+        # the eigh kernel); thin, sorted; Svd.compute completes U or V for full_matrices
+        from . import jacobi
+
+        U, S, Vh = jacobi.block_svd(A.detach() if _BLOCK_EIGH is not None else A, _block_eigh_solver(A.device),
+                                    compute_uv)
+        return (U, S, Vh) if compute_uv else (A.new_empty(0), S, A.new_empty(0))
     if _SVD is not None:
         return _SVD(A.detach(), compute_uv)
     if A.device.type == "hpu":
@@ -1166,7 +1346,15 @@ def _run_svd(A, compute_uv, full_matrices=False, sort=True, flush=True):
 def _complete_orthogonal(U, S):
     m, k = U.shape[-2], U.shape[-1]
     eye = torch.eye(m, dtype=U.dtype, device=U.device)
-    unull = _run_svd(eye - U @ U.mT, True)[0]
+    P = eye - U @ U.mT
+    if m > tpc.SMALL_MAXN and (_BLOCK_EIGH is not None or U.device.type == "hpu"):
+        # past the SVD kernel: the eigenvectors of eigenvalue 1 of the projector (block Jacobi eigh, on the card),
+        # which its eigenvalues 0 and 1 separate cleanly; the block SVD's Gram sees its zeros as sqrt(eps)
+        from . import jacobi
+
+        _, Q = jacobi.block_eigh((P + P.mT) / 2, _block_eigh_solver(U.device))
+        return torch.cat([U, Q[..., k:]], -1)
+    unull = _run_svd(P, True)[0]
     return torch.cat([U, unull[..., :m - k]], -1)
 
 
@@ -1314,9 +1502,10 @@ def install_svd(device_type):
             def ag(*args, **kwargs):
                 A, ord_, dim, keepdim, dtype = _bind(op_, args, kwargs)
                 dims = _norm_dims(A, dim) if dtype is None and pred_(ord_) else None
+                small = device_type == "hpu" or (dims is not None and
+                                                 max(A.shape[dims[0]], A.shape[dims[1]]) <= tpc.SMALL_MAXN)
                 if dims is not None and not _transformed() and _takes_tensors(device_type, "svd", [A]) and \
-                        A.shape[dims[0]] <= tpc.SMALL_MAXN and A.shape[dims[1]] <= tpc.SMALL_MAXN and \
-                        (device_type != "hpu" or tpc.ready()):
+                        small and (device_type != "hpu" or tpc.ready()):
                     return _norm_run(A, ord_, dims[0], dims[1], keepdim)
                 return op_._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
 
@@ -1719,6 +1908,10 @@ def _pade13_uv(A_s):
     X2 = A_s @ A_s
     X4 = X2 @ X2
     X6 = X2 @ X4
+    if A_s.device.type == "hpu" and n > tpc.SMALL_MAXN:
+        # lazy mode, Gaudi2 (bridge 1.21.4): the whole Padé graph at batch 32, n = 64 failed to compile (synStatus 26,
+        # tests/probe_lazy_cases.py; batch 8 compiled): a graph boundary after the powers
+        tpc._flush()
     W1 = c[13] * X6 + c[11] * X4 + c[9] * X2
     W2 = c[7] * X6 + c[5] * X4 + c[3] * X2 + c[1] * eye
     W = X6 @ W1 + W2
@@ -1739,8 +1932,11 @@ def _matrix_exp_composite(A, use_grad):
     A_s = A if s_t is None and s_max == 0 else A * scale
     U, V = _pade13_uv(A_s)
     R = SolveEx.apply(V - U, V + U, True, False)[0] if use_grad else SolveEx.compute(V - U, V + U, True, False)[0]
+    eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)
     for k in range(s_max):
-        R = R @ R if s_t is None else torch.where(s_t > k, R @ R, R)
+        # per-matrix counts: R @ (R where squared, else I), one matmul; torch.where(s_t > k, R @ R, R) failed to
+        # compile in lazy mode on Gaudi2 (bridge 1.21.4, batch 32, n = 64: synStatus 26)
+        R = R @ R if s_t is None else R @ torch.where(s_t > k, R, eye)
     return R
 
 
@@ -1767,6 +1963,8 @@ def _matrix_exp_frechet_torch(A, gY):
     M2 = As @ Es + Es @ As
     M4 = X2 @ M2 + M2 @ X2
     M6 = X2 @ M4 + M2 @ X4
+    if As.device.type == "hpu" and n > tpc.SMALL_MAXN:
+        tpc._flush()  # lazy mode: as in _pade13_uv
     W1 = c[13] * X6 + c[11] * X4 + c[9] * X2
     W2 = c[7] * X6 + c[5] * X4 + c[3] * X2 + c[1] * eye
     W = X6 @ W1 + W2
@@ -1797,13 +1995,21 @@ def _matrix_exp_frechet_torch(A, gY):
     return L
 
 
+def _expm_kernel(A):
+    """Whether ``A`` fits the Padé-13 kernels (n <= ``tpc.SMALL_MAXN``); past it the composite, on the card too (its
+    matmuls and the Gauss-Jordan solve of ``SolveEx``), with one host read of the scaling counts."""
+    return A.shape[-1] <= tpc.SMALL_MAXN
+
+
 @_function
 class MatrixExp(torch.autograd.Function):
-    """``aten.linalg_matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.SMALL_MAXN``), with differentiable Padé-13
-    Fréchet backward for double backward and ``torch.compile``."""
+    """``aten.linalg_matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.SMALL_MAXN``, the composite past it), with
+    differentiable Padé-13 Fréchet backward for double backward and ``torch.compile``."""
 
     @staticmethod
     def compute(A):
+        if not _expm_kernel(A):
+            return _matrix_exp_composite(A, False)
         if _is_fake(A):
             return tpc.matrix_exp(A) if (A.device.type == "hpu" and tpc.ready()) else _matrix_exp_composite(A, False)
         if _EXPM_STRATEGY in ("auto", "tpc"):
@@ -1822,6 +2028,8 @@ class MatrixExp(torch.autograd.Function):
     @staticmethod
     def backward(ctx, gY):
         (A,) = ctx.saved_tensors
+        if not _expm_kernel(A):
+            return _matrix_exp_frechet_torch(A, gY)
         if not torch.is_grad_enabled() and not _is_fake(A) and not _is_fake(gY) and _EXPM_STRATEGY in ("auto", "tpc"):
             if _MATRIX_EXP_FRECHET is not None:
                 return _MATRIX_EXP_FRECHET(A.detach(), gY.detach())
@@ -1834,10 +2042,10 @@ class MatrixExp(torch.autograd.Function):
 
 
 def install_matrix_exp(device_type):
-    """``linalg.matrix_exp`` / ``torch.matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.SMALL_MAXN``).
-    Returns an undo."""
+    """``linalg.matrix_exp`` / ``torch.matrix_exp`` via Gaudi2 Padé-13 TPC kernels (n <= ``tpc.SMALL_MAXN``; past it
+    the Padé-13 composite on the card). Returns an undo."""
     op = aten.linalg_matrix_exp.default
-    takes = _tpc_takes(device_type, _takes(device_type, "matrix_exp"), maxn=tpc.SMALL_MAXN)
+    takes = _tpc_takes(device_type, _takes(device_type, "matrix_exp"), maxn=math.inf)
 
     def expm_ag(A):
         if takes(A):
@@ -2267,27 +2475,26 @@ def _pivots_ok(LU, pivots):
 
 # Measured on Gaudi2 (bridge 1.21.4, TEAM_REPORT, same-process A/B): in lazy mode the LU ops are at parity with
 # Habana's CPU fallback or slower (one graph boundary per TPC launch: lu_factor_ex 0.71-0.98x, linalg.lu 0.65x), and
-# linalg.lu is at parity or slower in eager mode too (0.87x median of 5 rounds). So on HPU ``install_lu`` installs
-# only what was faster (lu_factor / lu_factor_ex, lu_solve, lu_unpack in eager mode) unless ``HPU_OPS_LU_SLOW=1``
-# asks for every LU op in both modes (no fallbacks, at that speed).
+# linalg.lu is at parity or slower in eager mode too (0.87x median of 5 rounds). They are installed anyway, in both
+# modes: nothing runs on the CPU. ``HPU_OPS_LU_SLOW`` is no longer read.
 LU_SLOW = "HPU_OPS_LU_SLOW"
 
 
 def _lu_wanted(device_type, op_name):
-    """Whether ``install_lu`` installs ``op_name`` ("lu" for ``linalg.lu``, else the factor, solve and unpack ops)."""
-    if device_type != "hpu" or os.environ.get(LU_SLOW) == "1":
-        return True
-    return not tpc.lazy_mode() and op_name != "lu"
+    """Whether ``install_lu`` installs ``op_name``: every LU op, on every device and in both modes."""
+    return True
 
 
 def install_lu(device_type):
     """``linalg.lu_factor`` / ``lu_factor_ex``, ``lu_solve``, ``lu_unpack`` and ``linalg.lu`` on ``device_type`` for
-    square float32 matrices of n <= ``tpc.SMALL_MAXN``, through the TPC LU kernel. On HPU only the ops measured faster than
-    the fallback, unless ``HPU_OPS_LU_SLOW=1`` (see ``LU_SLOW``). Returns an undo."""
-    factor_base = _tpc_takes(device_type, _takes(device_type, "lu_factor"), maxn=tpc.SMALL_MAXN)
-    lu_base = _tpc_takes(device_type, _takes(device_type, "lu"), maxn=tpc.SMALL_MAXN)
-    solve_base = _tpc_takes(device_type, _takes(device_type, "lu_solve"), maxn=tpc.SMALL_MAXN)
-    unpack_base = _tpc_takes(device_type, _takes(device_type, "lu_unpack"), maxn=tpc.SMALL_MAXN)
+    square float32 matrices, through the TPC LU kernel (n <= ``tpc.SMALL_MAXN``; past it the composites, on the card), in
+    both modes (see ``LU_SLOW``). Returns an undo."""
+    # past tpc.SMALL_MAXN the composites on the card: ``lu`` (n masked steps, LAPACK's pivots), ``pivots_to_perm``
+    # and the triangular solves (the substitution kernel, blocked past tpc.MAXN)
+    factor_base = _tpc_takes(device_type, _takes(device_type, "lu_factor"), maxn=math.inf)
+    lu_base = _tpc_takes(device_type, _takes(device_type, "lu"), maxn=math.inf)
+    solve_base = _tpc_takes(device_type, _takes(device_type, "lu_solve"), maxn=math.inf)
+    unpack_base = _tpc_takes(device_type, _takes(device_type, "lu_unpack"), maxn=math.inf)
 
     def factor_takes(A, pivot=True, check_errors=False):
         return pivot is True and factor_base(A)

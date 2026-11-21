@@ -1,5 +1,6 @@
 """The linalg composites checked on the CPU standing in for HPU: outputs and gradients against torch's own, and what
 compiled graphs contain."""
+import math
 import os
 import re
 import sys
@@ -517,7 +518,7 @@ def test_eigh_is_declined_past_maxn_on_hpu_and_without_the_kernel(monkeypatch):
     assert takes(A, "L", True) is False
     monkeypatch.setattr(tpc, "ready", lambda: True)
     assert takes(A, "L", True) is True
-    assert takes(torch.randn(tpc.EIGH_MAXN + 1, tpc.EIGH_MAXN + 1), "L", True) is False
+    assert takes(torch.randn(tpc.EIGH_MAXN + 1, tpc.EIGH_MAXN + 1), "L", True) is True  # block Jacobi, on the card
     assert takes(torch.randn(tpc.EIGH_MAXN, tpc.EIGH_MAXN), "L", True) is True
     cpu = jacobi._tpc_takes("cpu")
     monkeypatch.setattr(tpc, "ready", lambda: False)
@@ -716,11 +717,11 @@ def test_tpc_gj_solve_flattens_batch_dims(monkeypatch):
     torch.manual_seed(0)
     shapes = []
 
-    def fake(A, B):
+    def fake(A):  # the identity kernel, on A^T (tpc._small_inv)
         shapes.append((A.dim(), A.is_contiguous(), A.dtype))
-        return tpc.gj_solve_reference(A, B)
+        return tpc.gj_solve_reference(A, torch.eye(A.shape[-1]).expand_as(A))
 
-    monkeypatch.setattr(tpc, "_op", lambda: fake)
+    monkeypatch.setattr(tpc, "_inv_op", lambda: fake)
     A, B = f32(2, 3, n=4).mT, torch.randn(2, 3, 4, 2)
     X, D, S = tpc.gj_solve(A, B)
     assert shapes == [(3, True, torch.float32)]
@@ -807,11 +808,9 @@ def test_gj_is_declined_past_maxn_on_hpu_and_without_the_kernel(monkeypatch):
     assert takes(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is False
     assert takes(torch.randn(tpc.MAXN, tpc.MAXN)) is True
     large = linalg._tpc_takes("hpu", linalg._takes("hpu", "solve"), large=True)
-    n = tpc.LARGE_ANY_BATCH_N
-    assert large(torch.randn(n, n)) is True and large(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is True
-    assert large(torch.randn(tpc.LARGE_MIN_BATCH - 1, n + 1, n + 1)) is False  # past it, a small batch: fallback
-    assert large(torch.randn(tpc.LARGE_MIN_BATCH, n + 1, n + 1)) is True
-    assert large(torch.randn(tpc.LARGE_MIN_BATCH, tpc.LARGE_MAXN + 1, tpc.LARGE_MAXN + 1)) is False
+    assert large(torch.randn(256, 256)) is True and large(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is True
+    assert large(torch.randn(1, 257, 257)) is True  # a small batch: the blocked route, on the card
+    assert large(torch.randn(1, tpc.LARGE_MAXN + 1, tpc.LARGE_MAXN + 1)) is True  # past it: the blocked route
     cpu = linalg._tpc_takes("cpu", linalg._takes("cpu", "solve"))
     monkeypatch.setattr(tpc, "ready", lambda: False)
     assert cpu(torch.randn(tpc.MAXN + 1, tpc.MAXN + 1)) is True  # the CPU stand-in keeps the composite
@@ -824,12 +823,13 @@ def test_gj_used_to_large_maxn(gj_hook):
     assert gj_hook == [(2, tpc.MAXN + 1, tpc.MAXN + 1)]
 
 
-def test_gj_not_used_past_large_maxn(monkeypatch, gj_hook):
-    monkeypatch.setattr(tpc, "LARGE_MAXN", 80)  # the composite past it: keep the CPU test short
+def test_gj_used_past_large_maxn(monkeypatch, gj_hook):
+    """Past LARGE_MAXN the large route (the blocked route on the card) still takes the call."""
+    monkeypatch.setattr(tpc, "LARGE_MAXN", 80)
     torch.manual_seed(0)
     with cpu_as_hpu(linalg.install_solve):
         torch.linalg.solve(f32(2, n=81), torch.randn(2, 81, 2))
-    assert gj_hook == []
+    assert gj_hook == [(2, 81, 81)]
 
 
 DOUBLE_BACKWARD = {
@@ -1127,8 +1127,8 @@ def test_svd_declined_past_maxn_and_without_kernel(monkeypatch, svd_hook):
     assert takes(A) is False
     monkeypatch.setattr(tpc, "ready", lambda: True)
     assert takes(A) is True
-    assert takes(torch.randn(tpc.SMALL_MAXN + 1, 4)) is False
-    assert takes(torch.randn(4, tpc.SMALL_MAXN + 1)) is False
+    assert takes(torch.randn(tpc.SMALL_MAXN + 1, 4)) is True  # past the kernel: block Jacobi, on the card
+    assert takes(torch.randn(4, tpc.SMALL_MAXN + 1)) is True
     assert takes(torch.randn(tpc.SMALL_MAXN, tpc.SMALL_MAXN)) is True
     assert takes(A, driver="gesvd") is False
 
@@ -1580,12 +1580,11 @@ def test_svd_u_backend_takes_and_decline_copy_back(monkeypatch, svd_hook):
     torch.testing.assert_close(S, want_S, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close((U * S.unsqueeze(-2)) @ Vh, A, rtol=1e-4, atol=1e-4)
 
-    # Decline path: n > MAXN, float64, and compute_uv=False (driver != None is also declined by takes)
+    # Decline path: float64 (driver != None is also declined by takes); past SMALL_MAXN the block Jacobi takes it
     assert not linalg._svd_takes("hpu")(A, driver="gesvd")
+    assert linalg._svd_takes("hpu")(torch.randn(2, 4, tpc.SMALL_MAXN + 1))
     for mat, cuv in (
-        (torch.randn(2, 4, tpc.SMALL_MAXN + 1, dtype=torch.float32), True),
         (torch.randn(2, 4, 3, dtype=torch.float64), True),
-        (torch.randn(2, 4, tpc.SMALL_MAXN + 1, dtype=torch.float32), False),
     ):
         m, n = mat.shape[-2], mat.shape[-1]
         k = min(m, n)
@@ -1781,7 +1780,10 @@ def test_matrix_exp_compiled_and_out_and_declines(monkeypatch, expm_hook):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert takes_hpu(torch.randn(4, 4, dtype=torch.float64)) is False
-    assert takes_hpu(torch.randn(tpc.SMALL_MAXN + 1, tpc.SMALL_MAXN + 1)) is False
+    monkeypatch.setattr(tpc, "ready", lambda: True)
+    takes_hpu = linalg._tpc_takes("hpu", linalg._takes("hpu", "matrix_exp"), maxn=math.inf)  # as install_matrix_exp
+    assert takes_hpu(torch.randn(tpc.SMALL_MAXN + 1, tpc.SMALL_MAXN + 1)) is True  # past it the composite, on the card
+    monkeypatch.undo()
     assert takes_hpu(torch.randn(0, 4, 4)) is False
 
     for empty_shape in ((0, 0), (2, 0, 0), (0, 3, 3)):
@@ -1817,8 +1819,11 @@ def test_matrix_exp_compiled_and_out_and_declines(monkeypatch, expm_hook):
     torch.testing.assert_close(out_acc, torch.linalg.matrix_exp(A32), rtol=1e-5, atol=1e-5)
     out_dec = torch.empty(0, dtype=torch.float32)
     A_big = torch.randn(2, tpc.SMALL_MAXN + 1, tpc.SMALL_MAXN + 1, dtype=torch.float32)
-    assert out_be(A_big, out=out_dec) is out_dec
-    torch.testing.assert_close(out_dec, torch.linalg.matrix_exp(A_big))
+    assert out_be(A_big, out=out_dec) is out_dec  # past SMALL_MAXN: the composite (on the card on HPU)
+    want_big = torch.linalg.matrix_exp(A_big.double())
+    err = float((out_dec.double() - want_big).abs().max() / want_big.abs().max())
+    err32 = float((torch.linalg.matrix_exp(A_big).double() - want_big).abs().max() / want_big.abs().max())
+    assert err <= max(1e-6, 10 * err32)
 
 
 @pytest.mark.parametrize("fmode", ["tpc", "wy"])
@@ -2180,14 +2185,15 @@ def test_cholesky_solve_two_pass_and_ignores_unused_triangle(tri_hook):
     torch.testing.assert_close(got_u, want_u, rtol=1e-4, atol=1e-4)
 
 
-def test_tri_not_used_past_maxn(tri_hook):
+def test_tri_used_past_maxn(tri_hook):
+    """Past tpc.MAXN the triangular solves stay on the card's route (the blocked substitution on HPU)."""
     torch.manual_seed(0)
     n = tpc.MAXN + 1
     with cpu_as_hpu(linalg.install_solve_triangular):
         torch.linalg.solve_triangular(f32(2, n=n), torch.randn(2, n, 2), upper=False)
     with cpu_as_hpu(linalg.install_cholesky_solve):
         torch.cholesky_solve(torch.randn(2, n, 2), f32(2, n=n).tril())
-    assert tri_hook == []
+    assert len(tri_hook) == 3
 
 
 def test_tri_bad_shapes_raise_like_torch(tri_hook):
@@ -2790,12 +2796,11 @@ def test_lu_solve_and_unpack_modes(perm_mode, solve_mode, left, monkeypatch, lu_
 LU_OPS = ("linalg_lu_factor_ex", "linalg_lu", "linalg_lu_solve", "lu_unpack")
 
 
-@pytest.mark.parametrize("lazy, knob, installed", [
-    ("1", None, ()), (None, None, ("linalg_lu_factor_ex", "linalg_lu_solve", "lu_unpack")), ("1", "0", ()), ("1", "1", LU_OPS), ("0", "1", LU_OPS),
-    ("0", None, ("linalg_lu_factor_ex", "linalg_lu_solve", "lu_unpack"))])
-def test_lu_ops_installed_only_where_measured_faster(monkeypatch, lazy, knob, installed):
-    """Lazy-mode LU, and linalg.lu in both modes, were measured at parity or slower than Habana's fallback: on HPU they
-    are installed only with HPU_OPS_LU_SLOW=1."""
+@pytest.mark.parametrize("lazy, knob", [("1", None), (None, None), ("1", "0"), ("1", "1"), ("0", "1"), ("0", None)])
+def test_lu_ops_installed_in_every_mode(monkeypatch, lazy, knob):
+    """Nothing on the CPU: every LU op is installed on HPU in both modes, whatever HPU_OPS_LU_SLOW says (lazy-mode
+    LU and linalg.lu were measured at parity or slower than Habana's fallback; they run on the card anyway)."""
+    installed = LU_OPS
     for name, value in (("PT_HPU_LAZY_MODE", lazy), (linalg.LU_SLOW, knob)):
         if value is None:
             monkeypatch.delenv(name, raising=False)

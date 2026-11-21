@@ -408,6 +408,8 @@ class Case(NamedTuple):
     fallback: frozenset = frozenset()  # bridge ops expected in the float32 forward and backward fallback delta
     fallback64: frozenset = frozenset()  # the same for the float64 case
     warn64: bool = True  # the float64 case expects hpu-ops#16's warning once (else none: the op is not installed)
+    batch: int | None = None  # None: BATCH
+    xfail: str | None = None  # a known failure outside hpu_ops: a failing row reads "xfail" and does not count
 
 
 def fallback_problems(got, expected, what):
@@ -417,11 +419,9 @@ def fallback_problems(got, expected, what):
     return [f"{what} fell back on {extra}"] * bool(extra), [f"{what}: expected {k} did not fall back" for k in missing]
 
 
-# The LU ops are installed in eager mode only and linalg.lu not at all (measured slower than the fallback; see
-# install_lu and HPU_OPS_LU_SLOW): their Habana fallback is expected, not a failure
-LU_OFF_FB = frozenset({"aten::linalg_lu.out"})
-LU_LAZY_FB = (frozenset({"aten::linalg_lu_factor_ex.out", "aten::linalg_lu_solve.out", "aten::lu_unpack.out"})
-              if LAZY and os.environ.get("HPU_OPS_LU_SLOW") != "1" else frozenset())
+# Every LU op is installed in both modes (install_lu): no Habana fallback is expected
+LU_OFF_FB = frozenset()
+LU_LAZY_FB = frozenset()
 
 CASES = (
     Case("linalg.solve_triangular", make_triangular, lambda a, b: L.solve_triangular(a, b, upper=False), tpc=True,
@@ -446,6 +446,13 @@ CASES = (
          sizes=(70,)),
     Case("linalg.slogdet.huge_pivot", make_huge_pivot, lambda x: L.slogdet(x), err_slogdet, None, float64=False,
          tpc=True, sizes=(70,)),
+    # a small batch (the blocked route below LARGE_MAXN) and past LARGE_MAXN (the blocked route)
+    Case("linalg.solve.batch4", make_solve, lambda a, b: L.solve(a, b), float64=False, tpc=True, sizes=(384, 600),
+         batch=4),
+    Case("linalg.inv.batch4", make_pivoting, lambda x: L.inv(x), float64=False, tpc=True, sizes=(384, 600), batch=4),
+    Case("linalg.det.batch4", make_pivoting, lambda x: L.det(x), float64=False, tpc=True, sizes=(600,), batch=4),
+    Case("linalg.slogdet.batch4", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, float64=False,
+         tpc=True, sizes=(384, 1100), batch=4),
     Case("linalg.solve.cayley", make_cayley, lambda a, b: L.solve(a, b), float64=False, tpc=True, sizes=(96, 220)),
     Case("linalg.solve.left_false_large", make_solve_right, lambda a, b: L.solve(a, b, left=False), float64=False,
          tpc=True, sizes=(220,)),
@@ -473,7 +480,10 @@ CASES = (
          float64=False, tpc=True, sizes=(22,)),
     Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False),
     # factor 20: the forward is Habana's native qr, not an hpu_ops kernel (measured 10.2x at n=16)
-    Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20),
+    Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20,
+         xfail="Habana's native QR forward: on some inputs its factors give a gradient far off (0.51 at n = 22 in the "
+               "full run); qr_bwd.isolated, the same backward on CPU float32 factors, passes; repro/qr_native_grad.py "
+               "replays the dumped input"),
     # the same backward with CPU float32 QR factors: only hpu_ops' solve_triangular is measured
     Case("linalg.qr_bwd.isolated", make_general, qr_isolated, err_qr, loss_qr, scope="bwd", float64=False,
          factor=10, tpc=True),
@@ -535,16 +545,21 @@ def watch():
     rec = {}
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        f0 = fb_ops()
+        f0, r0 = fb_ops(), len(CPU_ROUTE)
         try:
             yield rec
         finally:
             rec["fallback"] = delta(f0, fb_ops())
+            rec["cpu_route"] = len(CPU_ROUTE) - r0
             rec["caught"] = [(w.category, str(w.message)) for w in caught]
 
 
 def cpu_warnings(rec, allow=None):
-    return [m for _, m in rec["caught"] if CPU_TEXT in m and not (allow and allow in m)]
+    """The "runs on the CPU" warnings of ``rec`` (but those containing ``allow``) and, unless ``allow`` is given (the
+    float64 default declines to the CPU by design), hpu-ops' own CPU route, which neither the bridge metric nor a
+    warning shows."""
+    said = [m for _, m in rec["caught"] if CPU_TEXT in m and not (allow and allow in m)]
+    return said + [f"took hpu-ops' CPU route {rec['cpu_route']}x"] * bool(rec.get("cpu_route") and allow is None)
 
 
 TIMED_CALLS = 20
@@ -605,11 +620,12 @@ def over_bar(what, err, err_cpu32, factor=CPU32_FACTOR):
 
 
 def run_case(case, n, timed=True):
-    row = {"op": case.name, "n": n, "batch": BATCH, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE,
+    batch = case.batch or BATCH
+    row = {"op": case.name, "n": n, "batch": batch, "dtype": "float32", "lazy": LAZY, "baseline": BASELINE,
            "timed": timed}
     hard, soft, notes = [], [], []  # wrong results or errors; unexpected fallbacks; expected ones that did not occur
     try:
-        cpu_in = case.make(BATCH, n, torch.float32)
+        cpu_in = case.make(batch, n, torch.float32)
         ref_in = [x.double() for x in cpu_in]
         ref = as_tensors(case.fn(*ref_in))
         out, row["hpu_ms"], rec = forward(case, [x.to(HPU) for x in cpu_in], timed)
@@ -633,13 +649,20 @@ def run_case(case, n, timed=True):
             notes += note
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
-    # fallbacks recorded, not failed: baseline, and the TPC ops past the kernel's n limit
-    large = case.name.split(".")[:2] in [op.split(".") for op in LARGE_OPS]
-    limit = (eigh_maxn if case.name in ("linalg.eigh", "linalg.eigvalsh")
-             else small_maxn if case.name.startswith(SMALL_OPS) else large_maxn if large else tpc_maxn)
-    expected = BASELINE or (case.tpc and n > limit)
+    # fallbacks recorded, not failed: baseline only (no size is exempt: past every kernel's n limit the call stays
+    # on the card too)
+    expected = BASELINE
     problems = hard + ([] if expected else soft)
     row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft, notes=notes)
+    if problems and os.environ.get("LINALG_ON_HPU_DUMP"):  # the failing inputs, for a reproducer
+        path = os.path.join(os.environ["LINALG_ON_HPU_DUMP"], f"{case.name}_n{n}.pt")
+        with contextlib.suppress(Exception):
+            torch.save({"inputs": cpu_in, "row": row}, path)
+            row["dumped"] = path
+    if problems and case.xfail and not soft:  # only accuracy problems, of a known outside cause
+        row.update(status="xfail", xfail=case.xfail)
+        emit(**row)
+        return True
     emit(**row)
     return not problems
 
@@ -986,7 +1009,8 @@ def run_codex_case(name, fn, ins, expect):
             err = max(errs, default=0.0)
             row["max_rel_err"] = err
             problems += [f"error {err:.3g} > 1e-6"] * (not err <= 1e-6)
-        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+        # hpu-ops' CPU route is judged below: allowed only where torch raises (it reproduces torch's error there)
+        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings({**rec, "cpu_route": 0})
         problems += [f"took hpu-ops' CPU route {row['cpu_route']}x"] * bool(row["cpu_route"] and want_err is None
                                                                             and expect != "raise")
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
@@ -1368,7 +1392,7 @@ def run_round3_edges():
             torch.randint(1, 3, (batch, n), generator=g).float())
         return lower @ upper
 
-    lu_fb = LAZY and os.environ.get("HPU_OPS_LU_SLOW") != "1"
+    lu_fb = False  # every LU op is installed in both modes
 
     def lu_ties(n):
         def check(r):
@@ -1624,6 +1648,7 @@ def main():
     large_maxn = tpc.MAXN if LAZY else tpc.LARGE_MAXN
     if not BASELINE:
         hpu_ops.enable()
+        count_cpu_route()  # every call of hpu-ops' own CPU route is counted (``watch``) and fails its case
     complex_state = "skipped (baseline)"
     if not BASELINE:
         try:
@@ -1658,7 +1683,6 @@ def main():
         results += run_svd_edges()
         results += run_expm_hh_edges()
         results += run_round3_edges()
-        count_cpu_route()  # from here on, calls of hpu-ops' CPU route are counted (the Codex rows check them)
         results += [run_codex_case(*case) for case in codex_cases()]
     if BASELINE:  # positive control: without hpu_ops eigh falls back, else the metric key is wrong
         ok = bool(EIGH_FALLBACKS)
