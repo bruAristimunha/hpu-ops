@@ -69,14 +69,14 @@ def _sorted_positions(x):
     key = x.detach()
     nan = key.isnan()
     posinf = key == float("inf")
-    code = torch.float32 if key.dtype == torch.float32 else key.dtype  # sort indices as data, exact to 2**24
-    inf = torch.full_like(key, float("inf"))
-    by_value = torch.sort(torch.where(nan, inf, key), dim=-1).indices.to(code)
-    j = torch.arange(n, dtype=key.dtype, device=key.device).expand_as(key)
-    by_kind = torch.sort(torch.where(posinf, j - n, torch.where(nan, j, inf)), dim=-1).indices.to(code)
-    n_valid = (~nan).sum(-1, keepdim=True)
+    code = key.dtype  # sort indices as float data, exact to 2**24
+    inf = float("inf")
+    by_value = torch.sort(key.nan_to_num(nan=inf, posinf=inf, neginf=-inf), dim=-1).indices.to(code)
+    pos = torch.arange(n, device=key.device)
+    j = pos.to(code)
+    by_kind = torch.sort(torch.where(posinf, j - n, j.masked_fill(~nan, inf)), dim=-1).indices.to(code)
+    n_valid = n - nan.sum(-1, keepdim=True)
     n_finite = n_valid - posinf.sum(-1, keepdim=True)
-    pos = torch.arange(n, device=key.device).expand(key.shape)
     order = torch.where(pos < n_finite, by_value, by_kind.gather(-1, (pos - n_finite).clamp(min=0)))
 
     def at(p):  # float data, int64 index: Gaudi's gather does not compile on int64 data
