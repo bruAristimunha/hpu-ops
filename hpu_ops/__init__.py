@@ -70,9 +70,10 @@ at the tensor's pickling:
   indices (the first NaN) and gradients, in inference mode too (at the ``HPU`` key, through the ops' ``.out``
   overloads), for ``out=`` calls and in-place ``clamp_``; in 16-bit dtypes ``argmax`` / ``max(dim)`` of a row of ``-inf`` no longer
   return the out-of-range index ``n``. ``softmax``, ``log_softmax``, ``logsumexp``, ``cummax`` and the sums were
-  right and stay native. ``sort`` / ``argsort`` / ``topk`` / ``kthvalue`` with NaN (and Gaudi's float ``sort`` of
-  1000+ elements with infs, which returns out-of-range indices even without NaN) only with ``HPU_OPS_EXACT_SORT=1``:
-  hpu-ops' own eigh and SVD sort their eigenvalues, and the exact sort made eager SPD steps up to 22% slower.
+  right and stay native. ``sort`` / ``argsort`` / ``topk`` / ``kthvalue`` / ``msort`` in torch's order with NaN, and
+  with indices in range where Gaudi's float sort returns out-of-range ones (NaN, and any real infinity at an n that
+  is not a power of two), eager, lazy and compiled; ``HPU_OPS_EXACT_SORT=0`` keeps Gaudi's sort. hpu-ops' own
+  eigenvalue / singular-value sorts keep Gaudi's sort, so the SPD steps keep main's cost.
 - ``bincount`` of 1-D integer inputs of 65536 to 2**24 elements with at most 4096 bins and no weights through one
   ``aminmax`` read and ``histc`` in chunks of 256 bins (``small``, #21): Gaudi's kernel took 4.7-427 ms at 409600
   elements (64 to 4096 bins), 2-43x longer.
