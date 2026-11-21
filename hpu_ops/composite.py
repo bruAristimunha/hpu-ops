@@ -1,5 +1,6 @@
-"""HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``), is missing (``renorm``) or is
-wrong (``embedding_dense_backward`` of a 0-d index, ``roll`` of a strided input by a multiple of the size).
+"""HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``), is missing (``renorm``, and
+``Tensor.unfold`` in lazy mode) or is wrong (``embedding_dense_backward`` of a 0-d index, ``roll`` of a strided input by
+a multiple of the size).
 
 Each is registered at ``AutogradHPU``, so eager calls and traced graphs both use it and autograd differentiates the
 composite; ``renorm`` is also registered at ``HPU`` for calls below autograd (inference mode). Cases a composite does
@@ -81,6 +82,16 @@ def _roll_takes(input, shifts, dims=()):
     return static(*sizes, *shifts) and all(size == 0 or shift % size == 0 for size, shift in zip(sizes, shifts))
 
 
+def unfold(input, dimension, size, step):
+    """``Tensor.unfold`` as the view ATen makes of it: ``as_strided`` with the sizes and strides that ATen's own kernel
+    computes, read from it on a meta tensor of ``input``'s sizes and strides (which also raises ATen's errors). The
+    result is a view of ``input`` at its storage offset, as ``unfold``'s. Habana's lazy stack has no ``unfold``
+    kernel: the bridge ran it on the CPU and returned a copy, not a view (``repro/tensor_unfold_lazy.py``)."""
+    meta = torch.empty_strided(input.shape, input.stride(), dtype=input.dtype, device="meta")
+    view = meta.unfold(dimension, size, step)
+    return input.as_strided(view.shape, view.stride(), input.storage_offset())
+
+
 def _kernel(op, name, composite, takes, fallback):
     """``composite`` for the arguments ``takes`` accepts, else ``op``'s kernel at the ``fallback`` key."""
 
@@ -123,3 +134,16 @@ def install_roll(device_type):
     op = aten.roll.default
     return register_kernels(device_type, [(op, "Autograd{}", _kernel(
         op, "roll_zero", roll_unshifted, _roll_takes, DispatchKey.Autograd))])
+
+
+def install_unfold(device_type):
+    """``Tensor.unfold`` on ``device_type`` as ``as_strided``, at the backend key, below torch's own autograd kernel
+    (whose backward is ``unfold_backward``). Habana's eager stack has its own kernel there, which is left alone, so
+    only lazy mode takes it. Returns an undo."""
+    op = aten.unfold.default
+
+    def kernel(input, dimension, size, step):
+        count("unfold")
+        return unfold(input, dimension, size, step)
+
+    return register_kernels(device_type, [(op, "{}", kernel)])
