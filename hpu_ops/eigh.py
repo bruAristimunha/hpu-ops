@@ -35,16 +35,27 @@ def _use_tpc(A):
 
 
 def _tpc_takes(device_type):
-    """``_takes`` for eigh, and on ``hpu`` also: n <= ``tpc.EIGH_MAXN`` and the TPC kernel ready. Otherwise the call is
-    declined and takes hpu-ops' own CPU route, which beats the composite on Gaudi2."""
+    """``_takes`` for eigh, and on ``hpu`` also: the TPC kernel ready (n <= ``tpc.EIGH_MAXN`` the Jacobi kernel, past it
+    the block Jacobi of ``hpu_ops.jacobi`` on the card). Otherwise the call is declined and takes hpu-ops' own CPU
+    route, which beats the composite on Gaudi2."""
     takes = _takes(device_type, "eigh")
 
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
             return False
-        return device_type != "hpu" or (args[0].shape[-1] <= tpc.EIGH_MAXN and tpc.ready())
+        return device_type != "hpu" or tpc.ready()
 
     return tpc_takes
+
+
+def _use_block(A):
+    """Past ``tpc.EIGH_MAXN`` on HPU (float32, the kernel ready), or with the ``linalg._BLOCK_EIGH`` hook (CPU tests):
+    the block Jacobi of ``hpu_ops.jacobi``, its pairs through the eigh kernel."""
+    from . import linalg
+
+    if A.shape[-1] <= tpc.EIGH_MAXN:
+        return False
+    return linalg._BLOCK_EIGH is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
 
 
 def _schedule(n, device=None):
@@ -98,10 +109,17 @@ class Eigh(torch.autograd.Function):
     def compute(A, UPLO, compute_v):
         if UPLO.upper() not in ("L", "U"):  # torch's own message
             raise RuntimeError(f"Expected UPLO argument to be 'L' or 'U', but got {UPLO}")
+        upper = UPLO.upper() == "U"
         if _use_tpc(A):
-            w, V = (tpc.eigh if _EIGH is None else _EIGH)(A, UPLO.upper() == "U")
+            w, V = (tpc.eigh if _EIGH is None else _EIGH)(A, upper)
+        elif _use_block(A):
+            from . import jacobi, linalg
+
+            S = torch.triu(A) + torch.triu(A, 1).mT if upper else torch.tril(A) + torch.tril(A, -1).mT
+            w, V = jacobi.block_eigh(S, linalg._block_eigh_solver(A.device), compute_v)
+            V = V if compute_v else A.new_empty(0)
         else:
-            w, V = eigh(A, UPLO.upper() == "U")
+            w, V = eigh(A, upper)
         return w, (V if compute_v else A.new_empty(0))
 
     @staticmethod
@@ -116,6 +134,11 @@ class Eigh(torch.autograd.Function):
         w, V = ctx.saved_tensors
         if gw is None and gV is None:
             return None, None, None
+        if V.device.type == "hpu" and V.shape[-1] > tpc.EIGH_MAXN:
+            # lazy mode, Gaudi2 (bridge 1.21.4): linalg_on_hpu's eigh at n = 64 and 128 (batch 32) failed to compile a
+            # fused graph (synStatus 26) where the isolated forward and backward compiled; a graph boundary here, as
+            # in linalg._pade13_uv
+            tpc._flush()
         if gV is None:  # eigenvalues only: V diag(gw) V^H, finite for repeated eigenvalues
             return (V * gw.unsqueeze(-2)) @ V.mH, None, None
         gw = torch.zeros_like(w) if gw is None else gw

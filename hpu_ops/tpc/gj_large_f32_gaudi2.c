@@ -11,8 +11,8 @@
  *   Q [m, batch]      f32: Q[p_k] = k (the inverse permutation when square), n + i for a row i never taken
  *   D [n, batch]      f32: the k-th pivot (U's diagonal of P A = L U)
  *   S [2, batch]      f32: lane 0 unused (0; the caller takes the sign from P), lane 1 = info (1 + first zero pivot)
- * A NaN anywhere in A makes every entry of R and D NaN (LAPACK's results are NaN there; the elimination's need not
- * be), so the caller needs no check of its own.
+ * A NaN anywhere in A makes every entry of R and D NaN and the info 0 (LAPACK's results are NaN there and its NaN
+ * pivots are not zero; the elimination's need not be), so the caller needs no check of its own.
  * Pivoting is implicit (no row moves): step k takes the unused row p of largest |column k| (the first among ties; a
  * NaN counts as 0, so the order stays a permutation), stores 1 at (p, k) and leaves the rest of row p unnormalized;
  * every other row i gets q_i = -R[i][k] / pivot at (i, k) and q_i times the pivot row added elsewhere (LU-style, as
@@ -417,6 +417,7 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
             }
         }
         int5 cs = {0, bt, 0, 0, 0};
+        infov = v_f32_sel_eq_f32_b(anynan, 1.0f, 0.0f, infov);  // a NaN: info 0, as LAPACK's (NaN pivots are not 0)
         v_f32_st_tnsr_partial(cs, S, v_f32_sel_eq_u32_b(lane, 1u, infov, 0.0f), 1, 0);
     }
 }

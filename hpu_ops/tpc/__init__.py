@@ -1017,7 +1017,9 @@ def _panel(W):
     """Partial pivoting over the whole height of the panel ``W[b, r, c]`` (MAXN < c <= LARGE_MAXN, c <= r):
     ``(rows, X, D, info, key)`` with ``rows[b, c]`` the pivot row of each step (float, exact integers), ``X[b, c, c] =
     W[rows]^-1``, ``D[b, c]`` the pivots (``det W[rows] = prod D``), ``info[b]`` 1 + the first zero pivot (else 0) and
-    ``key[b, r]`` whose ascending order puts the pivot rows first, in order, then the others in theirs. One
+    ``key[b, r]`` whose ascending order puts the pivot rows first, in order, then the others in theirs, and ``R[b, r,
+    c]``, the kernel's in-place panel (``R[rows] = X``, the other rows ``-W[o] X``, computed by the elimination: the
+    multipliers of the Schur update, more accurate than the matmul ``W[o] @ X``), None past ``TALL_MAXM``. One
     ``gj_tall`` launch up to ``TALL_MAXM`` rows; past it a tournament (CALU): each chunk of rows nominates its own
     pivot rows, and the panel of the nominees picks the final ones."""
     b, r, c = W.shape
@@ -1027,12 +1029,13 @@ def _panel(W):
         q, extra = divmod(r, k)
         starts = [i * q + min(i, extra) for i in range(k + 1)]
         nominees = torch.cat([_panel(_fresh(W[:, a:e].contiguous()))[0] + a for a, e in zip(starts, starts[1:])], -1)
-        rows_c, X, D, info, _ = _panel(_rows(W, nominees))
+        rows_c, X, D, info, _, _ = _panel(_rows(W, nominees))
         rows = nominees.gather(-1, rows_c.long())
         key = (_arange(r, W, b) + c).scatter(-1, rows.long(), _arange(c, W, b))
-        return rows, X, D, info, key
+        return rows, X, D, info, key, None
     R, P, Q, D, S = _call(_large_op(), W)
-    return P, _rows(R[..., :c], P), D, S[..., 1], Q
+    R = R[..., :c]
+    return P, _rows(R, P), D, S[..., 1], Q, R
 
 
 def _cat(parts, dim):
@@ -1057,21 +1060,27 @@ def _blocked(A, inverse=True, sign=True):
     for c in _panel_widths(n):
         e = s + c
         W = M[:, s:, s:e] if inverse else M[..., :c]
-        rows, X, D, _, key = _panel(_fresh(W.contiguous()))
+        rows, X, D, _, key, R = _panel(_fresh(W.contiguous()))
         order = key.argsort(-1)
         perm = _cat([perm[:, :s], perm[:, s:].gather(-1, order)], -1)
         Ds.append(D)
+        # K: the rows not taken yet, -W[o] X, from the kernel's elimination (the matmul past TALL_MAXM)
         if inverse:
             tail = _rows(M[:, s:], order)
-            G = X @ tail[:, :c]  # the pivot rows, normalized: X at their own columns
-            G = _cat([G[..., :s], X, G[..., e:]], -1)
+            Mp = tail[:, :c]
+            K = _rows(R, order)[:, c:] if R is not None else -tail[:, c:, s:e] @ X
+            if s:  # the rows already taken: -M[taken, panel] X by a matmul (they were not the kernel's candidates)
+                K = _cat([-M[:, :s, s:e] @ X, K], 1)
             rest = _cat([M[:, :s], tail[:, c:]], 1)
-            C = rest[..., s:e]
-            rest = _cat([rest[..., :s], torch.zeros_like(C), rest[..., e:]], -1) - C @ G
+            Mp0 = _cat([Mp[..., :s], torch.zeros_like(X), Mp[..., e:]], -1)
+            XM = X @ Mp0
+            G = _cat([XM[..., :s], X, XM[..., e:]], -1)
+            rest = _cat([rest[..., :s], K, rest[..., e:]], -1) + K @ Mp0
             M = _cat([rest[:, :s], G, rest[:, s:]], 1)
         elif e < n:
             T = _rows(M, order)
-            M = T[:, c:, c:] - T[:, c:, :c] @ (X @ T[:, :c, c:])
+            K = _rows(R, order)[:, c:] if R is not None else -T[:, c:, :c] @ X
+            M = T[:, c:, c:] + K @ T[:, :c, c:]
         s = e
     D = _cat(Ds, -1)
     # info: 1 + the first zero pivot (the kernel's own info, per panel, is the same test on its D)
@@ -1125,6 +1134,11 @@ def _large(A, B=None, sign=True):
     At = A.mT.contiguous()
     if not _square_pays_for(At):
         Xt, D, S = _blocked(At, sign=sign)
+        # one Newton step X += X (I - A X): the block updates multiply by each pivot block's explicit inverse, which
+        # left the inverse up to 15x CPU float32's error (replica, n = 600); after it, 0.2-0.5x. A non-finite
+        # correction (a singular block: zero rows) is dropped.
+        C = Xt @ (torch.eye(n, dtype=At.dtype, device=At.device) - At @ Xt)
+        Xt = Xt + torch.where(torch.isfinite(C), C, 0.0)
         return (Xt.mT if B is None else Xt.mT @ B), D, S
     R, P, Q, D, S = _square(At, sign)
     Rt = R[..., :n].mT
@@ -1137,29 +1151,54 @@ def _large(A, B=None, sign=True):
     return _rows(Rt @ _rows(B, Q), Q), D, S
 
 
+def _small_inv(A):
+    """``(A^-1, D, S)`` for ``A[b, n, n]`` (n <= ``MAXN``) from the identity kernel run on ``A^T``, as the large path
+    and torch's CPU kernels do (LAPACK factors the row-major A as its column-major A^T): on ``A`` itself the pivot
+    order differs, and Wilkinson-type matrices (``I - tril(1, -1)``, last column 1; condition 11-29) lost every digit
+    to partial pivoting's 2^(n-1) growth, duplicate rows cancelled to det exactly 0 with a zero gradient (torch: the
+    adjugate), ``[[2^100, 2^100], [2^-100, 2^-100]]`` reported det 1 and info 0, and ``[[0, 1], [nan, 1]]`` info 1
+    (code review of main, finding 3). ``D`` and ``S`` are those of ``A^T``'s elimination; ``det A = det A^T``."""
+    X, D, S = _call(_inv_op(), A.mT.contiguous())
+    return X.mT, D, S
+
+
+def _inv_solve(A, B, Ainv):
+    """``A^-1 B`` from the inverse, with one residual step ``X += A^-1 (B - A X)`` (a non-finite correction, from Inf
+    in A, is dropped): on the in-place kernel's float32 replica the forward error then matches LAPACK's from condition
+    1 to 1e7."""
+    X = Ainv @ B
+    C = Ainv @ (B - A @ X)
+    return X + torch.where(torch.isfinite(C), C, 0.0)
+
+
 def gj_solve(A, B):
-    """``(X, D, S)`` for ``A[..., n, n]`` and ``B[..., n, m]`` (float32, n <= ``MAXN``) from the TPC kernel: ``X = A^-1
-    B``, ``D`` the pivots, ``S[..., 0]`` the sign of the permutation and ``S[..., 1]`` the info (1 + the first
-    zero pivot in the kernel's elimination order, else 0; it can differ from LAPACK's);
-    shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
+    """``(X, D, S)`` for ``A[..., n, n]`` and ``B[..., n, m]`` (float32) from the TPC kernels: ``X = A^-1 B`` (the
+    inverse of ``A^T``'s elimination, ``_small_inv`` / ``_large``, times ``B``, one residual step for n <= ``MAXN``),
+    ``D`` the pivots, ``S[..., 0]`` the sign of the permutation and ``S[..., 1]`` the info (1 + the first zero pivot
+    in the kernel's elimination order, else 0); shaped ``[..., n, m]``, ``[..., n]``, ``[..., 2]``."""
     n, m = A.shape[-1], B.shape[-1]
     _check(A, n, B, limit=None)
     if B.dim() < 2 or B.shape[-2] != n:
         raise ValueError(f"hpu_ops.tpc.gj_solve takes B with n rows, got {tuple(A.shape)} and {tuple(B.shape)}")
     batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
-    solve = _chunked if n <= MAXN else _large
-    X, D, S = solve(_flat(A, batch, n, n), _flat(B, batch, n, m))
+    A, B = _flat(A, batch, n, n), _flat(B, batch, n, m)
+    if n <= MAXN:
+        Ainv, D, S = _small_inv(A)
+        X = _inv_solve(A, B, Ainv)
+    else:
+        X, D, S = _large(A, B)
     return _unflatten(X, batch, n, m), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
 def gj_inv(A, sign=True):
-    """``(A^-1, D, S)`` for ``A[..., n, n]``: ``gj_solve`` against the identity, which the kernel builds itself.
-    Past ``MAXN``, ``sign=False`` leaves ``S[..., 0]`` 0 (not computed)."""
+    """``(A^-1, D, S)`` for ``A[..., n, n]``: the kernel on ``A^T`` with the identity as right-hand side, which the
+    kernel builds itself (``_small_inv``; past ``MAXN`` the in-place kernels, ``_large``). Past ``MAXN``,
+    ``sign=False`` leaves ``S[..., 0]`` 0 (not computed)."""
     n = A.shape[-1]
     _check(A, n, limit=None)
     batch = A.shape[:-2]
     A = _flat(A, batch, n, n)
-    X, D, S = _call(_inv_op(), A) if n <= MAXN else _large(A, sign=sign)
+    X, D, S = _small_inv(A) if n <= MAXN else _large(A, sign=sign)
     return _unflatten(X, batch, n, n), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 

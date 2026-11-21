@@ -84,14 +84,17 @@ def _scale(v):
     return np.where((_u32(v) & 0x7FFFFFFF) >= 0x5F800000, F32(2.0 ** -64), F32(1)).astype(F32)
 
 
-def gj_solve(A, B=None, legacy=False, legacy_tiny=False):
+def gj_solve(A, B=None, legacy=False, legacy_tiny=False, legacy_growth=False):
     """``(X, D, S)`` of ``gj_solve_f32_gaudi2.c`` (``gj_inv`` with ``B=None``) for one matrix ``A[n, n]`` and
     ``B[n, m]`` (numpy or torch, any float dtype; converted to float32). ``legacy_tiny=True``: the LU-style kernel
-    before multipliers below 2^-126 were carried scaled (commit 090da6b)."""
+    before multipliers below 2^-126 were carried scaled (commit 090da6b). ``legacy_growth=True``: before the stored
+    pivot row of |pivot| >= 2 was scaled down by a power of two (as gj_large's Codex #17). A NaN in ``A`` gives NaN ``X`` and ``D``
+    and info 0 (not with ``legacy``, the kernel before that)."""
     a = _ftz(np.array(A, dtype=F32))
     n = a.shape[0]
     b = np.eye(n, dtype=F32) if B is None else _ftz(np.array(B, dtype=F32))
     dv = np.zeros(n, F32)
+    dsv = np.zeros(n, F32)  # the k-th pivot times the 2^-e that normalized its row as stored
     sv, info = F32(1), 0
     for k in range(n):
         col = a[:, k].copy()
@@ -137,10 +140,19 @@ def gj_solve(A, B=None, legacy=False, legacy_tiny=False):
             if i != k:
                 a[i] = mac(aps, qs[i], mac(a[k], q[i], a[i]))
                 b[i] = mac(bps, qs[i], mac(b[k], q[i], b[i]))
+        if not (legacy or legacy_growth):  # the pivot row stored normalized by 2^-e (see gj_large)
+            pe = (int(_u32(pk)) >> 23) & 0xFF
+            ns = F32(1) if pe == 255 or pe < 128 else _f32((max(254 - pe, 1)) << 23)  # scaled down only
+            a[k], b[k] = mul(a[k], ns), mul(b[k], ns)
+            dsv[k] = mul(pk, ns)
+        else:
+            dsv[k] = pk
     if not legacy:
-        ds = _scale(dv)
-        dinv = recip(mul(dv, ds), zero_to_inf=False)
+        ds = _scale(dsv)
+        dinv = recip(mul(dsv, ds), zero_to_inf=False)
         b = mul(mul(b, ds[:, None]), dinv[:, None])
+        if np.isnan(np.array(A, dtype=F32)).any():  # a NaN in A: X and D NaN, info 0 (as LAPACK's)
+            b, dv, info = np.full_like(b, np.nan), np.full_like(dv, np.nan), 0
     return b, dv, np.array([sv, info], F32)
 
 
@@ -246,7 +258,7 @@ def gj_large(A, legacy=False, legacy_growth=False):
         ds = _scale(dr)
         R = mul(mul(R, ds[:, None]), recip(mul(dr, ds), zero_to_inf=False)[:, None])
         if np.isnan(a).any():
-            R, D = np.full_like(R, np.nan), np.full_like(D, np.nan)
+            R, D, info = np.full_like(R, np.nan), np.full_like(D, np.nan), F32(0)
     return R, P, Q, D, np.array([0, info], F32)
 
 

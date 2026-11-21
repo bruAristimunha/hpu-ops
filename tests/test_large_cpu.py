@@ -324,7 +324,8 @@ def test_review_nonfinite_info_as_torch(block, info, replica):
     A[:2, :2] = torch.tensor(block)
     _, _, S = tpc.gj_inv(A[None])
     assert int(S[0, 1]) == info == int(torch.linalg.inv_ex(A).info)
-    assert int(kr.gj_large(A.numpy())[4][1]) != info  # main's route, the kernel on A
+    if not np.isnan(block).any():  # a NaN now gives info 0 on either orientation (the kernel's NaN rule)
+        assert int(kr.gj_large(A.numpy())[4][1]) != info  # main's route, the kernel on A
 
 
 
@@ -597,3 +598,25 @@ def test_float64_opt_in_skips_out_overloads():
     k = object()
     assert linalg._float64_kernel("hpu", torch.ops.aten.linalg_solve_triangular.out, k) is k
     assert linalg._float64_kernel("cpu", torch.ops.aten.linalg_inv_ex.default, k) is not k  # wrapped, inert on cpu
+
+
+def test_codex3_huge_identity_solve_is_exact(large_on_cpu):
+    """Codex review of #34, #3: ``2^127 I`` (n = 65) with B its first column. Its inverse 2^-127 I flushes on the card,
+    so the solve returned 0 with info 0; equilibrated by a power of two (``linalg._equilibrate``) it is exact."""
+    A = 2.0 ** 127 * torch.eye(65)
+    B = A[:, :1].clone()
+    with cpu_as_hpu(linalg.install_solve):
+        X, info = torch.linalg.solve_ex(A, B)
+    assert torch.equal(X, torch.eye(65)[:, :1]) and int(info) == 0
+    with cpu_as_hpu(linalg.install_inv_det):
+        sign, logabsdet = torch.linalg.slogdet(A)
+    assert float(sign) == 1 and abs(float(logabsdet) - 65 * 127 * float(torch.log(torch.tensor(2.0)))) < 1e-2
+
+
+def test_equilibration_is_exact_on_ordinary_inputs(large_on_cpu):
+    """A power of two: on ordinary inputs the equilibrated route's results equal the unscaled kernel's bit for bit."""
+    A = permuted(2, 70, seed=9)
+    X0, D0, S0 = tpc.gj_inv(A)
+    for k in (-40, 0, 37):
+        X, D, S = linalg._gj_inv(A * 2.0 ** k)
+        assert torch.equal(X * 2.0 ** k, X0) and torch.equal(D * 2.0 ** -k, D0) and torch.equal(S, S0)

@@ -120,10 +120,12 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
 
     for (int bt = off[0]; bt < off[0] + size[0]; bt++)
     {
+        float64 nanv = 0.0f;  // lane-wise: 1 where a NaN of A was seen
         for (int i = 0; i < n; i++)
         {
             int5 c = {0, i, bt, 0, 0};
             a[i] = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, v_f32_ld_tnsr_b(c, A));
+            nanv = v_f32_sel_eq_f32_b(a[i], a[i], nanv, 1.0f);
 #ifdef IDENTITY_B
             b[i] = v_f32_sel_eq_u32_b(lane, (unsigned)i, 1.0f, 0.0f);
 #else
@@ -131,6 +133,7 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
 #endif
         }
         float64 dv = 0.0f;
+        float64 dsv = 0.0f;  // lane k: the k-th pivot times the 2^-e that normalized its row as stored
         float64 sv = 1.0f;
         float64 infov = 0.0f;
         for (int k = 0; k < n; k++)
@@ -215,15 +218,41 @@ void main(tensor A, tensor B, tensor X, tensor D, tensor S)
                 a[i] = v_f32_mac_b(aps, ls, v_f32_mac_b(ap, l, a[i]));
                 b[i] = v_f32_mac_b(bps, ls, v_f32_mac_b(bp, l, b[i]));
             }
+            // A pivot row of |pivot| >= 2 is stored scaled down by ns = 2^-e (pivot = 2^e m, m in [1, 2); exact but
+            // for entries below 2^-126 x pivot, which flush): a used row's later quotient is then bounded by its
+            // entries over the new pivot, not by them times its own pivot, which overflowed on A^T of [[2^64, 2^-64],
+            // [2^64, 2^-63]] (the used row's quotient 2^128, NaN; as Codex review #17 in gj_large). Never scaled up:
+            // B's row times 2^-e > 1 could overflow (Codex #3's 2^127 right-hand side). e = 127 takes 2^-126 (2^-127
+            // is subnormal); a non-finite pivot is not scaled. The final division takes pivot x ns.
+            const uint64 pe = v_u32_shr_b(v_u32_and_b(as_uint64(pk), 0x7F800000u), 23);
+            uint64 nsb = v_u32_shl_b(254u - pe, 23);
+            nsb = v_u32_sel_geq_u32_b(pe, 254u, 0x00800000u, nsb);
+            nsb = v_u32_sel_eq_u32_b(pe, 255u, 0x3F800000u, nsb);
+            nsb = v_u32_sel_less_u32_b(pe, 128u, 0x3F800000u, nsb);  // |pivot| < 2 (and zero, subnormal): not scaled
+            const float64 ns = as_float64(nsb);
+            a[k] = v_f32_mul_b(ap, ns);
+            b[k] = v_f32_mul_b(bp, ns);
+            dsv = v_f32_sel_eq_u32_b(lane, (unsigned)k, v_f32_mul_b(pk, ns), dsv);
         }
         // A is now diagonal (the pivots dv, up to the unread residues left of each diagonal): X row i = B row i / d_i,
         // with the same 2^-64 scaling of huge pivots; a zero pivot gives a zero row
-        float64 dscale = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(dv), 0x7FFFFFFFu), 0x5F800000u, 0x1p-64f, 1.0f);
-        float64 dinv = lut_free_recip(v_f32_mul_b(dv, dscale));
+        float64 dscale = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(dsv), 0x7FFFFFFFu), 0x5F800000u, 0x1p-64f, 1.0f);
+        float64 dinv = lut_free_recip(v_f32_mul_b(dsv, dscale));
+        // a NaN in A: X and D all NaN and info 0, as LAPACK's (its NaN pivots are not zero); the elimination's need
+        // not be (a NaN candidate never wins the pivot search, so a column of zeros could report a zero pivot)
+        float64 anynan = 0.0f;
+        for (int l = 0; l < 64; l++)
+        {
+            anynan = v_f32_sel_eq_f32_b(lane_bcast(nanv, l), 1.0f, 1.0f, anynan);
+        }
+        const float64 qnan = as_float64(v_u32_or_b(v_u32_and_b(as_uint64(anynan), 0u), 0x7FC00000u));
         for (int i = 0; i < n; i++)
         {
             b[i] = v_f32_mul_b(v_f32_mul_b(b[i], lane_bcast(dscale, i)), lane_bcast(dinv, i));
+            b[i] = v_f32_sel_eq_f32_b(anynan, 1.0f, qnan, b[i]);
         }
+        dv = v_f32_sel_eq_f32_b(anynan, 1.0f, qnan, dv);
+        infov = v_f32_sel_eq_f32_b(anynan, 1.0f, 0.0f, infov);
         for (int i = 0; i < n; i++)
         {
             int5 c = {0, i, bt, 0, 0};

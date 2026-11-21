@@ -446,12 +446,12 @@ CASES = (
     Case("linalg.slogdet.huge_pivot", make_huge_pivot, lambda x: L.slogdet(x), err_slogdet, None, float64=False,
          tpc=True, sizes=(70,)),
     # a small batch (the blocked route below LARGE_MAXN) and past LARGE_MAXN (the blocked route)
-    Case("linalg.solve.batch2", make_solve, lambda a, b: L.solve(a, b), float64=False, tpc=True, sizes=(384, 600),
-         batch=2),
-    Case("linalg.inv.batch2", make_pivoting, lambda x: L.inv(x), float64=False, tpc=True, sizes=(384, 600), batch=2),
-    Case("linalg.det.batch2", make_pivoting, lambda x: L.det(x), float64=False, tpc=True, sizes=(600,), batch=2),
-    Case("linalg.slogdet.batch2", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, float64=False,
-         tpc=True, sizes=(384, 1100), batch=2),
+    Case("linalg.solve.batch4", make_solve, lambda a, b: L.solve(a, b), float64=False, tpc=True, sizes=(384, 600),
+         batch=4),
+    Case("linalg.inv.batch4", make_pivoting, lambda x: L.inv(x), float64=False, tpc=True, sizes=(384, 600), batch=4),
+    Case("linalg.det.batch4", make_pivoting, lambda x: L.det(x), float64=False, tpc=True, sizes=(600,), batch=4),
+    Case("linalg.slogdet.batch4", make_pivoting, lambda x: L.slogdet(x), err_slogdet, loss_slogdet, float64=False,
+         tpc=True, sizes=(384, 1100), batch=4),
     Case("linalg.solve.cayley", make_cayley, lambda a, b: L.solve(a, b), float64=False, tpc=True, sizes=(96, 220)),
     Case("linalg.solve.left_false_large", make_solve_right, lambda a, b: L.solve(a, b, left=False), float64=False,
          tpc=True, sizes=(220,)),
@@ -996,7 +996,8 @@ def run_codex_case(name, fn, ins, expect):
             err = max(errs, default=0.0)
             row["max_rel_err"] = err
             problems += [f"error {err:.3g} > 1e-6"] * (not err <= 1e-6)
-        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings(rec)
+        # hpu-ops' CPU route is judged below: allowed only where torch raises (it reproduces torch's error there)
+        problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings({**rec, "cpu_route": 0})
         problems += [f"took hpu-ops' CPU route {row['cpu_route']}x"] * bool(row["cpu_route"] and want_err is None
                                                                             and expect != "raise")
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
