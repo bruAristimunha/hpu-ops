@@ -1322,7 +1322,7 @@ def test_lstsq_matches_torch_full_rank(a_shape, b_shape, driver, svd_hook):
     torch.testing.assert_close(got.singular_values, want.singular_values)
 
 
-def test_lstsq_declines_rank_deficient_and_double_backward(svd_hook):
+def test_lstsq_declines_rank_deficient_and_double_backward(svd_hook, monkeypatch):
     torch.manual_seed(0)
     A_rd = torch.randn(5, 2, dtype=torch.float64) @ torch.randn(2, 4, dtype=torch.float64)
     B_rd = torch.randn(5, 2, dtype=torch.float64)
@@ -1339,12 +1339,24 @@ def test_lstsq_declines_rank_deficient_and_double_backward(svd_hook):
         assert calls["lstsq"] >= 1
 
     # compiled: the rank-revealing default driver is declined while tracing (rank and residuals need the values),
-    # gels is taken; both match torch
+    # gels is taken; both match torch. svd_reference branches on values (its MGS repair) and cannot be traced, the
+    # device kernel can, so a traceable SVD stands in under fake tensors: otherwise tracing stops and whether the
+    # kernel then runs depends on how the torch version falls back to eager. A taken call leaves that SVD in the
+    # graph; a declined one leaves torch's lstsq, which graph-breaks (data-dependent output shape).
+    def traceable_svd(A_, compute_uv):
+        if not linalg._is_fake(A_):
+            return tpc.svd_reference(A_, compute_uv=compute_uv)
+        if not compute_uv:
+            return A_.new_empty(0), torch.linalg.svdvals(A_), A_.new_empty(0)
+        return torch.linalg.svd(A_, full_matrices=False)
+
+    monkeypatch.setattr(linalg, "_SVD", traceable_svd)
     for driver, taken in ((None, False), ("gels", True)):
         nodes = []
         with cpu_as_hpu(linalg.install_lstsq) as calls:
             got_c = compiled(lambda a, b: torch.linalg.lstsq(a, b, driver=driver).solution, nodes)(A.detach(), B.detach())
             assert (calls["lstsq"] >= 1) == taken
+        assert ("aten._linalg_svd.default" in ops(nodes)) == taken, ops(nodes)
         torch.testing.assert_close(got_c, torch.linalg.lstsq(A.detach(), B.detach(), driver=driver).solution)
 
 
@@ -1616,23 +1628,27 @@ def test_lstsq_rcond_zero_vs_negative(driver, rcond, svd_hook):
     torch.manual_seed(0)
     eps = torch.finfo(torch.float32).eps
     B = torch.randn(6, 2)
+    # A = [diag(S); 0] has exactly the singular values S (max 1), each at least 1.4x away from the threshold, so the
+    # expected rank and minimum-norm solution follow from torch's documented rule (rank = #{s > rcond * s_max},
+    # rcond = None -> eps * max(m, n)), not from one LAPACK's. A declined call is torch's own kernel: its rank on these
+    # inputs is backend-dependent (Linux gelsy returned 3, 2 and 1 for the same s_min = 0.7 eps), so only the routing
+    # is checked there.
+    m, n = 6, 4
+    thresh = max(m, n) * eps if (rcond is None or rcond < 0) else (0.5 * eps if driver == "gelsd" else 0.0)
     for s_min in (1e-3, 10.0 * eps, 3.0 * eps, 0.7 * eps, 0.2 * eps, 0.0):
         S = torch.tensor([1.0, 1.0, 1.0, s_min], dtype=torch.float32)
-        A = torch.cat([torch.diag(S), torch.zeros(2, 4)])
-        want = torch.linalg.lstsq(A, B, rcond=rcond, driver=driver)
+        A = torch.cat([torch.diag(S), torch.zeros(m - n, n)])
         with cpu_as_hpu(linalg.install_lstsq) as calls:
             got = torch.linalg.lstsq(A, B, rcond=rcond, driver=driver)
-        assert torch.equal(got.rank, want.rank)
-        thresh = 6.0 * eps if (rcond is None or rcond < 0) else (0.5 * eps if driver == "gelsd" else 0.0)
-        accept = s_min > thresh
+        kept = S > thresh * S.max()
+        accept = bool(kept.all())
         assert (calls["lstsq"] >= 1) == accept
-        if s_min >= 1e-3:
-            torch.testing.assert_close(got.solution, want.solution, rtol=1e-4, atol=1e-4)
-        elif not accept and torch.isfinite(want.solution).all():
-            torch.testing.assert_close(got.solution, want.solution)
-        elif s_min >= 10.0 * eps:
-            assert torch.isfinite(got.solution).all()
-            torch.testing.assert_close(got.solution, want.solution, rtol=1e-3, atol=1e-3)
+        if not accept:
+            continue
+        assert got.rank.dtype == torch.int64 and torch.equal(got.rank, kept.sum())
+        want_solution = (B[:n].double() / S.double().unsqueeze(-1)).float()
+        assert torch.isfinite(got.solution).all()
+        torch.testing.assert_close(got.solution, want_solution, rtol=1e-4, atol=1e-4)
 
 
 # ---- matrix_exp & householder_product (#13)
