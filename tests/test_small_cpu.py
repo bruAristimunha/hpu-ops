@@ -144,3 +144,103 @@ def test_bincount_traced_and_0d_and_deterministic_keep_atens_behaviour():
     same(compiled, torch.bincount(x), exact=True)
     same(det, torch.bincount(x), exact=True)
     assert calls["bincount"] >= 1
+
+
+# ---- transforms and tracers decline (coordinator review) ------------------------------------------------------------
+
+def _counts_input():
+    return torch.randint(0, 9, (1 << 16,))
+
+
+def test_bincount_under_jvp_and_forward_ad_keeps_atens_kernel():
+    x = _counts_input()
+    ref = torch.bincount(x)
+    with cpu_as_hpu(small.install_bincount) as calls:
+        out, tangent = torch.func.jvp(lambda t: torch.bincount(x) + 0 * t.sum(), (torch.ones(3),), (torch.ones(3),))
+        with torch.autograd.forward_ad.dual_level():
+            fw = torch.bincount(x)
+    assert calls["bincount"] == 0
+    same(out.long(), ref, exact=True)  # the 0 * t term makes the jvp output float
+    same(fw, ref, exact=True)
+
+
+def test_bincount_under_vmap_is_exact():
+    """bincount has no vmap batching rule: torch's fallback calls it once per sample on plain tensors, outside the
+    transform (no functorch layer is visible there), so the rewrite may take those calls; the result is ATen's."""
+    xs = torch.stack([_counts_input(), _counts_input()])
+    ref = torch.stack([torch.bincount(x, minlength=9) for x in xs])
+    with cpu_as_hpu(small.install_bincount) as calls, pytest.warns(UserWarning, match="batching rule"):
+        out = torch.vmap(lambda t: torch.bincount(t, minlength=9))(xs)
+    assert calls["bincount"] in (0, 2)
+    same(out, ref, exact=True)
+
+
+@pytest.mark.parametrize("mode", ["real", "fake", "symbolic"])
+def test_bincount_under_make_fx_keeps_atens_kernel(mode):
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    x = _counts_input()
+    f = lambda t: torch.bincount(t, minlength=9)
+
+    def trace():
+        try:
+            return make_fx(f, tracing_mode=mode)(x), None
+        except Exception as e:  # noqa: BLE001  (data-dependent output: torch's own fake tracing refuses)
+            return None, type(e)
+
+    native_gm, native_err = trace()
+    with cpu_as_hpu(small.install_bincount) as calls:
+        gm, err = trace()
+    assert calls["bincount"] == 0
+    assert err is native_err  # the same outcome as torch's own kernel (fake / symbolic: DynamicOutputShapeException)
+    if gm is not None:
+        assert "bincount" in str(gm.graph) and "histc" not in str(gm.graph)
+        same(gm(x), torch.bincount(x, minlength=9), exact=True)
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_bincount_under_compile_keeps_atens_kernel_while_tracing(backend):
+    x = _counts_input()
+    torch._dynamo.reset()
+    with cpu_as_hpu(small.install_bincount) as calls:
+        out = torch.compile(lambda t: torch.bincount(t) + 1, backend=backend, fullgraph=False)(x)
+    same(out, torch.bincount(x) + 1, exact=True)
+    assert calls["bincount"] <= 1  # a graph break may run the call eagerly (then taken); traced calls are not
+
+
+# ---- every histc interval the chunker generates ---------------------------------------------------------------------
+
+def _chunk_intervals(bins):
+    c = small.BINCOUNT_CHUNK
+    if bins <= c:
+        return [(0, bins - 1, bins)]
+    starts = list(range(0, bins - c, c)) + [bins - c]
+    return [(a, a + c - 1, c) for a in starts]
+
+
+def test_every_chunk_interval_maps_every_integer_to_its_own_bin_exactly():
+    """For every bin count 1..4096: each histc interval [lo, hi] with n bins puts each integer lo..hi in bin v - lo,
+    the closed last edge hi in the last bin, and lo - 1 / hi + 1 outside, as CPU float32 histc; and the bin edges
+    lo + k (hi - lo) / (n - 1) ... computed as histc does are exact in float32 there."""
+    seen = set()
+    for bins in range(1, small.BINCOUNT_MAX_BINS + 1):
+        seen.update(_chunk_intervals(bins))
+    for lo, hi, n in sorted(seen):
+        vals = torch.arange(lo - 1, hi + 2, dtype=torch.float32)
+        got = torch.histc(vals, n, lo, hi) if n > 1 else torch.histc(vals[1:-1], 1, lo, hi)
+        assert torch.equal(got, torch.ones(n)), (lo, hi, n)
+        # bin index of v as float32 arithmetic: (v - lo) * n / (hi - lo), floored, last edge clamped
+        v = torch.arange(lo, hi + 1, dtype=torch.float32)
+        idx = ((v - lo) * (n / max(hi - lo, 1))).floor().clamp(max=n - 1) if n > 1 else torch.zeros(1)
+        assert torch.equal(idx.long(), torch.arange(n)), (lo, hi, n)
+    assert len(seen) > 256
+
+
+@pytest.mark.parametrize("hi", [(1 << 24) - 1, (1 << 24) - 2, (1 << 23) + 1, 4095])
+def test_large_integer_values_stay_exact_in_float32_and_fall_outside_chunks(hi):
+    """Values up to 2**24 - 1 convert to float32 exactly; values past the bins never land in a chunk (the rewrite
+    declines past 4096 bins, but a value 2**24 - 1 in an input with minlength must not alias a small bin)."""
+    v = torch.tensor([hi], dtype=torch.int64)
+    assert int(v.float().item()) == hi
+    for lo, top, n in _chunk_intervals(4096):
+        assert torch.histc(v.float(), n, lo, top).sum() == (1 if lo <= hi <= top else 0)

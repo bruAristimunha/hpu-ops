@@ -26,9 +26,9 @@ Registered at ``AutogradHPU``; calls it does not take (weights, other dtypes and
 """
 import torch
 from torch._C import DispatchKey
-from torch._subclasses.fake_tensor import is_fake
 
 from ._dispatch import count, register_kernels, static
+from .linalg import _is_fake, _transformed
 
 aten = torch.ops.aten
 BINCOUNT_MIN_NUMEL = 1 << 16  # below, one host read plus histc is not faster than Habana's kernel (measured)
@@ -39,8 +39,16 @@ INTEGRAL = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
 
 
 def _concrete(x):
-    """True outside any tracer: the host read needs real values (a traced graph keeps Habana's lowering)."""
-    return torch._guards.detect_fake_mode() is None and not is_fake(x) and not torch._is_functional_tensor(x)
+    """True for a plain eager call: the host read needs real values, outside any transform or tracer. Declined, so
+    Habana's kernel runs: functorch transforms and forward-mode AD (``linalg._transformed``; the layer depth too,
+    since below ``torch.func.grad``'s layer the interpreter stack reads empty), fake or functional tensors and
+    ``torch.compile`` (``linalg._is_fake``), and any ``__torch_dispatch__`` mode such as ``make_fx``'s proxy mode
+    (``is_compiling()`` is false inside AOT dispatch)."""
+    if _transformed() or torch._C._functorch.get_dynamic_layer_stack_depth() > 0 or _is_fake(x):
+        return False
+    if torch._C._len_torch_dispatch_stack() > 0 or torch._guards.detect_fake_mode() is not None:
+        return False
+    return not torch._is_functional_tensor(x) and not torch._C._functorch.is_functorch_wrapped_tensor(x)
 
 
 def bincount_histc(x, bins):
