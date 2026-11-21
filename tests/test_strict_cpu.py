@@ -198,7 +198,8 @@ def test_det_double_backward_host_read():
     det = torch.linalg.det(A)
     with pytest.raises(hpu_ops.CPUExecutionError, match="singular check"):
         with hpu_ops.strict(watch_cpu_ops=False), torch.enable_grad():
-            linalg._det_backward(A, det, torch.ones_like(det), torch.linalg.inv)
+            # inv_ex: the card's inverse does not raise on a singular matrix (CPU torch's inv does from 2.15)
+            linalg._det_backward(A, det, torch.ones_like(det), lambda M: torch.linalg.inv_ex(M)[0])
 
 
 def test_save_is_allowed():
