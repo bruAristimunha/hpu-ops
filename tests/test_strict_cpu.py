@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import hpu_ops
+from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 from hpu_ops import _strict, linalg, serialization
 
 aten = torch.ops.aten
@@ -19,7 +20,7 @@ def clean():
     hpu_ops.strict_reset()
     yield
     hpu_ops.strict_reset()
-    assert _strict._STATE["level"] is None
+    assert not _strict.active()
 
 
 class FakeBridge:
@@ -215,20 +216,22 @@ def test_env(monkeypatch):
     monkeypatch.setattr(_strict, "_STATE", {**_strict._STATE, "atexit": True})  # no table at the tests' exit
     try:
         assert _strict.from_env() == "report"
-        assert _strict._STATE["level"] == "report" and _strict._STATE["allow"] == {"cpu op"}
+        assert _strict._config().level == "report" and _strict._config().allow == {"cpu op"}
         linalg._on_cpu(aten.linalg_inv.default, (torch.randn(2, 2) + 2 * torch.eye(2),), {})
         assert hpu_ops.strict_report()[0][1] == "aten::linalg_inv"
         assert _strict.from_env() == "report"  # once per process: no second watch
-        assert _strict._STATE["watches"] == 1
+        assert sum(isinstance(m, _strict._Watch) for m in _get_current_dispatch_mode_stack()) == 1
     finally:
-        _strict._STATE.pop("env_context").__exit__(None, None, None)
+        _strict._STATE.pop("env_config")
+        _strict._STATE.pop("env_block").exit(False)
     monkeypatch.setenv("HPU_OPS_STRICT", "0")
     assert _strict.from_env() is None
 
 
-def test_compile_still_compiles_after_a_strict_block():
-    """The watch is an infra mode: Dynamo compiles under it, and a frame first called inside a block is not skipped
-    for good (review: under a plain dispatch mode, 0 graphs over 1 strict + 3 plain steps)."""
+def test_compiled_code_runs_eagerly_in_a_block_and_compiles_after():
+    """Inside a per-op block compiled code runs eagerly (force_eager): no frame is skipped for good (a plain dispatch
+    mode: 0 graphs over 1 strict + 3 plain steps) and nothing recompiles at every call (an infra mode: the guards see
+    the mode's dispatch keys)."""
     compiles = {"n": 0}
 
     def backend(gm, example_inputs):
@@ -247,9 +250,13 @@ def test_compile_still_compiles_after_a_strict_block():
     model = torch.compile(Net(), backend=backend)
     x = torch.randn(4, 8)
     with hpu_ops.strict("report", watch_cpu_ops=False):
+        for _ in range(4):
+            model(x)
+    assert compiles["n"] == 0
+    for _ in range(3):
         model(x)
     assert compiles["n"] == 1
-    model(torch.randn(5, 8))  # a new shape after the block still compiles
+    model(torch.randn(5, 8))  # a new shape after the block compiles too
     assert compiles["n"] == 2
 
 
@@ -314,3 +321,65 @@ def test_the_watch_is_not_a_foreign_mode():
 def test_save_frames_are_skipped():
     with hpu_ops.strict(watch_cpu_ops=False):
         torch.save(torch.randn(3), io.BytesIO())
+
+
+def test_threads_have_their_own_blocks():
+    import threading
+
+    seen = {}
+
+    def other():
+        seen["active"] = _strict.active()
+        with hpu_ops.strict("report", watch_cpu_ops=False):
+            seen["inner"] = _strict.active()
+
+    with hpu_ops.strict():
+        thread = threading.Thread(target=other)
+        thread.start()
+        thread.join()
+    assert seen == {"active": False, "inner": True}
+    assert not _strict.active()
+
+
+def test_inner_block_settings_apply():
+    x = torch.randn(5)
+    with hpu_ops.strict("raise"):
+        with hpu_ops.strict("raise", watch_cpu_ops=False):
+            x * 2  # no cpu op row inside the inner block
+        with pytest.raises(hpu_ops.CPUExecutionError):
+            x * 2
+
+
+def test_views_and_metadata_are_not_cpu_ops():
+    x = torch.randn(4, 3)
+    with hpu_ops.strict():
+        x.t()
+        x.view(12)
+        x.detach()
+        torch.empty(3, 3)
+
+
+def test_higher_order_ops_run():
+    x = torch.randn(3)
+    with hpu_ops.strict("report", watch_cpu_ops=False):
+        out = torch.cond(x.sum() > 0, lambda v: v + 1, lambda v: v - 1, (x,))
+    assert out.shape == x.shape
+
+
+def test_fake_tensors_are_not_cpu_ops():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with hpu_ops.strict(), FakeTensorMode():
+        torch.randn(4) * torch.zeros(4)
+
+
+def test_per_op_env_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("HPU_OPS_STRICT", "report")
+    monkeypatch.setenv("HPU_OPS_STRICT_PER_OP", "OFF")
+    monkeypatch.setattr(_strict, "_STATE", {**_strict._STATE, "atexit": True})
+    try:
+        assert _strict.from_env() == "report"
+        assert not any(isinstance(m, _strict._Watch) for m in _get_current_dispatch_mode_stack())
+    finally:
+        _strict._STATE.pop("env_config")
+        _strict._STATE.pop("env_block").exit(False)

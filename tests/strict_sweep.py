@@ -23,6 +23,7 @@ import torch
 LAZY = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
 HPU = torch.device("hpu")
 BATCH, STEPS, TIMED = 32, 3, 5
+PER_OP = True  # --step-check: no dispatch mode, the counters read per block (the program as it runs unwatched)
 BRIDGE = "1.21.4"
 
 
@@ -132,7 +133,7 @@ def run(name, make, hpu_ops, compiled):
             stage = "warm-up"
             hpu_ops.strict_reset()
             if compiled:  # tracing and compiling: hpu-ops' routes are seen here, once
-                with hpu_ops.strict("report"):
+                with hpu_ops.strict("report", per_op=PER_OP):
                     step()
                     sync()
                 row["trace_rows"] = rows(hpu_ops)
@@ -141,7 +142,7 @@ def run(name, make, hpu_ops, compiled):
                 step()
                 sync()
             stage = "strict steps"
-            with hpu_ops.strict("report"):
+            with hpu_ops.strict("report", per_op=PER_OP):
                 for _ in range(STEPS):
                     keep = step()
                 sync()
@@ -159,7 +160,7 @@ def run(name, make, hpu_ops, compiled):
             with torch.inference_mode():
                 fwd(xb)  # warm-up (compile: a graph of its own)
                 sync()
-                with hpu_ops.strict("report"):
+                with hpu_ops.strict("report", per_op=PER_OP):
                     out = fwd(xb)
                     sync()
                 row["infer_rows"] = rows(hpu_ops)
@@ -183,9 +184,13 @@ def main():
     parser.add_argument("--models", default="")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--out", default="")
+    parser.add_argument("--step-check", action="store_true",
+                        help="strict(per_op=False): no dispatch mode at all, bridge and hpu_complex counters per block")
     parser.add_argument("--resume", action="store_true",
                         help="skip the models --out has; a model started and never finished is recorded as crashed")
     args = parser.parse_args()
+    global PER_OP
+    PER_OP = not args.step_check
     import hpu_complex
 
     hpu_complex.enable()

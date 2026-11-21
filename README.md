@@ -98,21 +98,26 @@ What it sees (source column of the report):
 `allow=("host sync", "cpu op")` (or `HPU_OPS_STRICT_ALLOW="host sync,cpu op"`) leaves sources out. `torch.save`'s
 host copy is never counted.
 
-The per-op attribution is a `TorchDispatchMode`, declared an infra mode so that torch.compile still compiles under
-it (under an ordinary mode Dynamo skips the frame, and keeps skipping it after the block). It costs about 40-60 us
-per op (bridge 1.21.4, eager and lazy, `tests/strict_probe.py`), so time steps outside it. What it cannot see:
+The per-op attribution is a `TorchDispatchMode`. It costs about 40-60 us per op (bridge 1.21.4, eager and lazy,
+`tests/strict_probe.py`), so time steps outside it. A dispatch mode and torch.compile do not mix: under an ordinary
+mode Dynamo skips the frame and keeps skipping it after the block; under an infra mode it recompiles at every call
+(its guards see the mode's dispatch keys). So inside a per-op block, compiled code runs eagerly
+(`torch.compiler.set_stance("force_eager")`, undone when the block ends, process-wide while it lasts): a per-op block
+checks the eager program. To check the compiled program, use `strict(per_op=False)` (`HPU_OPS_STRICT_PER_OP=0`):
+no mode, the bridge's and hpu-complex's counters read when the block ends (at exit for the environment form, or at
+`hpu_ops.strict_check()`), named by op, without a frame; hpu-ops' own routes are still raised where they run,
+marked when that is while a graph is traced (they are then nodes of the graph). What strict mode cannot see:
 
-- ops inside a compiled graph's Habana recipes, and inside C++ kernels (hpu-complex's own copies, Habana's): their
-  fallbacks come from the counters, named by op without a frame, at the next op or when the block ends
-  (`hpu_ops.strict_check()` reads them on demand). hpu-ops' own routes inside a compiled graph are seen once, when
-  the graph is traced (marked so in the error).
-- ops under hpu-complex's `complex_mode()` (it disables the modes below it), and host syncs inside an op's
-  kernel (`nonzero`, `torch.equal`).
+- ops inside C++ kernels (hpu-complex's own copies, Habana's) other than through their counters, and host syncs
+  inside an op's kernel (`nonzero`, `torch.equal`);
+- ops under hpu-complex's `complex_mode()` (it disables the modes below it);
+- complex64 `mm`/`bmm` against a `set_matmul_cpu_threshold` value set before the first strict block (the extension
+  has no getter: strict mode assumes 2^22 until it sees the setter called).
 
-`strict(per_op=False)` (`HPU_OPS_STRICT_PER_OP=0`) drops the mode and reads the counters only when the block ends
-(at exit for the environment form). Strict mode is off in forked DataLoader workers and while `torch.save` runs. The
-inventory of the 21 SPD models and the braindecode zoo under strict mode is in `INVENTORY.md`
-(`tests/strict_sweep.py`, `tests/strict_inventory.py`).
+Strict mode is per thread (autograd's threads follow the block's watch), off in DataLoader workers (forked or
+spawned) and while `torch.save` runs; `torch.export` inside a per-op block is not supported. The inventory of the 21
+SPD models and the braindecode zoo under strict mode is in `INVENTORY.md` (`tests/strict_sweep.py`,
+`tests/strict_inventory.py`).
 
 ## What it fixes
 

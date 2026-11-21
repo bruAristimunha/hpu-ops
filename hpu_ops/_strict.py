@@ -14,15 +14,16 @@ exit (``report()`` returns the rows). The sources:
   caller's code.
 - ``host copy``: a device tensor copied to the CPU (``.cpu()``, ``.to("cpu")``), outside hpu-ops' named routes.
 - ``cpu op``: an op computing CPU tensors of more than one element inside the step (the caller's or a library's);
-  copies of CPU tensors to the card are not.
+  views, metadata ops and copies of CPU tensors to the card are not.
 
-Per-op attribution is a ``TorchDispatchMode`` (``per_op=True``, the default), declared an infra mode so that
-torch.compile still compiles under it (Dynamo skips frames, for good, under other modes); the ops a compiled graph
-runs inside Habana's recipes are seen through the bridge's counter only, at the next op or when the block ends.
-``per_op=False`` (``HPU_OPS_STRICT_PER_OP=0``) reads the counters only when the block ends (or at ``check()``), named
+Per-op attribution is a ``TorchDispatchMode`` (``per_op=True``, the default). A dispatch mode and torch.compile do
+not mix (Dynamo skips the frames for good, or, as an infra mode, recompiles at every call: its guards see the mode's
+dispatch keys), so inside a per-op block torch.compile'd code runs eagerly (``set_stance("force_eager")``, undone
+when the block ends): the check is of the eager program. ``per_op=False`` (``HPU_OPS_STRICT_PER_OP=0``) leaves
+compilation alone and reads the bridge's and hpu-complex's counters when the block ends (or at ``check()``), named
 by op, without a stack frame. ``HPU_OPS_STRICT_ALLOW`` (or ``allow=``) lists sources, comma-separated, that are not
-raised nor counted, e.g. ``host sync,cpu op``. Strict mode is off in forked children (DataLoader workers) and while
-``torch.save`` runs.
+raised nor counted, e.g. ``host sync,cpu op``. Strict mode is per thread (autograd's threads follow the watch), off
+in DataLoader workers (forked or spawned) and while ``torch.save`` runs.
 """
 import atexit
 import collections
@@ -40,6 +41,7 @@ __all__ = ["CPUExecutionError", "strict", "record", "route", "host_read", "allow
 ENV, ENV_PER_OP, ENV_ALLOW = "HPU_OPS_STRICT", "HPU_OPS_STRICT_PER_OP", "HPU_OPS_STRICT_ALLOW"
 SOURCES = ("bridge fallback", "hpu_ops route", "hpu_complex", "host sync", "host copy", "cpu op")
 COMPLEX_MATMUL_CPU_BELOW = 1 << 22  # hpu_complex's default threshold, tracked through set_matmul_cpu_threshold
+OFF = ("", "0", "false", "off", "no")
 aten = torch.ops.aten
 
 
@@ -47,18 +49,49 @@ class CPUExecutionError(RuntimeError):
     """An HPU step ran something on the CPU (strict mode)."""
 
 
-_STATE = {"level": None, "allow": frozenset(), "counts": collections.Counter(), "where": {}, "baseline": None,
-          "atexit": False, "watches": 0, "matmul_cpu_below": COMPLEX_MATMUL_CPU_BELOW}
+class _Config:
+    """One strict block's settings."""
+
+    def __init__(self, level, allow=(), watch_cpu_ops=True):
+        self.level, self.allow, self.watch_cpu_ops = level, frozenset(allow), watch_cpu_ops
+
+
+# Counts and the counters' baseline are process-wide (the bridge's metric is); the settings are per thread.
+_STATE = {"counts": collections.Counter(), "where": {}, "baseline": None, "atexit": False,
+          "matmul_cpu_below": COMPLEX_MATMUL_CPU_BELOW}
 _TLS = threading.local()
 
 
+def _watch_on_stack():
+    for mode in reversed(_get_current_dispatch_mode_stack()):
+        if isinstance(mode, _Watch):
+            return mode
+    return None
+
+
+def _config():
+    """The settings in effect on this thread: its innermost block's, else (autograd's threads, the watch's own
+    handler) the watch's."""
+    blocks = getattr(_TLS, "blocks", None)
+    if blocks:
+        return blocks[-1]
+    watch = getattr(_TLS, "watch", None) or _watch_on_stack()
+    return watch.config if watch is not None else None
+
+
 def active():
-    """Whether strict mode is on (raise or report)."""
-    return _STATE["level"] is not None
+    """Whether strict mode is on (raise or report) on this thread."""
+    return _config() is not None
 
 
-def _reset_in_child():  # a forked DataLoader worker computes on the CPU by design
-    _STATE.update(level=None, baseline=None, watches=0)
+def _reset_in_child():
+    """A forked child (a DataLoader worker) computes on the CPU by design: strict mode off, the watch popped."""
+    _TLS.blocks = []
+    _TLS.watch = None
+    from torch.utils._python_dispatch import _pop_mode
+
+    while _get_current_dispatch_mode_stack() and isinstance(_get_current_dispatch_mode_stack()[-1], _Watch):
+        _pop_mode()
 
 
 if hasattr(os, "register_at_fork"):
@@ -80,27 +113,27 @@ def _skip_dirs():
     return tuple(d + os.sep for d in dirs)
 
 
-_STDLIB = os.path.dirname(contextlib.__file__)  # its own files only: site-packages may sit below it (conda)
+_STDLIB = os.path.dirname(contextlib.__file__)
 
 
-def _frames():
-    frame = sys._getframe(2)
-    while frame is not None:
-        yield frame
-        frame = frame.f_back
+def _stdlib(name):
+    """A file of the stdlib (its subpackages too, not site-packages below it, as in conda)."""
+    return name.startswith(_STDLIB + os.sep) and "site-packages" not in name and "dist-packages" not in name
 
 
 def _caller():
     """``file:line in function`` of the first frame outside torch, Habana, hpu-ops, hpu-complex, the stdlib and FX's
     generated code; ``None`` inside ``torch.save``."""
     skip, found = _skip_dirs(), None
-    for frame in _frames():
+    frame = sys._getframe(2)
+    while frame is not None:
         name = frame.f_code.co_filename
         if name.endswith(os.path.join("torch", "serialization.py")):
             return None  # saving is I/O (hpu-complex's complex128 save reduces through .cpu())
-        if found is None and not name.startswith(skip) and os.path.dirname(name) != _STDLIB \
+        if found is None and not name.startswith(skip) and not _stdlib(name) \
                 and not name.startswith(("<frozen", "<eval_with_key")):
             found = f"{name}:{frame.f_lineno} in {frame.f_code.co_name}"
+        frame = frame.f_back
     return found or "(no Python caller: autograd's backward)"
 
 
@@ -112,24 +145,35 @@ def _signature(tensors):
     return ", ".join(parts)
 
 
-def _tracing(tensors):
-    if torch.compiler.is_compiling():
+def _fake(t):
+    """A tensor no data is behind: fake, or a functional wrapper of one (AOT autograd's)."""
+    if is_fake(t):
         return True
-    return any(isinstance(t, torch.Tensor) and (is_fake(t) or torch._is_functional_tensor(t)) for t in tensors)
+    if torch._is_functional_tensor(t):
+        return True
+    elem = getattr(t, "elem", None)
+    return isinstance(elem, torch.Tensor) and is_fake(elem)
 
 
-def record(source, op, tensors=(), detail="", n=1, where=None):
+def _tracing(tensors):
+    if torch.compiler.is_compiling() or torch._guards.detect_fake_mode() is not None:
+        return True
+    return any(isinstance(t, torch.Tensor) and _fake(t) for t in tensors)
+
+
+def record(source, op, tensors=(), detail="", n=1, where=None, config=None):
     """One CPU execution of ``op`` from ``source``: raised in strict mode, counted in report mode, else nothing."""
-    if _STATE["level"] is None or source in _STATE["allow"] or getattr(_TLS, "allowed", 0):
+    config = config or _config()
+    if config is None or source in config.allow or getattr(_TLS, "allowed", 0):
         return
     if where is None:
         where = _caller()
         if where is None:
             return
     if _tracing(tensors):
-        detail = (detail + "; " if detail else "") + "while a graph is traced: once per compile, not per step"
+        detail = (detail + "; " if detail else "") + "while a graph is traced: in the graph, every step"
     sig = _signature(tensors)
-    if _STATE["level"] == "raise":
+    if config.level == "raise":
         raise CPUExecutionError(f"hpu_ops strict: {op} runs on the CPU [{source}]"
                                 + (f" ({sig})" if sig else "") + (f": {detail}" if detail else "")
                                 + f"\n  called from {where}")
@@ -159,7 +203,7 @@ def route(op, *tensors, detail="", source="hpu_ops route", leaves=None):
     """A named CPU route of hpu-ops around its body: recorded once; the copies, syncs and CPU ops inside are not
     recorded again. ``leaves``: a pytree whose tensors are the route's, flattened only when strict mode is on. A
     no-op context when strict mode is off."""
-    if _STATE["level"] is None:
+    if _config() is None:
         return _NULL
     if leaves is not None:
         import torch.utils._pytree as pytree
@@ -177,7 +221,7 @@ def host_read(op, tensor):
 
 def quiet():
     """CPU work inside is part of a route recorded elsewhere: not recorded."""
-    return _depth() if _STATE["level"] is not None else _NULL
+    return _depth() if _config() is not None else _NULL
 
 
 @contextlib.contextmanager
@@ -222,7 +266,7 @@ _COMPLEX = {}
 
 def _resolve_complex():
     """hpu_complex's counters (looked up again while missing: its extension may load after strict mode starts), and
-    its matmul threshold, followed through its Python setter."""
+    its matmul threshold, followed through its Python setter from then on (the extension has no getter)."""
     if _COMPLEX.get("cpu_fallback_calls") is not None:
         return
     ns = torch.ops.hpu_complex
@@ -261,11 +305,12 @@ def _snapshot():
     return _bridge_stats(), _complex_calls()
 
 
-def check():
+def check(config=None):
     """Record (or raise on) the bridge fallbacks and hpu-complex fallbacks since the last ``check()``, the last op the
     watch saw, or the start of the strict block, named by op, without a frame: what ran outside any op the watch saw
     (a compiled graph's recipes, another thread) or every fallback with ``per_op=False``."""
-    if _STATE["level"] is None:
+    config = config or _config()
+    if config is None:
         return
     (total0, ops0), calls0 = _STATE["baseline"] or ((0, {}), 0)
     (total, ops), calls = _snapshot()
@@ -274,10 +319,10 @@ def check():
         for op, value in ops.items():
             if value - ops0.get(op, 0):
                 record("bridge fallback", op, (), "counted per step (not attributed to a call)",
-                       n=value - ops0.get(op, 0), where="(per step)")
+                       n=value - ops0.get(op, 0), where="(per step)", config=config)
     if calls != calls0:
         record("hpu_complex", "hpu_complex cpu_fallback", (), "counted per step (not attributed to a call)",
-               n=calls - calls0, where="(per step)")
+               n=calls - calls0, where="(per step)", config=config)
 
 
 # ---- the per-op watch --------------------------------------------------------------------------------------------
@@ -285,6 +330,20 @@ def check():
 _COPIES = {aten._to_copy.default, aten.copy_.default, aten.to.device, aten.to.dtype_layout, aten.to.dtype,
            aten.to.other}
 _MATMUL = {aten.mm.default, aten.bmm.default, aten.mm.out, aten.bmm.out}
+_METADATA = {aten.detach.default, aten.alias.default, aten.lift_fresh.default, aten.empty.memory_format,
+             aten.empty_strided.default, aten.resize_.default, aten.set_.source_Storage_storage_offset,
+             aten.set_.source_Storage, aten.set_.source_Tensor, aten.set_.default, aten.clone.default}
+_MAKES_COMPLEX = {}  # func -> whether it can make a complex tensor from real ones (hpu_complex's fallback then)
+
+
+def _makes_complex(func):
+    known = _MAKES_COMPLEX.get(func)
+    if known is None:
+        name = _op_name(func)
+        known = "fft" in name or "stft" in name or any(
+            name.startswith(p) for p in ("aten::complex", "aten::polar", "aten::view_as_complex"))
+        _MAKES_COMPLEX[func] = known
+    return known
 
 
 def _tensors(args, kwargs):
@@ -305,13 +364,12 @@ def _outputs(out):
     return [t for t in (out if isinstance(out, (list, tuple)) else (out,)) if isinstance(t, torch.Tensor)]
 
 
-def _classify(func, args, tensors, out):
+def _classify(func, args, tensors, outs):
     """The ``(source, detail)`` of a CPU execution this op is, or None."""
     if func is aten._local_scalar_dense.default:
         if _is_hpu(args[0]):
             return "host sync", "a device value read on the host (.item(), bool(), int(), float())"
         return None
-    outs = _outputs(out)
     if func in _COPIES:
         if func is aten.copy_.default:
             dst, src = args[0], args[1]
@@ -330,36 +388,39 @@ def _classify(func, args, tensors, out):
         a, b = tensors[0], tensors[1]
         if a.numel() * b.shape[-1] < _STATE["matmul_cpu_below"]:
             return "hpu_complex", "complex64 mm/bmm below hpu_complex's CPU threshold (set_matmul_cpu_threshold(0))"
+    if func.is_view or func in _METADATA:
+        return None
     if both and all(t.device.type == "cpu" for t in both) and any(t.numel() > 1 for t in both):
         return "cpu op", "an op on CPU tensors inside the step"
     return None
 
 
 class _Watch(TorchDispatchMode):
-    """Reads the bridge's fallback total around each op, and hpu-complex's fallback count around ops with a complex
-    tensor."""
+    """Reads the bridge's fallback total around each op, and hpu-complex's fallback count around ops that have or
+    can make a complex tensor."""
 
-    def __init__(self, watch_cpu_ops=True):
+    def __init__(self, config):
         super().__init__()
-        self.watch_cpu_ops = watch_cpu_ops
-
-    @classmethod
-    def is_infra_mode(cls):
-        return True  # else Dynamo skips (for good) every frame it would compile under the watch
+        self.config = config
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         if func is aten._local_scalar_dense.default and not isinstance(args[0], torch.Tensor):
             return args[0]  # a wrapped number (z * 2j inside hpu_complex) reaches the mode as its Python value
         tensors = _tensors(args, kwargs)
-        if _STATE["level"] is None or getattr(_TLS, "allowed", 0) or _tracing(tensors):
+        config = _config() or self.config
+        if getattr(_TLS, "allowed", 0) or _tracing(tensors):
             return func(*args, **kwargs)
-        complex_in = any(t.is_complex() for t in tensors)  # hpu_complex's fallback takes complex tensors only
+        complex_in = any(t.is_complex() for t in tensors) or _makes_complex(func)
         base = _STATE["baseline"] or ((0, {}), 0)
         (total0, ops0), calls0 = _bridge_stats(), (_complex_calls() if complex_in else base[1])
         if base[0][0] != total0 or base[1] != calls0:
-            check()  # counted since the last op, outside any op this watch saw (another thread, a compiled graph)
-        out = func(*args, **kwargs)
+            check(config)  # counted since the last op, outside any op this watch saw (another thread, a graph)
+        outer, _TLS.watch = getattr(_TLS, "watch", None), self  # hpu-ops' routes below run with the mode popped
+        try:
+            out = func(*args, **kwargs)
+        finally:
+            _TLS.watch = outer
         (total, ops), calls = _bridge_stats(), (_complex_calls() if complex_in else calls0)
         _STATE["baseline"] = ((total, ops), calls)  # before recording: a raise must not report these again
         name = _op_name(func)
@@ -367,40 +428,79 @@ class _Watch(TorchDispatchMode):
             for op, value in ops.items():
                 if value - ops0.get(op, 0):
                     record("bridge fallback", op, tensors, f"under {name}" if op != name else "",
-                           n=value - ops0.get(op, 0))
+                           n=value - ops0.get(op, 0), config=config)
         if calls != calls0:
-            record("hpu_complex", name, tensors, "hpu_complex's CPU fallback", n=calls - calls0)
+            record("hpu_complex", name, tensors, "hpu_complex's CPU fallback", n=calls - calls0, config=config)
         if getattr(_TLS, "depth", 0) == 0:
-            found = _classify(func, args, tensors, out)
-            if found is not None and (found[0] != "cpu op" or self.watch_cpu_ops):
-                record(found[0], name, tensors, found[1])
+            outs = _outputs(out)
+            if not any(_fake(t) for t in outs):
+                found = _classify(func, args, tensors, outs)
+                if found is not None and (found[0] != "cpu op" or config.watch_cpu_ops):
+                    record(found[0], name, tensors, found[1], config=config)
         return out
+
+
+def _passthrough_hops():
+    """Higher-order ops (``torch.cond``, ``while_loop``, ...) need a rule per mode: run them as without the watch."""
+    for hop in list(torch._ops._higher_order_ops.values()):
+        if _Watch not in hop.python_key_table:
+            def rule(mode, *args, _hop=hop, **kwargs):
+                return _hop(*args, **kwargs)
+
+            hop.py_impl(_Watch)(rule)
+
+
+class _Block:
+    """One strict block: its settings pushed on this thread, the watch (the outermost per-op block's), the counters'
+    baseline, and under the watch ``set_stance("force_eager")`` (see the module doc)."""
+
+    def __init__(self, config, per_op):
+        self.config, self.per_op = config, per_op
+        self.watch = self.stance = None
+
+    def enter(self):
+        _resolve_complex()
+        check()  # an outer block's fallbacks so far are the outer block's
+        _TLS.blocks = getattr(_TLS, "blocks", []) + [self.config]
+        _STATE["baseline"] = _snapshot()
+        if self.per_op and _watch_on_stack() is None:
+            _passthrough_hops()
+            self.stance = torch.compiler.set_stance("force_eager")
+            self.stance.__enter__()
+            self.watch = _Watch(self.config)
+            self.watch.__enter__()
+        return self
+
+    def exit(self, failed):
+        try:
+            if not failed:
+                check(self.config)
+        finally:
+            if self.watch is not None:
+                if any(m is self.watch for m in _get_current_dispatch_mode_stack()):  # not popped in a fork
+                    self.watch.__exit__(None, None, None)
+                self.stance.__exit__(None, None, None)
+            _TLS.blocks = _TLS.blocks[:-1]  # the baseline stays: an outer block does not count these again
 
 
 @contextlib.contextmanager
 def strict(level="raise", per_op=True, allow=(), watch_cpu_ops=True):
     """Raise (``level="raise"``) or count (``"report"``) every CPU execution inside the block (see the module doc).
-    ``per_op=False``: the bridge's and hpu-complex's fallbacks are checked when the block ends only. ``allow``:
-    sources neither raised nor counted. ``watch_cpu_ops=False`` drops the ``cpu op`` source. Nested blocks share one
-    watch; the inner block's level and ``allow`` apply inside it."""
+    ``per_op=False``: no dispatch mode (compiled code compiles), the bridge's and hpu-complex's fallbacks are checked
+    when the block ends. ``allow``: sources neither raised nor counted. ``watch_cpu_ops=False`` drops the ``cpu op``
+    source. Nested blocks share the outermost per-op block's watch; the innermost block's settings apply."""
     if level not in ("raise", "report"):
         raise ValueError(f"strict level {level!r}: 'raise' or 'report'")
     unknown = set(allow) - set(SOURCES)
     if unknown:
         raise ValueError(f"unknown strict sources {sorted(unknown)}; known: {SOURCES}")
-    _resolve_complex()
-    check()  # an outer block's fallbacks so far are the outer block's
-    saved = dict(level=_STATE["level"], allow=_STATE["allow"])
-    _STATE.update(level=level, allow=frozenset(allow), baseline=_snapshot())
-    watch = _Watch(watch_cpu_ops) if per_op and not _STATE["watches"] else _NULL
-    _STATE["watches"] += watch is not _NULL
+    block = _Block(_Config(level, allow, watch_cpu_ops), per_op).enter()
+    failed = True
     try:
-        with watch:
-            yield
-        check()
+        yield
+        failed = False
     finally:
-        _STATE["watches"] -= watch is not _NULL
-        _STATE.update(saved)  # the baseline stays: an outer block does not count the inner one's fallbacks again
+        block.exit(failed)
 
 
 def report():
@@ -426,30 +526,44 @@ def format_report(rows=None):
 
 
 def _at_exit():
-    try:
-        check()
-    except CPUExecutionError as e:  # raise mode, per_op=False: the fallbacks no op was there to raise on
-        print(str(e), file=sys.stderr, flush=True)
+    config = _STATE.get("env_config")
+    if config is None:
         return
-    if _STATE["level"] == "report":
-        print(format_report(), file=sys.stderr, flush=True)
+    if config.level == "raise":  # per_op=False: the fallbacks no op was there to raise on, all of them, as a table
+        before = len(_STATE["counts"])
+        check(_Config("report", config.allow, config.watch_cpu_ops))
+        if len(_STATE["counts"]) != before:
+            print("hpu_ops strict (HPU_OPS_STRICT=1): CPU executions seen after the last op\n" + format_report(),
+                  file=sys.stderr, flush=True)
+        return
+    check(config)
+    print(format_report(), file=sys.stderr, flush=True)
+
+
+def _in_worker():
+    """A multiprocessing child (a DataLoader worker, spawned or forked): computes on the CPU by design."""
+    import multiprocessing
+
+    return multiprocessing.parent_process() is not None
 
 
 def from_env():
     """``HPU_OPS_STRICT`` read by ``enable()``: ``1``/``raise`` raises, ``report`` counts and prints at exit, for the
-    whole process (the main thread's watch; autograd's threads inherit it). Once per process. Returns the level or
-    None."""
-    if "env_context" in _STATE:
-        return _STATE["env_level"]
+    main thread (autograd's threads follow its watch). Once per process; never in a multiprocessing child. Returns
+    the level or None."""
+    if "env_config" in _STATE:
+        return _STATE["env_config"].level
     value = os.environ.get(ENV, "").strip().lower()
-    if value in ("", "0", "false", "off"):
+    if value in OFF or _in_worker():
         return None
     level = "report" if value == "report" else "raise"
     allow = tuple(s.strip() for s in os.environ.get(ENV_ALLOW, "").split(",") if s.strip())
-    per_op = os.environ.get(ENV_PER_OP, "1").strip() not in ("0", "false", "off")
-    context = strict(level, per_op=per_op, allow=allow)
-    context.__enter__()  # for the process: never exited
-    _STATE.update(env_context=context, env_level=level)
+    unknown = set(allow) - set(SOURCES)
+    if unknown:
+        raise ValueError(f"{ENV_ALLOW}: unknown sources {sorted(unknown)}; known: {SOURCES}")
+    per_op = os.environ.get(ENV_PER_OP, "1").strip().lower() not in OFF
+    block = _Block(_Config(level, allow), per_op).enter()  # for the process: never exited
+    _STATE.update(env_config=block.config, env_block=block)
     if not _STATE["atexit"]:
         atexit.register(_at_exit)
         _STATE["atexit"] = True

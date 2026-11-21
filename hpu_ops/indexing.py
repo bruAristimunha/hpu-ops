@@ -181,8 +181,9 @@ def index_select_flat(self, indices, checked=True):
         if ok is not None:
             lin = torch.where(ok.reshape(tuple(ok.shape) + (1,) * len(mids)), lin, -1)
         lin = torch.broadcast_to(lin, shape)
+        lin_flat = lin.reshape(-1).to(self.device)
     flat = self.flatten(start, end) if end > start else self
-    out = flat.index_select(start, lin.reshape(-1).to(self.device))
+    out = flat.index_select(start, lin_flat)
     if lin.dim() == 0:
         return out.squeeze(start)  # 0-d indices (direct aten calls): the indexed dims go away
     out = out.unflatten(start, shape) if lin.dim() != 1 else out
