@@ -19,7 +19,8 @@ import torch
 import torch.nn.functional as F
 
 from . import tpc
-from .linalg import _kernels, _takes, register_paired
+from .extrema import internal_sort
+from .linalg import _function, _kernels, _takes, register_paired
 
 aten = torch.ops.aten
 JACOBI_SWEEPS = 10
@@ -120,11 +121,12 @@ def eigh(A, upper=False):
             S = J.mT @ S @ J
             V = V @ J
         S = (S + S.mT) / 2
-    w, order = torch.diagonal(S, dim1=-2, dim2=-1)[..., :n].sort(-1)
+    w, order = internal_sort(torch.diagonal(S, dim1=-2, dim2=-1)[..., :n], -1)
     V = V[..., :n, :n]
     return w, V.gather(-1, order[..., None, :].expand_as(V))
 
 
+@_function
 class Eigh(torch.autograd.Function):
     """``aten._linalg_eigh`` from parallel Jacobi, with torch's Hermitian backward (``linalg_eig_backward``) over the
     result. ``V`` is empty when ``compute_v`` is false."""

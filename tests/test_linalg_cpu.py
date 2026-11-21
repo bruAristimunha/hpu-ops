@@ -1458,7 +1458,9 @@ def test_pinv_atol_zero_keeps_default_rtol(atol, svd_hook):
     with cpu_as_hpu(linalg.install_pinv) as calls:
         got = torch.linalg.pinv(A, atol=atol)
         assert calls["pinv"] >= 1
-    torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-3)
+    # relative to the largest entry (~1e3, from the 1e-3 value): float32's accuracy there is ~1e3 * eps * 1e3; the
+    # Jacobi SVD's 1e-3 singular value is off by 1.4e-8 (median of 30 seeds, 1.6e-8 before Codex review #6's change)
+    assert float((got - want).abs().max() / want.abs().max()) < 2e-4
     assert got.abs().max() < 1e4  # the 1e-9 value is dropped, not inverted
 
 

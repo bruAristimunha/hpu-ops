@@ -44,12 +44,17 @@ per call on Gaudi2 (one launch per op). The solve kernel, batch 32, n = 22, eage
 Habana reads ``GC_KERNEL_PATH`` when the device initialises, so ``install_kernel_path`` must run before the first HPU
 op of the process; ``hpu_ops.enable()`` calls it. ``HPU_OPS_TPC=0`` in the environment keeps the kernels off.
 """
+import contextlib
 import functools
+import math
 import os
 import pathlib
+import time
 import warnings
 
 import torch
+
+from ..extrema import internal_sort
 
 MAXN = 64  # MAXN of gj_solve and tri_solve (main)
 SMALL_MAXN = 32  # MAXN of jacobi_svd, matrix_exp, lu_factor, lu_perm and lu_solve
@@ -805,18 +810,105 @@ def lazy_mode():
     return os.environ.get("PT_HPU_LAZY_MODE", "0") == "1"
 
 
+# The build of the C++ ops (``_load``) waits at most this many seconds (environment variable, default 600) for another
+# process's build; past it ``ready()`` warns once and is False. torch's own lock (``FileBaton``, a ``lock`` file in the
+# build directory) is a file that a killed builder leaves behind, and every later process then waited for it forever
+# (code review #4: a job preempted during its first linalg op hung the next one at its first linalg op).
+BUILD_TIMEOUT = "HPU_OPS_BUILD_TIMEOUT"
+# hpu-ops' own build lock: an ``flock`` (released by the kernel when its holder dies, never stale) on this file in the
+# build directory, which also records the holder (host and pid).
+BUILD_LOCK = "hpu_ops.flock"
+# A torch ``lock`` file found while holding ``BUILD_LOCK`` is removed when the builder recorded there ran on this host
+# and is gone, or when it is older than this (s): a process without ``BUILD_LOCK`` (an older hpu-ops) may hold it.
+STALE_LOCK_S = 120.0
+STALE_WARNING = "hpu_ops: removed the stale build lock {path} ({age:.0f} s old, {why})."
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # another user's process
+        return True
+    return True
+
+
+@contextlib.contextmanager
+def _exclusive(path, deadline):
+    """An exclusive ``flock`` on ``path`` (created if missing), waited for until ``deadline`` (``time.monotonic``),
+    else ``TimeoutError``. Yields the previous holder's record ``(host, pid)`` (None if unreadable) and writes this
+    process's."""
+    import fcntl
+    import socket
+
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"another process holds {path}") from None
+                time.sleep(0.2)
+        try:
+            host, pid = os.pread(fd, 256, 0).decode().split()
+            previous = (host, int(pid))
+        except (ValueError, UnicodeDecodeError):
+            previous = None
+        record = f"{socket.gethostname()} {os.getpid()}\n".encode()
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, record, 0)
+        yield previous
+    finally:
+        os.close(fd)  # releases the lock
+
+
+def _clear_baton(path, deadline, previous):
+    """Wait for torch's ``FileBaton`` file ``path`` to go, holding ``BUILD_LOCK``. Every hpu-ops builder holds that
+    lock while it builds, so the file is left by a dead builder or held by a process without the lock (an older
+    hpu-ops). It is removed, with one warning, when ``previous`` (the last holder of ``BUILD_LOCK``) ran on this host
+    and is gone, or when it is older than ``STALE_LOCK_S``; past ``deadline``, ``TimeoutError``."""
+    import socket
+
+    dead = previous is not None and previous[0] == socket.gethostname() and not _alive(previous[1])
+    while True:
+        try:
+            age = time.time() - os.stat(path).st_mtime
+        except FileNotFoundError:
+            return
+        if dead or age > STALE_LOCK_S:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                return
+            why = f"its builder, pid {previous[1]}, is gone" if dead else "no builder holds hpu-ops' lock"
+            warnings.warn(STALE_WARNING.format(path=path, age=age, why=why), stacklevel=3)
+            return
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"{path} is held by another process ({age:.0f} s)")
+        time.sleep(0.2)
+
+
 @functools.cache
 def _load():
     """Compile and load the C++ ops: the legacy API of lazy mode when ``lazy_mode()``, the eager and compile API
-    otherwise."""
+    otherwise. The build waits at most ``HPU_OPS_BUILD_TIMEOUT`` seconds for another builder (``TimeoutError``,
+    which ``ready()`` turns into one warning and False) and clears a stale torch lock (``_clear_baton``)."""
     from habana_frameworks.torch.utils.lib_utils import get_include_dir, get_lib_dir
-    from torch.utils.cpp_extension import load_inline
+    from torch.utils.cpp_extension import _get_build_directory, load_inline
 
     lazy = lazy_mode()
-    load_inline(name="linalg_tpc_plugin_lazy" if lazy else "linalg_tpc_plugin", cpp_sources=[CPP_LAZY if lazy else CPP],
-                verbose=False, is_python_module=False,
-                extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
-                extra_ldflags=[f"-L{get_lib_dir()}", "-lhabana_pytorch_plugin" if lazy else "-lhabana_pytorch2_plugin"])
+    name = "linalg_tpc_plugin_lazy" if lazy else "linalg_tpc_plugin"
+    build_dir = _get_build_directory(name, verbose=False)
+    deadline = time.monotonic() + float(os.environ.get(BUILD_TIMEOUT) or 600)
+    with _exclusive(os.path.join(build_dir, BUILD_LOCK), deadline) as previous:
+        _clear_baton(os.path.join(build_dir, "lock"), deadline, previous)
+        load_inline(name=name, cpp_sources=[CPP_LAZY if lazy else CPP], verbose=False, is_python_module=False,
+                    build_directory=build_dir, extra_include_paths=[get_include_dir(), "/usr/include/habanalabs"],
+                    extra_ldflags=[f"-L{get_lib_dir()}",
+                                   "-lhabana_pytorch_plugin" if lazy else "-lhabana_pytorch2_plugin"])
 
 
 def _op():
@@ -1319,6 +1411,19 @@ def tri_solve_reference(A, B, upper=False, left=True, unitriangular=False):
     return torch.stack(rows, dim=-2)
 
 
+def _sort(x, descending=False):
+    """``(values, indices)`` of ``x`` sorted along the last dimension, NaN kept as NaN with an index in range: Gaudi's
+    sort returns NaN as +inf with out-of-range indices (measured, ``hpu_ops.extrema``), so the eigenvalues and singular
+    values of a matrix with a NaN came out +-inf, the vectors gathered with bad indices (code review #13). The order
+    key is ``x`` with NaN as +inf (``nan_to_num``, one op; NaN and +inf then tie, where torch puts NaN last); Gaudi
+    sorts a key without NaN right at these sizes (n <= 32; its non-stable sort went wrong past 1000 elements with
+    infs, and its 1-D stable sort runs on the CPU, so the sort is the plain one). The values are gathered from ``x``
+    (float data, an int64 index): two ops more than the sort alone."""
+    key = torch.nan_to_num(x, nan=float("inf"), posinf=float("inf"), neginf=float("-inf"))
+    order = internal_sort(key, -1, descending)[1]  # Gaudi's own sort: the key has no NaN
+    return x.gather(-1, order), order
+
+
 def eigh(A, upper):
     """``(w, V)`` of the symmetric matrix held in one triangle of ``A[..., n, n]`` (float32, n <= ``EIGH_MAXN``) from
     the TPC kernel: ``w`` ascending, the columns of ``V`` the eigenvectors. The kernel returns ``w`` unsorted and the
@@ -1335,7 +1440,7 @@ def eigh(A, upper):
     S_flat = S.reshape(-1, n, n).to(torch.float32).contiguous()
     _, Vt1 = _call(_eigh_op(), S_flat)
     W, Vt = _call(_eigh_refine_op(), S_flat, Vt1)
-    w, order = W.sort(-1)
+    w, order = _sort(W)
     V = Vt.gather(-2, order[..., :, None].expand_as(Vt)).mT
     return w.reshape(*batch, n), V.reshape(*batch, n, n)
 
@@ -1475,7 +1580,7 @@ def jacobi_svd(A, full_matrices=False, sort=True, flush=True):
     S = S.reshape(*batch, k)
     if not sort:
         return U, S, Vh
-    S, order = S.sort(-1, descending=True)
+    S, order = _sort(S, descending=True)
     if full:
         full_order = torch.cat([order, torch.arange(k, big, device=order.device).expand(*batch, big - k)], -1)
         u_ord, v_ord = (order, full_order) if swap else (full_order, order)
@@ -1495,14 +1600,23 @@ def jacobi_svdvals(A, sort=True, flush=True):
     no_t = m < n or (m == n and A.is_contiguous())
     A_t = _fresh((A if no_t else A.mT).reshape(-1, k, max(m, n)).to(torch.float32).contiguous())
     S = (_call(_svdvals_op(), A_t) if flush else _svdvals_op()(A_t)).reshape(*batch, k)
-    return S.sort(-1, descending=True).values if sort else S
+    return _sort(S, descending=True)[0] if sort else S
+
+
+def _ftz32(t):
+    """``t`` with float32 values below the smallest normal flushed to 0, as the card's arithmetic does (float64
+    unchanged)."""
+    if t.dtype != torch.float32:
+        return t
+    return torch.where(t.abs() < torch.finfo(torch.float32).tiny, 0.0, t)
 
 
 def svd_reference(A, compute_uv=True, full_matrices=False):
     """``jacobi_svd`` / ``jacobi_svdvals`` in plain torch, matching the kernel contract: the rows of A orthogonalized
     when m < n or A is square and contiguous (else the rows of A^T), 1/max|a| scaling (not of a zero matrix), the
-    kernel's round-robin rotations and skip rules (gamma = 0, gamma^2 <= tol alpha beta, r^2 < 1e-34), singular
-    values of squared row norms below 1e-36 set to 0, MGS completion for zero/degenerate rows, optional full
+    kernel's round-robin rotations and skip rules on alpha, beta, gamma scaled by 1 / (alpha + beta) (gamma = 0,
+    gamma^2 <= tol alpha beta, r^2 < 1e-34; exactly 45 degrees for equal norms), row norms as max|x| ||x / max|x|||,
+    MGS completion of the zero and near-zero rows (below 1e-5 of the largest), optional full
     orthogonal extension, descending ``S``. For the CPU tests (``tests/kernel_replica.py`` replays the float32
     arithmetic)."""
     _check_svd(A)
@@ -1523,6 +1637,11 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
     safe_sigma = torch.where(sigma == 0, 1.0, sigma)
     W = W / safe_sigma
     V = torch.eye(k, dtype=A.dtype, device=A.device).expand(b, k, k).clone() if compute_uv else None
+
+    def row_norms(X):  # the kernel's ROW_NORM: max|x| * ||x / max|x||| (no squares of tiny rows), and x / max|x|
+        mx = X.abs().amax(-1, keepdim=True)
+        cw = X / torch.where(mx == 0, 1.0, mx)
+        return mx.squeeze(-1), cw, cw.norm(dim=-1) * mx.squeeze(-1)
 
     if k > 1:
         k_even = (k + 1) & ~1
@@ -1545,40 +1664,47 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
         for _ in range(sweeps):
             for ps, qs in rounds:
                 wp, wq = W[:, ps], W[:, qs]
-                alpha = (wp * wp).sum(-1)
-                beta = (wq * wq).sum(-1)
-                gamma = (wp * wq).sum(-1)
-                d = beta - alpha
-                g2 = 2.0 * gamma
+                # the card flushes each product below float32's smallest normal (FTZ): so does the reference
+                alpha = _ftz32(wp * wp).sum(-1)
+                beta = _ftz32(wq * wq).sum(-1)
+                gamma = _ftz32(wp * wq).sum(-1)
+                # the kernel's JACOBI_CS: alpha, beta, gamma scaled by 1 / (alpha + beta), skip rules relative
+                ab = alpha + beta
+                scale = 1.0 / torch.where(ab == 0, 1.0, ab)
+                a_, b_, g_ = alpha * scale, beta * scale, gamma * scale
+                d = b_ - a_
+                g2 = 2.0 * g_
                 r = torch.hypot(d, g2)
-                skip = (gamma == 0) | (r * r < 1e-34) | (gamma * gamma <= tol_scale * alpha * beta)
+                skip = (gamma == 0) | (r * r < 1e-34) | (g_ * g_ <= tol_scale * a_ * b_)
                 sr = torch.where(skip, 1.0, r)
                 c2 = 0.5 * (1.0 + d.abs() / sr)
                 c = torch.where(skip, 1.0, c2.sqrt())
                 s = torch.where(skip, 0.0, torch.where(d < 0, -1.0, 1.0) * 0.5 * g2 / (sr * torch.where(skip, 1.0, c)))
+                half = math.sqrt(0.5)  # equal norms: exactly 45 degrees, so identical rows cancel exactly
+                c = torch.where((d == 0) & ~skip, half, c)
+                s = torch.where((d == 0) & ~skip, torch.where(g2 < 0, -half, half), s)
                 c_, s_ = c.unsqueeze(-1), s.unsqueeze(-1)
                 W[:, ps], W[:, qs] = c_ * wp - s_ * wq, s_ * wp + c_ * wq
                 if compute_uv:
                     vp, vq = V[:, ps], V[:, qs]
                     V[:, ps], V[:, qs] = c_ * vp - s_ * vq, s_ * vp + c_ * vq
 
-    sq = (W * W).sum(-1)
-    norm = sq.sqrt()
-    S = torch.where(sq < 1e-36, 0.0, norm * safe_sigma.squeeze(-1))
+    mx, cw, norm = row_norms(W)
+    zero = mx == 0
+    norm = torch.where(zero, 0.0, norm)
+    S = norm * safe_sigma.squeeze(-1)
     if not compute_uv:
         return A.new_empty(0), S.reshape(*batch, k).sort(-1, descending=True).values, A.new_empty(0)
 
-    thresh = torch.clamp(1e-10 * sq.amax(-1, keepdim=True), min=1e-36)
-    U_t = torch.where(sq.unsqueeze(-1) < 1e-36, 0.0, W / torch.where(norm.unsqueeze(-1) > 0, norm.unsqueeze(-1), 1.0))
-    bad_mask = sq < thresh
+    U_t = torch.where(zero.unsqueeze(-1), 0.0, cw / torch.where(zero, 1.0, cw.norm(dim=-1)).unsqueeze(-1))
+    bad_mask = norm < torch.clamp(1e-5 * norm.amax(-1, keepdim=True), min=1e-37)  # zero and near-zero rows
     if bad_mask.any():
         for bi in range(b):
             if not bad_mask[bi].any():
                 continue
             done = [j for j in range(k) if not bad_mask[bi, j]]
-            for j in range(k):
-                if not bad_mask[bi, j]:
-                    continue
+            # the near-zero rows (own directions) before the zero rows, which would take them (the kernel: diag_p)
+            for j in sorted((j for j in range(k) if bad_mask[bi, j]), key=lambda j: bool(norm[bi, j] == 0)):
                 accepted = False
                 if norm[bi, j] > 0:
                     cand = U_t[bi, j].clone()

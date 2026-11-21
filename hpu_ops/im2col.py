@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch._C import DispatchKey
 
+from . import _strict
 from ._dispatch import count, register_kernels
 
 aten = torch.ops.aten
@@ -119,9 +120,17 @@ def _fresh(res, src):
 
 
 def _flat_indices(height, width, kh, kw, dh, dw, ph, pw, sh, sw, device, tracing):
+    idx_device = device if tracing else torch.device("cpu")
+    if idx_device == device:
+        return _flat_indices_on(height, width, kh, kw, dh, dw, ph, pw, sh, sw, device, idx_device)
+    with _strict.route("im2col/col2im index built on the host",
+                       detail=lambda: f"{kh}x{kw} patches of {height}x{width}: on the CPU, copied to the card"):
+        return _flat_indices_on(height, width, kh, kw, dh, dw, ph, pw, sh, sw, device, idx_device)
+
+
+def _flat_indices_on(height, width, kh, kw, dh, dw, ph, pw, sh, sw, device, idx_device):
     hp, wp = height + 2 * ph, width + 2 * pw
     oh, ow = _out_size(height, width, kh, kw, dh, dw, ph, pw, sh, sw)
-    idx_device = device if tracing else torch.device("cpu")
     ky = torch.arange(kh, device=idx_device, dtype=torch.int64) * dh
     kx = torch.arange(kw, device=idx_device, dtype=torch.int64) * dw
     oy = torch.arange(oh, device=idx_device, dtype=torch.int64) * sh
@@ -210,6 +219,11 @@ def col2im(self, output_size, kernel_size, dilation, padding, stride):
 
 
 def _cpu_fallback(op, self, *args, out=None):
+    with _strict.route(str(op), self, detail="declined im2col/col2im on a CPU copy"):
+        return _cpu_fallback_body(op, self, *args, out=out)
+
+
+def _cpu_fallback_body(op, self, *args, out=None):
     cpu_self = self.to("cpu")
     if out is None:
         return op(cpu_self, *args).to(self.device)
