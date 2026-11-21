@@ -48,7 +48,7 @@ import math
 import torch
 from torch._C import DispatchKey
 
-from ._dispatch import count, register_kernels, tracing
+from ._dispatch import count, register_kernels
 
 aten = torch.ops.aten
 INTEGER = (torch.int64, torch.int32)
@@ -75,9 +75,14 @@ def _in_range(t, size):
 
 
 def _tracing(t):
-    """True while a tracer sees ``t`` (``_dispatch.tracing``: dynamo, AOT autograd's fake and functional tensors, a
-    fake or proxy mode): index arithmetic then goes on the device, in the graph, instead of on the host."""
-    return tracing(t)
+    """True while ``torch.compile`` traces (dynamo, or AOT autograd's fake tensors): index arithmetic then goes on the
+    device, in the graph, instead of on the host. Not AOT's ``FunctionalTensor`` pass, on purpose: there a CPU index
+    tensor's linear index is built from host ops and copied once per step, which measured faster on Gaudi2 than
+    building it in the graph on the device (bridge 1.21.4, compiled ``(x @ x.mT)[..., triu_indices]`` forward and
+    backward, batch 32, n = 22, one process, 4 alternating rounds: 1.94 against 2.22 ms per step)."""
+    from torch._subclasses.fake_tensor import is_fake
+
+    return torch.compiler.is_compiling() or is_fake(t)
 
 
 def _off_device(self, t):

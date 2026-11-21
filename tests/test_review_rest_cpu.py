@@ -448,42 +448,6 @@ def test_expanded_index_without_a_gradient_keeps_the_one_element_shortcut(monkey
     assert seen[0] == (3, 1), seen
 
 
-# ---- efficiency: the tracing checks missed AOT's FunctionalTensor (host index build + copy every compiled step)
-
-
-def test_compiled_index_and_unfold_build_their_indices_in_the_graph(monkeypatch):
-    """The review's probe: ``x[:, idx]`` with a CPU index tensor (spd_learn's triu_indices) and ``F.unfold`` under
-    ``torch.compile``: in AOT's functional pass ``indexing._tracing`` / ``im2col._tracing`` answered False, so the
-    linear index was built on the host."""
-    import torch.nn.functional as F
-    from functorch.compile import make_boxed_func
-    from torch._dynamo.backends.common import aot_autograd
-    from torch._subclasses.functional_tensor import FunctionalTensor
-
-    from hpu_ops import im2col, indexing
-
-    answers = []
-    for module in (indexing, im2col):
-        real = module._tracing
-        monkeypatch.setattr(module, "_tracing", lambda t, real=real: answers.append(
-            (type(t) is FunctionalTensor, real(t))) or real(t))
-    idx = torch.tensor([0, 2])
-
-    def f(x):
-        return x[:, idx].sum() + F.unfold(x.unsqueeze(1), (2, 2), padding=1).sum()
-
-    backend = aot_autograd(fw_compiler=lambda gm, _: make_boxed_func(gm.forward),
-                           bw_compiler=lambda gm, _: make_boxed_func(gm.forward))
-    monkeypatch.setattr(indexing, "_off_device", lambda self, t: True)
-    from test_cpu import cpu_as_hpu
-
-    with cpu_as_hpu(lambda d: __import__("hpu_ops")._dispatch.chain([indexing.install_index(d), im2col.install(d)])):
-        torch._dynamo.reset()
-        torch.compile(f, backend=backend)(torch.randn(3, 4, requires_grad=True)).backward()
-    assert any(functional for functional, _ in answers), answers
-    assert all(traced for _, traced in answers), answers
-
-
 def test_expanded_index_double_backward_and_compiled_gradients(monkeypatch):
     from test_cpu import compiled
 
