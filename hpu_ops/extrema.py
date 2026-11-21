@@ -48,11 +48,14 @@ result. A NaN scalar bound of ``clamp``
   index, and its non-stable sort pads each row to a power of two with +inf (descending: -inf), so a real infinity
   ties with the padding and its index comes back out of range, at any n that is not a power of two (measured n = 3
   to 5000); its descending sort along a non-last dim returns indices that are no permutation for rows holding -max.
-  Two sorts of finite keys along the last dim (see ``_sorted``), eager, lazy and under ``torch.compile`` (compiled on
-  the card: right in 390 of 390 cases), with autograd on. hpu-ops' own sorts of eigenvalues and singular values (and
-  quantile's NaN-free keys) keep Gaudi's sort (``internal_sort``), at main's cost. Not rewritten: inference mode and
-  ``out=`` (Gaudi's sort), and a stable sort past what Gaudi's stable kernel takes (n ~1000 or a non-last dim: its
-  own CPU fallback, as on main).
+  sort: two sorts of finite keys along the last dim (``_sorted``); topk / kthvalue: Gaudi's own op on one finite key
+  (``_select_key``; exact up to the three largest finite magnitudes, which tie). Every eager call, inference mode and
+  ``out=`` included, at the ``BackendSelect`` key (``_select_kernels``: Gaudi reached through the ``.out``
+  overloads at the backend key); traced by ``torch.compile`` (on the card: right in 390 of 390 cases), the composite
+  at ``Autograd{}``. hpu-ops' own sorts of eigenvalues, singular values and quantile keys use ``internal_sort``
+  (Gaudi's sort of ``nan_to_num(x)``: indices in range, NaN kept). A dim longer than ``SORT_MAXN`` keeps Gaudi's
+  op (one warning); a stable sort past what Gaudi's stable kernel takes falls back to the CPU in Habana's bridge, as
+  on main.
 """
 import functools
 import math
@@ -599,17 +602,85 @@ def _pool_kernel(op, backward_op, name, nd):
 
 
 SORT_MAXN = (1 << 24) // 3  # the second key (positions + 3 class offsets of n) is exact in float32 up to here
+_BACKEND_KEYS = {"cpu": DispatchKey.CPU, "hpu": DispatchKey.HPU, "meta": DispatchKey.Meta}
 
 
-def internal_sort(x, dim=-1, descending=False):
-    """``(values, indices)`` of Gaudi's own sort of ``x``, below the exact rewrite: for hpu-ops' sorts of
-    eigenvalues, singular values and NaN-free keys (eigh, the SVDs, quantile), whose rows hold no +-inf and whose
-    order is the same either way. They ran Gaudi's sort before the rewrite was on by default and keep its cost
-    (2-39 sorts per SPD step), traced by ``torch.compile`` too."""
-    return native(aten.sort.default)(x, dim, descending)
+def _backend_key(device_type):
+    return _BACKEND_KEYS.get(device_type) or getattr(DispatchKey, device_type.upper())
 
 
-_POSITIONS = {}  # (n, device) -> arange(n) in float32, built once
+@functools.lru_cache(maxsize=None)
+def _below(op, device_type):
+    """``op`` below ``BackendSelect`` for a tensor on ``device_type``: its kernel at the backend key, or its
+    CompositeExplicitAutograd decomposition (whose inner calls pass ``BackendSelect`` again), or the backend's
+    fallback (Habana's eager functional sorts have no kernel of their own at ``HPU``)."""
+    name = op.name()
+    key = _backend_key(device_type)
+    if not torch._C._dispatch_has_kernel_for_dispatch_key(name, str(key).split(".")[-1]):
+        # Habana's eager functional sort / topk are structured: CompositeExplicitAutogradNonFunctional over the .out
+        # kernel (measured: going to HPU's key instead ran Habana's CPU fallback)
+        for alias in ("CompositeExplicitAutogradNonFunctional", "CompositeExplicitAutograd"):
+            if torch._C._dispatch_has_kernel_for_dispatch_key(name, alias):
+                key = getattr(DispatchKey, alias)
+                break
+    return functools.partial(op._op_dk, key)
+
+
+def native_backend(op, device_type):
+    """``op``'s kernel at ``device_type``'s backend key (Gaudi's sort / topk / kthvalue, below the ``BackendSelect``
+    layer here). The CPU tests swap it for a stand-in that returns Gaudi's out-of-range indices."""
+    return functools.partial(op._op_dk, _backend_key(device_type))
+
+
+_OUT_OF = {aten.sort.stable: aten.sort.values_stable, aten.topk.default: aten.topk.values,
+           aten.kthvalue.default: aten.kthvalue.values, aten.sort.default: aten.sort.values_stable}
+
+
+def _primitive(op, x):
+    """Gaudi's ``op`` (``sort.stable``, ``sort.default``, ``topk``, ``kthvalue``) for ``x``: for a real tensor its
+    ``.out`` overload at the backend key into fresh outputs (below this module's ``BackendSelect`` kernels; the
+    ``.out`` kernels are the ones Habana registers at ``HPU`` in eager and lazy mode); when traced the autograd kernel
+    (a tracer's fake tensors never reach ``BackendSelect``)."""
+    if not _concrete(x):
+        return native(op)
+    out_op = native_backend(_OUT_OF[op], x.device.type)
+
+    def call(t, *args, **kwargs):
+        values, indices = torch.empty(0, dtype=t.dtype, device=t.device), torch.empty(0, dtype=torch.int64,
+                                                                                    device=t.device)
+        if op is aten.sort.default:  # (dim, descending) positional
+            dim, descending = (list(args) + [-1, False][len(args):])[:2]
+            return out_op(t, stable=False, dim=dim, descending=descending, values=values, indices=indices)
+        return out_op(t, *args, **kwargs, values=values, indices=indices)
+
+    return call
+
+
+def _held_max(x):
+    """The largest finite value of ``x``'s dtype as the card holds it: float64 is stored as float32 there
+    (hpu-ops#16), so float64's max would become +inf, which ties with the sort's padding."""
+    held = torch.float32 if x.dtype == torch.float64 and x.device.type != "cpu" else x.dtype
+    return torch.finfo(held)
+
+
+def internal_sort(x, dim=-1, descending=False, keys=False):
+    """``(values, indices)`` for hpu-ops' own sorts of eigenvalues and singular values (eigh, the SVDs): one Gaudi sort
+    of ``nan_to_num(x)`` (finite keys: no infinity ties with the padding, no NaN index out of range), values read
+    from ``x`` (a NaN stays NaN: eigh / svd of a matrix with a NaN return NaN where torch's LAPACK raises, not an
+    out-of-range gather). Below the exact rewrite: 2 ops more than Gaudi's sort alone, where the exact form takes
+    about 9 (2-39 such sorts per SPD step). ``keys``: quantile's NaN-free keys, whose +-inf are deliberate and must
+    not tie with +-max (``nan_to_num`` made ``quantile([inf, FLT_MAX], 0)`` NaN): Gaudi's sort of ``x`` as is; quantile
+    reads only the positions its padding cannot reach."""
+    with torch.no_grad():
+        if keys:
+            return _primitive(aten.sort.default, x)(x, dim, descending)
+        mx = _held_max(x).max
+        _, i = _primitive(aten.sort.default, x)(torch.nan_to_num(x, nan=mx, posinf=mx, neginf=-mx), dim, descending)
+    return x.gather(dim, i), i
+
+
+_POSITIONS = {}  # (n, device) -> arange(n) in float32, at most _POSITIONS_MAX, the oldest dropped first
+_POSITIONS_MAX = 64
 
 
 def _positions(n, device, like):
@@ -617,6 +688,8 @@ def _positions(n, device, like):
         return torch.arange(n, dtype=torch.float32, device=device)
     key = (n, str(device))
     if key not in _POSITIONS:
+        if len(_POSITIONS) >= _POSITIONS_MAX:
+            _POSITIONS.pop(next(iter(_POSITIONS)))
         _POSITIONS[key] = torch.arange(n, dtype=torch.float32, device=device)
     return _POSITIONS[key]
 
@@ -626,27 +699,25 @@ def _sorted(x, d, descending, stable=False):
     Gaudi's float sort reads NaN as +inf with an out-of-range index, and its non-stable sort pads a row to a power of
     two with +inf (descending: -inf): a real infinity ties with the padding and its index comes back out of range
     (measured at n = 3 to 5000). Its stable sort is right without NaN but falls back to the CPU at 1000 elements or
-    along a non-last dim (14-52 ms at 22000 rows of 1000; non-stable: 0.1-0.3 ms). So two sorts of finite keys. First ``nan_to_num(x)`` (NaN and +-inf as +-max; stable
-    when asked): right but for the order among max, +inf and NaN (among -max and -inf). Then the positions ``p`` of
-    that order (a scatter of the first sort's indices) shifted by ``n`` per class, read off ``x - key`` (0 for a
-    finite value, +-inf for +-inf, NaN for NaN): ``p + n`` for +inf, ``p + 2n`` for NaN, ``p - n`` for -inf
-    (mirrored descending). These are unique and finite, so a non-stable sort orders them exactly and keeps the first
-    sort's order within a class (stable: the input's). An int32 key of the float bits would need one sort, but ``view(torch.int32)`` in a lazy graph converts
-    the value instead of reinterpreting its bits (measured: inf to INT_MAX), and in eager it was no cheaper."""
+    along a non-last dim (14-52 ms at 22000 rows of 1000; non-stable: 0.1-0.3 ms). So two sorts of finite keys.
+    First ``nan_to_num(x)`` (NaN and +-inf as +-max; stable when asked): right but for the order among max, +inf and
+    NaN (among -max and -inf). Then the positions ``p`` of that order (a scatter of the first sort's indices)
+    shifted by ``n`` per class, read off ``x - key`` (0 for a finite value, +-inf for +-inf, NaN for NaN): ``p + n``
+    for +inf, ``p + 2n`` for NaN, ``p - n`` for -inf (mirrored descending). These are unique and finite, so a
+    non-stable sort orders them exactly and keeps the first sort's order within a class (stable: the input's). An
+    int32 key of the float bits would need one sort, but ``view(torch.int32)`` in a lazy graph converts the value
+    instead of reinterpreting its bits (measured: inf to INT_MAX), and in eager it was no cheaper."""
     n = x.shape[d]
     if n == 1:  # Gaudi's bfloat16 sort of a dim of size 1 fails graph compile (measured); torch: x and index 0
         return x.clone(), torch.zeros(x.shape, dtype=torch.int64, device=x.device)
-    sort = native(aten.sort.stable)
+    sort = _primitive(aten.sort.stable, x)
     last = d == x.dim() - 1
     with torch.no_grad():
         # along the last dim: Gaudi's descending sort along another dim returns indices that are no permutation
         # when a row holds -max (measured at n = 8, 22)
         xt = x if last else x.movedim(d, -1).contiguous()
-        # the largest finite value of the dtype as the card holds it: float64 is stored as float32 there (hpu-ops#16),
-        # so float64's max would become +inf, which ties with the padding
-        held = torch.float32 if x.dtype == torch.float64 and x.device.type != "cpu" else x.dtype
-        key = torch.nan_to_num(xt, nan=torch.finfo(held).max, posinf=torch.finfo(held).max,
-                               neginf=-torch.finfo(held).max)
+        mx = _held_max(x).max
+        key = torch.nan_to_num(xt, nan=mx, posinf=mx, neginf=-mx)
         _, i = sort(key, stable=stable, dim=-1, descending=descending)
         # each element's position in that order (float data, int64 index)
         p = torch.empty(xt.shape, dtype=torch.float32, device=x.device).scatter_(
@@ -660,53 +731,251 @@ def _sorted(x, d, descending, stable=False):
     return x.gather(d, i), i  # autograd: the gradient to the index, torch's backward of sort
 
 
+def _select_key(x):
+    """A finite key in torch's order of ``x`` for Gaudi's topk / kthvalue (one call instead of the exact sort's two
+    sorts and a scatter): NaN as max, +inf as the float below it (m1), -inf as -m1, finite values clamped to
+    [-m2, m2] (m2: the float below m1). No key is infinite, so none ties with the padding; the order is torch's up to
+    the three largest finite magnitudes (m2, m1 and max, within 2 ulp of FLT_MAX), which tie at m2 (documented)."""
+    info = _held_max(x)
+    ulp = 2.0 ** (math.frexp(info.max)[1] - 1) * info.eps
+    m1, m2 = info.max - ulp, info.max - 2 * ulp
+    key = torch.nan_to_num(x, nan=info.max, posinf=m1, neginf=-m1)
+    return torch.where(torch.isfinite(x), x.clamp(-m2, m2), key)
+
+
+def _selected(x, d, k, largest, op):
+    """``(values, indices)`` of ``op`` (``topk`` with ``k`` and ``largest``, or ``kthvalue`` with ``k``) along ``d`` in
+    torch's order: Gaudi's op on ``_select_key(x)`` along the last dim, the values read from ``x``."""
+    last = d == x.dim() - 1
+    with torch.no_grad():
+        xt = x if last else x.movedim(d, -1).contiguous()
+        key = _select_key(xt)
+        if op is aten.topk.default:
+            _, i = _primitive(op, x)(key, k, -1, largest, True)
+        else:
+            _, i = _primitive(op, x)(key, k, -1, True)
+        if not last:
+            i = i.movedim(-1, d).contiguous()
+    return x.gather(d, i), i
+
+
+_WARNED_LONG = set()
+
+
 def _sortable(x, dim):
     # traced by torch.compile too: compiled on the card (hpu_backend) the composite is right (measured)
     if not (_floating(x) and x.dim() > 0 and x.numel() > 0):
         return False
-    return x.shape[_dims(x, dim)[0]] <= SORT_MAXN
+    if x.shape[_dims(x, dim)[0]] > SORT_MAXN:
+        if x.device.type not in _WARNED_LONG:
+            _WARNED_LONG.add(x.device.type)
+            import warnings
+            warnings.warn(f"hpu_ops: sort / topk / kthvalue along a dim longer than {SORT_MAXN} elements runs "
+                          "Gaudi's own kernel (NaN read as +inf, an infinity's index can be out of range)")
+        return False
+    return True
+
+
+def _sort_args(overload_stable, args, kwargs):
+    """``(dim, descending, stable)`` of a ``sort.stable`` (``overload_stable``) or ``sort.default`` call."""
+    if overload_stable:
+        stable = bool(args[0] if len(args) > 0 else kwargs.get("stable", False))
+        return kwargs.get("dim", -1), kwargs.get("descending", False), stable
+    dim = args[0] if len(args) > 0 else kwargs.get("dim", -1)
+    descending = args[1] if len(args) > 1 else kwargs.get("descending", False)
+    return dim, descending, False
+
+
+def _sort_fn(self, overload_stable, args, kwargs, name="sort"):
+    dim, descending, stable = _sort_args(overload_stable, args, kwargs)
+    count(name)
+    return _sorted(self, _dims(self, dim)[0], descending, stable)
+
+
+def _topk_fn(self, k, dim=-1, largest=True, sorted=True, name="topk"):
+    count(name)
+    d = _dims(self, dim)[0]
+    if not _concrete(self):
+        # traced: from the exact sort. A graph run through the dispatcher (aot_eager, inductor's fallbacks) sends its
+        # nodes through BackendSelect again: the sort of finite keys comes back unchanged there, the topk key would
+        # not (a key's max clamps to the float below)
+        values, i = _sorted(self, d, largest)
+        return values.narrow(d, 0, k), i.narrow(d, 0, k)
+    return _selected(self, d, k, largest, aten.topk.default)
+
+
+def _kthvalue_fn(self, k, dim=-1, keepdim=False, name="kthvalue"):
+    count(name)
+    d = _dims(self, dim)[0]
+    if not _concrete(self):  # traced: from the exact sort (see _topk_fn)
+        values, i = _sorted(self, d, False)
+        values, i = values.narrow(d, k - 1, 1), i.narrow(d, k - 1, 1)
+    else:
+        values, i = _selected(self, d, k, False, aten.kthvalue.default)
+    return (values, i) if keepdim else (values.squeeze(d), i.squeeze(d))
+
+
+def _topk_ok(self, k, dim=-1, *_, **__):
+    return _sortable(self, dim) and 0 <= k <= self.shape[_dims(self, dim)[0]]
+
+
+def _kth_ok(self, k, dim=-1, *_, **__):
+    return _sortable(self, dim) and 1 <= k <= self.shape[_dims(self, dim)[0]]
 
 
 def _sort_kernel(op, name, overload_stable):
+    """At ``Autograd{}``: traced by ``torch.compile``, the composite; else torch's autograd kernel, whose call below
+    reaches the ``BackendSelect`` kernel (``_select_kernels``), which computes it exactly (no rewrite twice)."""
     def kernel(self, *args, **kwargs):
-        if overload_stable:
-            stable = bool(args[0] if len(args) > 0 else kwargs.get("stable", False))
-            dim, descending = kwargs.get("dim", -1), kwargs.get("descending", False)
-        else:
-            stable = False
-            dim = args[0] if len(args) > 0 else kwargs.get("dim", -1)
-            descending = args[1] if len(args) > 1 else kwargs.get("descending", False)
-        if not _sortable(self, dim):
+        if not _sortable(self, _sort_args(overload_stable, args, kwargs)[0]) or (
+                _concrete(self) and _SELECT.get(self.device.type)):
             return native(op)(self, *args, **kwargs)
-        count(name)
-        return _sorted(self, _dims(self, dim)[0], descending, stable)
+        return _sort_fn(self, overload_stable, args, kwargs, name)
 
     return kernel
 
 
 def _topk_kernel(op, name):
     def kernel(self, k, dim=-1, largest=True, sorted=True):
-        if not _sortable(self, dim) or not 0 <= k <= self.shape[_dims(self, dim)[0]]:
+        if not _topk_ok(self, k, dim) or (_concrete(self) and _SELECT.get(self.device.type)):
             return native(op)(self, k, dim, largest, sorted)  # its own error for a k out of range
-        count(name)
-        d = _dims(self, dim)[0]
-        values, i = _sorted(self, d, largest)
-        return values.narrow(d, 0, k), i.narrow(d, 0, k)
+        return _topk_fn(self, k, dim, largest, sorted, name)
 
     return kernel
 
 
 def _kthvalue_kernel(op, name):
     def kernel(self, k, dim=-1, keepdim=False):
-        if not _sortable(self, dim) or not 1 <= k <= self.shape[_dims(self, dim)[0]]:
+        if not _kth_ok(self, k, dim) or (_concrete(self) and _SELECT.get(self.device.type)):
             return native(op)(self, k, dim, keepdim)
-        count(name)
-        d = _dims(self, dim)[0]
-        values, i = _sorted(self, d, False)
-        values, i = values.narrow(d, k - 1, 1), i.narrow(d, k - 1, 1)
-        return (values, i) if keepdim else (values.squeeze(d), i.squeeze(d))
+        return _kthvalue_fn(self, k, dim, keepdim, name)
 
     return kernel
+
+
+# ---- the sort family at BackendSelect: every eager call (inference mode, out=, below autograd)
+
+
+_SELECT = {}  # device type -> True while the BackendSelect kernels are installed for it
+
+
+def _copy_outs(outs, values, check):
+    """``out=`` with torch's rules: ``check(meta_values, meta_indices)`` runs the op's own ``.out`` meta kernel on
+    meta copies of the outputs (its dtype errors, its warning for a nonempty output of the wrong shape); then each
+    output is resized (silently, the warning is out) and written."""
+    meta = [torch.empty_strided(o.shape, o.stride(), dtype=o.dtype, device="meta") for o in outs]
+    check(*meta)
+    for o, v in zip(outs, values):
+        if o.shape != v.shape:
+            o.resize_(v.shape)
+        o.copy_(v)
+    return tuple(outs)
+
+
+def _meta(x):
+    return torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device="meta")
+
+
+def _out_dtypes(x, values, indices, kth=False):
+    """torch's dtype errors for the sort family's ``out=`` (its CPU kernels check them; the meta kernels do not):
+    on a mismatch, the same call on one-element CPU tensors of these dtypes, so the message is torch's own on this
+    platform (int64 prints as "long long" on macOS, "long int" on Linux)."""
+    if values.dtype == x.dtype and indices.dtype == torch.int64:
+        return
+    one = torch.zeros(1, dtype=x.dtype)
+    v, i = torch.empty(0, dtype=values.dtype), torch.empty(0, dtype=indices.dtype)
+    if kth:
+        aten.kthvalue.values._op_dk(DispatchKey.CPU, one, 1, -1, False, values=v, indices=i)
+    else:
+        aten.sort.values_stable._op_dk(DispatchKey.CPU, one, stable=False, dim=-1, descending=False,
+                                       values=v, indices=i)
+    raise RuntimeError(f"out= of dtypes {values.dtype} / {indices.dtype} for a {x.dtype} input")
+
+
+def _select_kernels(device_type):
+    """``(op, kernel)`` for the ``BackendSelect`` key, which every eager call of an op passes on its way to the backend
+    (above it only autograd, ADInplaceOrView and the tracers' keys; inference mode skips autograd, not this). For
+    tensors on ``device_type``: the exact form, with Gaudi's own kernels called at the backend key; ``out=``
+    overloads computed and copied out. Any other device, dtype or shape: the backend kernel of the op. torch's
+    autograd formulas over the result give torch's gradients."""
+    def mine(x):
+        return (isinstance(x, torch.Tensor) and x.device.type == device_type and _concrete(x)
+                and _SELECT.get(device_type, False))
+
+    def sort_default(self, dim=-1, descending=False):
+        if mine(self) and _sortable(self, dim):
+            return _sort_fn(self, False, (dim, descending), {})
+        return _below(aten.sort.default, self.device.type)(self, dim, descending)
+
+    def sort_stable(self, *, stable=None, dim=-1, descending=False):
+        if mine(self) and _sortable(self, dim):
+            return _sort_fn(self, True, (), dict(stable=stable, dim=dim, descending=descending))
+        return _below(aten.sort.stable, self.device.type)(self, stable=stable, dim=dim, descending=descending)
+
+    def sort_values(self, dim=-1, descending=False, *, values, indices):
+        if mine(self) and _sortable(self, dim):
+            _out_dtypes(self, values, indices)
+            return _copy_outs((values, indices), _sort_fn(self, False, (dim, descending), {}),
+                              lambda v, i: aten.sort.values_stable._op_dk(
+                                  DispatchKey.Meta, _meta(self), stable=False, dim=dim, descending=descending,
+                                  values=v, indices=i))
+        return _below(aten.sort.values, self.device.type)(self, dim, descending, values=values, indices=indices)
+
+    def sort_values_stable(self, *, stable=None, dim=-1, descending=False, values, indices):
+        if mine(self) and _sortable(self, dim):
+            _out_dtypes(self, values, indices)
+            return _copy_outs((values, indices),
+                              _sort_fn(self, True, (), dict(stable=stable, dim=dim, descending=descending)),
+                              lambda v, i: aten.sort.values_stable._op_dk(
+                                  DispatchKey.Meta, _meta(self), stable=stable, dim=dim, descending=descending,
+                                  values=v, indices=i))
+        return _below(aten.sort.values_stable, self.device.type)(self, stable=stable, dim=dim, descending=descending,
+                                                                 values=values, indices=indices)
+
+    def topk_default(self, k, dim=-1, largest=True, sorted=True):
+        if mine(self) and _topk_ok(self, k, dim):
+            return _topk_fn(self, k, dim, largest, sorted)
+        return _below(aten.topk.default, self.device.type)(self, k, dim, largest, sorted)
+
+    def topk_values(self, k, dim=-1, largest=True, sorted=True, *, values, indices):
+        if mine(self) and _topk_ok(self, k, dim):
+            _out_dtypes(self, values, indices)
+            return _copy_outs((values, indices), _topk_fn(self, k, dim, largest, sorted),
+                              lambda v, i: aten.topk.values._op_dk(DispatchKey.Meta, _meta(self), k, dim, largest,
+                                                                   sorted, values=v, indices=i))
+        return _below(aten.topk.values, self.device.type)(self, k, dim, largest, sorted, values=values, indices=indices)
+
+    def kthvalue_default(self, k, dim=-1, keepdim=False):
+        if mine(self) and _kth_ok(self, k, dim):
+            return _kthvalue_fn(self, k, dim, keepdim)
+        return _below(aten.kthvalue.default, self.device.type)(self, k, dim, keepdim)
+
+    def kthvalue_values(self, k, dim=-1, keepdim=False, *, values, indices):
+        if mine(self) and _kth_ok(self, k, dim):
+            _out_dtypes(self, values, indices, True)
+            return _copy_outs((values, indices), _kthvalue_fn(self, k, dim, keepdim),
+                              lambda v, i: aten.kthvalue.values._op_dk(DispatchKey.Meta, _meta(self), k, dim,
+                                                                       keepdim, values=v, indices=i))
+        return _below(aten.kthvalue.values, self.device.type)(self, k, dim, keepdim, values=values, indices=indices)
+
+    return [(aten.sort.default, sort_default), (aten.sort.stable, sort_stable), (aten.sort.values, sort_values),
+            (aten.sort.values_stable, sort_values_stable), (aten.topk.default, topk_default),
+            (aten.topk.values, topk_values), (aten.kthvalue.default, kthvalue_default),
+            (aten.kthvalue.values, kthvalue_values)]
+
+
+def _install_select(device_type):
+    library = torch.library.Library("aten", "IMPL")
+    kernels = _select_kernels(device_type)
+    for op, kernel in kernels:
+        library.impl(op, kernel, "BackendSelect")
+    _SELECT[device_type] = True
+
+    def undo():
+        _SELECT.pop(device_type, None)
+        library._destroy()
+
+    return undo
 
 
 # ---- the backend layer: every call (inference mode too), through the ops' .out overloads
@@ -1092,13 +1361,14 @@ def install(device_type, exact_sort=None):
     k.append((aten.norm.Scalar, "Autograd{}", _norm_kernel(aten.norm.Scalar, "norm_inf", False)))
     k += [(out_op, "Autograd{}", _out_kernel(out_op, functional, names)) for out_op, functional, names in OUTS]
     family = len(k)  # the sort family after these: its own switch, HPU_OPS_NAN_PROPAGATION=0 does not cancel it
+    undo_select = _install_select(device_type) if exact_sort else (lambda: None)
     if exact_sort:
         k.append((aten.sort.default, "Autograd{}", _sort_kernel(aten.sort.default, "sort", False)))
         k.append((aten.sort.stable, "Autograd{}", _sort_kernel(aten.sort.stable, "sort", True)))
         k.append((aten.topk.default, "Autograd{}", _topk_kernel(aten.topk.default, "topk")))
         k.append((aten.kthvalue.default, "Autograd{}", _kthvalue_kernel(aten.kthvalue.default, "kthvalue")))
     if not nan:
-        return register_kernels(device_type, k[family:])
+        return chain([register_kernels(device_type, k[family:]), undo_select])
     undo_backend = override_kernels(device_type, _backend_kernels(device_type))
     _BACKEND[device_type] = True
     undo_autograd = register_kernels(device_type, k)
@@ -1110,4 +1380,4 @@ def install(device_type, exact_sort=None):
     def undo_flag():
         _BACKEND.pop(device_type, None)
 
-    return chain([undo_backend, undo_flag, undo_autograd, undo_traced])
+    return chain([undo_backend, undo_flag, undo_autograd, undo_traced, undo_select])

@@ -125,29 +125,39 @@ def gaudi_out(op, device_type):
 
 
 def gaudi(op):
-    """The functional ops hpu-ops rewrites at the autograd key only (the sorts), as Gaudi computes them: NaN read as
-    +-inf. Every other op is torch's own (it reaches the backend layer,
-    which calls ``gaudi_out``)."""
-    real = REAL(op)
+    """The autograd-key view of the ops hpu-ops rewrites: torch's own (the sorts reach the BackendSelect layer, whose
+    Gaudi calls go through ``gaudi_backend``; the other ops reach the backend layer, which calls ``gaudi_out``)."""
+    return REAL(op)
 
-    def fn(*args, **kwargs):
-        x, rest = args[0], args[1:]
-        if not (isinstance(x, torch.Tensor) and x.is_floating_point()):
-            return real(*args, **kwargs)
-        if op in (aten.sort.default, aten.sort.stable):
-            stable = op is aten.sort.stable and bool(kwargs.get("stable", rest[0] if rest else False))
-            dim = kwargs.get("dim", -1) if op is aten.sort.stable else (rest[0] if rest else -1)
-            desc = kwargs.get("descending", rest[1] if len(rest) > 1 and op is aten.sort.default else False)
+
+REAL_BACKEND = extrema.native_backend
+
+
+def gaudi_backend(op, device_type):
+    """Gaudi's sort / topk / kthvalue ``.out`` kernels at the backend key, as measured: NaN read as +inf (descending
+    -inf) with an out-of-range index; a non-stable sort's infinity that ties with the padding to a power of two out of
+    range too."""
+    real = REAL_BACKEND(op, device_type)
+
+    def fn(x, *args, **kwargs):
+        if not (isinstance(x, torch.Tensor) and x.is_floating_point()) or x.dim() == 0:
+            return real(x, *args, **kwargs)
+        if op is aten.sort.values_stable:
+            stable, dim, desc = bool(kwargs.get("stable")), kwargs.get("dim", -1), kwargs.get("descending", False)
             pad = -INF if desc else INF
-            v, i = real(drop(x, pad), *rest, **kwargs)
-            n = x.shape[dim] if x.dim() else 1
-            # out of range (measured): a NaN's index, and a non-stable sort's index of an infinity that ties with
-            # the padding to a power of two (+inf ascending, -inf descending)
-            bad = torch.isnan(x.gather(dim, i)) if x.dim() else torch.isnan(x)
+            v, i = real(drop(x, pad), *args, **kwargs)
+            n = x.shape[dim]
+            bad = torch.isnan(x.gather(dim, i))
             if not stable and n & (n - 1):
                 bad = bad | (v == pad)
-            return v, i.masked_fill(bad, n)
-        return real(*args, **kwargs)
+            i.masked_fill_(bad, n)
+            return v, i
+        if op in (aten.topk.values, aten.kthvalue.values):
+            dim = args[1] if len(args) > 1 else kwargs.get("dim", -1)
+            v, i = real(drop(x, INF), *args, **kwargs)
+            i.masked_fill_(torch.isnan(x.gather(dim, i)), x.shape[dim])
+            return v, i
+        return real(x, *args, **kwargs)
 
     return fn
 
@@ -183,7 +193,7 @@ def compiled(f, nodes, **options):
     def record(gm, example_inputs):
         nodes.extend(n for n in gm.graph.nodes if n.op == "call_function")
 
-        def run(*args):
+        def run(*args):  # through the dispatcher, BackendSelect included (as aot_eager runs a graph)
             with torch._C._AutoDispatchBelowAutograd():
                 return gm.forward(*args)
 
@@ -197,6 +207,7 @@ def compiled(f, nodes, **options):
 def card(monkeypatch):
     """extrema installed for "cpu", over the NaN-dropping stand-in of Gaudi's kernels; yields the call counts."""
     monkeypatch.setattr(extrema, "native", gaudi)
+    monkeypatch.setattr(extrema, "native_backend", gaudi_backend)
     monkeypatch.setattr(extrema, "native_out", gaudi_out)
     _CURRENT["undo"] = _install_card()
     hpu_ops._STATE["calls"].clear()
@@ -637,6 +648,7 @@ def test_compiled_max_pool_and_maximum_with_gradients(card):
 def test_undo_restores_the_native_op(monkeypatch):
     """After the undo the stand-in (dropping NaN) is what runs: the rewrite is gone."""
     monkeypatch.setattr(extrema, "native", gaudi)
+    monkeypatch.setattr(extrema, "native_backend", gaudi_backend)
     monkeypatch.setattr(extrema, "native_out", gaudi_out)
     undo = extrema.install("cpu")
     x = rows(dtype=torch.float32)
@@ -927,3 +939,163 @@ def test_inplace_ops_keep_a_cpu_scalar_self_on_the_cpu():
     assert extrema._onto_device((s, bound))[0].device.type == "meta"
     with pytest.raises(RuntimeError, match="device"):  # what the native kernel then does with a CPU self
         torch.ops.aten.clamp_.Tensor(s, bound, None)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_sorts_exact_in_inference_mode_and_with_out(card, dtype):
+    """The BackendSelect layer: inference mode (no autograd key) and out= calls are exact too."""
+    x = rows(n=22, dtype=dtype)
+    x[6, 2], x[6, 0] = INF, NAN
+    cases = {
+        "sort": (lambda t: tuple(t.sort(-1)), False),
+        "sort_stable_desc": (lambda t: tuple(t.sort(dim=-1, stable=True, descending=True)), True),
+        "topk": (lambda t: tuple(t.topk(4, -1)), False),
+        "kthvalue": (lambda t: tuple(t.kthvalue(3, -1, keepdim=True)), False),
+    }
+    for name, (f, exact) in cases.items():
+        want = _reference(f, x)
+        with torch.inference_mode():
+            same_selection(f(x), want, x, -1, exact)
+    for name, call in (("sort", lambda t, o: torch.sort(t, -1, out=o)),
+                       ("sort_stable", lambda t, o: torch.sort(t, dim=-1, stable=True, out=o)),
+                       ("topk", lambda t, o: torch.topk(t, 4, -1, out=o)),
+                       ("kthvalue", lambda t, o: torch.kthvalue(t, 3, -1, out=o))):
+        want = _reference(lambda t: call(t, (torch.empty(0, dtype=dtype), torch.empty(0, dtype=torch.int64))), x)
+        for mode in (torch.inference_mode, torch.no_grad):
+            with mode():
+                out = (torch.empty(0, dtype=dtype), torch.empty(0, dtype=torch.int64))
+                got = call(x, out)
+            assert got[0] is out[0] or got[0].data_ptr() == out[0].data_ptr()
+            same_selection(tuple(got), tuple(want), x, -1, name == "sort_stable")
+    assert card["sort"] and card["topk"] and card["kthvalue"]
+
+
+def test_internal_sort_with_nan_and_inf_keeps_indices_in_range(card):
+    """hpu-ops' own eigenvalue sorts: a NaN or an infinity no longer gives Gaudi's out-of-range index (the stand-in's
+    gather raised 'index out of bounds'); the NaN comes back as NaN."""
+    x = torch.randn(4, 22, dtype=torch.float32)
+    x[1, 3], x[2] = NAN, NAN
+    x[3, ::4] = INF
+    v, i = extrema.internal_sort(x, -1)
+    assert bool(((i >= 0) & (i < 22)).all()) and card["sort"] == 0
+    assert torch.isnan(v[1]).sum() == 1 and torch.isnan(v[2]).all()
+    same(v[0], _reference(lambda t: t.sort(-1).values, x)[0])
+    same(v[3], _reference(lambda t: t.sort(-1).values, x)[3])
+
+
+def test_eigh_of_a_nan_matrix_returns_nan_without_an_out_of_range_gather(monkeypatch):
+    from hpu_ops import eigh as eigh_mod
+
+    monkeypatch.setattr(extrema, "native_backend", gaudi_backend)
+    A = torch.randn(2, 6, 6)
+    A = A @ A.mT
+    A[1, 2, 3] = A[1, 3, 2] = NAN
+    with cpu_as_hpu(extrema.install):
+        w, V = eigh_mod.eigh(A, False)
+    assert torch.isfinite(w[0]).all() and torch.isnan(w[1]).any()
+
+
+def test_rows_past_sort_maxn_warn_once(card, monkeypatch):
+    monkeypatch.setattr(extrema, "SORT_MAXN", 4)
+    monkeypatch.setattr(extrema, "_WARNED_LONG", set())
+    x = torch.randn(3, 6)
+    with pytest.warns(UserWarning, match="longer than 4"):
+        x.sort(-1)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        x.topk(2, -1)  # warned once
+
+
+def test_positions_cache_is_bounded(monkeypatch):
+    monkeypatch.setattr(extrema, "_POSITIONS", {})
+    x = torch.zeros(1)
+    for n in range(2, 2 + 3 * extrema._POSITIONS_MAX):
+        extrema._positions(n, x.device, x)
+    assert len(extrema._POSITIONS) == extrema._POSITIONS_MAX
+
+
+def test_select_key_order():
+    """topk / kthvalue's finite key: torch's order, NaN above +inf above every finite value."""
+    info = torch.finfo(torch.float32)
+    x = torch.tensor([NAN, INF, info.max, 1.0, -0.0, -info.max, -INF])
+    k = extrema._select_key(x)
+    assert torch.isfinite(k).all() and bool((k[:-1] > k[1:])[[0, 1, 3, 5]].all())
+
+
+def test_quantile_keeps_its_inf_keys(card):
+    """Review of PR #44: internal_sort's nan_to_num tied quantile's +-inf keys with +-FLT_MAX: quantile([inf, max], 0)
+    gave NaN (torch 3.4028e38), nanquantile([nan, max, 1], .5) NaN (torch 1.7014e38). Quantile sorts its keys as is."""
+    from hpu_ops import quantile
+
+    M = torch.finfo(torch.float32).max
+    a, b = torch.tensor([INF, M]), torch.tensor([NAN, M, 1.0])
+    want = _reference(lambda: (torch.quantile(a, 0.0), torch.nanquantile(b, 0.5), torch.quantile(a, 1.0)))
+    with cpu_as_hpu(quantile.install):
+        got = (torch.quantile(a, 0.0), torch.nanquantile(b, 0.5), torch.quantile(a, 1.0))
+    same(got, want)
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_topk_kthvalue_compiled_through_the_dispatcher(card, backend):
+    """Review of PR #44: a compiled graph whose aten.topk re-enters BackendSelect applied the topk key twice
+    ([inf, 1, nan, max, 2] topk(2) -> [0, 2], torch [2, 0]). Traced, topk / kthvalue come from the exact sort."""
+    x = torch.tensor([[INF, 1.0, NAN, torch.finfo(torch.float32).max, 2.0]])
+    for f in (lambda t: torch.topk(t, 2, -1), lambda t: torch.kthvalue(t, 4, -1),
+              lambda t: torch.sort(t, -1, descending=True)):
+        want = _reference(f, x)
+        torch._dynamo.reset()
+        got = torch.compile(f, backend=backend)(x)
+        same(got.indices, want.indices)
+        same(got.values, want.values)
+
+
+@pytest.mark.parametrize("mode", ["grad", "no_grad", "inference"])
+def test_out_dtype_rules_and_resize_warning_as_torch(card, mode):
+    """Review of PR #44: out= with a float64 / bfloat16 values tensor, an int32 indices tensor must raise as torch;
+    a nonempty out of the wrong shape is resized with torch's warning."""
+    import contextlib
+    import warnings
+
+    x = rows(n=10, dtype=torch.float32)
+    ctx = {"grad": contextlib.nullcontext, "no_grad": torch.no_grad, "inference": torch.inference_mode}[mode]
+    bad = [lambda: torch.sort(x, -1, out=(torch.empty(0, dtype=torch.float64), torch.empty(0, dtype=torch.int64))),
+           lambda: torch.topk(x, 2, -1, out=(torch.empty(0), torch.empty(0, dtype=torch.int32))),
+           lambda: torch.kthvalue(x, 2, -1, out=(torch.empty(0, dtype=torch.bfloat16),
+                                                 torch.empty(0, dtype=torch.int64))),
+           lambda: torch.kthvalue(x, 2, -1, out=(torch.empty(0), torch.empty(0, dtype=torch.int32)))]
+    for f in bad:
+        with pytest.raises(RuntimeError) as want:
+            _reference(f)
+        with ctx():
+            with pytest.raises(RuntimeError, match=str(want.value).split(",")[0][:40].replace("(", ".")):
+                f()
+    with ctx(), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        v, i = torch.empty(5), torch.empty(5, dtype=torch.int64)
+        torch.topk(x, 2, -1, out=(v, i))
+    assert any("was resized" in str(w.message) for w in caught) and v.shape == (10, 2)
+
+
+def test_quantile_lerp_next_to_an_infinity_is_torch_s(card):
+    """torch's lerp has two branches (w < 0.5 from a, else from b): quantile([inf, max], .5) is nan and
+    quantile([max, inf, -inf, -max], .3) is -inf there; Gaudi's one-form lerp gave inf and nan."""
+    from hpu_ops import quantile
+
+    M = torch.finfo(torch.float32).max
+    cases = [(torch.tensor([INF, M]), 0.5), (torch.tensor([M, INF, -INF, -M]), 0.3), (torch.tensor([1.0, 2.0]), 0.25),
+             (torch.tensor([1.0, 2.0, 4.0]), 0.75)]
+    want = [_reference(lambda: torch.quantile(a, q)) for a, q in cases]
+    with cpu_as_hpu(quantile.install):
+        got = [torch.quantile(a, q) for a, q in cases]
+    same(got, want)
+
+
+def test_out_dtype_messages_are_torch_s_on_this_platform(card):
+    """The out= dtype errors come from torch's own CPU kernels (int64 is "long long" on macOS, "long int" on Linux)."""
+    x = torch.randn(3, 5)
+    with pytest.raises(RuntimeError) as want:
+        _reference(lambda: torch.sort(x, -1, out=(torch.empty(0), torch.empty(0, dtype=torch.int32))))
+    with pytest.raises(RuntimeError) as got:
+        torch.sort(x, -1, out=(torch.empty(0), torch.empty(0, dtype=torch.int32)))
+    assert str(got.value).splitlines()[0] == str(want.value).splitlines()[0]

@@ -343,7 +343,8 @@ def test_review_expm_constant_component():
     A = np.diag([-1e8, 0.0]).astype(np.float32)
     assert kr.rcp_newton(np.float32(1))[0] == 1 and kr.rcp_newton(np.float32(1), legacy=True)[0] < 1
     assert kr.matrix_exp(A)[1, 1] == 1 and kr.matrix_exp(A)[0, 0] == 0
-    assert abs(kr.matrix_exp(A, legacy_rcp=True)[1, 1] - 0.13530262) < 1e-6  # the review's value, reproduced
+    # the review's value, reproduced at the theta of then (5.37; the kernel's is 2 since code review #8)
+    assert abs(kr.matrix_exp(A, legacy_rcp=True, theta=kr.THETA_LEGACY)[1, 1] - 0.13530262) < 1e-6
     x = np.float32(2.0) ** np.arange(-60, 60, 7, dtype=np.float32)
     assert np.array_equal(kr.rcp_newton(x), (1 / x.astype(np.float64)).astype(np.float32))  # powers of two exact
 
