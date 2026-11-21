@@ -59,6 +59,58 @@ static inline float64 rsqrt_newton(float64 x)
     return v_f32_mul_b(r, v_f32_mac_b(v_f32_mul_b(-0.5f, x), v_f32_mul_b(r, r), 1.5f));
 }
 
+// The rotation (c, s) of the pair with squared norms alpha, beta and dot product gamma, computed on alpha, beta,
+// gamma scaled by ~1 / (alpha + beta): c and s depend on their ratios only, and r^2 = d^2 + (2 gamma)^2 and
+// alpha * beta, products of squares, underflowed for rows of norm ~1e-10 (Codex review #6: two identical rows
+// [0, 1e-10, 0] never rotated, rank 3 for 2). The skip rules (gamma = 0, gamma^2 <= 1e-14 alpha beta, r^2 < 1e-34)
+// read the scaled values, so they are relative to the pair. The update of row p is c up - s uq as two rounded
+// products (no FMA), so that with c = s two identical rows give exactly 0.
+#define JACOBI_CS(alpha, beta, gamma, c, s)                                                        \
+    do                                                                                             \
+    {                                                                                              \
+        float64 ab_ = v_f32_add_b((alpha), (beta));                                                \
+        float64 k_ = rsqrt_newton(v_f32_sel_eq_f32_b(ab_, 0.0f, 1.0f, ab_));                       \
+        k_ = v_f32_mul_b(k_, k_);                                                                  \
+        float64 a_ = v_f32_mul_b((alpha), k_);                                                     \
+        float64 b_ = v_f32_mul_b((beta), k_);                                                      \
+        float64 g_ = v_f32_mul_b((gamma), k_);                                                     \
+        float64 d_ = v_f32_sub_b(b_, a_);                                                          \
+        float64 g2_ = v_f32_add_b(g_, g_);                                                         \
+        float64 r2_ = v_f32_mac_b(g2_, g2_, v_f32_mul_b(d_, d_));                                  \
+        float64 inv_r_ = rsqrt_newton(v_f32_sel_less_f32_b(r2_, 1.0e-34f, 1.0f, r2_));             \
+        float64 c2_ = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d_), inv_r_, 1.0f));               \
+        float64 inv_c_ = rsqrt_newton(c2_);                                                        \
+        (c) = v_f32_mul_b(c2_, inv_c_);                                                            \
+        (s) = v_f32_mul_b(v_f32_mul_b(0.5f, g2_), v_f32_mul_b(inv_r_, inv_c_));                    \
+        (s) = v_f32_sel_less_f32_b(d_, 0.0f, v_f32_sub_b(0.0f, (s)), (s));                         \
+        /* equal norms: exactly 45 degrees, c = |s| (two identical rows then cancel to an exact zero row) */      \
+        (c) = v_f32_sel_eq_f32_b(d_, 0.0f, 0.70710677f, (c));                                      \
+        (s) = v_f32_sel_eq_f32_b(d_, 0.0f, v_f32_sel_less_f32_b(g2_, 0.0f, -0.70710677f, 0.70710677f), (s)); \
+        float64 gsq_ = v_f32_mul_b(g_, g_);                                                        \
+        float64 tol_ = v_f32_mul_b(1.0e-14f, v_f32_mul_b(a_, b_));                                 \
+        (c) = v_f32_sel_less_f32_b(tol_, gsq_, (c), 1.0f);                                         \
+        (s) = v_f32_sel_less_f32_b(tol_, gsq_, (s), 0.0f);                                         \
+        (c) = v_f32_sel_less_f32_b(r2_, 1.0e-34f, 1.0f, (c));                                      \
+        (s) = v_f32_sel_less_f32_b(r2_, 1.0e-34f, 0.0f, (s));                                      \
+        (c) = v_f32_sel_eq_f32_b((gamma), 0.0f, 1.0f, (c));                                        \
+        (s) = v_f32_sel_eq_f32_b((gamma), 0.0f, 0.0f, (s));                                        \
+    } while (0)
+
+// The norm of row x (per 32-lane half) without squaring it into underflow: max|x| * ||x / max|x|||, the row
+// scaled by 1 / max|x| (cw) and 1 / ||cw|| (rn): cw * rn is the unit row (Codex review #6). nrm is 0 for a zero row.
+#define ROW_NORM(x, mx, cw, nrm, rn)                                                               \
+    do                                                                                             \
+    {                                                                                              \
+        (mx) = reduce_max_half32(v_f32_abs_b(x));                                                  \
+        float64 smx_ = v_f32_sel_eq_f32_b((mx), 0.0f, 1.0f, (mx));                                 \
+        float64 rmx_ = v_reciprocal_f32(smx_);                                                     \
+        rmx_ = v_f32_mul_b(rmx_, v_f32_sub_b(2.0f, v_f32_mul_b(smx_, rmx_)));                      \
+        (cw) = v_f32_mul_b((x), rmx_);                                                             \
+        float64 sq_ = reduce_add_half32(v_f32_mul_b((cw), (cw)));                                  \
+        (rn) = rsqrt_newton(v_f32_sel_less_f32_b(sq_, 1.0e-36f, 1.0f, sq_));                       \
+        (nrm) = v_f32_mul_b(v_f32_mul_b(sq_, (rn)), smx_);                                         \
+    } while (0)
+
 #define RR_PAIR(r, k, rr_m, p, q)          \
     do                                     \
     {                                      \
@@ -180,80 +232,19 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
                     float64 beta2 = reduce_add_half32(v_f32_mul_b(uq2, uq2));
                     float64 gamma2 = reduce_add_half32(v_f32_mul_b(up2, uq2));
 
-                    float64 d0 = v_f32_sub_b(beta0, alpha0);
-                    float64 d1 = v_f32_sub_b(beta1, alpha1);
-                    float64 d2 = v_f32_sub_b(beta2, alpha2);
-                    float64 g20 = v_f32_add_b(gamma0, gamma0);
-                    float64 g21 = v_f32_add_b(gamma1, gamma1);
-                    float64 g22 = v_f32_add_b(gamma2, gamma2);
-                    float64 r20 = v_f32_mac_b(g20, g20, v_f32_mul_b(d0, d0));
-                    float64 r21 = v_f32_mac_b(g21, g21, v_f32_mul_b(d1, d1));
-                    float64 r22 = v_f32_mac_b(g22, g22, v_f32_mul_b(d2, d2));
-                    float64 sr20 = v_f32_sel_less_f32_b(r20, 1.0e-34f, 1.0f, r20);
-                    float64 sr21 = v_f32_sel_less_f32_b(r21, 1.0e-34f, 1.0f, r21);
-                    float64 sr22 = v_f32_sel_less_f32_b(r22, 1.0e-34f, 1.0f, r22);
-
-                    float64 inv_r0 = rsqrt_newton(sr20);
-                    float64 inv_r1 = rsqrt_newton(sr21);
-                    float64 inv_r2 = rsqrt_newton(sr22);
-
-                    float64 c20 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d0), inv_r0, 1.0f));
-                    float64 c21 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d1), inv_r1, 1.0f));
-                    float64 c22 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d2), inv_r2, 1.0f));
-
-                    float64 inv_c0 = rsqrt_newton(c20);
-                    float64 inv_c1 = rsqrt_newton(c21);
-                    float64 inv_c2 = rsqrt_newton(c22);
-
-                    float64 c0 = v_f32_mul_b(c20, inv_c0);
-                    float64 c1 = v_f32_mul_b(c21, inv_c1);
-                    float64 c2 = v_f32_mul_b(c22, inv_c2);
-                    float64 s0 = v_f32_mul_b(v_f32_mul_b(0.5f, g20), v_f32_mul_b(inv_r0, inv_c0));
-                    float64 s1 = v_f32_mul_b(v_f32_mul_b(0.5f, g21), v_f32_mul_b(inv_r1, inv_c1));
-                    float64 s2 = v_f32_mul_b(v_f32_mul_b(0.5f, g22), v_f32_mul_b(inv_r2, inv_c2));
-                    s0 = v_f32_sel_less_f32_b(d0, 0.0f, v_f32_sub_b(0.0f, s0), s0);
-                    s1 = v_f32_sel_less_f32_b(d1, 0.0f, v_f32_sub_b(0.0f, s1), s1);
-                    s2 = v_f32_sel_less_f32_b(d2, 0.0f, v_f32_sub_b(0.0f, s2), s2);
-
-                    float64 gsq0 = v_f32_mul_b(gamma0, gamma0);
-                    float64 tol0 = v_f32_mul_b(1.0e-14f, v_f32_mul_b(alpha0, beta0));
-                    c0 = v_f32_sel_less_f32_b(tol0, gsq0, c0, 1.0f);
-                    s0 = v_f32_sel_less_f32_b(tol0, gsq0, s0, 0.0f);
-                    c0 = v_f32_sel_less_f32_b(r20, 1.0e-34f, 1.0f, c0);
-                    s0 = v_f32_sel_less_f32_b(r20, 1.0e-34f, 0.0f, s0);
-                    c0 = v_f32_sel_eq_f32_b(gamma0, 0.0f, 1.0f, c0);
-                    s0 = v_f32_sel_eq_f32_b(gamma0, 0.0f, 0.0f, s0);
-
-                    float64 gsq1 = v_f32_mul_b(gamma1, gamma1);
-                    float64 tol1 = v_f32_mul_b(1.0e-14f, v_f32_mul_b(alpha1, beta1));
-                    c1 = v_f32_sel_less_f32_b(tol1, gsq1, c1, 1.0f);
-                    s1 = v_f32_sel_less_f32_b(tol1, gsq1, s1, 0.0f);
-                    c1 = v_f32_sel_less_f32_b(r21, 1.0e-34f, 1.0f, c1);
-                    s1 = v_f32_sel_less_f32_b(r21, 1.0e-34f, 0.0f, s1);
-                    c1 = v_f32_sel_eq_f32_b(gamma1, 0.0f, 1.0f, c1);
-                    s1 = v_f32_sel_eq_f32_b(gamma1, 0.0f, 0.0f, s1);
-
-                    float64 gsq2 = v_f32_mul_b(gamma2, gamma2);
-                    float64 tol2 = v_f32_mul_b(1.0e-14f, v_f32_mul_b(alpha2, beta2));
-                    c2 = v_f32_sel_less_f32_b(tol2, gsq2, c2, 1.0f);
-                    s2 = v_f32_sel_less_f32_b(tol2, gsq2, s2, 0.0f);
-                    c2 = v_f32_sel_less_f32_b(r22, 1.0e-34f, 1.0f, c2);
-                    s2 = v_f32_sel_less_f32_b(r22, 1.0e-34f, 0.0f, s2);
-                    c2 = v_f32_sel_eq_f32_b(gamma2, 0.0f, 1.0f, c2);
-                    s2 = v_f32_sel_eq_f32_b(gamma2, 0.0f, 0.0f, s2);
+                    float64 c0, s0, c1, s1, c2, s2;
+                    JACOBI_CS(alpha0, beta0, gamma0, c0, s0);
+                    JACOBI_CS(alpha1, beta1, gamma1, c1, s1);
+                    JACOBI_CS(alpha2, beta2, gamma2, c2, s2);
 
                     BROADCAST_CS(c0, s0);
                     BROADCAST_CS(c1, s1);
                     BROADCAST_CS(c2, s2);
-
-                    float64 ns0 = v_f32_sub_b(0.0f, s0);
-                    float64 ns1 = v_f32_sub_b(0.0f, s1);
-                    float64 ns2 = v_f32_sub_b(0.0f, s2);
-                    ARR[p0] = v_f32_mac_b(uq0, ns0, v_f32_mul_b(up0, c0));
+                    ARR[p0] = v_f32_sub_b(v_f32_mul_b(up0, c0), v_f32_mul_b(uq0, s0));
                     ARR[q0] = v_f32_mac_b(up0, s0, v_f32_mul_b(uq0, c0));
-                    ARR[p1] = v_f32_mac_b(uq1, ns1, v_f32_mul_b(up1, c1));
+                    ARR[p1] = v_f32_sub_b(v_f32_mul_b(up1, c1), v_f32_mul_b(uq1, s1));
                     ARR[q1] = v_f32_mac_b(up1, s1, v_f32_mul_b(uq1, c1));
-                    ARR[p2] = v_f32_mac_b(uq2, ns2, v_f32_mul_b(up2, c2));
+                    ARR[p2] = v_f32_sub_b(v_f32_mul_b(up2, c2), v_f32_mul_b(uq2, s2));
                     ARR[q2] = v_f32_mac_b(up2, s2, v_f32_mul_b(uq2, c2));
                 }
                 if (k + 1 < half_n)
@@ -273,57 +264,15 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
                     float64 beta1 = reduce_add_half32(v_f32_mul_b(uq1, uq1));
                     float64 gamma1 = reduce_add_half32(v_f32_mul_b(up1, uq1));
 
-                    float64 d0 = v_f32_sub_b(beta0, alpha0);
-                    float64 d1 = v_f32_sub_b(beta1, alpha1);
-                    float64 g20 = v_f32_add_b(gamma0, gamma0);
-                    float64 g21 = v_f32_add_b(gamma1, gamma1);
-                    float64 r20 = v_f32_mac_b(g20, g20, v_f32_mul_b(d0, d0));
-                    float64 r21 = v_f32_mac_b(g21, g21, v_f32_mul_b(d1, d1));
-                    float64 sr20 = v_f32_sel_less_f32_b(r20, 1.0e-34f, 1.0f, r20);
-                    float64 sr21 = v_f32_sel_less_f32_b(r21, 1.0e-34f, 1.0f, r21);
-
-                    float64 inv_r0 = rsqrt_newton(sr20);
-                    float64 inv_r1 = rsqrt_newton(sr21);
-
-                    float64 c20 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d0), inv_r0, 1.0f));
-                    float64 c21 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d1), inv_r1, 1.0f));
-
-                    float64 inv_c0 = rsqrt_newton(c20);
-                    float64 inv_c1 = rsqrt_newton(c21);
-
-                    float64 c0 = v_f32_mul_b(c20, inv_c0);
-                    float64 c1 = v_f32_mul_b(c21, inv_c1);
-                    float64 s0 = v_f32_mul_b(v_f32_mul_b(0.5f, g20), v_f32_mul_b(inv_r0, inv_c0));
-                    float64 s1 = v_f32_mul_b(v_f32_mul_b(0.5f, g21), v_f32_mul_b(inv_r1, inv_c1));
-                    s0 = v_f32_sel_less_f32_b(d0, 0.0f, v_f32_sub_b(0.0f, s0), s0);
-                    s1 = v_f32_sel_less_f32_b(d1, 0.0f, v_f32_sub_b(0.0f, s1), s1);
-
-                    float64 gsq0 = v_f32_mul_b(gamma0, gamma0);
-                    float64 tol0 = v_f32_mul_b(1.0e-14f, v_f32_mul_b(alpha0, beta0));
-                    c0 = v_f32_sel_less_f32_b(tol0, gsq0, c0, 1.0f);
-                    s0 = v_f32_sel_less_f32_b(tol0, gsq0, s0, 0.0f);
-                    c0 = v_f32_sel_less_f32_b(r20, 1.0e-34f, 1.0f, c0);
-                    s0 = v_f32_sel_less_f32_b(r20, 1.0e-34f, 0.0f, s0);
-                    c0 = v_f32_sel_eq_f32_b(gamma0, 0.0f, 1.0f, c0);
-                    s0 = v_f32_sel_eq_f32_b(gamma0, 0.0f, 0.0f, s0);
-
-                    float64 gsq1 = v_f32_mul_b(gamma1, gamma1);
-                    float64 tol1 = v_f32_mul_b(1.0e-14f, v_f32_mul_b(alpha1, beta1));
-                    c1 = v_f32_sel_less_f32_b(tol1, gsq1, c1, 1.0f);
-                    s1 = v_f32_sel_less_f32_b(tol1, gsq1, s1, 0.0f);
-                    c1 = v_f32_sel_less_f32_b(r21, 1.0e-34f, 1.0f, c1);
-                    s1 = v_f32_sel_less_f32_b(r21, 1.0e-34f, 0.0f, s1);
-                    c1 = v_f32_sel_eq_f32_b(gamma1, 0.0f, 1.0f, c1);
-                    s1 = v_f32_sel_eq_f32_b(gamma1, 0.0f, 0.0f, s1);
+                    float64 c0, s0, c1, s1;
+                    JACOBI_CS(alpha0, beta0, gamma0, c0, s0);
+                    JACOBI_CS(alpha1, beta1, gamma1, c1, s1);
 
                     BROADCAST_CS(c0, s0);
                     BROADCAST_CS(c1, s1);
-
-                    float64 ns0 = v_f32_sub_b(0.0f, s0);
-                    float64 ns1 = v_f32_sub_b(0.0f, s1);
-                    ARR[p0] = v_f32_mac_b(uq0, ns0, v_f32_mul_b(up0, c0));
+                    ARR[p0] = v_f32_sub_b(v_f32_mul_b(up0, c0), v_f32_mul_b(uq0, s0));
                     ARR[q0] = v_f32_mac_b(up0, s0, v_f32_mul_b(uq0, c0));
-                    ARR[p1] = v_f32_mac_b(uq1, ns1, v_f32_mul_b(up1, c1));
+                    ARR[p1] = v_f32_sub_b(v_f32_mul_b(up1, c1), v_f32_mul_b(uq1, s1));
                     ARR[q1] = v_f32_mac_b(up1, s1, v_f32_mul_b(uq1, c1));
                 }
                 if (k < half_n)
@@ -335,30 +284,11 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
                     float64 beta = reduce_add_half32(v_f32_mul_b(uq, uq));
                     float64 gamma = reduce_add_half32(v_f32_mul_b(up, uq));
 
-                    float64 d = v_f32_sub_b(beta, alpha);
-                    float64 g2 = v_f32_add_b(gamma, gamma);
-                    float64 r2 = v_f32_mac_b(g2, g2, v_f32_mul_b(d, d));
-                    float64 sr2 = v_f32_sel_less_f32_b(r2, 1.0e-34f, 1.0f, r2);
-                    float64 inv_r = rsqrt_newton(sr2);
-                    float64 c2 = v_f32_mul_b(0.5f, v_f32_mac_b(v_f32_abs_b(d), inv_r, 1.0f));
-                    float64 inv_c = rsqrt_newton(c2);
-                    float64 c = v_f32_mul_b(c2, inv_c);
-                    float64 s = v_f32_mul_b(v_f32_mul_b(0.5f, g2), v_f32_mul_b(inv_r, inv_c));
-                    s = v_f32_sel_less_f32_b(d, 0.0f, v_f32_sub_b(0.0f, s), s);
-
-                    float64 gsq = v_f32_mul_b(gamma, gamma);
-                    float64 tol = v_f32_mul_b(1.0e-14f, v_f32_mul_b(alpha, beta));
-                    c = v_f32_sel_less_f32_b(tol, gsq, c, 1.0f);
-                    s = v_f32_sel_less_f32_b(tol, gsq, s, 0.0f);
-                    c = v_f32_sel_less_f32_b(r2, 1.0e-34f, 1.0f, c);
-                    s = v_f32_sel_less_f32_b(r2, 1.0e-34f, 0.0f, s);
-                    c = v_f32_sel_eq_f32_b(gamma, 0.0f, 1.0f, c);
-                    s = v_f32_sel_eq_f32_b(gamma, 0.0f, 0.0f, s);
+                    float64 c, s;
+                    JACOBI_CS(alpha, beta, gamma, c, s);
 
                     BROADCAST_CS(c, s);
-
-                    float64 ns = v_f32_sub_b(0.0f, s);
-                    ARR[p] = v_f32_mac_b(uq, ns, v_f32_mul_b(up, c));
+                    ARR[p] = v_f32_sub_b(v_f32_mul_b(up, c), v_f32_mul_b(uq, s));
                     ARR[q] = v_f32_mac_b(up, s, v_f32_mul_b(uq, c));
                 }
             }
@@ -369,10 +299,11 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
 #ifdef NO_UV
         for (int j = 0; j < n; j++)
         {
-            float64 sq = reduce_add_half32(v_f32_mul_b(w[j], w[j]));
-            float64 safe_sq = v_f32_sel_less_f32_b(sq, 1.0e-36f, 1.0f, sq);
-            float64 rn = rsqrt_newton(safe_sq);
-            float64 sj = v_f32_sel_less_f32_b(sq, 1.0e-36f, 0.0f, v_f32_mul_b(v_f32_mul_b(sq, rn), safe_sigma));
+            // the norm of the row scaled by 1 / max|row| (Codex review #6: the squared norm of a row of 1e-20
+            // underflowed, svdvals(diag(1e20, 1)) = [1e20, 0]); 0 for a zero row
+            float64 mx, cw, nrm, rn;
+            ROW_NORM(w[j], mx, cw, nrm, rn);
+            float64 sj = v_f32_sel_eq_f32_b(mx, 0.0f, 0.0f, v_f32_mul_b(nrm, safe_sigma));
             s_vec = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, sj, s_vec);
         }
         int5 cs0 = {0, bt, 0, 0, 0};
@@ -383,28 +314,37 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
             v_f32_st_tnsr_partial(cs1, S, unpack_hi_half(s_vec), n - 1, 0);
         }
 #else
-        float64 sq_vec = 0.0f;
-        float64 max_sq = 0.0f;
+        float64 nrm_vec = 0.0f;
+        float64 max_nrm = 0.0f;
         for (int j = 0; j < n; j++)
         {
+            // the norm of w_j scaled by 1 / max|w_j| (Codex review #6: the squared norm of a row of 1e-20
+            // underflowed, svdvals(diag(1e20, 1)) = [1e20, 0]); 0 for a zero row.
+            // Lanes >= 32 (v_j) keep their values; their norm is unused.
             float64 cur = uv[j];
-            float64 sq = reduce_add_half32(v_f32_mul_b(cur, cur));
-            sq_vec = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, sq, sq_vec);
-            max_sq = v_f32_max_b(max_sq, sq);
+            float64 mx, cw, nrm, rn;
+            ROW_NORM(cur, mx, cw, nrm, rn);
+            float64 zero = v_f32_sel_eq_f32_b(mx, 0.0f, 1.0f, 0.0f);
+            nrm = v_f32_sel_eq_f32_b(zero, 1.0f, 0.0f, nrm);
+            nrm_vec = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, nrm, nrm_vec);
+            max_nrm = v_f32_max_b(max_nrm, nrm);
 
-            float64 safe_sq = v_f32_sel_less_f32_b(sq, 1.0e-36f, 1.0f, sq);
-            float64 rn = rsqrt_newton(safe_sq);
-            float64 sj = v_f32_sel_less_f32_b(sq, 1.0e-36f, 0.0f, v_f32_mul_b(v_f32_mul_b(sq, rn), safe_sigma));
-            s_vec = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, sj, s_vec);
+            s_vec = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, v_f32_mul_b(nrm, safe_sigma), s_vec);
 
-            float64 scale_w = v_f32_sel_less_f32_b(sq, 1.0e-36f, 0.0f, rn);
-            float64 scale_uv = v_f32_sel_geq_u32_b(lane, 32u, 1.0f, scale_w);
-            uv[j] = v_f32_mul_b(cur, scale_uv);
+            // u_j = cw * rn, the unit row (0 for a zeroed row, then completed below); v_j kept
+            float64 u = v_f32_mul_b(cw, v_f32_sel_eq_f32_b(zero, 1.0f, 0.0f, rn));
+            uv[j] = v_f32_sel_geq_u32_b(lane, 32u, cur, u);
         }
 
-        // Vectorized 2-pass MGS completion for any zero/near-zero columns (predicated by done_vec, no scalar sync)
-        float64 thresh = v_f32_max_b(1.0e-36f, v_f32_mul_b(1.0e-10f, max_sq));
-        float64 done_vec = v_f32_sel_less_f32_b(sq_vec, thresh, 0.0f, 1.0f);
+        // Vectorized 2-pass MGS completion for zero/near-zero rows, norms below 1e-5 of the largest (squared: 1e-10,
+        // as before), predicated by done_vec, no scalar sync: each takes its own direction orthogonalized against the
+        // rows done so far when that survives, else the basis vector of most remaining room (diag_p, the done rows'
+        // room, as before). In two phases: the nonzero near-zero rows first, then the zero rows, so a zero row cannot
+        // take a small row's direction (Codex review #6's [[1,0,0],[0,1e-10,0],[0,1e-10,0]] after its rotation), and a
+        // row that duplicates an earlier one is re-orthogonalized against it (counting both in diag_p up front left no
+        // room: [[1,0,0],[0,s,s],[0,s,s]], s <= 1e-19, gave a zero row of Vh).
+        float64 thresh = v_f32_max_b(1.0e-37f, v_f32_mul_b(1.0e-5f, max_nrm));
+        float64 done_vec = v_f32_sel_less_f32_b(nrm_vec, thresh, 0.0f, 1.0f);
         done_vec = v_f32_sel_geq_u32_b(lane, (unsigned)n, 0.0f, done_vec);
         float64 diag_p = v_f32_sel_less_u32_b(lane, (unsigned)m, 1.0f, -1.0f);
         for (int k = 0; k < n; k++)
@@ -414,9 +354,15 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
             diag_p = v_f32_sub_b(diag_p, v_f32_mul_b(uk, uk));
         }
 
+        for (int phase = 0; phase < 2; phase++)
+        {
         for (int j = 0; j < n; j++)
         {
             float64 dj = reduce_add_half32(v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, done_vec, 0.0f));
+            float64 nj = reduce_add_half32(v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, nrm_vec, 0.0f));
+            // active: not done, and nonzero in phase 0, zero in phase 1 (else 0, which leaves the row and diag_p)
+            float64 act = v_f32_sel_eq_f32_b(dj, 0.0f, 1.0f, 0.0f);
+            act = phase == 0 ? v_f32_sel_eq_f32_b(nj, 0.0f, 0.0f, act) : v_f32_sel_eq_f32_b(nj, 0.0f, act, 0.0f);
             float64 cand1 = v_f32_sel_geq_u32_b(lane, (unsigned)m, 0.0f, uv[j]);
             uint64 p_idx = v_f32_reduce_argmax(diag_p).v1;
             float64 cand2 = v_f32_sel_eq_u32_b(lane, p_idx, 1.0f, 0.0f);
@@ -441,12 +387,14 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
             cand = v_f32_mul_b(cand, rsqrt_newton(safe_cn));
 
             float64 cur_uv = uv[j];
-            float64 new_w = v_f32_sel_eq_f32_b(dj, 0.0f, cand, cur_uv);
+            float64 new_w = v_f32_sel_eq_f32_b(act, 1.0f, cand, cur_uv);
             uv[j] = v_f32_sel_geq_u32_b(lane, 32u, cur_uv, new_w);
 
-            float64 new_uk = v_f32_sel_eq_f32_b(dj, 0.0f, cand, 0.0f);
+            float64 new_uk = v_f32_sel_eq_f32_b(act, 1.0f, cand, 0.0f);
             diag_p = v_f32_sub_b(diag_p, v_f32_mul_b(new_uk, new_uk));
-            done_vec = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, 1.0f, done_vec);
+            done_vec = v_f32_sel_eq_u32_b(lane_mod32, (unsigned)j, v_f32_sel_eq_f32_b(act, 1.0f, 1.0f, done_vec),
+                                          done_vec);
+        }
         }
 
         int5 cs = {0, bt, 0, 0, 0};

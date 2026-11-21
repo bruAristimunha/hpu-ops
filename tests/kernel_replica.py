@@ -461,10 +461,12 @@ def _rr_pairs(r, n):
     return out
 
 
-def jacobi_svd_kernel(A_t, compute_uv=True, full_u=False, legacy_tiny=False):
+def jacobi_svd_kernel(A_t, compute_uv=True, full_u=False, legacy_tiny=False, legacy_cutoffs=False):
     """``(Ut, S, Vt)`` of jacobi_svd_f32_gaudi2.c for one ``A_t[k, big]`` (the rows it orthogonalizes, k <= big <=
     32): ``S`` unsorted; ``Ut`` [k or big, big] and ``Vt`` [k, k] (None without ``compute_uv``). ``legacy_tiny``: a
-    matrix with max|a| < 1e-36 not scaled (before review round 3), so its squares underflow and S is 0."""
+    matrix with max|a| < 1e-36 not scaled (before review round 3), so its squares underflow and S is 0.
+    ``legacy_cutoffs``: the kernel before Codex review #6 (absolute rotation cutoffs on unscaled alpha, beta, gamma;
+    squared row norms, 0 below 1e-36)."""
     w0 = _ftz(np.array(A_t, dtype=F32))
     n, m = w0.shape
     w = np.zeros((n, 32), F32)
@@ -477,13 +479,31 @@ def jacobi_svd_kernel(A_t, compute_uv=True, full_u=False, legacy_tiny=False):
     inv = hw_recip(adj)
     inv = mul(inv, sub(F32(2), mul(adj, inv)))
     w = mul(mul(w, pre), inv)
+
+    def row_norm(x):  # ROW_NORM: (mx, cw, nrm, rn)
+        mx = F32(np.max(np.abs(x)))
+        smx = F32(1) if mx == 0 else mx
+        rmx = hw_recip(smx)
+        rmx = mul(rmx, sub(F32(2), mul(smx, rmx)))
+        cw = mul(x, rmx)
+        sq = _red_add(mul(cw, cw))
+        rn = _rsqrt_newton(F32(1) if sq < F32(1e-36) else sq)
+        return mx, cw, mul(mul(sq, rn), smx), rn
+
     sweeps = 6 if n <= 4 else 10 if n <= 16 else 12
     for _ in range(sweeps):
         for r in range(((n + 1) & ~1) - 1):
             for p, q in _rr_pairs(r, n):
                 up, uq = w[p].copy(), w[q].copy()
                 alpha, beta, gamma = _red_add(mul(up, up)), _red_add(mul(uq, uq)), _red_add(mul(up, uq))
-                d, g2 = sub(beta, alpha), add(gamma, gamma)
+                if legacy_cutoffs:  # before Codex review #6: alpha, beta, gamma unscaled
+                    a_, b_, g_ = alpha, beta, gamma
+                else:  # JACOBI_CS: scaled by ~1 / (alpha + beta)
+                    ab = add(alpha, beta)
+                    k_ = _rsqrt_newton(F32(1) if ab == 0 else ab)
+                    k_ = mul(k_, k_)
+                    a_, b_, g_ = mul(alpha, k_), mul(beta, k_), mul(gamma, k_)
+                d, g2 = sub(b_, a_), add(g_, g_)
                 r2 = mac(g2, g2, mul(d, d))
                 inv_r = _rsqrt_newton(F32(1) if r2 < F32(1e-34) else r2)
                 c2 = mul(F32(0.5), mac(np.abs(d), inv_r, F32(1)))
@@ -491,47 +511,71 @@ def jacobi_svd_kernel(A_t, compute_uv=True, full_u=False, legacy_tiny=False):
                 c = mul(c2, inv_c)
                 s = mul(mul(F32(0.5), g2), mul(inv_r, inv_c))
                 s = sub(F32(0), s) if d < 0 else s
-                if not mul(F32(1e-14), mul(alpha, beta)) < mul(gamma, gamma) or r2 < F32(1e-34) or gamma == 0:
+                if d == 0 and not legacy_cutoffs:  # equal norms: exactly 45 degrees
+                    c = F32(0.70710677)
+                    s = F32(-0.70710677) if g2 < 0 else F32(0.70710677)
+                if not mul(F32(1e-14), mul(a_, b_)) < mul(g_, g_) or r2 < F32(1e-34) or gamma == 0:
                     c, s = F32(1), F32(0)
-                w[p], w[q] = mac(uq, sub(F32(0), s), mul(up, c)), mac(up, s, mul(uq, c))
+                if legacy_cutoffs:  # row p by one FMA
+                    w[p], w[q] = mac(uq, sub(F32(0), s), mul(up, c)), mac(up, s, mul(uq, c))
+                else:  # row p as two rounded products (identical rows cancel exactly)
+                    w[p], w[q] = sub(mul(up, c), mul(uq, s)), mac(up, s, mul(uq, c))
                 if compute_uv:
                     vp, vq = v[p].copy(), v[q].copy()
-                    v[p], v[q] = mac(vq, sub(F32(0), s), mul(vp, c)), mac(vp, s, mul(vq, c))
+                    if legacy_cutoffs:
+                        v[p], v[q] = mac(vq, sub(F32(0), s), mul(vp, c)), mac(vp, s, mul(vq, c))
+                    else:
+                        v[p], v[q] = sub(mul(vp, c), mul(vq, s)), mac(vp, s, mul(vq, c))
     S = np.zeros(n, F32)
-    sq_all = np.zeros(n, F32)
+    nrm_all = np.zeros(n, F32)
     for j in range(n):
-        sq = _red_add(mul(w[j], w[j]))
-        sq_all[j] = sq
-        tiny = sq < F32(1e-36)
-        rn = _rsqrt_newton(F32(1) if tiny else sq)
-        S[j] = F32(0) if tiny else mul(mul(sq, rn), safe_sigma)
+        if legacy_cutoffs:  # before Codex review #6: the squared norm unscaled, 0 below 1e-36
+            sq = _red_add(mul(w[j], w[j]))
+            tiny = sq < F32(1e-36)
+            rn = _rsqrt_newton(F32(1) if tiny else sq)
+            nrm_all[j] = sq  # (squared, against the squared threshold below)
+            S[j] = F32(0) if tiny else mul(mul(sq, rn), safe_sigma)
+            if compute_uv:
+                w[j] = mul(w[j], F32(0) if tiny else rn)
+            continue
+        mx, cw, nrm, rn = row_norm(w[j])
+        zero = mx == 0
+        nrm = F32(0) if zero else nrm
+        nrm_all[j] = nrm
+        S[j] = mul(nrm, safe_sigma)
         if compute_uv:
-            w[j] = mul(w[j], F32(0) if tiny else rn)
+            w[j] = mul(cw, F32(0) if zero else rn)
     if not compute_uv:
         return None, S, None
     # MGS completion of the columns below the threshold, in the kernel's order (done flags updated as it goes)
-    thresh = max(F32(1e-36), mul(F32(1e-10), np.max(sq_all)))
-    done = (~(sq_all < thresh)).astype(F32)
+    if legacy_cutoffs:  # rows below 1e-5 of the largest norm redone (on squares: 1e-10)
+        done = (~(nrm_all < max(F32(1e-36), mul(F32(1e-10), np.max(nrm_all))))).astype(F32)
+    else:
+        done = (~(nrm_all < max(F32(1e-37), mul(F32(1e-5), np.max(nrm_all))))).astype(F32)
     diag = np.where(np.arange(32) < m, F32(1), F32(-1)).astype(F32)
-    for k in range(n):
+    for k in range(n):  # the done rows' room
         uk = mul(w[k], done[k])
         diag = sub(diag, mul(uk, uk))
-    for j in range(n):
-        dj = done[j]
-        cand1, cand2 = w[j].copy(), np.zeros(32, F32)
-        cand2[_first_max(diag)] = 1
-        for _ in range(2):
-            for k in range(n):
-                uk = mul(w[k], done[k])
-                d1, d2 = _red_add(mul(cand1, uk)), _red_add(mul(cand2, uk))
-                cand1, cand2 = sub(cand1, mul(d1, uk)), sub(cand2, mul(d2, uk))
-        cn1, cn2 = _red_add(mul(cand1, cand1)), _red_add(mul(cand2, cand2))
-        cand, cn = (cand1, cn1) if F32(0.25) < cn1 else (cand2, cn2)
-        cand = mul(cand, _rsqrt_newton(F32(1) if cn < F32(1e-36) else cn))
-        if dj == 0:
+    # legacy: one pass in row order; now the nonzero near-zero rows first, then the zero rows
+    order = [list(range(n))] if legacy_cutoffs else [[j for j in range(n) if nrm_all[j] != 0],
+                                                      [j for j in range(n) if nrm_all[j] == 0]]
+    for phase in order:
+        for j in phase:
+            if done[j] != 0:
+                continue
+            cand1, cand2 = w[j].copy(), np.zeros(32, F32)
+            cand2[_first_max(diag)] = 1
+            for _ in range(2):
+                for k in range(n):
+                    uk = mul(w[k], done[k])
+                    d1, d2 = _red_add(mul(cand1, uk)), _red_add(mul(cand2, uk))
+                    cand1, cand2 = sub(cand1, mul(d1, uk)), sub(cand2, mul(d2, uk))
+            cn1, cn2 = _red_add(mul(cand1, cand1)), _red_add(mul(cand2, cand2))
+            cand, cn = (cand1, cn1) if F32(0.25) < cn1 else (cand2, cn2)
+            cand = mul(cand, _rsqrt_newton(F32(1) if cn < F32(1e-36) else cn))
             w[j] = cand
             diag = sub(diag, mul(cand, cand))
-        done[j] = 1
+            done[j] = 1
     Ut = w[:, :m].copy()
     if full_u:
         rows = [np.where(np.arange(32) < m, w[j], F32(0)).astype(F32) for j in range(n)]
@@ -550,7 +594,7 @@ def jacobi_svd_kernel(A_t, compute_uv=True, full_u=False, legacy_tiny=False):
     return Ut, S, v[:, :n].copy()
 
 
-def jacobi_svd(A, compute_uv=True, full_matrices=False, contiguous=True, legacy_tiny=False):
+def jacobi_svd(A, compute_uv=True, full_matrices=False, contiguous=True, legacy_tiny=False, legacy_cutoffs=False):
     """``torch.linalg.svd`` of one ``A[m, n]`` as ``hpu_ops.tpc.jacobi_svd`` computes it: the rows of A are
     orthogonalized when m < n, or when A is square and contiguous (``contiguous``), else the rows of A^T; then the
     kernel, then the singular values sorted descending. Returns ``(U, S, Vh)`` (U, Vh None without ``compute_uv``)."""
@@ -559,7 +603,7 @@ def jacobi_svd(A, compute_uv=True, full_matrices=False, contiguous=True, legacy_
     k, big = min(m, n), max(m, n)
     full = full_matrices and m != n
     swap = m < n or (m == n and contiguous)
-    Ut, S, Vt = jacobi_svd_kernel(a if swap else a.T, compute_uv, full, legacy_tiny)
+    Ut, S, Vt = jacobi_svd_kernel(a if swap else a.T, compute_uv, full, legacy_tiny, legacy_cutoffs)
     order = np.argsort(-S, kind="stable")
     if not compute_uv:
         return None, S[order], None

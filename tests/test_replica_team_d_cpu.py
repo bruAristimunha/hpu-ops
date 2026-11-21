@@ -12,6 +12,7 @@ import pytest
 import torch
 
 import kernel_replica as R
+from test_cpu import cpu_as_hpu
 from hpu_ops import linalg, tpc
 
 
@@ -208,10 +209,89 @@ def test_svd_tiny_matrix_is_scaled():
     was 0. The kernel now scales any nonzero matrix by 1/max|a| (normal for any normal max|a|)."""
     a = (torch.randn(5, 5, generator=torch.Generator().manual_seed(4)) * 1e-37).float()
     assert a.abs().max() < 1e-36
-    _, s_old, _ = R.jacobi_svd(a.numpy(), compute_uv=False, legacy_tiny=True)
+    _, s_old, _ = R.jacobi_svd(a.numpy(), compute_uv=False, legacy_tiny=True, legacy_cutoffs=True)
     assert (s_old == 0).all()
     U, S, Vh = R.jacobi_svd(a.numpy())
     flushed = torch.where(a.abs() < 2.0 ** -126, 0.0, a)  # the card's FTZ of the input (also in the replica)
     truth = np.linalg.svd(flushed.double().numpy(), compute_uv=False)
     assert rel(S, truth) < 1e-5
     assert rel(tpc.svd_reference(flushed)[1].numpy(), truth) < 1e-5
+
+
+# ---- Codex review #6 (PR #34, open there): the Jacobi SVD's absolute cutoffs
+
+
+CODEX6_ROWS = np.array([[1, 0, 0], [0, 1e-10, 0], [0, 1e-10, 0]], np.float32)
+CODEX6_DIAG = np.diag(np.array([1e20, 1], np.float32))
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_codex6_identical_small_rows_rotate(contiguous):
+    """Two identical rows [0, 1e-10, 0]: r^2 = 4e-40 and alpha * beta = 1e-40 underflowed, so the pair was never rotated
+    (rank 3 at rtol = 0, torch 2). Scaled by 1 / (alpha + beta) the pair rotates by exactly 45 degrees and cancels."""
+    want = torch.linalg.svdvals(torch.tensor(CODEX6_ROWS)).numpy()
+    _, s_old, _ = R.jacobi_svd(CODEX6_ROWS, compute_uv=False, contiguous=contiguous, legacy_cutoffs=True)
+    if contiguous:
+        assert (s_old > 0).sum() == 3  # main's kernel
+    U, S, Vh = R.jacobi_svd(CODEX6_ROWS, contiguous=contiguous)
+    _, S2, _ = R.jacobi_svd(CODEX6_ROWS, compute_uv=False, contiguous=contiguous)
+    assert np.array_equal(S, S2) and (S > 0).sum() == 2 and S[2] == 0
+    assert np.abs(S - want).max() <= 1e-7 * want.max() and abs(S[1] - want[1]) <= 1e-6 * want[1]
+    check_svd(U, S, Vh, CODEX6_ROWS)
+    assert np.abs((U * S) @ Vh - CODEX6_ROWS).max() <= 1e-16
+
+
+def test_codex6_graded_diagonal_keeps_its_small_value():
+    """diag(1e20, 1): scaled by 1/1e20 the second row is 1e-20, its square 1e-40 underflowed: svdvals [1e20, 0]. Its
+    norm is now max|x| * ||x / max|x|||: [1e20, 1], each value exact (relative, not only against the largest)."""
+    _, s_old, _ = R.jacobi_svd(CODEX6_DIAG, compute_uv=False, legacy_cutoffs=True)
+    assert s_old[1] == 0
+    for compute_uv in (False, True):
+        U, S, Vh = R.jacobi_svd(CODEX6_DIAG, compute_uv=compute_uv)
+        assert np.array_equal(S, np.array([1e20, 1], np.float32))
+    assert np.array_equal(np.abs(U), np.eye(2)) and np.array_equal(np.abs(Vh), np.eye(2))
+
+
+def test_codex6_through_the_public_routes(monkeypatch):
+    """matrix_rank(rtol=0), svdvals, matrix_norm(ord=-2) and pinv(rtol=0) through hpu-ops' routes on the reference
+    (the kernel contract in torch): torch's answers on both inputs."""
+    from hpu_ops import linalg
+
+    monkeypatch.setattr(linalg, "_SVD", lambda A, compute_uv: tpc.svd_reference(A.detach(), compute_uv=compute_uv))
+    A, D = torch.tensor(CODEX6_ROWS), torch.tensor(CODEX6_DIAG)
+    fns = {"rank": lambda x: torch.linalg.matrix_rank(x, rtol=0.0), "svdvals": torch.linalg.svdvals,
+           "norm-2": lambda x: torch.linalg.matrix_norm(x, ord=-2), "pinv": lambda x: torch.linalg.pinv(x, rtol=0.0)}
+    want = {(k, i): f(x) for k, f in fns.items() for i, x in enumerate((A, D))}
+    installs = (linalg.install_matrix_rank, linalg.install_svd, linalg.install_svd, linalg.install_pinv)
+    for (k, f), install in zip(fns.items(), installs):
+        with cpu_as_hpu(install) as calls:
+            got = [f(x) for x in (A, D)]
+        assert sum(calls.values()) >= 1, k
+        for i, g in enumerate(got):
+            w = want[(k, i)]
+            assert torch.equal(g, w) if k == "rank" else torch.allclose(g, w, rtol=1e-6, atol=0), (k, i, g, w)
+
+
+@pytest.mark.parametrize("s", [1e-10, 1e-19, 1e-20, 1e-25])
+def test_codex6_round2_duplicate_tiny_rows_stay_orthonormal(s):
+    """Review of PR #44: [[1,0,0],[0,s,s],[0,s,s]] with s <= 1e-19 (squares flush, the pair never rotates): counting
+    both duplicate rows' room up front left none, and Vh got an all-zero row (orth error 1.0). The two-phase
+    completion re-orthogonalizes the duplicate against the first; the reference agrees (it flushes the products)."""
+    a = np.array([[1, 0, 0], [0, s, s], [0, s, s]], np.float32)
+    U, S, Vh = R.jacobi_svd(a)
+    assert np.abs(U.T @ U - np.eye(3)).max() < 1e-6 and np.abs(Vh @ Vh.T - np.eye(3)).max() < 1e-6
+    # below s ~ 1e-19 the pair cannot rotate (its squares flush), so S keeps [.., s sqrt2, s sqrt2] for torch's
+    # [.., 2 s, 0]: an error of the order of s, far below float32's resolution of max|A| = 1 (main: [0, 0])
+    assert np.abs((U * S) @ Vh - a).max() <= (1e-6 * s if s >= 1e-18 else 3 * s)
+    Ur, Sr, Vr = (t[0].numpy() for t in tpc.svd_reference(torch.tensor(a)[None]))
+    assert np.allclose(Sr, S, rtol=1e-6, atol=0)
+    assert np.abs(Ur.T @ Ur - np.eye(3)).max() < 1e-6 and np.abs(Vr @ Vr.T - np.eye(3)).max() < 1e-6
+
+
+@pytest.mark.parametrize("n", [16, 17, 32])
+def test_codex6_round2_rank2_block_scaled_1e21(n):
+    g = np.random.default_rng(n)
+    a = g.standard_normal((n, n)).astype(np.float32)
+    a[-3:] = (g.standard_normal((3, 2)) @ g.standard_normal((2, n)) * 1e-21).astype(np.float32)
+    U, S, Vh = R.jacobi_svd(a)
+    assert np.abs(U.T @ U - np.eye(n)).max() < 1e-4 and np.abs(Vh @ Vh.T - np.eye(n)).max() < 1e-4

@@ -44,6 +44,7 @@ Habana reads ``GC_KERNEL_PATH`` when the device initialises, so ``install_kernel
 op of the process; ``hpu_ops.enable()`` calls it. ``HPU_OPS_TPC=0`` in the environment keeps the kernels off.
 """
 import functools
+import math
 import os
 import pathlib
 import warnings
@@ -1200,11 +1201,20 @@ def jacobi_svdvals(A, sort=True, flush=True):
     return internal_sort(S, -1, descending=True)[0] if sort else S
 
 
+def _ftz32(t):
+    """``t`` with float32 values below the smallest normal flushed to 0, as the card's arithmetic does (float64
+    unchanged)."""
+    if t.dtype != torch.float32:
+        return t
+    return torch.where(t.abs() < torch.finfo(torch.float32).tiny, 0.0, t)
+
+
 def svd_reference(A, compute_uv=True, full_matrices=False):
     """``jacobi_svd`` / ``jacobi_svdvals`` in plain torch, matching the kernel contract: the rows of A orthogonalized
     when m < n or A is square and contiguous (else the rows of A^T), 1/max|a| scaling (not of a zero matrix), the
-    kernel's round-robin rotations and skip rules (gamma = 0, gamma^2 <= tol alpha beta, r^2 < 1e-34), singular
-    values of squared row norms below 1e-36 set to 0, MGS completion for zero/degenerate rows, optional full
+    kernel's round-robin rotations and skip rules on alpha, beta, gamma scaled by 1 / (alpha + beta) (gamma = 0,
+    gamma^2 <= tol alpha beta, r^2 < 1e-34; exactly 45 degrees for equal norms), row norms as max|x| ||x / max|x|||,
+    MGS completion of the zero and near-zero rows (below 1e-5 of the largest), optional full
     orthogonal extension, descending ``S``. For the CPU tests (``tests/kernel_replica.py`` replays the float32
     arithmetic)."""
     _check_svd(A)
@@ -1225,6 +1235,11 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
     safe_sigma = torch.where(sigma == 0, 1.0, sigma)
     W = W / safe_sigma
     V = torch.eye(k, dtype=A.dtype, device=A.device).expand(b, k, k).clone() if compute_uv else None
+
+    def row_norms(X):  # the kernel's ROW_NORM: max|x| * ||x / max|x||| (no squares of tiny rows), and x / max|x|
+        mx = X.abs().amax(-1, keepdim=True)
+        cw = X / torch.where(mx == 0, 1.0, mx)
+        return mx.squeeze(-1), cw, cw.norm(dim=-1) * mx.squeeze(-1)
 
     if k > 1:
         k_even = (k + 1) & ~1
@@ -1247,40 +1262,47 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
         for _ in range(sweeps):
             for ps, qs in rounds:
                 wp, wq = W[:, ps], W[:, qs]
-                alpha = (wp * wp).sum(-1)
-                beta = (wq * wq).sum(-1)
-                gamma = (wp * wq).sum(-1)
-                d = beta - alpha
-                g2 = 2.0 * gamma
+                # the card flushes each product below float32's smallest normal (FTZ): so does the reference
+                alpha = _ftz32(wp * wp).sum(-1)
+                beta = _ftz32(wq * wq).sum(-1)
+                gamma = _ftz32(wp * wq).sum(-1)
+                # the kernel's JACOBI_CS: alpha, beta, gamma scaled by 1 / (alpha + beta), skip rules relative
+                ab = alpha + beta
+                scale = 1.0 / torch.where(ab == 0, 1.0, ab)
+                a_, b_, g_ = alpha * scale, beta * scale, gamma * scale
+                d = b_ - a_
+                g2 = 2.0 * g_
                 r = torch.hypot(d, g2)
-                skip = (gamma == 0) | (r * r < 1e-34) | (gamma * gamma <= tol_scale * alpha * beta)
+                skip = (gamma == 0) | (r * r < 1e-34) | (g_ * g_ <= tol_scale * a_ * b_)
                 sr = torch.where(skip, 1.0, r)
                 c2 = 0.5 * (1.0 + d.abs() / sr)
                 c = torch.where(skip, 1.0, c2.sqrt())
                 s = torch.where(skip, 0.0, torch.where(d < 0, -1.0, 1.0) * 0.5 * g2 / (sr * torch.where(skip, 1.0, c)))
+                half = math.sqrt(0.5)  # equal norms: exactly 45 degrees, so identical rows cancel exactly
+                c = torch.where((d == 0) & ~skip, half, c)
+                s = torch.where((d == 0) & ~skip, torch.where(g2 < 0, -half, half), s)
                 c_, s_ = c.unsqueeze(-1), s.unsqueeze(-1)
                 W[:, ps], W[:, qs] = c_ * wp - s_ * wq, s_ * wp + c_ * wq
                 if compute_uv:
                     vp, vq = V[:, ps], V[:, qs]
                     V[:, ps], V[:, qs] = c_ * vp - s_ * vq, s_ * vp + c_ * vq
 
-    sq = (W * W).sum(-1)
-    norm = sq.sqrt()
-    S = torch.where(sq < 1e-36, 0.0, norm * safe_sigma.squeeze(-1))
+    mx, cw, norm = row_norms(W)
+    zero = mx == 0
+    norm = torch.where(zero, 0.0, norm)
+    S = norm * safe_sigma.squeeze(-1)
     if not compute_uv:
         return A.new_empty(0), S.reshape(*batch, k).sort(-1, descending=True).values, A.new_empty(0)
 
-    thresh = torch.clamp(1e-10 * sq.amax(-1, keepdim=True), min=1e-36)
-    U_t = torch.where(sq.unsqueeze(-1) < 1e-36, 0.0, W / torch.where(norm.unsqueeze(-1) > 0, norm.unsqueeze(-1), 1.0))
-    bad_mask = sq < thresh
+    U_t = torch.where(zero.unsqueeze(-1), 0.0, cw / torch.where(zero, 1.0, cw.norm(dim=-1)).unsqueeze(-1))
+    bad_mask = norm < torch.clamp(1e-5 * norm.amax(-1, keepdim=True), min=1e-37)  # zero and near-zero rows
     if bad_mask.any():
         for bi in range(b):
             if not bad_mask[bi].any():
                 continue
             done = [j for j in range(k) if not bad_mask[bi, j]]
-            for j in range(k):
-                if not bad_mask[bi, j]:
-                    continue
+            # the near-zero rows (own directions) before the zero rows, which would take them (the kernel: diag_p)
+            for j in sorted((j for j in range(k) if bad_mask[bi, j]), key=lambda j: bool(norm[bi, j] == 0)):
                 accepted = False
                 if norm[bi, j] > 0:
                     cand = U_t[bi, j].clone()
