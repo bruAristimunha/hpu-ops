@@ -65,53 +65,103 @@ def to_global(local, x, args, nd):
     return flat
 
 
-def gaudi(op):
-    """Gaudi's kernel as measured: NaN dropped (read as -inf by the max ops, +inf by the min ops, 0 by the
-    inf-norms), ``maximum`` / ``fmax`` and their min twins return the first operand where one is NaN, clamp ignores
-    a NaN input or bound, and in 16-bit dtypes argmax / max(dim) return index n for a row of -inf (+inf: min)."""
-    real = REAL(op)
+REAL_OUT = extrema.native_out
+INT64_MIN = torch.iinfo(torch.int64).min
+OUT_LARGEST = {aten.amax.out, aten.max.dim_max, aten.argmax.out, aten.median.dim_values,
+               aten.max_pool2d_with_indices.out, aten.max_pool3d_with_indices.out}
+OUT_SMALLEST = {aten.amin.out, aten.min.dim_min, aten.argmin.out}
+# 16-bit rows of the fill (-inf for max, +inf for min) get an index out of range: n eager, INT64_MIN lazy (measured)
+OUT_OF_RANGE = {aten.max.dim_max: "garbage", aten.argmin.out: "garbage", aten.min.dim_min: "n", aten.argmax.out: "n"}
+POOL_OUTS = {aten.max_pool2d_with_indices.out: 2, aten.max_pool3d_with_indices.out: 3}
 
-    def drop(x, fill):
-        return torch.where(torch.isnan(x), fill, x) if isinstance(x, torch.Tensor) and x.is_floating_point() else x
+
+def drop(x, fill):
+    return torch.where(torch.isnan(x), fill, x) if isinstance(x, torch.Tensor) and x.is_floating_point() else x
+
+
+def gaudi_out(op, device_type):
+    """Gaudi's ``.out`` kernels as measured: NaN dropped (read as -inf by the max ops, +inf by the min ops),
+    ``maximum`` / ``fmax`` and their min twins return the first operand where one is NaN, clamp ignores a NaN input
+    or bound, max_pool returns window-local indices, and in 16-bit dtypes argmax / max(dim) of a row of -inf (+inf:
+    min) return an index out of range (n, or INT64_MIN as lazy mode)."""
+    real = REAL_OUT(op, device_type)
 
     def fn(*args, **kwargs):
         x, rest = args[0], args[1:]
-        if op in POOLS_ND and x.is_floating_point():  # NaN as -inf, window-local indices
-            out, gidx = real(drop(x, -INF), *rest)
-            return out, to_local(gidx, x, rest, POOLS_ND[op])
-        if op in POOL_BACKWARDS:  # reads window-local indices
-            grad, x, *rest, local = args
-            return op(grad, x, *rest, to_global(local, x, rest, POOL_BACKWARDS[op]))
-        if op in (aten.sort.default, aten.sort.stable) and x.is_floating_point():  # NaN read as +-inf
-            desc = kwargs.get("descending", rest[1] if len(rest) > 1 else False)
-            return real(drop(x, -INF if desc else INF), *rest, **kwargs)
-        if op in LARGEST or op in SMALLEST:
-            fill = -INF if op in LARGEST else INF
+        if not x.is_floating_point():
+            return real(*args, **kwargs)
+        if op in POOL_OUTS:
+            real(drop(x, -INF), *rest, **kwargs)
+            kwargs["indices"].copy_(to_local(kwargs["indices"], x, rest, POOL_OUTS[op]))
+            return kwargs["out"], kwargs["indices"]
+        if op in OUT_LARGEST or op in OUT_SMALLEST:
+            fill = -INF if op in OUT_LARGEST else INF
             out = real(drop(x, fill), *rest, **kwargs)
-            indexed = op in (aten.argmax.default, aten.argmin.default, aten.max.dim, aten.min.dim)
-            if indexed and x.dtype in extrema.REDUCED and x.dim() and rest and rest[0] is not None:
+            if op in OUT_OF_RANGE and x.dtype in extrema.REDUCED and x.dim() and rest and rest[0] is not None:
                 d, keep = rest[0], len(rest) > 1 and rest[1]
-                out_of_range = (drop(x, fill) == fill).all(d, keepdim=keep)
-                i = torch.where(out_of_range, x.shape[d], out[1] if isinstance(out, tuple) else out)
-                out = (out[0], i) if isinstance(out, tuple) else i
+                bad = x.shape[d] if OUT_OF_RANGE[op] == "n" else INT64_MIN
+                i = out[1] if isinstance(out, tuple) else out
+                i.copy_(torch.where((drop(x, fill) == fill).all(d, keepdim=keep), bad, i))
             return out
-        if op is aten.aminmax.default:
-            return real(drop(x, INF), *rest, **kwargs)[0], real(drop(x, -INF), *rest, **kwargs)[1]
-        if op in (aten.linalg_vector_norm.default, aten.norm.ScalarOpt_dim, aten.norm.Scalar):
-            return real(drop(x, 0.0), *rest, **kwargs)
-        if op in (aten.maximum.default, aten.minimum.default, aten.fmax.default, aten.fmin.default):
+        if op is aten.aminmax.out:
+            lo, hi = kwargs["min"], kwargs["max"]
+            tmp = torch.empty_like(hi)
+            real(drop(x, INF), dim=kwargs.get("dim"), keepdim=kwargs.get("keepdim", False), min=lo, max=tmp)
+            real(drop(x, -INF), dim=kwargs.get("dim"), keepdim=kwargs.get("keepdim", False), min=tmp, max=hi)
+            return lo, hi
+        if op in (aten.maximum.out, aten.minimum.out, aten.fmax.out, aten.fmin.out):
             a, b = args
-            if not (a.is_floating_point() or b.is_floating_point()):
-                return real(a, b)
-            either = torch.isnan(a) | torch.isnan(b)
-            return torch.where(either, a + 0 * torch.nan_to_num(b), real(a, b))
-        if op in (aten.clamp.Tensor, aten.clamp_min.Tensor, aten.clamp_max.Tensor):
-            lows = op is not aten.clamp_max.Tensor
+            out = real(a, b, **kwargs)
+            return out.copy_(torch.where(torch.isnan(a) | torch.isnan(b), a, out))
+        if op in (aten.clamp.Tensor_out, aten.clamp_min.Tensor_out, aten.clamp_max.Tensor_out):
+            lows = op is not aten.clamp_max.Tensor_out
             bounds = [drop(b, -INF if k == 0 and lows else INF) for k, b in enumerate(rest)]
-            return real(drop(x, 0.0), *bounds)
+            return real(drop(x, 0.0), *bounds, **kwargs)
         return real(*args, **kwargs)
 
     return fn
+
+
+def gaudi(op):
+    """The functional ops hpu-ops rewrites at the autograd key only (inf-norms, sorts), as Gaudi computes them:
+    NaN read as 0 by the inf-norms, as +-inf by sort. Every other op is torch's own (it reaches the backend layer,
+    which calls ``gaudi_out``)."""
+    real = REAL(op)
+
+    def fn(*args, **kwargs):
+        x, rest = args[0], args[1:]
+        if not (isinstance(x, torch.Tensor) and x.is_floating_point()):
+            return real(*args, **kwargs)
+        if op in (aten.sort.default, aten.sort.stable):
+            desc = kwargs.get("descending", rest[1] if len(rest) > 1 else False)
+            return real(drop(x, -INF if desc else INF), *rest, **kwargs)
+        if op in (aten.linalg_vector_norm.default, aten.norm.ScalarOpt_dim, aten.norm.Scalar):
+            return real(drop(x, 0.0), *rest, **kwargs)
+        return real(*args, **kwargs)
+
+    return fn
+
+
+def _pool_backward_reads_local_indices():
+    """Gaudi's max_pool backward reads its window-local indices; torch's CPU one reads flat plane indices."""
+    library = torch.library.Library("aten", "IMPL")
+    for op, out_op, nd in ((aten.max_pool2d_with_indices_backward.default,
+                            aten.max_pool2d_with_indices_backward.grad_input, 2),
+                           (aten.max_pool3d_with_indices_backward.default,
+                            aten.max_pool3d_with_indices_backward.grad_input, 3)):
+        def kernel(grad, x, *rest, out_op=out_op, nd=nd):
+            *args, local = rest
+            out = torch.empty_like(x)
+            return out_op._op_dk(torch._C.DispatchKey.CPU, grad, x, *args, to_global(local, x, args, nd),
+                                 grad_input=out)
+
+        library.impl(op, kernel, "CPU")
+    return library._destroy
+
+
+def _install_card():
+    undos = [extrema.install("cpu", exact_sort=True), _pool_backward_reads_local_indices()]
+    return lambda: [u() for u in reversed(undos)]
 
 
 def compiled(f, nodes, **options):
@@ -137,8 +187,8 @@ def compiled(f, nodes, **options):
 def card(monkeypatch):
     """extrema installed for "cpu", over the NaN-dropping stand-in of Gaudi's kernels; yields the call counts."""
     monkeypatch.setattr(extrema, "native", gaudi)
-    monkeypatch.setattr(extrema, "native_backward", gaudi)
-    _CURRENT["undo"] = extrema.install("cpu", exact_sort=True)
+    monkeypatch.setattr(extrema, "native_out", gaudi_out)
+    _CURRENT["undo"] = _install_card()
     hpu_ops._STATE["calls"].clear()
     try:
         yield hpu_ops._STATE["calls"]
@@ -152,7 +202,7 @@ def _reference(f, *args):
     try:
         return f(*args)
     finally:
-        _CURRENT["undo"] = extrema.install("cpu", exact_sort=True)
+        _CURRENT["undo"] = _install_card()
 
 
 def rows(n=7, dtype=torch.float64, seed=0):
@@ -176,6 +226,9 @@ def same(got, want):
         assert len(got) == len(want)
         for g, w in zip(got, want):
             same(g, w)
+        return
+    if want is None:
+        assert got is None
         return
     assert got.dtype == want.dtype and got.shape == want.shape, (got.dtype, want.dtype, got.shape, want.shape)
     if want.is_floating_point():
@@ -239,11 +292,16 @@ def test_aminmax_has_no_derivative_as_torch(card):
 def test_the_stand_in_drops_nan_like_the_card(monkeypatch):
     """Without the rewrite, the stand-in reproduces the card's results (so the tests above test something)."""
     x = rows(dtype=torch.float32)
-    amax = gaudi(aten.amax.default)(x, [-1], False)
+    amax = gaudi_out(aten.amax.out, "cpu")(x, [-1], False, out=torch.empty(10))
     assert not torch.isnan(amax).any() and amax[0] == x[0, 1:].max()
-    v, i = gaudi(aten.max.dim)(rows(dtype=torch.bfloat16), -1, False)
-    assert not torch.isnan(v).any() and i[7] == 7  # out of range for the row of -inf, as Gaudi
-    assert not torch.isnan(gaudi(aten.maximum.default)(torch.ones(2), torch.tensor([NAN, 1.0]))).any()
+    xb = rows(dtype=torch.bfloat16)
+    v, i = gaudi_out(aten.max.dim_max, "cpu")(xb, -1, False, max=torch.empty(10, dtype=xb.dtype),
+                                              max_values=torch.empty(10, dtype=torch.int64))
+    assert not torch.isnan(v).any() and i[7] == INT64_MIN  # garbage for the row of -inf, as Gaudi lazy
+    i = gaudi_out(aten.argmax.out, "cpu")(xb, -1, False, out=torch.empty(10, dtype=torch.int64))
+    assert i[7] == 7  # n, as Gaudi eager
+    out = gaudi_out(aten.maximum.out, "cpu")(torch.ones(2), torch.tensor([NAN, 1.0]), out=torch.empty(2))
+    assert not torch.isnan(out).any()
 
 
 @pytest.mark.parametrize("dtype", FLOATS)
@@ -394,14 +452,117 @@ def test_non_contiguous_and_offset_views(card):
             same(f(v), _reference(f, v))
 
 
-def test_out_and_inference_mode_keep_the_native_op(card):
-    x = rows(dtype=torch.float32)
-    out = torch.empty(10)
-    torch.amax(x, -1, out=out)  # out= is not rewritten: the native op runs
-    assert card["amax"] == 0
+INFERENCE = {**{k: v for k, v in REDUCTIONS.items() if not k.startswith(("norm", "vnorm"))},
+             "maximum": lambda x: torch.maximum(x, x.flip(0)), "fmin": lambda x: torch.fmin(x, x.flip(0)),
+             "clamp_t": lambda x: x.clamp(x.flip(0) - 1, x.flip(0) + 1),
+             "clamp_inplace": lambda x: x.clone().clamp_(min=x.flip(0)),
+             "clamp_max_inplace": lambda x: x.clone().clamp_max_(x.flip(-1)),
+             "pool1d": lambda x: F.max_pool1d(x.unsqueeze(0), 2, return_indices=True)[0],
+             "pool3d": lambda x: F.max_pool3d(x.reshape(1, 10, 1, 1, -1), (1, 1, 2))}
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("name", sorted(INFERENCE))
+def test_inference_mode_propagates_nan(card, name, dtype):
+    """Evaluation loops (Lightning validate / test / predict) run under inference mode, below autograd: the backend
+    layer fixes them too."""
+    x, f = rows(n=8, dtype=dtype), INFERENCE[name]
     with torch.inference_mode():
-        x.amax(-1)
-    assert card["amax"] == 0
+        got = f(x)
+    same(got, _reference(f, x))
+    assert sum(card.values()) > 0
+
+
+OUT_CALLS = {
+    "amax": lambda x: torch.amax(x, -1, out=torch.empty(0, dtype=x.dtype)),
+    "amin_keep": lambda x: torch.amin(x, 0, keepdim=True, out=torch.empty(1, 8, dtype=x.dtype)),
+    "max_dim": lambda x: tuple(torch.max(x, -1, out=(torch.empty(0, dtype=x.dtype), torch.empty(0, dtype=torch.long)))),
+    "min_dim": lambda x: tuple(torch.min(x, 0, out=(torch.empty(8, dtype=x.dtype), torch.empty(8, dtype=torch.long)))),
+    "median_dim": lambda x: tuple(torch.median(x, -1, out=(torch.empty(0, dtype=x.dtype),
+                                                          torch.empty(0, dtype=torch.long)))),
+    "argmax": lambda x: torch.argmax(x, -1, out=torch.empty(0, dtype=torch.long)),
+    "argmin": lambda x: torch.argmin(x, out=torch.empty(0, dtype=torch.long)),
+    "aminmax": lambda x: tuple(torch.aminmax(x, dim=-1, out=(torch.empty(0, dtype=x.dtype),
+                                                             torch.empty(0, dtype=x.dtype)))),
+    "maximum": lambda x: torch.maximum(x, x.flip(0), out=torch.empty(0, dtype=x.dtype)),
+    "fmax_to_double": lambda x: torch.fmax(x, x.flip(0), out=torch.empty(0, dtype=torch.float64)),
+    "clamp_t": lambda x: torch.clamp(x, x.flip(0) - 1, x.flip(0) + 1, out=torch.empty(0, dtype=x.dtype)),
+    "clamp_min_t": lambda x: torch.clamp_min(x, x.flip(0), out=torch.empty(0, dtype=x.dtype)),
+    "pool": lambda x: tuple(torch.ops.aten.max_pool2d_with_indices.out(
+        x.reshape(1, 10, 1, 8), [1, 2], [], [0, 0], [1, 1], False, out=torch.empty(0, dtype=x.dtype),
+        indices=torch.empty(0, dtype=torch.long)))[:1],
+    "vnorm_inf": lambda x: torch.linalg.vector_norm(x, INF, -1, out=torch.empty(0, dtype=x.dtype)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(OUT_CALLS))
+def test_out_overloads_propagate_nan(card, name):
+    x, f = rows(n=8, dtype=torch.float32), OUT_CALLS[name]
+    same(f(x), _reference(f, x))
+
+
+def test_out_keeps_torch_s_errors(card):
+    x = rows(dtype=torch.float32)
+    for f in (lambda: torch.amax(x, -1, out=torch.empty(10, dtype=torch.long)),  # float into long
+              lambda: torch.amax(x.requires_grad_(), -1, out=torch.empty(10))):  # out= with autograd
+        with pytest.raises(RuntimeError):
+            _reference(f)
+        with pytest.raises(RuntimeError):
+            f()
+
+
+def test_compiled_inplace_clamp_runs_the_rewrite(card):
+    nodes = []
+    f = lambda t, lo: t.clone().clamp_(min=lo)  # noqa: E731
+    x, lo = torch.tensor([1.0, NAN, 3.0]), torch.tensor([NAN, 0.0, 2.0])
+    same(compiled(f, nodes, dynamic=False)(x, lo), _reference(f, x, lo))
+    assert "aten.isnan.default" in ops(nodes), ops(nodes)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_clamp_with_one_nan_bound_has_torch_s_gradient(card, dtype):
+    """clamp(5, min=nan, max=1): NaN, and the max bound's gradient 1, as torch's comparisons give."""
+    args = (torch.tensor([5.0, 0.0, NAN, -3.0], dtype=dtype), torch.tensor([NAN, 1.0, 0.0, -1.0], dtype=dtype),
+            torch.tensor([1.0, NAN, 2.0, NAN], dtype=dtype))
+    for f in (torch.clamp, lambda t, lo, hi: torch.clamp_min(t, lo), lambda t, lo, hi: torch.clamp_max(t, hi)):
+        same(grads(f, *args), _reference(grads, f, *args))
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("name", sorted(set(REDUCTIONS) - NO_GRAD))
+def test_reduction_gradients_in_float32_and_bfloat16(card, name, dtype):
+    f, x = REDUCTIONS[name], rows(dtype=dtype)
+    same(grads(f, x), _reference(grads, f, x))
+
+
+MULTI = {"max_dim": lambda x: tuple(x.max(-1)), "min_dim": lambda x: tuple(x.min(-1)),
+         "median_dim": lambda x: tuple(x.median(-1)), "argmax": lambda x: x.argmax(-1), "argmin": lambda x: x.argmin(0),
+         "amax": lambda x: x.amax(-1), "pool": lambda x: F.max_pool1d(x.unsqueeze(0), 4, return_indices=True)[0]}
+
+
+@pytest.mark.parametrize("name", sorted(MULTI))
+def test_rows_with_several_nans(card, name):
+    """torch's index of the first NaN, and the gradients, with two or three NaNs in a row."""
+    x = torch.tensor([[1.0, NAN, 2.0, NAN, 0.0, 5.0, NAN, 1.0], [NAN, NAN, 1.0, 2.0, 3.0, NAN, NAN, NAN],
+                      [INF, 0.0, NAN, -INF, NAN, 1.0, 2.0, 3.0]], dtype=torch.float64)
+    same(MULTI[name](x), _reference(MULTI[name], x))
+    if name not in ("argmax", "argmin"):
+        f = (lambda t: MULTI[name](t)[0]) if isinstance(MULTI[name](x), tuple) else MULTI[name]
+        same(grads(f, x), _reference(grads, f, x))
+
+
+def test_garbage_indices_of_16_bit_rows_are_fixed(card):
+    """Lazy mode returns INT64_MIN (negative) for a 16-bit row of -inf; eager returns n: both become torch's 0."""
+    x = torch.tensor([[-INF] * 3, [1.0, 2.0, -INF]], dtype=torch.bfloat16)
+    same(tuple(x.max(-1)), _reference(lambda t: tuple(t.max(-1)), x))
+    same((-x).argmin(-1), _reference(lambda t: (-t).argmin(-1), x))
+
+
+def test_vector_norm_with_a_wider_dtype(card):
+    x = rows(dtype=torch.float32)
+    f = lambda t: torch.linalg.vector_norm(t, INF, -1, dtype=torch.float64)  # noqa: E731
+    same(f(x), _reference(f, x))
+    same(grads(f, x), _reference(grads, f, x))
 
 
 def test_other_devices_keep_the_native_op():
@@ -419,10 +580,24 @@ def test_no_grad_and_requires_grad_agree(card):
         same(f(x.clone().requires_grad_()).detach(), a)
 
 
-def test_double_backward_of_amax(card):
-    x = rows(dtype=torch.float64).requires_grad_()
-    (g,) = torch.autograd.grad(x.amax(-1).sum(), x, create_graph=True)
-    assert g.requires_grad or not g.grad_fn  # differentiable ops in the backward
+@pytest.mark.parametrize("name", ["amax_last", "max_dim", "max_all", "norm_inf"])
+def test_double_backward(card, name):
+    """The gradient of the gradient (weights times the input's first gradient) as torch's."""
+    f = REDUCTIONS[name]
+    f = (lambda t: REDUCTIONS[name](t)[0]) if name == "max_dim" else f
+
+    def second(x):  # the double backward with respect to the output's weights: J v
+        x = x.detach().requires_grad_()
+        out = f(x)
+        w = torch.ones_like(out).requires_grad_()
+        (g,) = torch.autograd.grad((out * w).sum(), x, create_graph=True)
+        v = torch.arange(x.numel(), dtype=x.dtype).reshape(x.shape)
+        (gw,) = torch.autograd.grad((g.nan_to_num(0.0) * v).sum(), w)
+        return g.detach(), gw
+
+    x = rows()
+    x[8, 0] = 2.0  # break the tie of row 8
+    same(second(x), _reference(second, x))
 
 
 @pytest.mark.parametrize("name", ["amax_last", "max_dim", "argmax", "aminmax"])
@@ -444,12 +619,14 @@ def test_compiled_max_pool_and_maximum_with_gradients(card):
 def test_undo_restores_the_native_op(monkeypatch):
     """After the undo the stand-in (dropping NaN) is what runs: the rewrite is gone."""
     monkeypatch.setattr(extrema, "native", gaudi)
+    monkeypatch.setattr(extrema, "native_out", gaudi_out)
     undo = extrema.install("cpu")
     x = rows(dtype=torch.float32)
-    assert torch.isnan(x.amax(-1)[0])
+    with torch.inference_mode():
+        assert torch.isnan(x.amax(-1)[0])
     undo()
-    assert not torch.isnan(gaudi(aten.amax.default)(x, [-1], False)[0])
-    assert torch.isnan(x.amax(-1)[0])  # torch's CPU kernel itself, no rewrite in between
+    assert not extrema._BACKEND
+    assert torch.isnan(x.amax(-1)[0])  # torch's CPU kernel itself, no rewrite (nor stand-in) in between
 
 
 # ---- adversarial round

@@ -4,38 +4,46 @@ On Gaudi2 (bridge 1.21.4, eager, lazy and compiled) the max/min family drops NaN
 (a leading NaN), ``max(-1)`` returns ``2`` and an index that is not the NaN's, ``maximum(1, nan)`` is ``1``,
 ``max_pool`` keeps a window's finite max, ``norm(x, inf)`` is finite. A NaN in a model then never reaches the loss:
 NaN checks do not fire and the loss stays finite (``repro/probe_reduction_nan.py``). In 16-bit dtypes ``argmax``,
-``argmin`` and ``max(dim)`` / ``min(dim)`` also return the index ``n`` (out of range) for a row of ``-inf`` (``+inf``
-for the min ops) and for an all-NaN row.
+``argmin`` and ``max(dim)`` / ``min(dim)`` also return an index out of range for a row of ``-inf`` (``+inf`` for the
+min ops) and an all-NaN row: ``n`` eager, garbage such as INT64_MIN lazy.
 
-Each op here runs Gaudi's own kernel and then puts NaN where torch has it, with torch's index and torch's gradient:
+Each op runs Gaudi's own kernel and then puts NaN where torch has it, with torch's index and torch's gradient:
 
 - ``amax`` / ``amin``, ``max()`` / ``min()`` and ``median()`` of the whole tensor, ``aminmax``, ``norm`` /
   ``linalg.vector_norm`` with ``ord = +-inf``: NaN for each reduced slice holding a NaN (``isnan().any()`` and
-  ``where``). The gradient is torch's formula over that result: for ``amax`` a NaN slice's gradient is NaN, for
-  ``max()`` / ``median()`` it is split among the NaNs, for the inf-norms it is 0 (torch's ``norm_backward`` with the
-  sign of NaN 0, as torch's; Gaudi's sign of NaN is NaN).
+  ``where``).
 - ``max(dim)`` / ``min(dim)`` / ``median(dim)``, ``argmax`` / ``argmin``: the index of the slice's first NaN (an
-  ``argmax`` of the NaN mask), as torch, and in 16-bit dtypes index 0 for the out-of-range rows. The values are read
-  at that index (``gather``), whose gradient is torch's (the gradient goes to the index).
-- ``maximum`` / ``minimum`` (and ``max(a, b)`` / ``min(a, b)``): ``a + b`` where either is NaN (NaN, with torch's
-  gradient: the whole gradient to both); ``fmax`` / ``fmin`` the other operand where one is NaN (Gaudi returns the
-  first operand, NaN or not); ``clamp`` with tensor bounds: NaN where the input or a bound is NaN (lazy mode drops the
-  input's NaN, eager a bound's), with torch's zero gradient there.
+  ``argmax`` of the NaN mask), as torch, and index 0 where Gaudi's index is out of range. The values are read at that
+  index.
+- ``maximum`` / ``minimum`` (and ``max(a, b)`` / ``min(a, b)``): ``a + b`` where either is NaN; ``fmax`` / ``fmin``
+  the other operand where one is NaN (Gaudi returns the first operand, NaN or not); ``clamp`` / ``clamp_min`` /
+  ``clamp_max`` with tensor bounds, in place too: NaN where the input or a bound is NaN (lazy mode drops the input's
+  NaN, eager a bound's).
 - ``max_pool2d`` / ``max_pool3d`` with indices (``F.max_pool1d`` reaches the 2-D op): NaN for each window holding a
-  NaN, found by pooling the NaN positions (the last NaN of a window, the one torch picks), and there the index of that
-  NaN. Gaudi's indices are window-local (kernel coordinates, row-major), not torch's flat plane indices (a separate
-  Gaudi difference, left as is), and its backward reads them: the fixed indices go to Gaudi's own backward, which then
-  sends a NaN window's gradient to that NaN, as torch.
+  NaN, found by pooling NaN codes (the last NaN of a window, the one torch picks), and there the index of that NaN.
+  Gaudi's indices are window-local (kernel coordinates, row-major), not torch's flat plane indices (a separate Gaudi
+  difference, left as is), and its backward reads them: with the fixed indices Gaudi's own backward sends a NaN
+  window's gradient to that NaN, as torch.
+
+Two layers. At the device's backend key (``HPU``), for every call, inference mode and anything else below autograd
+included: the values above, reaching Gaudi through each op's ``.out`` overload (Habana's lazy kernels of the
+functional ops are replaced: the dispatcher cannot call a kernel it no longer routes to). torch's own autograd
+formulas then run over the fixed results, which gives torch's gradients (amax: NaN; max(dim): to the first NaN;
+maximum: both operands; clamp: torch's comparisons). At ``Autograd{}``: what ``torch.compile`` traces (its fake
+tensors never reach a backend kernel), the same fixes as a composite; outside a tracer these kernels hand the call to
+torch's autograd kernel, so nothing is fixed twice. ``max()`` / ``min()`` / ``median()`` keep their own backward
+(torch's reads the NaN flag on the host, a sync per call) and the inf-norms theirs (torch's formula with Gaudi's
+``sign(NaN) = NaN`` gives NaN where torch gives 0); the inf-norms are fixed at ``Autograd{}`` only, so inference mode
+keeps Gaudi's. ``out=`` calls are computed as the functional op and copied out (with autograd on; in inference mode
+Gaudi's ``.out`` kernels run). Integer and bool dtypes keep the native result. A NaN scalar bound of ``clamp``
+(``clamp(x, min=nan)``) is not rewritten: Gaudi gives FLT_MAX / inf (torch: ``x`` for one NaN bound, NaN for two).
 
 - With ``HPU_OPS_EXACT_SORT=1`` (off by default, see ``install``): ``sort`` / ``argsort`` / ``msort`` / ``topk`` /
   ``kthvalue`` with NaN above +inf, as torch: a stable sort of the values with NaN as +inf, then a stable sort of the
   NaN mask. Gaudi's sort returns NaN as +inf with out-of-range indices, and its non-stable sort of 1000+ elements
-  with infs returns out-of-range indices even without NaN; its stable sort is right. Eager and lazy only:
-  traced by ``torch.compile`` the native op stays (compiled on the card, two of the rewritten sorts came out wrong).
-
-Registered at ``Autograd{}`` only: ``torch.inference_mode()`` calls, below autograd, keep Gaudi's kernels. Integer
-and bool dtypes keep the native op (they have no NaN), and so do ``out=`` calls. The native kernels run first, so
-their argument errors (empty dims, bad dims) are raised as usual.
+  with infs returns out-of-range indices even without NaN; its stable sort is right. Eager and lazy, with autograd
+  on: traced by ``torch.compile`` the native op stays (compiled on the card, two of the rewritten sorts came out
+  wrong), and so in inference mode.
 """
 import functools
 import math
@@ -45,7 +53,7 @@ import torch
 from torch._C import DispatchKey
 from torch._subclasses.fake_tensor import is_fake
 
-from ._dispatch import count, register_kernels
+from ._dispatch import chain, count, override_kernels, register_kernels
 
 aten = torch.ops.aten
 NAN = float("nan")
@@ -57,6 +65,12 @@ def native(op):
     """``op``'s own kernel below this rewrite: torch's autograd kernel, which records the native op's gradient when
     grad mode is on and reaches Gaudi's kernel. The CPU tests swap this for a stand-in that drops NaN like Gaudi."""
     return functools.partial(op._op_dk, DispatchKey.Autograd)
+
+
+def native_out(op, device_type):
+    """``op`` (an ``.out`` overload) at the device's backend key: Gaudi's kernel, which the backend kernels here call
+    (they replace the functional ops' kernels). The CPU tests swap it for a stand-in that drops NaN like Gaudi."""
+    return functools.partial(op._op_dk, getattr(DispatchKey, device_type.upper()))
 
 
 def native_backward(op):
@@ -102,6 +116,38 @@ def _restore(t, x, dims, keepdim):
     """``t`` with the reduced ``dims`` of ``x`` back as size 1 (torch's restore_reduced_dims), by a reshape: in lazy
     mode the backward of ``amax()`` over all dims with unsqueezes fails ("incorrect input sizes for Copy")."""
     return t if keepdim or x.dim() == 0 else t.reshape(_kept(x, dims))
+
+
+def _concrete(t):
+    """True for a real tensor outside any tracer."""
+    return not is_fake(t) and torch._guards.detect_fake_mode() is None and not torch._is_functional_tensor(t)
+
+
+def _traced(args, kwargs):
+    """True when ``torch.compile`` traces the call: its fake / functional tensors never reach a backend kernel."""
+    ts = [a for a in list(args) + list(kwargs.values()) if isinstance(a, torch.Tensor)]
+    return any(not _concrete(t) for t in ts)
+
+
+def _eager_native(op, composite):
+    """At ``Autograd{}``: outside a tracer, torch's autograd kernel of ``op`` (over the backend kernel's fixed result:
+    torch's gradient); traced, ``composite``."""
+    def kernel(*args, **kwargs):
+        if _BACKEND.get(_device(args)) and not _traced(args, kwargs):
+            return native(op)(*args, **kwargs)
+        return composite(*args, **kwargs)
+
+    return kernel
+
+
+_BACKEND = {}  # device type -> True while the backend kernels are installed
+
+
+def _device(args):
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            return a.device.type
+    return None
 
 
 def _grad_needed(*ts):
@@ -154,7 +200,8 @@ class _Whole(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, fn):
         r = fn(x)
-        r = torch.where(torch.isnan(x).any(), NAN, r)
+        if not (_BACKEND.get(x.device.type) and _concrete(x)):  # else the backend kernel fixed it
+            r = torch.where(torch.isnan(x).any(), NAN, r)
         ctx.save_for_backward(x, r)
         return r
 
@@ -174,6 +221,8 @@ def _whole_kernel(op, name):
         if _grad_needed(self):
             return _Whole.apply(self, fn)
         r = fn(self)
+        if _BACKEND.get(self.device.type) and _concrete(self):
+            return r
         return torch.where(torch.isnan(self).any(), NAN, r)
 
     return kernel
@@ -182,13 +231,13 @@ def _whole_kernel(op, name):
 # ---- max(dim) / min(dim) / median(dim), argmax / argmin: the first NaN's index
 
 
-def _fixed_index(x, d, i):
-    """``i`` (keepdim) with each NaN slice's first NaN, and in 16-bit dtypes index 0 where Gaudi returns ``n``."""
+def _fixed_index(x, d, i, argmax=None):
+    """``i`` (keepdim) with each NaN slice's first NaN, and index 0 where Gaudi's index is out of range (16-bit rows
+    of -inf, +inf for min: ``n`` eager, garbage such as INT64_MIN lazy; ``first`` is 0 there)."""
     m = torch.isnan(x)
-    first = native(aten.argmax.default)(m.to(torch.uint8), d, True)  # Gaudi's argmax: the first among ties
-    bad = m.any(d, keepdim=True)
-    if x.dtype in REDUCED:
-        bad = bad | (i >= x.shape[d])  # a row of -inf (+inf for min), where ``first`` is 0
+    argmax = argmax or native(aten.argmax.default)
+    first = argmax(m.to(torch.uint8), d, True)  # Gaudi's argmax: the first among ties (measured)
+    bad = m.any(d, keepdim=True) | (i < 0) | (i >= x.shape[d])
     return torch.where(bad, first, i)
 
 
@@ -284,8 +333,10 @@ def _inf_norm(self, dim, keepdim, fn, name):
 def _vector_norm_kernel(op, name):
     def kernel(self, ord=2, dim=None, keepdim=False, *, dtype=None):
         fn = native(op)
-        if not _inf(ord) or not _floating(self) or self.is_complex() or dtype not in (None, self.dtype):
+        if not _inf(ord) or not _floating(self) or self.is_complex():
             return fn(self, ord, dim, keepdim, dtype=dtype)
+        if dtype not in (None, self.dtype):  # the inf-norm is the largest |x|: exact in either dtype
+            self = self.to(dtype)
         return _inf_norm(self, dim, keepdim, lambda x: fn(x, ord, dim, keepdim), name)
 
     return kernel
@@ -368,7 +419,17 @@ def _clamp_kernel(op, name, arity):
         for b in bounds[:arity]:
             if isinstance(b, torch.Tensor):
                 m = m | torch.isnan(b)
-        return torch.where(m, NAN, out)  # a constant: torch's gradient there is 0 for the input and the bounds
+        # out + NaN, not a NaN constant: the gradient still reaches torch's formula, which compares the raw operands
+        # (clamp(5, min=nan, max=1): max's gradient 1, as torch's)
+        return torch.where(m, out + NAN, out)
+
+    return kernel
+
+
+def _clamp_inplace_kernel(functional, name):
+    def kernel(self, *bounds):
+        r = functional(self, *bounds)  # the rewritten functional op (traced: the composite)
+        return self.copy_(r)
 
     return kernel
 
@@ -470,11 +531,6 @@ def _sorted(x, d, descending):
     return x.gather(d, i), i  # autograd: the gradient to the index, torch's backward of sort
 
 
-def _concrete(t):
-    """True for a real tensor outside any tracer."""
-    return not is_fake(t) and torch._guards.detect_fake_mode() is None and not torch._is_functional_tensor(t)
-
-
 def _sortable(x):
     # not under torch.compile: compiled on the card, sort(dim=0, descending) and msort came out wrong (measured)
     return _floating(x) and x.dim() > 0 and x.numel() > 0 and max(x.shape) < POOL_PLANE_MAX and _concrete(x)
@@ -520,39 +576,317 @@ def _kthvalue_kernel(op, name):
     return kernel
 
 
+# ---- the backend layer: every call (inference mode too), through the ops' .out overloads
+
+
+def _reduced(x, dims, keepdim):
+    return [1 if d in dims else n for d, n in enumerate(x.shape)] if keepdim else \
+        [n for d, n in enumerate(x.shape) if d not in dims]
+
+
+def _empty(shape, dtype, like):
+    return torch.empty(shape, dtype=dtype, device=like.device)
+
+
+def _b_amax(out_op, name, dev):
+    def kernel(self, dim=(), keepdim=False):
+        dims = _dims(self, dim)
+        out = _empty(_reduced(self, dims, keepdim), self.dtype, self)
+        native_out(out_op, dev)(self, dim, keepdim, out=out)
+        if not _floating(self):
+            return out
+        count(name)
+        return torch.where(_nan_any(self, dims, keepdim), NAN, out)
+
+    return kernel
+
+
+def _b_whole(out_op, name, dev):  # max() / min() as amax / amin over every dim (Gaudi has no max.unary_out)
+    def kernel(self):
+        out = _empty((), self.dtype, self)
+        native_out(out_op, dev)(self, [], False, out=out)
+        if not _floating(self):
+            return out
+        count(name)
+        return torch.where(torch.isnan(self).any(), NAN, out)
+
+    return kernel
+
+
+def _b_median_whole(dev):  # median() as median(dim 0) of the flattened tensor (no median.out)
+    def kernel(self):
+        if self.numel() == 0:
+            return torch.full((), NAN, dtype=self.dtype, device=self.device)
+        # keepdim, then a reshape: Gaudi's median(dim) of a 1-D tensor to a 0-d one fails graph compile (measured,
+        # its own op too: x.reshape(-1).median(0))
+        v, i = _empty([1], self.dtype, self), _empty([1], torch.int64, self)
+        native_out(aten.median.dim_values, dev)(self.reshape(-1), 0, True, values=v, indices=i)
+        v = v.reshape(())
+        if not _floating(self):
+            return v
+        count("median")
+        return torch.where(torch.isnan(self).any(), NAN, v)
+
+    return kernel
+
+
+def _argmax_out(dev):
+    def argmax(x, d, keepdim):
+        out = _empty(_reduced(x, [d], keepdim), torch.int64, x)
+        return native_out(aten.argmax.out, dev)(x, d, keepdim, out=out)
+
+    return argmax
+
+
+SELECT_OUTS = {aten.max.dim_max: ("max", "max_values"), aten.min.dim_min: ("min", "min_indices"),
+               aten.median.dim_values: ("values", "indices")}
+
+
+def _b_select(out_op, name, dev):
+    values_name, index_name = SELECT_OUTS[out_op]
+
+    def kernel(self, dim, keepdim=False):
+        if self.dim() == 0:
+            _dims(self, dim)
+            v, i = kernel(self.reshape(1), 0, False)
+            return v.reshape(()), i.reshape(())
+        d = _dims(self, dim)[0]
+        kept = _reduced(self, [d], True)
+        v, i = _empty(kept, self.dtype, self), _empty(kept, torch.int64, self)
+        native_out(out_op, dev)(self, d, True, **{values_name: v, index_name: i})
+        if _floating(self):
+            count(name)
+            i = _fixed_index(self, d, i, _argmax_out(dev))
+            v = self.gather(d, i)
+        return (v, i) if keepdim else (v.squeeze(d), i.squeeze(d))
+
+    return kernel
+
+
+def _b_arg(out_op, name, dev):
+    def kernel(self, dim=None, keepdim=False):
+        if not _floating(self) or self.dim() == 0 or self.numel() == 0:
+            dims = _dims(self, dim) if dim is not None else list(range(self.dim()))
+            shape = _reduced(self, dims, keepdim) if dim is not None else ([1] * self.dim() if keepdim else [])
+            return native_out(out_op, dev)(self, dim, keepdim, out=_empty(shape, torch.int64, self))
+        count(name)
+        x = self.reshape(-1) if dim is None else self
+        d = 0 if dim is None else _dims(self, dim)[0]
+        i = native_out(out_op, dev)(x, d, True, out=_empty(_reduced(x, [d], True), torch.int64, x))
+        i = _fixed_index(x, d, i, _argmax_out(dev))
+        if dim is None:
+            return i.reshape([1] * self.dim()) if keepdim else i.reshape(())
+        return i if keepdim else i.squeeze(d)
+
+    return kernel
+
+
+def _b_aminmax(dev):
+    def kernel(self, *, dim=None, keepdim=False):
+        dims = _dims(self, dim)
+        shape = _reduced(self, dims, keepdim) if dim is not None else ([1] * self.dim() if keepdim else [])
+        lo, hi = _empty(shape, self.dtype, self), _empty(shape, self.dtype, self)
+        native_out(aten.aminmax.out, dev)(self, dim=dim, keepdim=keepdim, min=lo, max=hi)
+        if not _floating(self):
+            return lo, hi
+        count("aminmax")
+        m = _nan_any(self, dims, keepdim).reshape(shape)
+        return torch.where(m, NAN, lo), torch.where(m, NAN, hi)
+
+    return kernel
+
+
+def _binary_out(out_op, dev, a, b):
+    out = _empty(torch.broadcast_shapes(a.shape, b.shape), torch.result_type(a, b), a)
+    return native_out(out_op, dev)(a, b, out=out)
+
+
+def _b_binary(out_op, name, dev, nan_first):
+    def kernel(self, other):
+        out = _binary_out(out_op, dev, self, other)
+        if not out.is_floating_point():
+            return out
+        count(name)
+        if nan_first:  # maximum / minimum: NaN where either is
+            return torch.where(torch.isnan(self) | torch.isnan(other), self + other, out)
+        return torch.where(torch.isnan(other), self, torch.where(torch.isnan(self), other, out)).to(out.dtype)
+
+    return kernel
+
+
+def _clamp_dtype(x, bounds):
+    dtype = x.dtype
+    for b in bounds:
+        if isinstance(b, torch.Tensor):
+            dtype = torch.promote_types(dtype, torch.result_type(x, b))
+    return dtype
+
+
+def _b_clamp(out_op, name, dev):
+    def fixed(self, *bounds):
+        ts = [b for b in bounds if isinstance(b, torch.Tensor)]
+        out = _empty(torch.broadcast_shapes(self.shape, *[b.shape for b in ts]), _clamp_dtype(self, bounds), self)
+        native_out(out_op, dev)(self, *bounds, out=out)
+        if not out.is_floating_point():
+            return out
+        count(name)
+        m = torch.isnan(self)
+        for b in ts:
+            m = m | torch.isnan(b)
+        return torch.where(m, NAN, out)
+
+    return fixed
+
+
+def _b_clamp_inplace(out_op, name, dev):
+    functional = _b_clamp(out_op, name, dev)
+
+    def kernel(self, *bounds):
+        return self.copy_(functional(self, *bounds))
+
+    return kernel
+
+
+POOL_META = {2: aten.max_pool2d_with_indices.default, 3: aten.max_pool3d_with_indices.default}
+
+
+def _b_pool(out_op, name, dev, nd):
+    def fn(x, *args):  # Gaudi's pool into fresh outputs (shapes from the meta kernel)
+        out, idx = POOL_META[nd](torch.empty(x.shape, dtype=x.dtype, device="meta"), *args)
+        out, idx = _empty(out.shape, x.dtype, x), _empty(idx.shape, torch.int64, x)
+        native_out(out_op, dev)(x, *args, out=out, indices=idx)
+        return out, idx
+
+    def kernel(self, kernel_size, stride=(), padding=0, dilation=1, ceil_mode=False):
+        args = (kernel_size, stride, padding, dilation, ceil_mode)
+        if not _floating(self) or self.dim() < nd or not _codes_exact(self.shape[-nd:], kernel_size, nd):
+            return fn(self, *args)
+        count(name)
+        return _pool(self, args, fn, nd)
+
+    return kernel
+
+
+def _backend_kernels(dev):
+    k = [(aten.amax.default, _b_amax(aten.amax.out, "amax", dev)),
+         (aten.amin.default, _b_amax(aten.amin.out, "amin", dev)),
+         (aten.max.default, _b_whole(aten.amax.out, "max", dev)),
+         (aten.min.default, _b_whole(aten.amin.out, "min", dev)),
+         (aten.median.default, _b_median_whole(dev)),
+         (aten.max.dim, _b_select(aten.max.dim_max, "max_dim", dev)),
+         (aten.min.dim, _b_select(aten.min.dim_min, "min_dim", dev)),
+         (aten.median.dim, _b_select(aten.median.dim_values, "median_dim", dev)),
+         (aten.argmax.default, _b_arg(aten.argmax.out, "argmax", dev)),
+         (aten.argmin.default, _b_arg(aten.argmin.out, "argmin", dev)),
+         (aten.aminmax.default, _b_aminmax(dev)),
+         (aten.maximum.default, _b_binary(aten.maximum.out, "maximum", dev, True)),
+         (aten.minimum.default, _b_binary(aten.minimum.out, "minimum", dev, True)),
+         (aten.fmax.default, _b_binary(aten.fmax.out, "fmax", dev, False)),
+         (aten.fmin.default, _b_binary(aten.fmin.out, "fmin", dev, False)),
+         (aten.clamp.Tensor, _b_clamp(aten.clamp.Tensor_out, "clamp_tensor", dev)),
+         (aten.clamp_min.Tensor, _b_clamp(aten.clamp_min.Tensor_out, "clamp_tensor", dev)),
+         (aten.clamp_max.Tensor, _b_clamp(aten.clamp_max.Tensor_out, "clamp_tensor", dev)),
+         (aten.clamp_.Tensor, _b_clamp_inplace(aten.clamp.Tensor_out, "clamp_tensor", dev)),
+         (aten.clamp_min_.Tensor, _b_clamp_inplace(aten.clamp_min.Tensor_out, "clamp_tensor", dev)),
+         (aten.clamp_max_.Tensor, _b_clamp_inplace(aten.clamp_max.Tensor_out, "clamp_tensor", dev)),
+         (aten.max_pool2d_with_indices.default, _b_pool(aten.max_pool2d_with_indices.out, "max_pool2d", dev, 2)),
+         (aten.max_pool3d_with_indices.default, _b_pool(aten.max_pool3d_with_indices.out, "max_pool3d", dev, 3))]
+    return k
+
+
+# ---- out= overloads: the functional op (rewritten), copied out
+
+
+OUTS = [  # (out overload, functional op, names of the out arguments)
+    (aten.amax.out, aten.amax.default, ("out",)), (aten.amin.out, aten.amin.default, ("out",)),
+    (aten.max.dim_max, aten.max.dim, ("max", "max_values")), (aten.min.dim_min, aten.min.dim, ("min", "min_indices")),
+    (aten.median.dim_values, aten.median.dim, ("values", "indices")),
+    (aten.argmax.out, aten.argmax.default, ("out",)), (aten.argmin.out, aten.argmin.default, ("out",)),
+    (aten.aminmax.out, aten.aminmax.default, ("min", "max")),
+    (aten.maximum.out, aten.maximum.default, ("out",)), (aten.minimum.out, aten.minimum.default, ("out",)),
+    (aten.fmax.out, aten.fmax.default, ("out",)), (aten.fmin.out, aten.fmin.default, ("out",)),
+    (aten.clamp.Tensor_out, aten.clamp.Tensor, ("out",)),
+    (aten.clamp_min.Tensor_out, aten.clamp_min.Tensor, ("out",)),
+    (aten.clamp_max.Tensor_out, aten.clamp_max.Tensor, ("out",)),
+    (aten.max_pool2d_with_indices.out, aten.max_pool2d_with_indices.default, ("out", "indices")),
+    (aten.max_pool3d_with_indices.out, aten.max_pool3d_with_indices.default, ("out", "indices")),
+    (aten.linalg_vector_norm.out, aten.linalg_vector_norm.default, ("out",)),
+    (aten.norm.out, aten.norm.ScalarOpt_dim, ("out",)),
+]
+
+
+def _copy_out(out, value):
+    """torch's out= rules: the result cast to ``out``'s dtype where torch allows it, ``out`` resized to the result."""
+    if not torch.can_cast(value.dtype, out.dtype):
+        raise RuntimeError(f"result type {value.dtype} can't be cast to the desired output type {out.dtype}")
+    if out.shape != value.shape:
+        out.resize_(value.shape)
+    return out.copy_(value)
+
+
+def _out_kernel(out_op, functional, names):
+    def kernel(*args, **kwargs):
+        outs = [kwargs.pop(n) for n in names]
+        tensors = [a for a in list(args) + list(kwargs.values()) if isinstance(a, torch.Tensor)]
+        if _grad_needed(*tensors) or _traced(args, kwargs):  # torch's own error / the tracer's handling
+            return native(out_op)(*args, **kwargs, **dict(zip(names, outs)))
+        values = functional(*args, **kwargs)
+        values = values if isinstance(values, tuple) else (values,)
+        done = tuple(_copy_out(o, v) for o, v in zip(outs, values))
+        return done if len(done) > 1 else done[0]
+
+    return kernel
+
+
 def install(device_type, exact_sort=None):
-    """NaN propagation of Gaudi's max/min ops on ``device_type``, at its autograd key. Returns an undo. The sort
-    family (``sort``, ``argsort``, ``msort``, ``topk``, ``kthvalue``) only with ``exact_sort`` (default: the
-    environment's ``HPU_OPS_EXACT_SORT=1``): measured eager, it made the training steps of the SPD models up to 22%
-    slower (hpu-ops' own eigh and SVD sort their eigenvalues; TensorCSPNet 205 to 250 ms), lazy within noise."""
+    """NaN propagation of Gaudi's max/min ops on ``device_type``: the backend layer at its backend key, the traced
+    composites (and the inf-norms, the whole-tensor reductions' backward, the out= overloads) at its autograd key.
+    Returns an undo. The sort family (``sort``, ``argsort``, ``msort``, ``topk``, ``kthvalue``) only with
+    ``exact_sort`` (default: the environment's ``HPU_OPS_EXACT_SORT=1``): measured eager, it made the training steps
+    of the SPD models up to 22% slower (hpu-ops' own eigh and SVD sort their eigenvalues; TensorCSPNet 205 to 250 ms),
+    lazy within noise."""
     if exact_sort is None:
         exact_sort = os.environ.get("HPU_OPS_EXACT_SORT") == "1"
-    k = []
+    traced = []  # (op, composite): handed to torch's autograd kernel outside a tracer
     for op, name in ((aten.amax.default, "amax"), (aten.amin.default, "amin")):
-        k.append((op, "Autograd{}", _amax_kernel(op, name)))
+        traced.append((op, _amax_kernel(op, name)))
+    for op, name in ((aten.max.dim, "max_dim"), (aten.min.dim, "min_dim"), (aten.median.dim, "median_dim")):
+        traced.append((op, _select_kernel(op, name)))
+    for op, name in ((aten.argmax.default, "argmax"), (aten.argmin.default, "argmin")):
+        traced.append((op, _arg_kernel(op, name)))
+    traced.append((aten.aminmax.default, _aminmax_kernel(aten.aminmax.default, "aminmax")))
+    for op, name, largest in ((aten.maximum.default, "maximum", True), (aten.minimum.default, "minimum", False)):
+        traced.append((op, _binary_kernel(op, name, largest)))
+    for op, name in ((aten.fmax.default, "fmax"), (aten.fmin.default, "fmin")):
+        traced.append((op, _fbinary_kernel(op, name)))
+    clamps = {}
+    for op, arity in ((aten.clamp.Tensor, 2), (aten.clamp_min.Tensor, 1), (aten.clamp_max.Tensor, 1)):
+        clamps[op] = _clamp_kernel(op, "clamp_tensor", arity)
+        traced.append((op, clamps[op]))
+    for op, functional in ((aten.clamp_.Tensor, aten.clamp.Tensor), (aten.clamp_min_.Tensor, aten.clamp_min.Tensor),
+                           (aten.clamp_max_.Tensor, aten.clamp_max.Tensor)):
+        traced.append((op, _clamp_inplace_kernel(clamps[functional], "clamp_tensor")))
+    for op, bwd, nd in ((aten.max_pool2d_with_indices.default, aten.max_pool2d_with_indices_backward.default, 2),
+                        (aten.max_pool3d_with_indices.default, aten.max_pool3d_with_indices_backward.default, 3)):
+        traced.append((op, _pool_kernel(op, bwd, f"max_pool{nd}d", nd)))
+    k = [(op, "Autograd{}", _eager_native(op, composite)) for op, composite in traced]
     for op, name in ((aten.max.default, "max"), (aten.min.default, "min"), (aten.median.default, "median")):
         k.append((op, "Autograd{}", _whole_kernel(op, name)))
-    for op, name in ((aten.max.dim, "max_dim"), (aten.min.dim, "min_dim"), (aten.median.dim, "median_dim")):
-        k.append((op, "Autograd{}", _select_kernel(op, name)))
-    for op, name in ((aten.argmax.default, "argmax"), (aten.argmin.default, "argmin")):
-        k.append((op, "Autograd{}", _arg_kernel(op, name)))
-    k.append((aten.aminmax.default, "Autograd{}", _aminmax_kernel(aten.aminmax.default, "aminmax")))
     k.append((aten.linalg_vector_norm.default, "Autograd{}",
               _vector_norm_kernel(aten.linalg_vector_norm.default, "norm_inf")))
     k.append((aten.norm.ScalarOpt_dim, "Autograd{}", _norm_kernel(aten.norm.ScalarOpt_dim, "norm_inf", True)))
     k.append((aten.norm.Scalar, "Autograd{}", _norm_kernel(aten.norm.Scalar, "norm_inf", False)))
-    for op, name, largest in ((aten.maximum.default, "maximum", True), (aten.minimum.default, "minimum", False)):
-        k.append((op, "Autograd{}", _binary_kernel(op, name, largest)))
-    for op, name in ((aten.fmax.default, "fmax"), (aten.fmin.default, "fmin")):
-        k.append((op, "Autograd{}", _fbinary_kernel(op, name)))
-    for op, arity in ((aten.clamp.Tensor, 2), (aten.clamp_min.Tensor, 1), (aten.clamp_max.Tensor, 1)):
-        k.append((op, "Autograd{}", _clamp_kernel(op, "clamp_tensor", arity)))
-    for op, bwd, nd in ((aten.max_pool2d_with_indices.default, aten.max_pool2d_with_indices_backward.default, 2),
-                        (aten.max_pool3d_with_indices.default, aten.max_pool3d_with_indices_backward.default, 3)):
-        k.append((op, "Autograd{}", _pool_kernel(op, bwd, f"max_pool{nd}d", nd)))
+    k += [(out_op, "Autograd{}", _out_kernel(out_op, functional, names)) for out_op, functional, names in OUTS]
     if exact_sort:
         k.append((aten.sort.default, "Autograd{}", _sort_kernel(aten.sort.default, "sort", False)))
         k.append((aten.sort.stable, "Autograd{}", _sort_kernel(aten.sort.stable, "sort", True)))
         k.append((aten.topk.default, "Autograd{}", _topk_kernel(aten.topk.default, "topk")))
         k.append((aten.kthvalue.default, "Autograd{}", _kthvalue_kernel(aten.kthvalue.default, "kthvalue")))
-    return register_kernels(device_type, k)
+    undo_backend = override_kernels(device_type, _backend_kernels(device_type))
+    _BACKEND[device_type] = True
+    undo_autograd = register_kernels(device_type, k)
+
+    def undo_flag():
+        _BACKEND.pop(device_type, None)
+
+    return chain([undo_backend, undo_flag, undo_autograd])
