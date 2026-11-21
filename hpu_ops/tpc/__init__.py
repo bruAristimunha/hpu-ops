@@ -52,6 +52,8 @@ import warnings
 
 import torch
 
+from ..extrema import internal_sort
+
 MAXN = 64  # MAXN of gj_solve and tri_solve (main)
 SMALL_MAXN = 32  # MAXN of jacobi_svd, matrix_exp, lu_factor, lu_perm and lu_solve
 MAXHH = 64
@@ -1188,7 +1190,7 @@ def _sort(x, descending=False):
     infs, and its 1-D stable sort runs on the CPU, so the sort is the plain one). The values are gathered from ``x``
     (float data, an int64 index): two ops more than the sort alone."""
     key = torch.nan_to_num(x, nan=float("inf"), posinf=float("inf"), neginf=float("-inf"))
-    order = key.sort(dim=-1, descending=descending)[1]
+    order = internal_sort(key, -1, descending)[1]  # Gaudi's own sort: the key has no NaN
     return x.gather(-1, order), order
 
 

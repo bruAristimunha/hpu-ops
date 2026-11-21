@@ -13,7 +13,7 @@ arm = sys.argv.pop(1)
 if arm == "off":
     os.environ["HPU_OPS_NAN_PROPAGATION"] = "0"  # the documented opt-out
 elif arm == "nosort":
-    extrema._sortable = lambda x: False
+    extrema._sortable = lambda x, dim: False
 elif arm == "on":
     os.environ["HPU_OPS_EXACT_SORT"] = "1"  # the sort family on too
 print(f"ARM {arm}", flush=True)
