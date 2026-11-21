@@ -296,3 +296,14 @@ def test_with_every_fix_installed(dynamic_dim):
     m.zero_grad()
     m(x).square().sum().backward()
     assert_same(got, [p.grad for p in m.parameters()], tol=1e-10)
+
+
+def test_empty_batch_with_another_symbolic_size_compiles():
+    """An empty batch has no ``-1`` to infer in the group reshape (review of #49)."""
+    x = torch.randn(0, 4, 7)
+    torch._dynamo.mark_dynamic(x, 2)
+    torch._dynamo.reset()
+    with cpu_as_hpu(norm.install_group_norm):
+        out = torch.compile(lambda t: torch.nn.functional.group_norm(t, 2), backend="aot_eager")(x)
+    torch._dynamo.reset()
+    assert out.shape == (0, 4, 7)

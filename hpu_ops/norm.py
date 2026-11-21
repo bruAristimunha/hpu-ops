@@ -6,10 +6,12 @@ argument (FX dump on bridge 1.21.4). Habana's ``hpu_backend`` then fails in its 
 isn't registered in KernelRegistry!", presumably from converting that argument. ``aten::IntImplicit`` is a
 TorchScript symbol without a dispatcher schema in torch 2.6, so ``torch.library`` cannot register a kernel for it.
 There, while tracing only, group norm is computed from a reshape into groups, ``var_mean`` and the affine terms,
-which take no size as an argument in the forward graph; autograd differentiates the composite. Static shapes and
+which take no symbolic scalar argument (the views keep the symbolic shape); autograd differentiates the composite. Static shapes and
 eager calls keep Gaudi's kernel. ``count("group_norm")`` counts the tracer's calls of the kernel (dynamo's fake
 propagation included), not launches on the card.
 """
+import math
+
 import torch
 from torch._C import DispatchKey
 from torch._prims_common import suggest_memory_format
@@ -27,7 +29,8 @@ def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
     overflows (about 1e19 and up) give a finite, wrong result where ATen's CPU kernel gives NaN."""
     dtype = torch.float32 if input.dtype in REDUCED else input.dtype
     with torch.autocast(input.device.type, enabled=False):
-        x = input.reshape(input.shape[0], num_groups, -1).to(dtype)
+        # the group size written out, not -1: an empty batch has no -1 to infer (review of #49)
+        x = input.reshape(input.shape[0], num_groups, input.shape[1] // num_groups * math.prod(input.shape[2:])).to(dtype)
         var, mean = torch.var_mean(x, dim=-1, correction=0, keepdim=True)
         out = ((x - mean) * torch.rsqrt(var + eps)).view(input.shape)
         affine = (-1,) + (1,) * (input.dim() - 2)  # per channel, broadcast over the inner dims
