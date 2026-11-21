@@ -240,11 +240,19 @@ def _eigh_raw(PA, upper):
     return W, V.reshape(-1, 2, n, n)
 
 
+def _upper(UPLO):
+    """``True`` for ``UPLO`` = "U"/"u", ``False`` for "L"/"l"; anything else raises as ``torch.linalg.eigh`` does."""
+    if not isinstance(UPLO, str) or UPLO.upper() not in ("L", "U"):
+        raise RuntimeError(f"Expected UPLO argument to be 'L' or 'U', but got {UPLO}")
+    return UPLO.upper() == "U"
+
+
 def eigh(A, UPLO="L", layout="pairs"):
     """``torch.linalg.eigh`` for a complex Hermitian A (n <= ``COMPLEX_MAXN``) held in the ``UPLO`` triangle (the
     imaginary parts of the diagonal are ignored, as LAPACK's heevd): ``(w (...,  n) ascending float32, V)`` with V's
     columns the eigenvectors as pairs (``(..., n, n, 2)`` or interleaved); each column's phase is arbitrary, as in
     torch. Two kernel launches, a sort and a gather on the card."""
+    upper = _upper(UPLO)
     PA = as_pairs(A, layout)
     n = _square(PA)
     batch = PA.shape[:-3]
@@ -254,7 +262,7 @@ def eigh(A, UPLO="L", layout="pairs"):
         w = PA[..., 0, 0, 0].reshape(*batch, 1).clone()
         V = torch.stack([torch.ones_like(w), torch.zeros_like(w)], -1)[..., None, :]
         return w, from_pairs(V, layout)
-    W, R = _eigh_raw(PA, UPLO.upper() == "U")
+    W, R = _eigh_raw(PA, upper)
     w, order = internal_sort(W, -1)
     R = R.gather(2, order[:, None, :, None].expand_as(R))  # rows j sorted
     V = torch.stack([R[:, 0].mT, -R[:, 1].mT], -1)  # V[i, j] = conj(x_j^H[i])
@@ -263,13 +271,14 @@ def eigh(A, UPLO="L", layout="pairs"):
 
 def eigvalsh(A, UPLO="L", layout="pairs"):
     """``torch.linalg.eigvalsh`` for a complex Hermitian A: the eigenvalues of ``eigh``, ascending."""
+    upper = _upper(UPLO)
     PA = as_pairs(A, layout)
     n = _square(PA)
     if _empty(PA.shape[:-3]):
         return PA.new_zeros(*PA.shape[:-3], n)
     if n == 1:
         return PA[..., 0, 0, 0].reshape(*PA.shape[:-3], 1).clone()
-    W, _ = _eigh_raw(PA, UPLO.upper() == "U")
+    W, _ = _eigh_raw(PA, upper)
     return internal_sort(W, -1)[0].reshape(*PA.shape[:-3], n)
 
 

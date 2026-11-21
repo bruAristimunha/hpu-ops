@@ -109,6 +109,19 @@ def test_eigh_triangles_layouts_n1():
     assert w1.tolist() == [[2.5]] and V1.tolist() == [[[[1.0, 0.0]]]]
 
 
+@pytest.mark.parametrize("uplo", ["X", "", "LU", "lower", None])
+@pytest.mark.parametrize("n", [1, 4])
+def test_eigh_invalid_uplo_raises(uplo, n):
+    """An invalid UPLO raises as torch.linalg.eigh does (it used to be taken as "L"), also for n = 1 and empty."""
+    H = pairs((lambda X: X + X.mH)(crandn(2, n, n, seed=14)))
+    for fn in (cl.eigh, cl.eigvalsh):
+        for A in (H, H[:0]):
+            with pytest.raises(RuntimeError, match="UPLO"):
+                fn(A, UPLO=uplo)
+    w_lo, _ = cl.eigh(H, UPLO="l")
+    assert torch.equal(w_lo, cl.eigh(H)[0]) and torch.equal(cl.eigvalsh(H, UPLO="u"), cl.eigvalsh(H, UPLO="U"))
+
+
 @pytest.mark.parametrize("bad", [math.nan, math.inf])
 def test_eigh_nonfinite(bad):
     H = (lambda X: X + X.mH)(crandn(2, 5, 5, seed=13))
