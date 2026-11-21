@@ -1105,8 +1105,9 @@ def _lstsq_eval(A, B, rcond, driver):
         residuals = (B_mat - A @ sol_mat).square().sum(-2)
     else:
         residuals = A.new_empty(0)
+    # a fresh tensor (torch's rank owns its storage; a stride-0 expand breaks in-place use and lazy-mode views)
     rank_out = A.new_empty(0, dtype=torch.int64) if driver == "gels" else A.new_full(
-        (), k, dtype=torch.int64).expand(A.shape[:-2])
+        A.shape[:-2], k, dtype=torch.int64)
     sv_out = S if driver in ("gelsd", "gelss") else A.new_empty(0)
     if bad is not None and bool(bad):
         return None
@@ -1286,6 +1287,21 @@ def install_matrix_rank(device_type):
 
 
 _PADE13_THETA = 5.371920351148152
+# The scaling cap of the matrix_exp kernels (S_MAX of matrix_exp_f32_gaudi2.c): ||A||_1 <= 3.4e38 needs <= 126 halvings
+_EXPM_S_MAX = 126
+
+
+def _expm_scaling(norm):
+    """The kernels' scaling count of a 1-norm (a float): halvings until it is <= ``_PADE13_THETA``, at most
+    ``_EXPM_S_MAX``; 0 when the norm is not finite. Halving is exact, so this is the kernel's count."""
+    if not math.isfinite(norm):
+        return 0
+    theta = float(torch.tensor(_PADE13_THETA, dtype=torch.float32))  # the kernel compares with the float32 constant
+    s = 0
+    while norm > theta and s < _EXPM_S_MAX:
+        norm *= 0.5
+        s += 1
+    return s
 _PADE13_C = (
     1.0,
     0.5,
@@ -1334,7 +1350,7 @@ def _matrix_exp_composite(A, use_grad):
             R = torch.where(s_t > k, R @ R, R)
         return R
     norm = float(A.detach().abs().sum(-2).amax().item())
-    s = 0 if (norm <= _PADE13_THETA or not math.isfinite(norm)) else min(math.ceil(math.log2(norm / _PADE13_THETA)), 128)
+    s = _expm_scaling(norm)
     A_s = A if s == 0 else A * math.ldexp(1.0, -s)
     U, V = _pade13_uv(A_s)
     R = SolveEx.apply(V - U, V + U, True, False)[0] if use_grad else SolveEx.compute(V - U, V + U, True, False)[0]
@@ -1355,8 +1371,7 @@ def _matrix_exp_frechet_torch(A, gY):
         s = None
     else:
         norm = float(At.detach().abs().sum(-2).amax().item())
-        s = 0 if (norm <= _PADE13_THETA or not math.isfinite(norm)) else min(
-            math.ceil(math.log2(norm / _PADE13_THETA)), 128)
+        s = _expm_scaling(norm)
         scale = math.ldexp(1.0, -s)
         As, Es = (At, gY) if s == 0 else (At * scale, gY * scale)
     n = As.shape[-1]

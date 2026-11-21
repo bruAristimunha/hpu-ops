@@ -1045,8 +1045,12 @@ def jacobi_svdvals(A, sort=True, flush=True):
 
 
 def svd_reference(A, compute_uv=True, full_matrices=False):
-    """``jacobi_svd`` / ``jacobi_svdvals`` in plain torch, matching the kernel contract (1/sigma scaling, MGS
-    completion for zero/degenerate columns, optional full orthogonal extension, descending ``S``). For the CPU tests."""
+    """``jacobi_svd`` / ``jacobi_svdvals`` in plain torch, matching the kernel contract: the rows of A orthogonalized
+    when m < n or A is square and contiguous (else the rows of A^T), 1/max|a| scaling (not of a zero matrix), the
+    kernel's round-robin rotations and skip rules (gamma = 0, gamma^2 <= tol alpha beta, r^2 < 1e-34), singular
+    values of squared row norms below 1e-36 set to 0, MGS completion for zero/degenerate rows, optional full
+    orthogonal extension, descending ``S``. For the CPU tests (``tests/kernel_replica.py`` replays the float32
+    arithmetic)."""
     _check_svd(A)
     batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
     k = min(m, n)
@@ -1057,7 +1061,7 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
             return A.new_empty(0), S, A.new_empty(0)
         return A.new_empty(*batch, m, m if full else k), S, A.new_empty(*batch, n if full else k, n)
 
-    swap = m < n
+    swap = m < n or (m == n and A.is_contiguous())
     big = max(m, n)
     W = (A if swap else A.mT).reshape(-1, k, big).clone()
     b = W.shape[0]
@@ -1093,7 +1097,7 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
                 d = beta - alpha
                 g2 = 2.0 * gamma
                 r = torch.hypot(d, g2)
-                skip = (gamma == 0) | (r == 0) | (gamma * gamma <= tol_scale * alpha * beta)
+                skip = (gamma == 0) | (r * r < 1e-34) | (gamma * gamma <= tol_scale * alpha * beta)
                 sr = torch.where(skip, 1.0, r)
                 c2 = 0.5 * (1.0 + d.abs() / sr)
                 c = torch.where(skip, 1.0, c2.sqrt())
@@ -1106,13 +1110,12 @@ def svd_reference(A, compute_uv=True, full_matrices=False):
 
     sq = (W * W).sum(-1)
     norm = sq.sqrt()
-    S = norm * safe_sigma.squeeze(-1)
-    S = torch.where(sigma.squeeze(-1) == 0, 0.0, S)
+    S = torch.where(sq < 1e-36, 0.0, norm * safe_sigma.squeeze(-1))
     if not compute_uv:
         return A.new_empty(0), S.reshape(*batch, k).sort(-1, descending=True).values, A.new_empty(0)
 
     thresh = torch.clamp(1e-10 * sq.amax(-1, keepdim=True), min=1e-36)
-    U_t = W / torch.where(norm.unsqueeze(-1) > 0, norm.unsqueeze(-1), 1.0)
+    U_t = torch.where(sq.unsqueeze(-1) < 1e-36, 0.0, W / torch.where(norm.unsqueeze(-1) > 0, norm.unsqueeze(-1), 1.0))
     bad_mask = sq < thresh
     if bad_mask.any():
         for bi in range(b):
@@ -1245,17 +1248,28 @@ def matrix_exp_frechet(A, G, flush=True):
 
 
 def matrix_exp_reference(A):
-    """``matrix_exp`` in plain torch, matching the TPC kernel contract. For the CPU tests."""
+    """``matrix_exp`` in plain torch with the TPC kernel's contract: each matrix scaled by 2^-s, s its own count of
+    halvings of the 1-norm until <= theta_13 (at most 126, 0 if not finite: ``linalg._expm_scaling``), Padé-13,
+    then s squarings. Detached. For the CPU tests."""
     from .. import linalg
 
-    return linalg._matrix_exp_composite(A, False)
+    n = A.shape[-1]
+    flat = A.detach().reshape(-1, n, n)
+    out = [linalg._matrix_exp_composite(a, False) for a in flat]
+    return (torch.stack(out) if out else flat.clone()).reshape(A.shape)
 
 
 def matrix_exp_frechet_reference(A, G):
-    """``matrix_exp_frechet`` in plain torch, matching the TPC kernel contract. For the CPU tests."""
+    """``matrix_exp_frechet`` in plain torch with the TPC kernel's contract (per-matrix scaling of A^T, as
+    ``matrix_exp_reference``). Detached. For the CPU tests."""
     from .. import linalg
 
-    return linalg._matrix_exp_frechet_torch(A, G)
+    n = A.shape[-1]
+    batch = torch.broadcast_shapes(A.shape[:-2], G.shape[:-2])
+    fa = A.detach().expand(*batch, n, n).reshape(-1, n, n)
+    fg = G.detach().expand(*batch, n, n).reshape(-1, n, n)
+    out = [linalg._matrix_exp_frechet_torch(a, g) for a, g in zip(fa, fg)]
+    return (torch.stack(out) if out else fa.clone()).reshape(*batch, n, n)
 
 
 def lu_factor(A, pivots=True):

@@ -9,6 +9,8 @@
  * 64-lane vector in local memory, so n, m <= MAXN. Lane k of a row is broadcast by a masked reduce.
  */
 #define MAXN 32
+#define TWO_64 1.8446744073709552e19f   // 2^64: a diagonal at or above it is scaled by 2^-64 before the reciprocal
+#define TWO_M64 5.421010862427522e-20f
 
 __local__ float64 lu[MAXN];
 __local__ float64 b[MAXN];
@@ -69,7 +71,9 @@ void main(tensor LU, tensor PIVF, tensor B, tensor X)
             {
                 acc = v_f32_mac_b(b[j], v_f32_sub_b(0.0f, lane_bcast(lu[i], lane, j)), acc);
             }
-            b[i] = v_f32_mul_b(acc, v_reciprocal_f32(lane_bcast(lu[i], lane, i)));
+            float64 d = lane_bcast(lu[i], lane, i);
+            float64 sc = v_f32_sel_less_f32_b(v_f32_abs_b(d), TWO_64, 1.0f, TWO_M64);  // 1/d never flushed to zero
+            b[i] = v_f32_mul_b(v_f32_mul_b(acc, sc), v_reciprocal_f32(v_f32_mul_b(d, sc)));
         }
         for (int i = 0; i < n; i++)
         {

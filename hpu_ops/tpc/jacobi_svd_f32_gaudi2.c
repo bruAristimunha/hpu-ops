@@ -140,7 +140,8 @@ void main(tensor A_t, tensor Ut, tensor S, tensor Vt)
         }
 #endif
         float64 pre_scale = v_f32_sel_less_f32_b(1.0e35f, sigma, 1.0e-4f, 1.0f);
-        float64 safe_sigma = v_f32_sel_less_f32_b(sigma, 1.0e-36f, 1.0f, sigma);
+        // every matrix is scaled by 1/max|a| (also a tiny one: 1/sigma is normal for any normal sigma), except a zero one
+        float64 safe_sigma = v_f32_sel_eq_f32_b(sigma, 0.0f, 1.0f, sigma);
         float64 adj_sigma = v_f32_mul_b(safe_sigma, pre_scale);
         float64 inv_sigma = v_reciprocal_f32(adj_sigma);
         inv_sigma = v_f32_mul_b(inv_sigma, v_f32_sub_b(2.0f, v_f32_mul_b(adj_sigma, inv_sigma)));

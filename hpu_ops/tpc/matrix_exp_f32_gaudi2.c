@@ -10,10 +10,27 @@
  *
  * 100% LUT-free (no v_f32_reduce_*, v_reciprocal_f32, sqrt, rsqrt) -> 80 KB VLM.
  * Forward uses 6 x 8 KB = 48 KB; -DFRECHET uses 8 x 8 KB = 64 KB.
+ *
+ * Scaling: s = the number of halvings of ||A||_1 (of A^T under -DFRECHET) until it is <= THETA_13, at most S_MAX
+ * (0 when the norm is not finite; the result is then non-finite, from the inputs). S_MAX = 126 covers float32:
+ * ||A||_1 <= 3.4e38 = THETA_13 * 2^125.9, and 2^-126 is still a normal float. s lives in a vector (all lanes equal);
+ * the squarings are masked by it. S_FIXED masked squarings always run (cheap; ||A||_1 <= 3.5e5 needs no more). For
+ * s > S_FIXED the scalar loop needs s as a scalar: it is stored to Y (overwritten at the end) and read back by one
+ * scalar load after the Pade solve. A read that is not a number in (S_FIXED, S_MAX] is ignored, so the kernel
+ * can never run fewer than S_FIXED squarings, nor more than S_MAX.
  */
 #define MAXN 32
 #define THETA_13 5.371920351148152f
-#define S_MAX 16
+#define S_MAX 126
+#define S_FIXED 16
+
+// The squaring count for the scalar loop: s read back from Y (see above), else S_FIXED.
+static int squaring_trips(tensor Y_out, int bt)
+{
+    int5 c0 = {0, 0, bt, 0, 0};
+    float sv = s_f32_ld_g((__global__ float*)gen_addr(c0, Y_out));
+    return (sv > (float)S_FIXED && sv <= (float)S_MAX) ? (int)sv : S_FIXED;
+}
 
 __local__ float64 a_mat[MAXN];
 __local__ float64 u_mat[MAXN];
@@ -293,6 +310,10 @@ void main(tensor A_in, tensor Y_out)
             cur_norm = v_f32_sel_eq_f32_b(need, 1.0f, v_f32_mul_b(cur_norm, 0.5f), cur_norm);
             s_vec = v_f32_sel_eq_f32_b(need, 1.0f, v_f32_add_b(s_vec, 1.0f), s_vec);
         }
+        {
+            int5 c0 = {0, 0, bt, 0, 0};
+            v_f32_st_tnsr_partial(c0, Y_out, s_vec, 0, 0);  // s, read back by squaring_trips
+        }
         for (int i = 0; i < n; i++)
         {
             a_mat[i] = v_f32_mul_b(a_mat[i], scale);
@@ -338,7 +359,8 @@ void main(tensor A_in, tensor Y_out)
         }
         gj_solve_inplace(n, lane, x2_mat, lv_mat);  // lv_mat = L_0
 
-        for (int step = 0; step < S_MAX; step++)
+        const int trips = squaring_trips(Y_out, bt);
+        for (int step = 0; step < trips; step++)
         {
             float64 active = v_f32_sel_grt_f32_b(s_vec, (float)step, 1.0f, 0.0f);
             matmul_add_nn(n, lane, v_mat, lv_mat, lv_mat, v_mat, a_mat);
@@ -346,7 +368,7 @@ void main(tensor A_in, tensor Y_out)
             {
                 lv_mat[i] = v_f32_sel_eq_f32_b(active, 1.0f, a_mat[i], lv_mat[i]);
             }
-            if (step + 1 < S_MAX)
+            if (step + 1 < trips)
             {
                 matmul_nn(n, lane, v_mat, v_mat, a_mat);
                 for (int i = 0; i < n; i++)
@@ -394,7 +416,8 @@ void main(tensor A_in, tensor Y_out)
             v_mat[i] = v_f32_add_b(vi, ui);
         }
         gj_solve_inplace(n, lane, a_mat, v_mat);
-        for (int step = 0; step < S_MAX; step++)
+        const int trips = squaring_trips(Y_out, bt);
+        for (int step = 0; step < trips; step++)
         {
             float64 active = v_f32_sel_grt_f32_b(s_vec, (float)step, 1.0f, 0.0f);
             matmul_nn(n, lane, v_mat, v_mat, a_mat);

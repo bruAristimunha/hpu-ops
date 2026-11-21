@@ -9,15 +9,42 @@
  * Row i of A is one 64-lane vector in local memory (lane j = column j), so n <= MAXN. Whole rows are swapped, as
  * LAPACK's laswp does, so the multipliers of earlier steps follow their row. A zero pivot (its whole column below
  * is zero, as the pivot is the largest) gives zero multipliers: the step is a no-op, as in LAPACK.
- * Lane k of a row is broadcast to all lanes by a masked reduce; no lane is ever moved to a scalar.
+ * Lane k of a row is broadcast to all lanes by a masked reduce; no lane is ever moved to a scalar. The pivot is the
+ * first largest |a_ik| (LAPACK's rule, also with ties); l_ik = (a_ik s) (1 / (pivot s)), s = 2^-64 for |pivot| >= 2^64.
  *
  * With -DPERM_FROM_PIVOTS the kernel takes PIVF [n, batch] f32 (LAPACK's 1-based pivots as floats) and writes
  * PERM [n, batch] f32, the row permutation (row 1 of PV above): the swaps replayed in order. lu_solve and
  * lu_unpack use it, so a permutation costs one launch instead of n gathers.
  */
 #define MAXN 32
+#define TWO_64 1.8446744073709552e19f    // 2^64: pivots at or above it are scaled by 2^-64 before the reciprocal,
+#define TWO_M64 5.421010862427522e-20f   // so 1/pivot (below 2^-126 past 2^126) is never flushed to zero
 
 __local__ float64 a[MAXN];
+
+#ifndef PERM_FROM_PIVOTS
+// Max / min over lanes 0..31 (and, separately, over lanes 32..63), in every lane: n <= 32, so the lower half holds
+// every row. The same reductions as matrix_exp_f32_gaudi2.c.
+static inline float64 reduce_max_half32(float64 p)
+{
+    p = v_f32_max_b(p, v_f32_mov_dual_group_all_b(p, 0xFFFFFFFF, 1, 0, 3, 2, SW_MDG_ALL, p));
+    p = v_f32_max_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 8)));
+    p = v_f32_max_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 4)));
+    p = v_f32_max_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 2)));
+    p = v_f32_max_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 1)));
+    return p;
+}
+
+static inline float64 reduce_min_half32(float64 p)
+{
+    p = v_f32_min_b(p, v_f32_mov_dual_group_all_b(p, 0xFFFFFFFF, 1, 0, 3, 2, SW_MDG_ALL, p));
+    p = v_f32_min_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 8)));
+    p = v_f32_min_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 4)));
+    p = v_f32_min_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 2)));
+    p = v_f32_min_b(p, as_float64(v_element_shift_xor_i32(as_int64(p), 1)));
+    return p;
+}
+#endif
 
 float64 lane_bcast(float64 v, uint64 lane, int k)
 {
@@ -71,6 +98,7 @@ void main(tensor A, tensor LU, tensor PV)
     {
         iota = v_f32_sel_eq_u32_b(lane, (unsigned)i, (float)i, iota);
     }
+    const float64 iota_all = v_convert_u32_to_f32_b(lane);  // lane i = i, every lane
 
     for (int bt = off[0]; bt < off[0] + size[0]; bt++)
     {
@@ -93,7 +121,13 @@ void main(tensor A, tensor LU, tensor PV)
             float64 cand = v_f32_abs_b(col);
             cand = v_f32_sel_less_u32_b(lane, (unsigned)k, -1.0f, cand);
             cand = v_f32_sel_geq_u32_b(lane, (unsigned)n, -1.0f, cand);
-            uint64 p = v_f32_reduce_argmax(cand).v1;  // pivot row, in every lane
+            // pivot row, in every lane: the FIRST row of largest |a_ik| (LAPACK's idamax; the hardware argmax breaks
+            // ties in another order): the smallest lane whose candidate equals the max
+            float64 mx = reduce_max_half32(cand);
+            float64 lane_f = v_f32_sel_eq_f32_b(cand, mx, iota_all, 100.0f);
+            uint64 p = v_convert_f32_to_u32_b(reduce_min_half32(lane_f));
+            p = v_u32_sel_less_u32_b(p, (unsigned)k, (unsigned)k, p);
+            p = v_u32_sel_geq_u32_b(p, (unsigned)n, (unsigned)k, p);
 
             // pivots[k] = p + 1; perm: swap lanes k and p
             float64 pf = lane_bcast_v(iota, lane, p);
@@ -116,10 +150,11 @@ void main(tensor A, tensor LU, tensor PV)
             a[k] = ap;
             float64 pk = lane_bcast(ap, lane, k);
             infov = v_f32_sel_eq_f32_b(pk, 0.0f, v_f32_sel_eq_f32_b(infov, 0.0f, (float)(k + 1), infov), infov);
-            float64 inv = v_f32_sel_eq_f32_b(pk, 0.0f, 0.0f, v_reciprocal_f32(pk));
+            float64 sc = v_f32_sel_less_f32_b(v_f32_abs_b(pk), TWO_64, 1.0f, TWO_M64);
+            float64 inv = v_f32_sel_eq_f32_b(pk, 0.0f, 0.0f, v_reciprocal_f32(v_f32_mul_b(pk, sc)));
             for (int i = k + 1; i < n; i++)
             {
-                float64 l = v_f32_mul_b(lane_bcast(a[i], lane, k), inv);
+                float64 l = v_f32_mul_b(v_f32_mul_b(lane_bcast(a[i], lane, k), sc), inv);
                 float64 upd = v_f32_mac_b(ap, v_f32_sub_b(0.0f, l), a[i]);
                 float64 row = v_f32_sel_less_u32_b(lane, (unsigned)(k + 1), a[i], upd);  // lanes <= k keep L
                 a[i] = v_f32_sel_eq_u32_b(lane, (unsigned)k, l, row);
