@@ -409,6 +409,7 @@ class Case(NamedTuple):
     fallback64: frozenset = frozenset()  # the same for the float64 case
     warn64: bool = True  # the float64 case expects hpu-ops#16's warning once (else none: the op is not installed)
     batch: int | None = None  # None: BATCH
+    xfail: str | None = None  # a known failure outside hpu_ops: a failing row reads "xfail" and does not count
 
 
 def fallback_problems(got, expected, what):
@@ -479,7 +480,10 @@ CASES = (
          float64=False, tpc=True, sizes=(22,)),
     Case("linalg.cholesky_bwd", make_spd, lambda x: L.cholesky(x), scope="bwd", float64=False),
     # factor 20: the forward is Habana's native qr, not an hpu_ops kernel (measured 10.2x at n=16)
-    Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20),
+    Case("linalg.qr_bwd", make_general, lambda x: L.qr(x), err_qr, loss_qr, scope="bwd", float64=False, factor=20,
+         xfail="Habana's native QR forward: on some inputs its factors give a gradient far off (0.51 at n = 22 in the "
+               "full run); qr_bwd.isolated, the same backward on CPU float32 factors, passes; repro/qr_native_grad.py "
+               "replays the dumped input"),
     # the same backward with CPU float32 QR factors: only hpu_ops' solve_triangular is measured
     Case("linalg.qr_bwd.isolated", make_general, qr_isolated, err_qr, loss_qr, scope="bwd", float64=False,
          factor=10, tpc=True),
@@ -650,6 +654,15 @@ def run_case(case, n, timed=True):
     expected = BASELINE
     problems = hard + ([] if expected else soft)
     row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft, notes=notes)
+    if problems and os.environ.get("LINALG_ON_HPU_DUMP"):  # the failing inputs, for a reproducer
+        path = os.path.join(os.environ["LINALG_ON_HPU_DUMP"], f"{case.name}_n{n}.pt")
+        with contextlib.suppress(Exception):
+            torch.save({"inputs": cpu_in, "row": row}, path)
+            row["dumped"] = path
+    if problems and case.xfail and not soft:  # only accuracy problems, of a known outside cause
+        row.update(status="xfail", xfail=case.xfail)
+        emit(**row)
+        return True
     emit(**row)
     return not problems
 

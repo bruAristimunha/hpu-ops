@@ -272,7 +272,7 @@ def _equilibrate(A):
     return A * s, s
 
 
-def _gj_inv(A, sign=True, scaled=False):
+def _gj_inv(A, sign=True, scaled=False, det=False):
     """``(A^-1, D, S)``: the kernel with the identity as right-hand side, built in the kernel, on ``A^T`` as torch's
     CPU kernels (``tpc._small_inv``; the ``_GJ`` hook of the CPU tests gets ``A^T`` too), on ``A`` equilibrated by a
     power of two past ``tpc.MAXN`` (``_equilibrate``). With ``scaled``: ``((A s)^-1, D, S, s)``, for a solve that
@@ -282,7 +282,7 @@ def _gj_inv(A, sign=True, scaled=False):
         X, D, S = _gj(As.mT, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
         X = X.mT
     else:
-        X, D, S = tpc.gj_inv(As, sign=sign)
+        X, D, S = tpc.gj_inv(As, sign=sign, det=det)
     D = D if isinstance(s, float) else D / s[..., 0]
     return (X, D, S, s) if scaled else (X if isinstance(s, float) else X * s, D, S)
 
@@ -728,9 +728,13 @@ def lu_info(LU):
 
 
 def lu_info_of_diagonal(diagonal):
-    """``lu_info`` from the diagonal of U (the pivots) alone."""
-    zero = diagonal == 0
-    return torch.where(zero.any(-1), zero.int().argmax(-1) + 1, 0).to(torch.int32)
+    """``lu_info`` from the diagonal of U (the pivots) alone, by float arithmetic (exact below 2^24): on Gaudi2 (bridge
+    1.21.4, lazy mode, linalg_on_hpu's lu_factor_ex at n = 64 and 128) the int32 argmax / where gave a garbage info
+    (3e8) on the first execution of the graph."""
+    n = diagonal.shape[-1]
+    index = torch.arange(1, n + 1, dtype=torch.float32, device=diagonal.device)
+    first = torch.where(diagonal == 0, index, float(n + 1)).amin(-1)
+    return torch.where(first > n, 0.0, first).to(torch.int32)
 
 
 def lu_solve(LU, pivots, B, left=True):
@@ -930,7 +934,7 @@ class Det(torch.autograd.Function):
     def compute(A):
         if _use_tpc(A):
             D, S = _gj_factors(A)
-            return S[..., 0] * D.prod(-1), *_unused_factors(A)
+            return S[..., 0] * _tree(D, torch.mul), *_unused_factors(A)
         LU, pivots = lu(A)
         diag = torch.diagonal(LU, dim1=-2, dim2=-1)
         return _parity(pivots).to(A.dtype) * diag.prod(-1), LU, pivots
@@ -940,8 +944,8 @@ class Det(torch.autograd.Function):
         X = None
         if ctx.needs_input_grad[0] and _use_tpc(A):
             # the kernel's inverse comes with its pivots: kept for the backward, which then launches no kernel
-            X, D, S = _gj_inv(A)
-            det, LU, pivots = S[..., 0] * D.prod(-1), *_unused_factors(A)
+            X, D, S = _gj_inv(A, det=True)
+            det, LU, pivots = S[..., 0] * _tree(D, torch.mul), *_unused_factors(A)
         else:
             det, LU, pivots = Det.compute(A)
         ctx.save_for_backward(A, det, X)
@@ -960,6 +964,21 @@ def _saved_or_inverse(X):
     if X is not None and not torch.is_grad_enabled():
         return lambda M: X
     return lambda M: InvEx.apply(M, False)[0]
+
+
+def _tree(x, op):
+    """``x`` reduced over its last dim by ``op`` (add, mul) pairwise, a binary tree of log2(n) levels: on Gaudi2 the
+    reduction of a long row accumulated as a chain, and slogdet's sum of n = 384 and 1100 pivots' logs was 10x CPU
+    float32's error on near-identity matrices (1.8e-6 against 1.5e-7; torch's CPU sum is pairwise). n <= 64 keeps the
+    plain reduction (its error is already CPU float32's)."""
+    n = x.shape[-1]
+    if n <= 64:
+        return x.prod(-1) if op is torch.mul else x.sum(-1)
+    m = 1 << (n - 1).bit_length()
+    x = F.pad(x, (0, m - n), value=1.0 if op is torch.mul else 0.0)
+    while x.shape[-1] > 1:
+        x = op(x[..., 0::2], x[..., 1::2])
+    return x[..., 0]
 
 
 def _det_backward(A, det, grad, inverse):
@@ -1005,7 +1024,7 @@ class Slogdet(torch.autograd.Function):
     def compute(A):
         if _use_tpc(A):
             D, S = _gj_factors(A)
-            return (S[..., 0] * D.sign().prod(-1), D.abs().log().sum(-1), *_unused_factors(A))
+            return (S[..., 0] * D.sign().prod(-1), _tree(D.abs().log(), torch.add), *_unused_factors(A))
         LU, pivots = lu(A)
         diag = torch.diagonal(LU, dim1=-2, dim2=-1)
         sign = _parity(pivots).to(A.dtype) * diag.sign().prod(-1)
@@ -1015,8 +1034,8 @@ class Slogdet(torch.autograd.Function):
     def forward(ctx, A):
         X = None
         if ctx.needs_input_grad[0] and _use_tpc(A):
-            X, D, S = _gj_inv(A)  # kept for the backward, as in Det
-            sign, logabsdet, LU, pivots = (S[..., 0] * D.sign().prod(-1), D.abs().log().sum(-1), *_unused_factors(A))
+            X, D, S = _gj_inv(A, det=True)  # kept for the backward, as in Det
+            sign, logabsdet, LU, pivots = (S[..., 0] * D.sign().prod(-1), _tree(D.abs().log(), torch.add), *_unused_factors(A))
         else:
             sign, logabsdet, LU, pivots = Slogdet.compute(A)
         ctx.save_for_backward(A, X)

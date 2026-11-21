@@ -1149,8 +1149,16 @@ def _square(A, sign=True):
     return R, P, Q, D, S
 
 
-def _square_pays_for(A):
+# det and slogdet past this n take the blocked route whatever the cost model says: its Schur updates are matmuls,
+# where the square kernel accumulates n rank-1 updates per entry; measured on Gaudi2 (bridge 1.21.4, linalg_on_hpu's
+# near-identity matrices, batch 4, n = 384): logabsdet 3.4e-6 square, 1.4e-6 blocked, CPU float32 1.9e-7
+DET_BLOCKED_N = 256
+
+
+def _square_pays_for(A, det=False):
     n = A.shape[-1]
+    if det and n > DET_BLOCKED_N:
+        return False
     return n <= LARGE_MAXN and _square_pays(n, A.shape[0])
 
 
@@ -1161,14 +1169,14 @@ def large_factors(A):
     _check(A, n, limit=None)
     batch = A.shape[:-2]
     At = _flat(A, batch, n, n).mT.contiguous()
-    if _square_pays_for(At):
+    if _square_pays_for(At, det=True):
         _, _, _, D, S = _square(At)
     else:
         _, D, S = _blocked(At, inverse=False)
     return _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
-def _large(A, B=None, sign=True):
+def _large(A, B=None, sign=True, det=False):
     """``(X, D, S)`` of the in-place Gauss-Jordan kernels for ``A[b, n, n]`` (n > ``MAXN``): ``X = A^-1`` (``B``
     None) or ``A^-1 B``, ``S[:, 0]`` the sign of the pivot order. Run on ``A^T``, as torch: its CPU solve, inv and det
     factor the row-major A as LAPACK's column-major A^T, so the pivot order is LAPACK's on the matrix torch hands it.
@@ -1178,7 +1186,7 @@ def _large(A, B=None, sign=True):
     R^T[Q, :][:, P]`` and ``A^-1 B = (R^T @ B[Q])[Q]``) when it pays, else the blocked route (``_blocked``)."""
     n = A.shape[-1]
     At = A.mT.contiguous()
-    if not _square_pays_for(At):
+    if not _square_pays_for(At, det):
         Xt, D, S = _blocked(At, sign=sign)
         # one Newton step X += X (I - A X): the block updates multiply by each pivot block's explicit inverse, which
         # left the inverse up to 15x CPU float32's error (replica, n = 600); after it, 0.2-0.5x. A non-finite
@@ -1236,7 +1244,7 @@ def gj_solve(A, B):
     return _unflatten(X, batch, n, m), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
-def gj_inv(A, sign=True):
+def gj_inv(A, sign=True, det=False):
     """``(A^-1, D, S)`` for ``A[..., n, n]``: the kernel on ``A^T`` with the identity as right-hand side, which the
     kernel builds itself (``_small_inv``; past ``MAXN`` the in-place kernels, ``_large``). Past ``MAXN``,
     ``sign=False`` leaves ``S[..., 0]`` 0 (not computed)."""
@@ -1244,7 +1252,7 @@ def gj_inv(A, sign=True):
     _check(A, n, limit=None)
     batch = A.shape[:-2]
     A = _flat(A, batch, n, n)
-    X, D, S = _small_inv(A) if n <= MAXN else _large(A, sign=sign)
+    X, D, S = _small_inv(A) if n <= MAXN else _large(A, sign=sign, det=det)
     return _unflatten(X, batch, n, n), _unflatten(D, batch, n), _unflatten(S, batch, 2)
 
 
