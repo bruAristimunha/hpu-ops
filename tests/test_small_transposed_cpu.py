@@ -53,6 +53,19 @@ def test_wilkinson_solve_and_inv_keep_torchs_accuracy(n, random_last, replica):
         assert rel(torch.linalg.solve(W, B), want_x) <= max(1e-5, 10 * rel(torch.linalg.solve(W, B), want_x))
 
 
+def _dup_rows_adjugate(A):
+    """Exact ``d(det A)/dA`` in float64 for ``A[1] = A[0]``: row 0's cofactors, negated for row 1, 0 elsewhere."""
+    A64 = A.detach().double()
+    n = A64.shape[-1]
+    adj_t = torch.zeros_like(A64)
+    cols = list(range(n))
+    for j in range(n):
+        c = ((-1) ** j) * torch.linalg.det(A64[1:, [col for col in cols if col != j]])
+        adj_t[0, j] = c
+        adj_t[1, j] = -c
+    return adj_t
+
+
 @pytest.mark.parametrize("n", SIZES)
 def test_duplicate_rows_det_and_gradient_like_torch(n, replica):
     g = torch.Generator().manual_seed(n)
@@ -67,7 +80,10 @@ def test_duplicate_rows_det_and_gradient_like_torch(n, replica):
     ref = torch.linalg.det(A.double())
     assert abs(float(det) - float(torch.linalg.det(A))) <= max(1e-7, 10 * abs(float(torch.linalg.det(A)) - float(ref)))
     assert got.grad.abs().max() > 0  # torch gives the adjugate, not zero
-    assert rel(got.grad, want.grad) < 1e-2
+    # On Linux MKL at n = 4, torch.linalg.det(want) can cancel to -0.0 so PyTorch's DetBackward yields 0;
+    # compare against the exact mathematical adjugate there.
+    ref_grad = want.grad if want.grad.abs().max() > 0 else _dup_rows_adjugate(A)
+    assert rel(got.grad, ref_grad) < 1e-2
 
 
 def test_huge_tiny_singular_like_torch(replica):
