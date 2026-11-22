@@ -108,7 +108,10 @@ def test_im2col_col2im_override_inference_mode_and_undo():
 
 def test_im2col_tracing_detects_aot_functional_tensor_and_modes():
     from torch._subclasses.fake_tensor import FakeTensorMode
-    from torch._subclasses.functional_tensor import FunctionalTensor, FunctionalTensorMode
+    from torch._subclasses.functional_tensor import (
+        FunctionalTensor,
+        FunctionalTensorMode,
+    )
     from torch.fx.experimental.proxy_tensor import make_fx
 
     x = torch.randn(2, 3, 7, 9)

@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch._C import DispatchKey
 
-from . import _strict
+from . import _dispatch, _strict
 from ._dispatch import chain, count, override_kernels, register_kernels
 
 aten = torch.ops.aten
@@ -108,23 +108,7 @@ def _tracing(t):
     """True while ``torch.compile`` traces (dynamo, or AOT autograd's fake and functional tensors), in a fake mode,
     under ``torch.func.functionalize``, or ``make_fx`` proxy mode: build index tensors on the device, in the graph,
     instead of on the host."""
-    if (
-        torch._C._len_torch_dispatch_stack() == 0
-        and not torch.compiler.is_compiling()
-        and type(t) is torch.Tensor
-        and not torch._is_functional_tensor(t)
-    ):
-        return False
-    if torch.compiler.is_compiling() or torch._guards.detect_fake_mode() is not None:
-        return True
-    if torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY) is not None:
-        return True
-    if torch._is_functional_tensor(t):
-        return True
-    from torch._subclasses.fake_tensor import FakeTensor, is_fake
-    from torch._subclasses.functional_tensor import FunctionalTensor
-
-    return isinstance(t, (FakeTensor, FunctionalTensor)) or is_fake(t)
+    return _dispatch.tracing(t)
 
 
 def _fresh(res, src):
