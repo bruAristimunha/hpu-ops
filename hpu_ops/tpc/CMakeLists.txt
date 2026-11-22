@@ -198,3 +198,21 @@ foreach(KERNEL
     set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
     target_link_libraries(linalg_tpc ${KERNEL})
 endforeach()
+
+# complex64 general eig / eigvals (MPS recipe): ceig and ceigvals (-DNO_VECTORS) share ceig_f32_gaudi2.c.
+set(CEIG_SOURCE ceig_f32_gaudi2)
+foreach(KERNEL ceig_f32_gaudi2 ceigvals_f32_gaudi2)
+    set(DEFINES "")
+    if(KERNEL STREQUAL "ceigvals_f32_gaudi2")
+        set(DEFINES -DNO_VECTORS)
+    endif()
+    add_custom_command(
+        OUTPUT ${KERNEL}_x86.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${CEIG_SOURCE}.c
+        COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${CEIG_SOURCE}.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
+        COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 ${DEFINES} -I${TPC_INCLUDE_DIR}/ ./${KERNEL}.c -c
+        COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
+    add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
+    set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
+    target_link_libraries(linalg_tpc ${KERNEL})
+endforeach()

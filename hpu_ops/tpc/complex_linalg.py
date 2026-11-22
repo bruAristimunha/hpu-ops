@@ -68,6 +68,18 @@ def _cgj_inv_op():
     return torch.ops.linalg_tpc.cgj_inv
 
 
+def _ceig_op():
+    """``torch.ops.linalg_tpc.ceig``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.ceig
+
+
+def _ceigvals_op():
+    """``torch.ops.linalg_tpc.ceigvals``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.ceigvals
+
+
 # ---- layouts -------------------------------------------------------------------------------------------------------
 
 
@@ -114,6 +126,8 @@ def _empty(batch):
 
 
 def _square(P, limit=COMPLEX_MAXN):
+    if P.dim() < 3:
+        raise ValueError(f"hpu_ops.tpc.complex takes (..., n, n) matrices, got pairs {tuple(P.shape)}")
     n = P.shape[-2]
     if P.shape[-3] != n or n > limit or n < 1:
         raise ValueError(f"hpu_ops.tpc.complex takes square A with 1 <= n <= {limit}, got pairs {tuple(P.shape)}")
@@ -327,3 +341,47 @@ def svdvals(A, layout="pairs"):
         return P.new_zeros(*P.shape[:-3], min(m, n))
     S = _call(_csvdvals_op(), a)
     return internal_sort(S, -1, descending=True)[0].reshape(*P.shape[:-3], min(m, n))
+
+
+# ---- general eig, eigvals (MPS recipe) -----------------------------------------------------------------------------
+
+
+def eig(A, layout="pairs"):
+    """``torch.linalg.eig`` for a general complex64 matrix A (``1 <= n <= COMPLEX_MAXN``): returns
+    ``(eigenvalues, eigenvectors)`` as float32 pairs in ``layout`` (``(..., n, 2)`` / ``(..., 2n)`` and
+    ``(..., n, n, 2)`` / ``(..., n, 2n)``). Column ``k`` of ``eigenvectors`` has unit 2-norm and satisfies
+    ``A V = V diag(W)``. Non-finite inputs produce ``NaN`` outputs."""
+    PA = as_pairs(A, layout)
+    n = _square(PA)
+    batch = PA.shape[:-3]
+    if _empty(batch):
+        return from_pairs(PA.new_zeros(*batch, n, 2), layout), from_pairs(PA.new_zeros(PA.shape), layout)
+    if n == 1:
+        w = PA[..., 0, 0, :].reshape(*batch, 1, 2).clone()
+        bad = ~torch.isfinite(w).all(-1, keepdim=True)
+        w = torch.where(bad, float("nan"), w)
+        v = torch.stack([torch.ones_like(w[..., :1]), torch.zeros_like(w[..., :1])], -1)
+        v = torch.where(bad[..., None], float("nan"), v)
+        return from_pairs(w, layout), from_pairs(v, layout)
+    W_raw, V_raw, _ = _call(_ceig_op(), _planar(PA, batch))
+    W = W_raw.transpose(-1, -2).contiguous().reshape(*batch, n, 2)
+    V = _unplanar(V_raw, batch, n, n)
+    return from_pairs(W, layout), from_pairs(V, layout)
+
+
+def eigvals(A, layout="pairs"):
+    """``torch.linalg.eigvals`` for a general complex64 matrix A (``1 <= n <= COMPLEX_MAXN``): returns
+    ``eigenvalues`` as float32 pairs in ``layout`` (``(..., n, 2)`` or ``(..., 2n)``), without accumulating Q or V."""
+    PA = as_pairs(A, layout)
+    n = _square(PA)
+    batch = PA.shape[:-3]
+    if _empty(batch):
+        return from_pairs(PA.new_zeros(*batch, n, 2), layout)
+    if n == 1:
+        w = PA[..., 0, 0, :].reshape(*batch, 1, 2).clone()
+        bad = ~torch.isfinite(w).all(-1, keepdim=True)
+        w = torch.where(bad, float("nan"), w)
+        return from_pairs(w, layout)
+    W_raw, _ = _call(_ceigvals_op(), _planar(PA, batch))
+    W = W_raw.transpose(-1, -2).contiguous().reshape(*batch, n, 2)
+    return from_pairs(W, layout)
