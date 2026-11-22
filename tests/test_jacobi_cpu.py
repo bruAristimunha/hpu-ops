@@ -133,3 +133,32 @@ def test_jacobi_big_replica_matches_the_contract():
     want = tpc.jacobi_big_reference(S0)
     norm = lambda U: U[..., :40] / U[..., :40].norm(dim=-1, keepdim=True)  # noqa: E731
     assert (norm(got).abs() - norm(want).abs()).abs().max() < 1e-4  # rows to sign (the rotation conventions differ)
+
+
+@pytest.mark.parametrize("n", [129, 255])
+@pytest.mark.parametrize("scale", [1e-10, 1e-19])
+def test_block_eigh_small_scale_padded(n, scale):
+    """Padded n > 128 with small ||A|| must not add +1 to the padding sentinel or sweep-1 off/norm exits early."""
+    g = torch.Generator().manual_seed(n)
+    Q = torch.linalg.qr(torch.randn(1, n, n, generator=g, dtype=torch.float64))[0]
+    A = (scale * (Q * torch.logspace(0, -3, n, dtype=torch.float64)) @ Q.mT).float()
+    A = (A + A.mT) / 2
+    w, V = jacobi.block_eigh(A, eigh32)
+    w64 = torch.linalg.eigvalsh(A.double())
+    res = (A.double() @ V.double() - V.double() * w.double()[:, None, :]).abs().max() / A.double().abs().max()
+    assert rel(w, w64) < 1e-5
+    assert float(res) < 1e-5
+    assert (V.mT @ V - torch.eye(n)).abs().max() < 1e-5
+
+
+def test_block_eigh_zero_and_huge_padded_stay_finite():
+    """Zero padded input falls back to pad=1.0; huge input clamps 2*norm to finfo.max without inf/NaN."""
+    n = 129
+    A0 = torch.zeros(1, n, n)
+    w0, V0 = jacobi.block_eigh(A0, eigh32)
+    assert torch.equal(w0, torch.zeros(1, n))
+    assert (V0.mT @ V0 - torch.eye(n)).abs().max() < 1e-5
+    A_huge = 1e37 * torch.eye(n)[None]
+    wh, Vh = jacobi.block_eigh(A_huge, eigh32)
+    assert torch.isfinite(wh).all() and torch.isfinite(Vh).all()
+    assert rel(wh, A_huge.double().diagonal(dim1=-2, dim2=-1)) < 1e-5

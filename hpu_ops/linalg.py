@@ -1619,7 +1619,7 @@ def _lstsq_eval(A, B, rcond, driver):
     m, n = A.shape[-2], A.shape[-1]
     k = min(m, n)
     need_sort = driver in ("gelsd", "gelss")
-    U, S, Vh = Svd.compute(A, False, True, sort=need_sort)
+    U, S, Vh = Svd.compute(A.detach(), False, True, sort=need_sort)
     eps = torch.finfo(S.dtype).eps
     rtol_val = max(m, n) * eps if (rcond is None or rcond < 0) else (
         0.5 * eps if rcond == 0 and driver == "gelsd" else float(rcond))

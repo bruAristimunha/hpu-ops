@@ -660,6 +660,69 @@ def test_eigh_big_tiny_eigenvalue_ftz_safe(monkeypatch):
     assert torch.equal(w[1], torch.zeros(33))
 
 
+def test_eigh_big_near_zero_ftz_safe(monkeypatch):
+    """Near-zero normal matrices (1e-35 * spd) must be pre-scaled before V @ X @ V.mT so FTZ does not underflow."""
+    seen_scales = []
+
+    def ref_op(refine=False):
+        def op(S0):
+            seen_scales.append(float(S0[0].abs().amax()))
+            return tpc.jacobi_big_reference(S0, 3 if refine else 8)
+
+        return op
+
+    monkeypatch.setattr(tpc, "_big_op", ref_op)
+    g = torch.Generator().manual_seed(127)
+    Q = torch.linalg.qr(torch.randn(1, 127, 127, generator=g, dtype=torch.float64))[0]
+    A = (1e-35 * (Q * torch.logspace(0, -1, 127, dtype=torch.float64)) @ Q.mT).float()
+    A = (A + A.mT) / 2
+    Az = torch.cat([A, torch.zeros_like(A)], 0)
+    w, V = tpc.eigh_big(Az)
+    w64 = torch.linalg.eigvalsh(A.double())
+    assert torch.isfinite(w).all() and torch.isfinite(V).all()
+    assert (V.mT @ V - torch.eye(127)).abs().max() < 1e-5
+    assert rel(w[:1], w64) < 1e-5
+    assert torch.equal(w[1], torch.zeros(127))
+    assert min(seen_scales) > 0.05  # Xs and T stay O(1) into the kernel, not 1e-35
+    # Also run the FTZ-emulated replica at n = 33 and test E.Eigh route
+    monkeypatch.setattr(tpc, "_big_op", kr.jacobi_big_op)
+    Q33 = torch.linalg.qr(torch.randn(1, 33, 33, generator=torch.Generator().manual_seed(33), dtype=torch.float64))[0]
+    A33 = (1e-35 * (Q33 * torch.logspace(0, -1, 33, dtype=torch.float64)) @ Q33.mT).float()
+    A33 = (A33 + A33.mT) / 2
+    w33, V33 = tpc.eigh_big(torch.cat([A33, torch.zeros_like(A33)], 0))
+    assert rel(w33[:1], torch.linalg.eigvalsh(A33.double())) < 1e-4
+    assert torch.equal(w33[1], torch.zeros(33))
+    assert (V33.mT @ V33 - torch.eye(33)).abs().max() < 1e-5
+
+
+def test_lstsq_requires_grad_detaches_before_svd(monkeypatch):
+    """_lstsq_eval must pass A.detach() to Svd.compute so jacobi_svd does not see requires_grad=True and warn."""
+    import warnings
+
+    orig_svd_ref = tpc.svd_reference
+
+    def checked_svd_ref(A, compute_uv=True, full_matrices=False):
+        assert not A.requires_grad
+        return orig_svd_ref(A, compute_uv=compute_uv, full_matrices=full_matrices)
+
+    monkeypatch.setattr(tpc, "svd_reference", checked_svd_ref)
+    g = torch.Generator().manual_seed(42)
+    A0 = torch.randn(2, 8, 5, generator=g)
+    B0 = torch.randn(2, 8, 3, generator=g)
+    Ar, Br = A0.clone().requires_grad_(), B0.clone().requires_grad_()
+    want = torch.linalg.lstsq(Ar, Br).solution
+    want.sum().backward()
+    A, B = A0.clone().requires_grad_(), B0.clone().requires_grad_()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with cpu_as_hpu(linalg.install_lstsq) as calls:
+            got = torch.linalg.lstsq(A, B).solution
+            got.sum().backward()
+    assert calls["lstsq"] == 1
+    assert rel(got.detach(), want.detach()) < 1e-4
+    assert rel(A.grad, Ar.grad) < 1e-4 and rel(B.grad, Br.grad) < 1e-4
+
+
 def test_codex3_huge_identity_solve_is_exact(large_on_cpu):
     """Codex review of #34, #3: ``2^127 I`` (n = 65) with B its first column. Its inverse 2^-127 I flushes on the card,
     so the solve returned 0 with info 0; equilibrated by a power of two (``linalg._equilibrate``) it is exact."""

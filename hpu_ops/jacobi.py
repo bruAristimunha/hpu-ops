@@ -92,7 +92,8 @@ def block_eigh(A, eigh, compute_v=True, b=BLOCK, sweeps=None, polish=POLISH, tol
     k = 2 * -(-n // (2 * b))
     m = k * b
     if m > n:  # pad with a value past the spectrum: the padded eigenvalues sort last
-        big = 2 * S.abs().sum(-1).amax(-1) + 1
+        norm = S.abs().sum(-1).amax(-1)
+        big = torch.where(norm > 0, (2 * norm).clamp_max(torch.finfo(S.dtype).max), 1.0)
         pad = torch.diag_embed(big[:, None].expand(B, m - n))
         S = torch.cat([torch.cat([S, S.new_zeros(B, n, m - n)], -1), torch.cat([S.new_zeros(B, m - n, n), pad], -1)], -2)
     A0 = S

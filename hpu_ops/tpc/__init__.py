@@ -1682,19 +1682,21 @@ def eigh_big(A):
     X = A.reshape(-1, n, n).to(torch.float32)
     sigma = X.abs().sum(-1).amax(-1)
     sigma = torch.where(sigma > 0, sigma, 1.0)
-    V = _big_pass(X, sigma, False)  # rows
-    T = V @ X @ V.mT
+    Xs = X / sigma[:, None, None]
+    ones = torch.ones_like(sigma)
+    V = _big_pass(Xs, ones, False)  # rows
+    T = V @ Xs @ V.mT
     T = (T + T.mT) / 2
-    # The refinement on T = V A V^T, nearly diagonal: unshifted where Gershgorin proves T positive definite (one-sided
+    # The refinement on T = V Xs V^T, nearly diagonal: unshifted where Gershgorin proves T positive definite (one-sided
     # Jacobi on a definite matrix keeps its small eigenvalues' relative accuracy; the shift of 1.001 compressed them:
     # 1e-6 came back as 1.41e-6 at n = 127, code review of #51), else shifted as the first pass
     off = T.abs().sum(-1) - torch.diagonal(T, dim1=-2, dim2=-1).abs()
-    definite = (torch.diagonal(T, dim1=-2, dim2=-1) - off > 1e-12 * sigma[:, None]).all(-1)
-    V = _big_pass(T, sigma, True, torch.where(definite, 0.0, BIG_SHIFT)) @ V
+    definite = (torch.diagonal(T, dim1=-2, dim2=-1) - off > 1e-12).all(-1)
+    V = _big_pass(T, ones, True, torch.where(definite, 0.0, BIG_SHIFT)) @ V
     eye = torch.eye(n, dtype=X.dtype, device=X.device)
     for _ in range(2):
         V = (1.5 * eye - 0.5 * (V @ V.mT)) @ V
-    w = ((V @ X) * V).sum(-1)
+    w = ((V @ Xs) * V).sum(-1) * sigma[:, None]
     w, order = w.sort(-1)
     V = V.gather(-2, order[..., :, None].expand_as(V)).mT
     return w.reshape(*batch, n), V.reshape(*batch, n, n)

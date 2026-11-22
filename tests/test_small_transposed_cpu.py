@@ -49,8 +49,9 @@ def test_wilkinson_solve_and_inv_keep_torchs_accuracy(n, random_last, replica):
     Xi, _, _ = tpc.gj_inv(W)
     assert rel(X, want_x) <= max(1e-5, 10 * rel(torch.linalg.solve(W, B), want_x))
     assert rel(Xi, want_inv) <= max(1e-5, 10 * rel(torch.linalg.inv(W), want_inv))
+    ref32 = torch.linalg.solve(W, B)
     with cpu_as_hpu(linalg.install_solve):
-        assert rel(torch.linalg.solve(W, B), want_x) <= max(1e-5, 10 * rel(torch.linalg.solve(W, B), want_x))
+        assert rel(torch.linalg.solve(W, B), want_x) <= max(1e-5, 10 * rel(ref32, want_x))
 
 
 def _dup_rows_adjugate(A):
