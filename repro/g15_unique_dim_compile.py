@@ -14,9 +14,10 @@ import os
 
 import habana_frameworks.torch.core as htcore
 import habana_frameworks.torch.hpu as hthpu
-import hpu_ops
 import torch
 from habana_frameworks.torch.hpu.metrics import metric_global
+
+import hpu_ops
 
 hpu_ops.enable()
 

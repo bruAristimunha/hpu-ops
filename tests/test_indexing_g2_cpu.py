@@ -5,12 +5,19 @@ import threading
 
 import pytest
 import torch
+from test_cpu import (  # noqa: F401
+    assert_same,
+    compiled,
+    cpu_as_hpu,
+    cpu_indices_off_device,
+    ops,
+    train_step,
+)
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import hpu_ops
 from hpu_ops import _dispatch, _strict, indexing
-from test_cpu import assert_same, compiled, cpu_as_hpu, cpu_indices_off_device, ops, train_step  # noqa: F401
 
 aten = torch.ops.aten
 
@@ -307,7 +314,7 @@ def test_aot_functional_tensor_tracing_zero_cache_and_strict_clean(dynamic):
     - ``hpu_ops.strict("raise")`` does NOT fail compile."""
     ix = torch.triu_indices(5, 5)
     x = torch.randn(4, 5, 5)
-    f = lambda t: t[..., ix[0], ix[1]]  # noqa: E731
+    f = lambda t: t[..., ix[0], ix[1]]
     want = train_step(f, x)
     nodes = []
     with cpu_as_hpu(indexing.install_index):
@@ -323,7 +330,10 @@ def test_aot_functional_tensor_tracing_zero_cache_and_strict_clean(dynamic):
 
 def test_dispatch_tracing_predicates():
     from torch._subclasses.fake_tensor import FakeTensorMode
-    from torch._subclasses.functional_tensor import FunctionalTensor, FunctionalTensorMode
+    from torch._subclasses.functional_tensor import (
+        FunctionalTensor,
+        FunctionalTensorMode,
+    )
 
     t = torch.randn(3, 3)
     assert _dispatch.tracing(t) is False

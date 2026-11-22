@@ -4,8 +4,9 @@
 import pytest
 import torch
 import torch.autograd.forward_ad as fwAD
-from hpu_ops import linalg, linalg_jvp, tpc
 from test_cpu import cpu_as_hpu
+
+from hpu_ops import linalg, linalg_jvp, tpc
 
 
 def _general(*batch, n=4, dtype=torch.float32):

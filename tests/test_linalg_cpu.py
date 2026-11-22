@@ -2487,9 +2487,9 @@ def test_generic_singular_triangle_is_non_finite(monkeypatch, n):
 # ---- adversarial findings (tests/adversarial_linalg.py)
 
 
-def test_solve_det_slogdet_register_no_backend_kernel(monkeypatch):
-    """Their backend (``{}``) kernel would return placeholder LU factors to torch's own derivative in a compiled graph
-    (NaN gradients); calls below autograd must reach Habana's kernel. inv_ex's has no such factors and stays."""
+def test_det_slogdet_register_no_backend_kernel(monkeypatch):
+    """det/slogdet backend (``{}``) kernels would return placeholder LU factors to torch's own derivative in a
+    compiled graph (NaN gradients); calls below autograd reach Habana's kernel. solve_ex and inv_ex stay."""
     seen = []
     monkeypatch.setattr(linalg, "register_paired", lambda device_type, groups: seen.extend(groups))
     linalg.install_solve("hpu")
