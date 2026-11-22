@@ -1224,6 +1224,19 @@ _EIG_EPS32 = F32(2.0 ** -23)
 _EIG_SMLNUM = F32((2.0 ** -126) / float(_EIG_EPS32))
 
 
+def _ceig_pow2_scale(m):
+    """``pow2_scale`` with exponent clamped to <= 253 so e == 254 ([2^127, FLT_MAX]) scales by 2^-126 into [2, 4)."""
+    e = (_u32(m) >> 23) & 0xFF
+    e_eff = np.minimum(e, 253)
+    return np.where(e == 0, F32(1), _f32(((254 - e_eff) & 0xFFFFFFFF) << 23)).astype(F32)
+
+
+def _ceig_pow2_unscale(m):
+    e = (_u32(m) >> 23) & 0xFF
+    e_eff = np.minimum(e, 253)
+    return np.where(e == 0, F32(1), _f32((e_eff & 0xFFFFFFFF) << 23)).astype(F32)
+
+
 def _cabs1(re, im):
     return add(np.abs(re), np.abs(im))
 
@@ -1238,17 +1251,17 @@ def _cdiv(ar, ai, br, bi):
     am = F32(max(abs(float(ar)), abs(float(ai))))
     if bm == 0 or am == 0:
         return F32(0), F32(0)
-    tb = _pow2_scale(bm)
+    tb = _ceig_pow2_scale(bm)
     btr, bti = mul(br, tb), mul(bi, tb)
     den = mac(bti, bti, mul(btr, btr))
     inv_den = recip(den, zero_to_inf=False)[0]
-    ta = _pow2_scale(am)
+    ta = _ceig_pow2_scale(am)
     atr, ati = mul(ar, ta), mul(ai, ta)
     nr = mac(ati, bti, mul(atr, btr))
     ni = mac(sub(F32(0), atr), bti, mul(ati, btr))
     qr, qi = mul(nr, inv_den), mul(ni, inv_den)
-    ea = (int(_u32(am)) >> 23) & 0xFF
-    eb = (int(_u32(bm)) >> 23) & 0xFF
+    ea = min(253, (int(_u32(am)) >> 23) & 0xFF)
+    eb = min(253, (int(_u32(bm)) >> 23) & 0xFF)
     ediff = ea - eb
     exp_biased = 127 + ediff
     if exp_biased >= 255:
@@ -1269,11 +1282,11 @@ def _chypot(ar, ai):
     m = F32(max(abs(float(ar)), abs(float(ai))))
     if m == 0:
         return F32(0)
-    t = _pow2_scale(m)
+    t = _ceig_pow2_scale(m)
     tr, ti = mul(ar, t), mul(ai, t)
     n2 = mac(ti, ti, mul(tr, tr))
     rn = F32(rsqrt_fine(n2))
-    return mul(mul(n2, rn), _pow2_unscale(m))
+    return mul(mul(n2, rn), _ceig_pow2_unscale(m))
 
 
 def _csqrt(zr, zi):
@@ -1305,21 +1318,21 @@ def _clartg(fr, fi, gr, gi):
     """Complex Givens rotation: [[cs, sn], [-conj(sn), cs]] @ [f; g] = [r; 0] with real cs >= 0."""
     fm = F32(max(abs(float(fr)), abs(float(fi))))
     gm = F32(max(abs(float(gr)), abs(float(gi))))
-    if gm == 0:
-        return F32(1), F32(0), F32(0), fr, fi
     mx = F32(max(float(fm), float(gm)))
-    t = _pow2_scale(mx)
-    un_t = _pow2_unscale(mx)
+    t = _ceig_pow2_scale(mx)
+    un_t = _ceig_pow2_unscale(mx)
     fsr, fsi = mul(fr, t), mul(fi, t)
     gsr, gsi = mul(gr, t), mul(gi, t)
     f2 = mac(fsi, fsi, mul(fsr, fsr))
     g2 = mac(gsi, gsi, mul(gsr, gsr))
+    if g2 == 0:
+        return F32(1), F32(0), F32(0), fr, fi
     fg2 = add(f2, g2)
     inv_fg = F32(rsqrt_fine(fg2))
-    if fm == 0:
+    if f2 == 0:
         g_abs = mul(mul(g2, inv_fg), un_t)
         return F32(0), mul(gsr, inv_fg), mul(sub(F32(0), gsi), inv_fg), g_abs, F32(0)
-    inv_f = F32(rsqrt_fine(f2)) if f2 > 0 else F32(0)
+    inv_f = F32(rsqrt_fine(f2))
     f_abs_s = mul(f2, inv_f)
     cs = mul(f_abs_s, inv_fg)
     pfr, pfi = mul(fsr, inv_f), mul(fsi, inv_f)
@@ -1353,9 +1366,9 @@ def ceig_kernel(A, compute_vectors=True):
             V1 = np.array([[1.0], [0.0]], F32) if compute_vectors else None
             return W1, V1, np.array([0.0], F32)
 
-        # Entry prescaling by exact power of 2 so max(|ar|, |ai|) in [1, 2)
-        sc_entry = _pow2_scale(max_abs)
-        unsc_entry = _pow2_unscale(max_abs)
+        # Entry prescaling by exact power of 2 so max(|ar|, |ai|) in [1, 2) (or [2, 4) for e == 254)
+        sc_entry = _ceig_pow2_scale(max_abs)
+        unsc_entry = _ceig_pow2_unscale(max_abs)
         ar, ai = mul(ar, sc_entry), mul(ai, sc_entry)
 
         # Stage 1: Parlett-Reinsch radix-2 diagonal balancing (16 sweeps, branchless binary-power steps)
@@ -1432,8 +1445,8 @@ def ceig_kernel(A, compute_vectors=True):
                 continue
             if not any(ar[i, k] != 0 or ai[i, k] != 0 for i in range(k + 2, n)):
                 continue
-            t = _pow2_scale(mx)
-            un_t = _pow2_unscale(mx)
+            t = _ceig_pow2_scale(mx)
+            un_t = _ceig_pow2_unscale(mx)
             sxr = np.zeros(32, dtype=F32)
             sxi = np.zeros(32, dtype=F32)
             sxr[k + 1:n] = mul(ar[k + 1:n, k], t)
@@ -1533,7 +1546,7 @@ def ceig_kernel(A, compute_vectors=True):
                     sigr, sigi = tr, ti
                 else:
                     sm = F32(sm)
-                    sc, unsc = _pow2_scale(sm), _pow2_unscale(sm)
+                    sc, unsc = _ceig_pow2_scale(sm), _ceig_pow2_unscale(sm)
                     xr, xi = mul(mul(ur, sc), F32(0.5)), mul(mul(ui, sc), F32(0.5))
                     bsr, bsi = mul(br, sc), mul(bi, sc)
                     csr, csi = mul(cr, sc), mul(ci, sc)
@@ -1630,17 +1643,17 @@ def ceig_kernel(A, compute_vectors=True):
                 rm = max(abs(float(rhsr)), abs(float(rhsi)))
                 dm = max(abs(float(dr)), abs(float(di)))
                 if rm > (2.0 ** 28) * dm:
-                    sc = _pow2_scale(F32(rm))
+                    sc = _ceig_pow2_scale(F32(rm))
                     yr[i + 1:k + 1], yi[i + 1:k + 1] = mul(yr[i + 1:k + 1], sc), mul(yi[i + 1:k + 1], sc)
                     rhsr, rhsi = mul(rhsr, sc), mul(rhsi, sc)
                 yr[i], yi[i] = _cdiv(rhsr, rhsi, dr, di)
                 ym = max(float(np.max(np.abs(yr[:k + 1]))), float(np.max(np.abs(yi[:k + 1]))))
                 if ym > 2.0 ** 28:
-                    sc = _pow2_scale(F32(ym))
+                    sc = _ceig_pow2_scale(F32(ym))
                     yr[:k + 1], yi[:k + 1] = mul(yr[:k + 1], sc), mul(yi[:k + 1], sc)
             ym = max(float(np.max(np.abs(yr[:k + 1]))), float(np.max(np.abs(yi[:k + 1]))))
             if ym > 0:
-                sc = _pow2_scale(F32(ym))
+                sc = _ceig_pow2_scale(F32(ym))
                 yr[:k + 1], yi[:k + 1] = mul(yr[:k + 1], sc), mul(yi[:k + 1], sc)
             vr, vi = np.zeros(n, dtype=F32), np.zeros(n, dtype=F32)
             for j in range(k + 1):
@@ -1649,7 +1662,7 @@ def ceig_kernel(A, compute_vectors=True):
             vr, vi = mul(vr, d_scale), mul(vi, d_scale)
             vm = max(float(np.max(np.abs(vr))), float(np.max(np.abs(vi))))
             if vm > 0:
-                sc = _pow2_scale(F32(vm))
+                sc = _ceig_pow2_scale(F32(vm))
                 vsr = np.pad(mul(vr, sc), (0, 32 - n))
                 vsi = np.pad(mul(vi, sc), (0, 32 - n))
                 sq = _red_add(mac(vsi, vsi, mul(vsr, vsr)))
@@ -1667,9 +1680,14 @@ def ceig_op(with_info=False):
     return _torch_op(lambda a: ceig_kernel(a, compute_vectors=True)[:2], 2)
 
 
+def _ceigvals_with_info(a):
+    w, _, info = ceig_kernel(a, compute_vectors=False)
+    return w, info
+
+
 def ceigvals_op(with_info=False):
     """Stand-in for ``torch.ops.linalg_tpc.ceigvals``: planar A [b, 2n, n] -> W [b, 2, n]
     (or ``(W, info)`` when ``with_info=True``)."""
     if with_info:
-        return _torch_op(lambda a: (lambda r: (r[0], r[2]))(ceig_kernel(a, compute_vectors=False)), 2)
+        return _torch_op(_ceigvals_with_info, 2)
     return _torch_op(lambda a: (ceig_kernel(a, compute_vectors=False)[0],), 1)

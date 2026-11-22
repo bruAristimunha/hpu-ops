@@ -100,13 +100,15 @@ static inline float64 rsqrt_fine(float64 x)
 static inline float64 pow2_scale(float64 m)
 {
     uint64 e = v_u32_shr_b(v_u32_and_b(as_uint64(m), 0x7F800000u), 23);
-    return as_float64(v_u32_sel_eq_u32_b(e, 0u, 0x3F800000u, v_u32_shl_b(254u - e, 23)));
+    uint64 e_eff = v_u32_min_b(e, 253u);
+    return as_float64(v_u32_sel_eq_u32_b(e, 0u, 0x3F800000u, v_u32_shl_b(254u - e_eff, 23)));
 }
 
 static inline float64 pow2_unscale(float64 m)
 {
-    uint64 e = v_u32_and_b(as_uint64(m), 0x7F800000u);
-    return as_float64(v_u32_sel_eq_u32_b(e, 0u, 0x3F800000u, e));
+    uint64 e = v_u32_shr_b(v_u32_and_b(as_uint64(m), 0x7F800000u), 23);
+    uint64 e_eff = v_u32_min_b(e, 253u);
+    return as_float64(v_u32_sel_eq_u32_b(e, 0u, 0x3F800000u, v_u32_shl_b(e_eff, 23)));
 }
 
 static inline float64 nonfinite(float64 x, float64 bad)
@@ -139,8 +141,8 @@ static inline cvec_t c_div(float64 ar, float64 ai, float64 br, float64 bi)
     float64 qr = v_f32_mul_b(nr, inv_den);
     float64 qi = v_f32_mul_b(ni, inv_den);
 
-    int64 ea = v_i32_and_b(v_i32_shr_b(as_int64(am), 23), 0xFF);
-    int64 eb = v_i32_and_b(v_i32_shr_b(as_int64(bm), 23), 0xFF);
+    int64 ea = v_i32_min_b(253, v_i32_and_b(v_i32_shr_b(as_int64(am), 23), 0xFF));
+    int64 eb = v_i32_min_b(253, v_i32_and_b(v_i32_shr_b(as_int64(bm), 23), 0xFF));
     int64 ediff = v_i32_sub_b(ea, eb);
     int64 exp_biased = v_i32_add_b(127, ediff);
     int64 e1 = v_i32_shr_b(ediff, 1);
@@ -221,18 +223,18 @@ static inline givens_t clartg(float64 fr, float64 fi, float64 gr, float64 gi)
     float64 g_abs = v_f32_mul_b(v_f32_mul_b(g2, inv_fg), un_t);
     float64 f0_snr = v_f32_mul_b(gsr, inv_fg);
     float64 f0_sni = v_f32_mul_b(v_f32_sub_b(0.0f, gsi), inv_fg);
-    cs = v_f32_sel_eq_f32_b(fm, 0.0f, 0.0f, cs);
-    snr = v_f32_sel_eq_f32_b(fm, 0.0f, f0_snr, snr);
-    sni = v_f32_sel_eq_f32_b(fm, 0.0f, f0_sni, sni);
-    rr = v_f32_sel_eq_f32_b(fm, 0.0f, g_abs, rr);
-    ri = v_f32_sel_eq_f32_b(fm, 0.0f, 0.0f, ri);
+    cs = v_f32_sel_eq_f32_b(f2, 0.0f, 0.0f, cs);
+    snr = v_f32_sel_eq_f32_b(f2, 0.0f, f0_snr, snr);
+    sni = v_f32_sel_eq_f32_b(f2, 0.0f, f0_sni, sni);
+    rr = v_f32_sel_eq_f32_b(f2, 0.0f, g_abs, rr);
+    ri = v_f32_sel_eq_f32_b(f2, 0.0f, 0.0f, ri);
 
     givens_t out;
-    out.cs = v_f32_sel_eq_f32_b(gm, 0.0f, 1.0f, cs);
-    out.snr = v_f32_sel_eq_f32_b(gm, 0.0f, 0.0f, snr);
-    out.sni = v_f32_sel_eq_f32_b(gm, 0.0f, 0.0f, sni);
-    out.rr = v_f32_sel_eq_f32_b(gm, 0.0f, fr, rr);
-    out.ri = v_f32_sel_eq_f32_b(gm, 0.0f, fi, ri);
+    out.cs = v_f32_sel_eq_f32_b(g2, 0.0f, 1.0f, cs);
+    out.snr = v_f32_sel_eq_f32_b(g2, 0.0f, 0.0f, snr);
+    out.sni = v_f32_sel_eq_f32_b(g2, 0.0f, 0.0f, sni);
+    out.rr = v_f32_sel_eq_f32_b(g2, 0.0f, fr, rr);
+    out.ri = v_f32_sel_eq_f32_b(g2, 0.0f, fi, ri);
     return out;
 }
 

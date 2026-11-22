@@ -126,6 +126,8 @@ def _empty(batch):
 
 
 def _square(P, limit=COMPLEX_MAXN):
+    if P.dim() < 3:
+        raise ValueError(f"hpu_ops.tpc.complex takes (..., n, n) matrices, got pairs {tuple(P.shape)}")
     n = P.shape[-2]
     if P.shape[-3] != n or n > limit or n < 1:
         raise ValueError(f"hpu_ops.tpc.complex takes square A with 1 <= n <= {limit}, got pairs {tuple(P.shape)}")

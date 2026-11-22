@@ -212,10 +212,26 @@ def _adversarial_cases():
     M_rand = rng.normal(size=(8, 8)) + 1j * rng.normal(size=(8, 8))
     cases.append(("bad_scale_8", (D_bad @ M_rand @ np.linalg.inv(D_bad)).astype(np.complex64), None))
 
-    # 10. Extreme scales (1e-30, 1e30, 3e37)
+    # 10. Extreme scales (1e-30, 1e30, 3e37, and e == 254 boundary 2.5e38)
     base6 = (rng.normal(size=(6, 6)) + 1j * rng.normal(size=(6, 6))).astype(np.complex64)
     for sc_name, sc in (("tiny_1e-30", 1e-30), ("huge_1e30", 1e30), ("huge_3e37", 3e37)):
         cases.append((sc_name, (base6 * np.float32(sc)).astype(np.complex64), None))
+    cases.append(("scale_eye_2p5e38", np.eye(4, dtype=np.complex64) * np.float32(2.5e38), None))
+    Q6, _ = np.linalg.qr(rng.normal(size=(6, 6)) + 1j * rng.normal(size=(6, 6)))
+    cases.append(("huge_2p5e38", (Q6 * 2.5e38).astype(np.complex64), None))
+
+    # 11. Forsythe perturbed nilpotent Jordan blocks (triggers clartg |f| <= 2^-64 |g| underflow)
+    for fn in (16, 24, 32):
+        Fo = np.diag(np.ones(fn - 1, dtype=np.complex64), 1)
+        Fo[fn - 1, 0] = np.float32(0.1)
+        cases.append((f"forsythe_n{fn}_eps0.1", Fo, None))
+
+    # 12. Graded Frank matrix (n=16 within residual tolerance)
+    F16 = np.zeros((16, 16), dtype=np.complex64)
+    for i in range(16):
+        for j in range(i - 1 if i > 0 else 0, 16):
+            F16[i, j] = float(16 - max(i, j))
+    cases.append(("frank_n16", F16, None))
 
     return cases
 
@@ -287,6 +303,9 @@ def test_replica_adversarial_classes(name, A, jordan_m):
         # Without cgebal permutation (JOB='P'), lower triangular matrices go through Hessenberg+QR
         # (cpu32 gets 0.0 via permutation), so backward-stable error is O(100 * n * eps32).
         assert ew <= max(1e-5, 100.0 * n * EPS32, 20.0 * ew32), f"{name}: ew={ew} cpu32={ew32}"
+    elif name.startswith("frank"):
+        # Graded Frank matrices have ill-conditioned small eigenvalues (cond ~ 10^5 at n=16); residual is O(n*eps32).
+        assert ew <= 0.02, f"{name}: ew={ew} cpu32={ew32}"
     else:
         assert ew <= max(1e-5, 20.0 * ew32), f"{name}: ew={ew} cpu32={ew32}"
 
@@ -395,7 +414,30 @@ def test_cl_eig_unbatched_multidim_empty_and_views(cl_eig_replica):
     assert torch.equal(W_c, W_c_ref) and torch.equal(V_c, V_c_ref)
 
 
+def test_replica_clartg_underflow_and_pow2_e254():
+    cs, snr, sni, rr, ri = kr._clartg(np.float32(1e-20), np.float32(0.0), np.float32(1.0), np.float32(0.0))
+    assert float(cs) == 0.0
+    assert math.isclose(float(snr) ** 2 + float(sni) ** 2, 1.0, rel_tol=1e-6)
+    assert math.isclose(float(rr), 1.0, rel_tol=1e-6) and float(ri) == 0.0
+
+    for val in (1.71e38, 2.5e38, float(np.finfo(np.float32).max)):
+        m = np.float32(val)
+        sc = kr._ceig_pow2_scale(m)
+        unsc = kr._ceig_pow2_unscale(m)
+        assert float(sc) > 0.0 and math.isfinite(float(sc))
+        assert float(sc * unsc) == 1.0
+        assert 2.0 <= float(m * sc) < 4.0
+
+
 def test_cl_eig_invalid_inputs_raise(cl_eig_replica):
+    with pytest.raises(ValueError):
+        cl.eig(torch.zeros(4, dtype=torch.complex64))
+    with pytest.raises(ValueError):
+        cl.eigvals(torch.zeros(4, dtype=torch.complex64))
+    with pytest.raises(ValueError):
+        cl.eig(torch.zeros((), dtype=torch.complex64))
+    with pytest.raises(ValueError):
+        cl.eig(torch.zeros(4, 2))
     with pytest.raises(ValueError):
         cl.eig(torch.zeros(2, 0, 0, 2))
     with pytest.raises(ValueError):

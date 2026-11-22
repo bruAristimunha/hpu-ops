@@ -464,12 +464,23 @@ def eig_cases():
         R6[0, 2 * k:2 * k + 2, 2 * k:2 * k + 2] = torch.tensor(
             [[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]], dtype=C64)
     yield "real_rot_6", R6, None
-    D_bad = torch.diag((2.0 ** torch.linspace(-30, 30, 8, dtype=torch.float64))).to(C128)
+    D_bad = torch.diag(2.0 ** torch.linspace(-30, 30, 8, dtype=torch.float64)).to(C128)
     M8 = crandn(8, 8, seed=25).to(C128)
     yield "bad_scale_8", (D_bad @ M8 @ torch.linalg.inv(D_bad)).to(C64)[None], None
     yield "tiny_1e-30", crandn(2, 6, 6, seed=26) * 1e-30, None
     yield "huge_1e30", crandn(2, 6, 6, seed=27) * 1e30, None
     yield "huge_3e37", crandn(2, 6, 6, seed=28) * 3e37, None
+    yield "scale_eye_2p5e38", (torch.eye(4, dtype=C64) * 2.5e38)[None], None
+    yield "huge_2p5e38", (unitary(6, 30) * 2.5e38).to(C64)[None], None
+    for fn in (16, 24, 32):
+        Fo = torch.diag(torch.ones(fn - 1, dtype=C64), 1)
+        Fo[fn - 1, 0] = 0.1
+        yield f"forsythe_n{fn}_eps0.1", Fo[None], None
+    F16 = torch.zeros(1, 16, 16, dtype=C64)
+    for i in range(16):
+        for j in range(max(0, i - 1), 16):
+            F16[0, i, j] = float(16 - max(i, j))
+    yield "frank_n16", F16, None
     for n in (1, 2, 4, 8, 16, 22, 32):
         yield f"randn_{n}", crandn(3, n, n, seed=100 + n), None
     NF = crandn(3, 5, 5, seed=29)
@@ -528,7 +539,9 @@ def run_eig(emit, time_it):
             if jordan_m:
                 ew_tol = 2.0 * (eps32 ** (1.0 / jordan_m))
             elif name.startswith("lower_tri"):
-                ew_tol = max(1e-5, 50.0 * n * eps32, 20.0 * max_ew32)
+                ew_tol = max(1e-5, 100.0 * n * eps32, 20.0 * max_ew32)
+            elif name.startswith("frank"):
+                ew_tol = 0.02
             else:
                 ew_tol = max(1e-5, 20.0 * max_ew32)
             row.update(res=max_res, vnorm_err=max_vnorm_err, err_w=max_ew, err_w_cpu32=max_ew32, ew_tol=ew_tol)
@@ -544,6 +557,16 @@ def run_eig(emit, time_it):
         emit(row)
 
     # Layouts, non-contiguous views, unbatched, multi-dim & empty batch, lazy repeat
+    def _pairs_eq(a, b):
+        return torch.equal(a[0].cpu(), b[0].cpu()) and torch.equal(a[1].cpu(), b[1].cpu())
+
+    def _raises_value_error(fn, *args):
+        try:
+            fn(*args)
+        except ValueError:
+            return True
+        return False
+
     A4 = crandn(4, 6, 6, seed=60)
     P4 = pairs(A4).to("hpu")
     with warnings.catch_warnings(record=True) as wrec:
@@ -552,30 +575,32 @@ def run_eig(emit, time_it):
         w_p, V_p = cl.eig(P4)
         w_i, V_i = cl.eig(P4.reshape(4, 6, 12), layout="interleaved")
         wv_i = cl.eigvals(P4.reshape(4, 6, 12), layout="interleaved")
+        u_eig = cl.eig(P4[1])
+        m_eig = cl.eig(P4.reshape(2, 2, 6, 6, 2))
         view_checks = {
             "interleaved": (
                 torch.equal(w_i.cpu(), w_p.cpu().reshape(4, 12))
                 and torch.equal(V_i.cpu(), V_p.cpu().reshape(4, 6, 12))
                 and torch.equal(wv_i.cpu(), w_i.cpu())
             ),
-            "strided_batch": (lambda a, b: torch.equal(a[0].cpu(), b[0].cpu()) and torch.equal(a[1].cpu(), b[1].cpu()))(
-                cl.eig(P4[::2]), cl.eig(P4[::2].contiguous())),
-            "mT_view": (lambda a, b: torch.equal(a[0].cpu(), b[0].cpu()) and torch.equal(a[1].cpu(), b[1].cpu()))(
-                cl.eig(P4.transpose(1, 2)), cl.eig(pairs(A4.mT).to("hpu"))),
-            "conj_view": (lambda a, b: torch.equal(a[0].cpu(), b[0].cpu()) and torch.equal(a[1].cpu(), b[1].cpu()))(
+            "strided_batch": _pairs_eq(cl.eig(P4[::2]), cl.eig(P4[::2].contiguous())),
+            "mT_view": _pairs_eq(cl.eig(P4.transpose(1, 2)), cl.eig(pairs(A4.mT).to("hpu"))),
+            "conj_view": _pairs_eq(
                 cl.eig(torch.stack([P4[..., 0], -P4[..., 1]], dim=-1)),
-                cl.eig(pairs(A4.conj().resolve_conj()).to("hpu"))),
-            "unbatched": (lambda u, r: torch.equal(u[0].cpu(), r[0][1].cpu()) and torch.equal(u[1].cpu(), r[1][1].cpu()))(
-                cl.eig(P4[1]), (w_p, V_p)),
-            "eig_twice": (lambda a, b: torch.equal(a[0].cpu(), b[0].cpu()) and torch.equal(a[1].cpu(), b[1].cpu()))(
-                (w_p, V_p), (cl.eig(P4), cl.eig(P4))[1]),
+                cl.eig(pairs(A4.conj().resolve_conj()).to("hpu")),
+            ),
+            "unbatched": torch.equal(u_eig[0].cpu(), w_p[1].cpu()) and torch.equal(u_eig[1].cpu(), V_p[1].cpu()),
+            "eig_twice": _pairs_eq((w_p, V_p), (cl.eig(P4), cl.eig(P4))[1]),
             "empty_batch": (
                 tuple(cl.eig(P4[:0])[0].shape) == (0, 6, 2)
                 and tuple(cl.eig(P4[:0])[1].shape) == (0, 6, 6, 2)
                 and tuple(cl.eigvals(P4[:0]).shape) == (0, 6, 2)
             ),
-            "multidim_batch": (lambda m: tuple(m[0].shape) == (2, 2, 6, 2) and tuple(m[1].shape) == (2, 2, 6, 6, 2))(
-                cl.eig(P4.reshape(2, 2, 6, 6, 2))),
+            "multidim_batch": tuple(m_eig[0].shape) == (2, 2, 6, 2) and tuple(m_eig[1].shape) == (2, 2, 6, 6, 2),
+            "invalid_1d_c64": (
+                _raises_value_error(cl.eig, torch.zeros(4, dtype=C64))
+                and _raises_value_error(cl.eigvals, torch.zeros(4, dtype=C64))
+            ),
         }
         fb_adv = fallbacks() - f0
     cpu_warns_adv = sum(1 for m in wrec if "runs on the CPU" in str(m.message))
@@ -588,18 +613,18 @@ def run_eig(emit, time_it):
     for n in (16, 22, 32):
         Ah = pairs(crandn(32, n, n, seed=30 + n)).to("hpu")
 
-        def cpu_route_eig():
-            w_, V_ = torch.linalg.eig(torch.view_as_complex(Ah.cpu()))
+        def cpu_route_eig(t=Ah):
+            w_, V_ = torch.linalg.eig(torch.view_as_complex(t.cpu()))
             return torch.view_as_real(w_).to("hpu"), torch.view_as_real(V_).to("hpu")
 
-        def cpu_route_eigvals():
-            return torch.view_as_real(torch.linalg.eigvals(torch.view_as_complex(Ah.cpu()))).to("hpu")
+        def cpu_route_eigvals(t=Ah):
+            return torch.view_as_real(torch.linalg.eigvals(torch.view_as_complex(t.cpu()))).to("hpu")
 
         with warnings.catch_warnings(record=True) as wrec:
             warnings.simplefilter("always", UserWarning)
             f0 = fallbacks()
-            eig_ms = timed(lambda: cl.eig(Ah))
-            eigvals_ms = timed(lambda: cl.eigvals(Ah))
+            eig_ms = timed(lambda t=Ah: cl.eig(t))
+            eigvals_ms = timed(lambda t=Ah: cl.eigvals(t))
             fb_t = fallbacks() - f0
         cw_t = sum(1 for m in wrec if "runs on the CPU" in str(m.message))
         row = {"op": "timing_eig", "n": n, "batch": 32,
