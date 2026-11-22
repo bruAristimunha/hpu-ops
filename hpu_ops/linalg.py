@@ -43,7 +43,7 @@ import torch.utils._pytree as pytree
 from torch._C import DispatchKey
 
 from . import _dispatch, _strict, tpc
-from ._dispatch import count, static
+from ._dispatch import chain, count, static
 
 aten = torch.ops.aten
 FLOAT64_WARNING = ("hpu_ops: {name} of float64 HPU tensors runs on the CPU: Gaudi2 stores float64 as float32, so "
@@ -1073,7 +1073,10 @@ def install_solve(device_type):
         return ag_orig(*args, **kwargs)
 
     entries = [(ag_op, ag_key, solve_autograd_kernel), (op, "{}", backend_kernel)]
-    return register_paired(device_type, [linalg_jvp.with_solve_jvp(device_type, op, entries)])
+    return chain([
+        register_paired(device_type, [linalg_jvp.with_solve_jvp(device_type, op, entries)]),
+        linalg_jvp.install_solve_composites(device_type),
+    ])
 
 
 def _inverse(LU, pivots):
@@ -1105,7 +1108,11 @@ class InvEx(torch.autograd.Function):
             X = None
         if check_errors:
             torch.ops.aten._linalg_check_errors(info, "linalg.inv_ex", is_matrix=A.dim() == 2)
-        return (_inverse(LU, pivots) if X is None else X), info
+        X = _inverse(LU, pivots) if X is None else X
+        # Match aten.linalg_inv_ex's Meta/FakeTensor output strides so torch.compile(..., backend="hpu_backend")
+        # does not misread a row-major buffer with column-major strides on either InvEx.forward or backend_kernel.
+        X = X.mT.contiguous().mT if X.dim() >= 2 else X.contiguous()
+        return X, info
 
     @staticmethod
     def forward(ctx, A, check_errors):
@@ -1409,7 +1416,10 @@ def install_inv_det(device_type):
         traced = {"det": _TracedDet, "slogdet": _TracedSlogdet}.get(name)
         entries = _kernels(device_type, op, name, function, takes, backend=name == "inv", traced=traced)
         groups.append(linalg_jvp.with_inv_det_jvp(device_type, op, name, entries))
-    return register_paired(device_type, groups)
+    return chain([
+        register_paired(device_type, groups),
+        linalg_jvp.install_inv_det_composites(device_type),
+    ])
 
 
 # ---- SVD family (#9): svd, svdvals, pinv, lstsq, matrix_norm(2/-2/'nuc'), matrix_rank

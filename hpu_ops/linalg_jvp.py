@@ -7,13 +7,16 @@ the same on-card ``compute`` paths while leaving mixed reverse+forward, ``vmap``
 the native path.
 """
 import threading
+import warnings
 
 import torch
 import torch.autograd.forward_ad as fwAD
+from torch._C import DispatchKey
 
 from . import _dispatch, linalg
 from ._dispatch import count
 
+aten = torch.ops.aten
 _DECLINING = threading.local()
 
 
@@ -312,3 +315,187 @@ def with_inv_det_jvp(device_type, op, name, entries):
     jvp_fn, traced_fn = pair
     takes = linalg._tpc_takes(device_type, _base_jvp_takes(device_type, name), large=True)
     return _wrap_autograd(entries, device_type, op, name, takes, jvp_fn, traced_fn)
+
+
+def _hpu_jvp_eligible(*tensors):
+    """Whether ``tensors`` are non-empty float32 HPU tensors on the same device with a square matrix ``tensors[0]``."""
+    devs = set()
+    for t in tensors:
+        if not isinstance(t, torch.Tensor) or t.device.type != "hpu" or t.dtype != torch.float32 or t.numel() == 0:
+            return False
+        devs.add(t.device)
+    if len(devs) > 1:
+        return False
+    A = tensors[0]
+    return A.dim() >= 2 and A.shape[-1] == A.shape[-2]
+
+
+def _unpack(tensor, lvl):
+    if not isinstance(tensor, torch.Tensor):
+        return tensor, None
+    u = fwAD.unpack_dual(tensor, level=lvl)
+    return u.primal, u.tangent
+
+
+def _any_dual(tensors, lvl):
+    return any(isinstance(t, torch.Tensor) and fwAD.unpack_dual(t, level=lvl).tangent is not None for t in tensors)
+
+
+def _solve_tangent(Ap, Bp, X, gA, gB, left):
+    vec = linalg._is_vector_rhs(Ap, Bp)
+    if gA is None:
+        rhs = gB
+    else:
+        x = X.unsqueeze(-1) if vec else X
+        d = gA @ x if left else x @ gA
+        if vec:
+            d = d.squeeze(-1)
+        rhs = -d if gB is None else gB - d
+    return torch.linalg.solve_ex(Ap, rhs, left=left, check_errors=False)[0]
+
+
+def _inv_via_solve(A):
+    eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device).expand_as(A)
+    return torch.linalg.solve(A, eye)
+
+
+def _cia_solve_ex(A, B, *, left=True, check_errors=False):
+    if _hpu_jvp_eligible(A, B) and _solve_shapes_ok(A, B, left):
+        fw_lvl = _dispatch.forward_ad_level(A, B)
+        if fw_lvl >= 0 and _any_dual((A, B), fw_lvl):
+            Ap, gA = _unpack(A, fw_lvl)
+            Bp, gB = _unpack(B, fw_lvl)
+            X, _, _, info = aten._linalg_solve_ex.default(Ap, Bp, left=left, check_errors=check_errors)
+            gX = _solve_tangent(Ap, Bp, X, gA, gB, left)
+            return fwAD.make_dual(X, gX, level=fw_lvl), info
+    X, _, _, info = aten._linalg_solve_ex.default(A, B, left=left, check_errors=check_errors)
+    return X, info
+
+
+def _cia_solve(A, B, *, left=True):
+    return _cia_solve_ex(A, B, left=left, check_errors=True)[0]
+
+
+def _other_solve_ex(A, B, *, left=True, check_errors=False):
+    if _hpu_jvp_eligible(A, B) and _solve_shapes_ok(A, B, left):
+        fw_lvl = _dispatch.forward_ad_level(A, B)
+        if fw_lvl >= 0 and _any_dual((A, B), fw_lvl):
+            Ap, gA = _unpack(A, fw_lvl)
+            Bp, gB = _unpack(B, fw_lvl)
+            X, LU, pivots, info = aten._linalg_solve_ex.default(Ap, Bp, left=left, check_errors=check_errors)
+            gX = _solve_tangent(Ap, Bp, X, gA, gB, left)
+            return fwAD.make_dual(X, gX, level=fw_lvl), LU, pivots, info
+    return aten._linalg_solve_ex.default._op_dk(DispatchKey.Autograd, A, B, left=left, check_errors=check_errors)
+
+
+def _cia_det(A):
+    if _hpu_jvp_eligible(A):
+        fw_lvl = _dispatch.forward_ad_level(A)
+        if fw_lvl >= 0 and _any_dual((A,), fw_lvl):
+            Ap, gA = _unpack(A, fw_lvl)
+            det = aten._linalg_det.default(Ap)[0]
+            if gA is None:
+                return det
+            invA = _inv_via_solve(Ap)
+            dt = torch.where(det == 0, 0.0, det * (invA.mT * gA).sum((-2, -1)))
+            return fwAD.make_dual(det, dt, level=fw_lvl)
+    return aten._linalg_det.default(A)[0]
+
+
+def _other_det(A):
+    if _hpu_jvp_eligible(A):
+        fw_lvl = _dispatch.forward_ad_level(A)
+        if fw_lvl >= 0 and _any_dual((A,), fw_lvl):
+            Ap, gA = _unpack(A, fw_lvl)
+            det, LU, pivots = aten._linalg_det.default(Ap)
+            if gA is None:
+                return det, LU, pivots
+            invA = _inv_via_solve(Ap)
+            dt = torch.where(det == 0, 0.0, det * (invA.mT * gA).sum((-2, -1)))
+            return fwAD.make_dual(det, dt, level=fw_lvl), LU, pivots
+    return aten._linalg_det.default._op_dk(DispatchKey.Autograd, A)
+
+
+def _cia_slogdet(A):
+    if _hpu_jvp_eligible(A):
+        fw_lvl = _dispatch.forward_ad_level(A)
+        if fw_lvl >= 0 and _any_dual((A,), fw_lvl):
+            Ap, gA = _unpack(A, fw_lvl)
+            sign, logabsdet, _, _ = aten._linalg_slogdet.default(Ap)
+            if gA is None:
+                return sign, logabsdet
+            invA = _inv_via_solve(Ap)
+            dlog = (invA.mT * gA).sum((-2, -1))
+            return fwAD.make_dual(sign, torch.zeros_like(sign), level=fw_lvl), fwAD.make_dual(
+                logabsdet, dlog, level=fw_lvl
+            )
+    sign, logabsdet, _, _ = aten._linalg_slogdet.default(A)
+    return sign, logabsdet
+
+
+def _other_slogdet(A):
+    if _hpu_jvp_eligible(A):
+        fw_lvl = _dispatch.forward_ad_level(A)
+        if fw_lvl >= 0 and _any_dual((A,), fw_lvl):
+            Ap, gA = _unpack(A, fw_lvl)
+            sign, logabsdet, LU, pivots = aten._linalg_slogdet.default(Ap)
+            if gA is None:
+                return sign, logabsdet, LU, pivots
+            invA = _inv_via_solve(Ap)
+            dlog = (invA.mT * gA).sum((-2, -1))
+            return (
+                fwAD.make_dual(sign, torch.zeros_like(sign), level=fw_lvl),
+                fwAD.make_dual(logabsdet, dlog, level=fw_lvl),
+                LU,
+                pivots,
+            )
+    return aten._linalg_slogdet.default._op_dk(DispatchKey.Autograd, A)
+
+
+def _install_impls(entries):
+    """Register ``(op, key, kernel)`` handlers on ``aten`` and return an undo that restores the dispatcher."""
+    library = torch.library.Library("aten", "IMPL")
+    touched = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        for op, key, kernel in entries:
+            if key != "CompositeImplicitAutograd" and torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), key):
+                continue
+            library.impl(op, kernel, key)
+            touched.append(op)
+    for op in touched:
+        op._dispatch_cache.clear()
+
+    def undo():
+        library._destroy()
+        for op in touched:
+            op._dispatch_cache.clear()
+
+    return undo
+
+
+def install_solve_composites(device_type):
+    """On ``hpu``, handle ``torch.func.jvp``/``jacfwd`` for ``linalg.solve``/``solve_ex`` above ``AOTAutograd`` so
+    ``torch.compile`` never emits ``aten.linalg_lu_solve`` against placeholder ``LU=0``. Returns an undo."""
+    if device_type != "hpu":
+        return lambda: None
+    return _install_impls([
+        (aten.linalg_solve.default, "CompositeImplicitAutograd", _cia_solve),
+        (aten.linalg_solve_ex.default, "CompositeImplicitAutograd", _cia_solve_ex),
+        (aten._linalg_solve_ex.default, "AutogradOther", _other_solve_ex),
+    ])
+
+
+def install_inv_det_composites(device_type):
+    """On ``hpu``, handle ``torch.func.jvp``/``jacfwd`` for ``det``/``slogdet`` above ``AOTAutograd`` (see
+    ``install_solve_composites``). Returns an undo."""
+    if device_type != "hpu":
+        return lambda: None
+    return _install_impls([
+        (aten.linalg_det.default, "CompositeImplicitAutograd", _cia_det),
+        (aten.det.default, "CompositeImplicitAutograd", _cia_det),
+        (aten._linalg_det.default, "AutogradOther", _other_det),
+        (aten.linalg_slogdet.default, "CompositeImplicitAutograd", _cia_slogdet),
+        (aten.slogdet.default, "CompositeImplicitAutograd", _cia_slogdet),
+        (aten._linalg_slogdet.default, "AutogradOther", _other_slogdet),
+    ])

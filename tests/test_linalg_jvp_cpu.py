@@ -606,24 +606,105 @@ def test_solve_backend_kernel_output_strides(monkeypatch):
     groups = []
     orig_register = linalg.register_paired
     monkeypatch.setattr(linalg, "register_paired", lambda dt, gs: (groups.extend(gs), orig_register(dt, []))[1])
-    linalg.install_solve("hpu")
-    backend_fn = {key: fn for _, key, fn in groups[0]}["{}"]
+    undo = linalg.install_solve("hpu")
+    try:
+        backend_fn = {key: fn for _, key, fn in groups[0]}["{}"]
 
-    torch.manual_seed(9)
-    cases = [
-        (_general(n=6), torch.randn(6, 2), True),
-        (_general(2, n=6), torch.randn(2, 6, 3), True),
-        (_general(2, 3, n=6), torch.randn(2, 3, 6, 4), True),
-        (_general(n=6), torch.randn(6), True),
-        (_general(2, n=6), torch.randn(2, 6), True),
-        (_general(2, n=6), torch.randn(2, 3, 6), False),
-    ]
-    for A, B, left in cases:
-        want_X = torch.ops.aten._linalg_solve_ex.default(A, B, left=left)[0]
-        got_fwd_X = linalg.SolveEx.apply(A, B, left, False)[0]
-        assert got_fwd_X.stride() == want_X.stride(), (A.shape, B.shape, left, got_fwd_X.stride(), want_X.stride())
-        torch.testing.assert_close(got_fwd_X, want_X, rtol=1e-4, atol=1e-4)
-        with torch.inference_mode():
-            got_X = backend_fn(A, B, left=left)[0]
-            assert got_X.stride() == want_X.stride(), (A.shape, B.shape, left, got_X.stride(), want_X.stride())
-            torch.testing.assert_close(got_X, want_X, rtol=1e-4, atol=1e-4)
+        torch.manual_seed(9)
+        cases = [
+            (_general(n=6), torch.randn(6, 2), True),
+            (_general(2, n=6), torch.randn(2, 6, 3), True),
+            (_general(2, 3, n=6), torch.randn(2, 3, 6, 4), True),
+            (_general(n=6), torch.randn(6), True),
+            (_general(2, n=6), torch.randn(2, 6), True),
+            (_general(2, n=6), torch.randn(2, 3, 6), False),
+        ]
+        for A, B, left in cases:
+            want_X = torch.ops.aten._linalg_solve_ex.default(A, B, left=left)[0]
+            got_fwd_X = linalg.SolveEx.apply(A, B, left, False)[0]
+            assert got_fwd_X.stride() == want_X.stride(), (A.shape, B.shape, left, got_fwd_X.stride(), want_X.stride())
+            torch.testing.assert_close(got_fwd_X, want_X, rtol=1e-4, atol=1e-4)
+            with torch.inference_mode():
+                got_X = backend_fn(A, B, left=left)[0]
+                assert got_X.stride() == want_X.stride(), (A.shape, B.shape, left, got_X.stride(), want_X.stride())
+                torch.testing.assert_close(got_X, want_X, rtol=1e-4, atol=1e-4)
+    finally:
+        undo()
+
+
+def test_hpu_jvp_composites_helpers_and_undo(monkeypatch, gj_hook):
+    """HPU JVP composite/AutogradOther handlers must stay inert on CPU, clean up completely across repeated
+    install/undo cycles, and accurately report HPU-tensor eligibility and dual-level unpacking."""
+
+    # Pure-Python helper checks
+    cpu_mat = torch.eye(4)
+    assert not linalg_jvp._hpu_jvp_eligible(cpu_mat)
+    assert linalg_jvp._unpack("scalar", 0) == ("scalar", None)
+    assert not linalg_jvp._any_dual((cpu_mat, 1.0), 0)
+    with fwAD.dual_level():
+        dual = fwAD.make_dual(cpu_mat, torch.ones_like(cpu_mat))
+        assert linalg_jvp._any_dual((dual,), 0)
+        p, t = linalg_jvp._unpack(dual, 0)
+        torch.testing.assert_close(p, cpu_mat)
+        torch.testing.assert_close(t, torch.ones_like(cpu_mat))
+
+    # Fake HPU-device metadata check on _hpu_jvp_eligible (without requiring an HPU device)
+    with monkeypatch.context() as mp:
+        mp.setattr(torch.Tensor, "device", property(lambda self: torch.device("hpu:0")))
+        assert linalg_jvp._hpu_jvp_eligible(torch.ones(3, 3))
+        assert linalg_jvp._hpu_jvp_eligible(torch.ones(3, 3), torch.ones(3, 2))
+        assert not linalg_jvp._hpu_jvp_eligible(torch.ones(3, 4))
+        assert not linalg_jvp._hpu_jvp_eligible(torch.ones(0, 0))
+        assert not linalg_jvp._hpu_jvp_eligible(torch.ones(3, 3, dtype=torch.float64))
+
+    ops_other = (
+        torch.ops.aten._linalg_solve_ex.default,
+        torch.ops.aten._linalg_det.default,
+        torch.ops.aten._linalg_slogdet.default,
+    )
+    for op in ops_other:
+        assert not torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), "AutogradOther")
+
+    # CPU installation must be a no-op
+    u_cpu = linalg_jvp.install_solve_composites("cpu")
+    u_cpu2 = linalg_jvp.install_inv_det_composites("cpu")
+    try:
+        for op in ops_other:
+            assert not torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), "AutogradOther")
+    finally:
+        u_cpu2()
+        u_cpu()
+
+    # Repeated install/undo roundtrip for HPU installers (mocking register_paired to avoid HPU key check)
+    orig_reg = linalg.register_paired
+    with monkeypatch.context() as mp:
+        mp.setattr(linalg, "register_paired", lambda dt, gs: orig_reg(dt, []))
+        for _ in range(2):
+            undo_solve = linalg.install_solve("hpu")
+            undo_inv = linalg.install_inv_det("hpu")
+            try:
+                for op in ops_other:
+                    assert torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), "AutogradOther")
+                # CPU inputs still pass straight through unmodified
+                A = _general(n=4)
+                B = torch.randn(4, 2)
+                tA, tB = torch.randn_like(A), torch.randn_like(B)
+                p_s, t_s = torch.func.jvp(torch.linalg.solve, (A, B), (tA, tB))
+                torch.testing.assert_close(p_s, torch.linalg.solve(A, B))
+                assert torch.isfinite(t_s).all()
+            finally:
+                undo_inv()
+                undo_solve()
+            for op in ops_other:
+                assert not torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), "AutogradOther")
+
+    # Verify cpu_as_hpu solve JVP still records calls["solve"] == 1 after undo
+    A = _general(n=4)
+    B = torch.randn(4, 2)
+    tA, tB = torch.randn_like(A), torch.randn_like(B)
+    want_p, want_t = torch.func.jvp(torch.linalg.solve, (A, B), (tA, tB))
+    with cpu_as_hpu(linalg.install_solve) as calls:
+        got_p, got_t = torch.func.jvp(torch.linalg.solve, (A, B), (tA, tB))
+        assert calls["solve"] == 1
+    torch.testing.assert_close(got_p, want_p, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(got_t, want_t, rtol=1e-4, atol=1e-4)

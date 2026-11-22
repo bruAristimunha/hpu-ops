@@ -2491,14 +2491,18 @@ def test_det_slogdet_register_no_backend_kernel(monkeypatch):
     """det/slogdet backend (``{}``) kernels would return placeholder LU factors to torch's own derivative in a
     compiled graph (NaN gradients); calls below autograd reach Habana's kernel. solve_ex and inv_ex stay."""
     seen = []
-    monkeypatch.setattr(linalg, "register_paired", lambda device_type, groups: seen.extend(groups))
-    linalg.install_solve("hpu")
-    linalg.install_inv_det("hpu")
-    keys = {group[0][0].name(): [key for _, key, _ in group] for group in seen}
-    for name in ("aten::_linalg_det", "aten::_linalg_slogdet"):
-        assert keys[name] == ["Autograd{}"], keys
-    for name in ("aten::_linalg_solve_ex", "aten::linalg_inv_ex"):
-        assert keys[name] == ["Autograd{}", "{}"], keys
+    monkeypatch.setattr(linalg, "register_paired", lambda device_type, groups: (seen.extend(groups), lambda: None)[1])
+    undo1 = linalg.install_solve("hpu")
+    undo2 = linalg.install_inv_det("hpu")
+    try:
+        keys = {group[0][0].name(): [key for _, key, _ in group] for group in seen}
+        for name in ("aten::_linalg_det", "aten::_linalg_slogdet"):
+            assert keys[name] == ["Autograd{}"], keys
+        for name in ("aten::_linalg_solve_ex", "aten::linalg_inv_ex"):
+            assert keys[name] == ["Autograd{}", "{}"], keys
+    finally:
+        undo2()
+        undo1()
 
 
 def test_enable_installs_the_triangular_solves():
@@ -2908,3 +2912,32 @@ def test_lstsq_rank_is_a_fresh_tensor(svd_hook):
     assert rank.shape == (3,) and 0 not in rank.stride() and rank._base is None
     rank[0] += 1  # writable without touching the other entries
     assert rank.tolist() == [5, 4, 4]
+
+
+def test_inv_ex_compute_output_strides(monkeypatch):
+    """``InvEx.compute`` output ``X`` must match ``torch.linalg.inv_ex``'s column-major strides across 2D, 3D, and 4D
+    matrices on both small/LU and ``_LARGE_ON_CPU`` routes so ``torch.compile`` never misreads row-major memory."""
+    import kernel_replica as kr
+
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "0")
+    monkeypatch.setattr(tpc, "_large_op", lambda: kr.gj_large_op())
+    g = torch.Generator().manual_seed(0)
+
+    def _well_conditioned(shape):
+        n = shape[-1]
+        return torch.eye(n) + 0.05 * torch.randn(shape, generator=g) / n ** 0.5
+
+    for large in (False, True):
+        monkeypatch.setattr(linalg, "_LARGE_ON_CPU", large)
+        n = tpc.MAXN + 2 if large else 6
+        shapes = ((n, n), (2, n, n), (2, 3, n, n))
+        hooks = (None,) if large else (None, tpc.gj_solve_reference)
+        for gj_hook in hooks:
+            monkeypatch.setattr(linalg, "_GJ", gj_hook)
+            for shape in shapes:
+                A = _well_conditioned(shape)
+                want_X, want_info = torch.linalg.inv_ex(A, check_errors=False)
+                got_X, got_info = linalg.InvEx.compute(A, False)
+                assert got_X.stride() == want_X.stride(), (large, gj_hook, shape, got_X.stride(), want_X.stride())
+                assert got_info.shape == want_info.shape
+                torch.testing.assert_close(got_X, want_X, rtol=1e-4, atol=1e-4)
