@@ -52,12 +52,11 @@ import torch.nn.functional as F
 from torch._C import DispatchKey
 from torch._subclasses.fake_tensor import is_fake
 
-from ._dispatch import chain, count, register_kernels, replace_py_kernels, static
+from ._dispatch import REDUCED, chain, count, register_kernels, replace_py_kernels, static
 
 aten = torch.ops.aten
 MAX_KERNEL = 256  # eager ops and compiled graphs
 LAZY_MAX_KERNEL = 128  # lazy mode: larger chunks fail or give wrong input gradients (see the module docstring)
-REDUCED = (torch.float16, torch.bfloat16)
 
 
 DEFAULTS = (None, 1, "valid", 1, 1)  # bias, stride, padding, dilation, groups; the dispatcher omits trailing defaults

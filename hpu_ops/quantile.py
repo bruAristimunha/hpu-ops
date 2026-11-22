@@ -31,21 +31,15 @@ import functools
 
 import torch
 from torch._C import DispatchKey
-from torch._subclasses.fake_tensor import is_fake
 
 from . import _strict
-from ._dispatch import chain, count, register_kernels, replace_py_kernels
+from ._dispatch import chain, concrete as _concrete, count, register_kernels, replace_py_kernels
 from .extrema import internal_sort
 
 aten = torch.ops.aten
 INTERPOLATIONS = ("linear", "lower", "higher", "midpoint", "nearest")
 MAX_LENGTH = 2 ** 24  # ATen: "quantile() input tensor is too large" past this many elements per slice
 RANGE_ERROR = "quantile() q values must be in the range [0, 1]"
-
-
-def _concrete(t):
-    """True for a real tensor outside any tracer: its values can be read on the host."""
-    return not is_fake(t) and torch._guards.detect_fake_mode() is None and not torch._is_functional_tensor(t)
 
 
 def _reduce_view(self, dim, keepdim):

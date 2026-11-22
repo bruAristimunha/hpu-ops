@@ -16,10 +16,9 @@ import torch
 from torch._C import DispatchKey
 
 from . import _strict
-from ._dispatch import count, register_kernels, static
+from ._dispatch import REDUCED, count, register_kernels, static
 
 aten = torch.ops.aten
-REDUCED = (torch.float16, torch.bfloat16)
 # the most elements of any tensor unfold_backward's rewrite makes or takes on the card: a pad of 1.1e9 x 2 elements
 # stopped Gaudi2 ("Synapse detected a device critical error", 3 of 3 runs; 1.0e9 x 2 was right); larger calls run
 # ATen's kernel on a CPU copy

@@ -13,7 +13,7 @@ def eager_tpc(monkeypatch):
 
 
 @pytest.fixture
-def lu_kernels(monkeypatch):
+def lu_kernels(gj_ref, monkeypatch):
     """The LU kernels' contracts in plain torch (as ``lu_hook`` of test_linalg_cpu) and the substitution kernel's
     (``tri_solve_reference``) behind ``_TRI``; records the hooks called."""
     calls = []
@@ -32,7 +32,6 @@ def lu_kernels(monkeypatch):
     monkeypatch.setattr(linalg, "_LU_PERM", lambda p: linalg.pivots_to_perm(p.detach()).to(torch.float32))
     monkeypatch.setattr(linalg, "_LU_SOLVE", solve)
     monkeypatch.setattr(linalg, "_TRI", tri)
-    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
     return calls
 
 
@@ -135,21 +134,6 @@ def test_large_route_declines_when_traced(tracer, monkeypatch):
 # ---- #11 / #12: lstsq
 
 
-@pytest.fixture
-def svd_hook(monkeypatch):
-    """``linalg._SVD``: ``svd_reference`` on real tensors, torch's (traceable) SVD under fake tensors, as
-    test_linalg_cpu's compiled lstsq test."""
-
-    def hook(A, compute_uv):
-        if not linalg._is_fake(A):
-            return tpc.svd_reference(A, compute_uv=compute_uv)
-        if not compute_uv:
-            return A.new_empty(0), torch.linalg.svdvals(A), A.new_empty(0)
-        return torch.linalg.svd(A, full_matrices=False)
-
-    monkeypatch.setattr(linalg, "_SVD", hook)
-
-
 @pytest.mark.parametrize("A, rcond", [(torch.eye(2), 1.0), (torch.diag(torch.tensor([1.0, 1e-8])), None)])
 def test_compiled_gels_ignores_rcond(A, rcond, svd_hook):
     from test_cpu import compiled
@@ -246,8 +230,7 @@ def test_svd_backward_distinct_values(diag, svd_hook):
 # ---- #9: matrix_exp backward, each matrix scaled by its own norm; traced branch capped as the kernels (126)
 
 
-def test_matrix_exp_double_backward_scales_per_matrix(monkeypatch):
-    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
+def test_matrix_exp_double_backward_scales_per_matrix(gj_ref):
     A = torch.stack([torch.eye(2), -1e8 * torch.eye(2)])
     grads = []
     for route in (False, True):
@@ -260,10 +243,9 @@ def test_matrix_exp_double_backward_scales_per_matrix(monkeypatch):
     torch.testing.assert_close(grads[1][0], torch.full((2, 2), 2.7182815), rtol=1e-6, atol=0)
 
 
-def test_matrix_exp_traced_frechet_reaches_large_norms(monkeypatch):
+def test_matrix_exp_traced_frechet_reaches_large_norms(gj_ref):
     from torch.fx.experimental.proxy_tensor import make_fx
 
-    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
     A, G = -1e10 * torch.eye(2), torch.ones(2, 2)
     traced = make_fx(linalg._matrix_exp_frechet_torch, tracing_mode="fake")(A, G)
     X = A.clone().requires_grad_()
