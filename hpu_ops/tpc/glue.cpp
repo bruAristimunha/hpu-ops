@@ -87,6 +87,10 @@ extern const char _binary___jacobi_csvd_f32_gaudi2_o_start[];
 extern const char _binary___jacobi_csvd_f32_gaudi2_o_end[];
 extern const char _binary___jacobi_csvdvals_f32_gaudi2_o_start[];
 extern const char _binary___jacobi_csvdvals_f32_gaudi2_o_end[];
+extern const char _binary___ceig_f32_gaudi2_o_start[];
+extern const char _binary___ceig_f32_gaudi2_o_end[];
+extern const char _binary___ceigvals_f32_gaudi2_o_start[];
+extern const char _binary___ceigvals_f32_gaudi2_o_end[];
 }
 
 namespace {
@@ -118,6 +122,8 @@ const char* kCEigh = "jacobi_ceigh_f32_gaudi2";
 const char* kCEighRefine = "jacobi_ceigh_refine_f32_gaudi2";  // -DREFINE_PASS
 const char* kCSvd = "jacobi_csvd_f32_gaudi2";
 const char* kCSvdvals = "jacobi_csvdvals_f32_gaudi2";  // -DNO_UV
+const char* kCEig = "ceig_f32_gaudi2";
+const char* kCEigvals = "ceigvals_f32_gaudi2";  // -DNO_VECTORS
 constexpr uint64_t kMaxComplexN = 32;  // MAXN of the complex kernels (n complex columns, 2n planar rows)
 constexpr uint64_t kMaxN = 64;      // MAXN of gj_solve and tri_solve
 constexpr uint64_t kMaxSmallN = 32; // MAXN of jacobi_svd, matrix_exp, lu_factor and lu_solve
@@ -426,6 +432,38 @@ tpc_lib_api::GlueCodeReturn csvd_defs(tpc_lib_api::HabanaKernelParams* in, tpc_l
     full2(out->outputTensorAccessPattern[1], k);
     full3(out->outputTensorAccessPattern[2], k, 2 * k);
     return copy_elf(out, _binary___jacobi_csvd_f32_gaudi2_o_start, _binary___jacobi_csvd_f32_gaudi2_o_end);
+}
+
+// General complex64 eig / eigvals (MPS recipe): A [n, 2n, batch] -> W [n, 2, batch], V [n, 2n, batch], S [2, batch]
+// (or W, S only under -DNO_VECTORS).
+tpc_lib_api::GlueCodeReturn ceig_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
+                                      bool vals)
+{
+    auto status = check_io(in, 1, vals ? 2 : 3);
+    if (status != tpc_lib_api::GLUE_SUCCESS)
+    {
+        return status;
+    }
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    if (n < 1 || n > kMaxComplexN || in->inputTensors[0].geometry.maxSizes[1] != 2 * n)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+    full3(out->inputTensorAccessPattern[0], n, 2 * n);
+    if (vals)
+    {
+        full3(out->outputTensorAccessPattern[0], n, 2);
+        full2(out->outputTensorAccessPattern[1], 2);
+        return copy_elf(out, _binary___ceigvals_f32_gaudi2_o_start, _binary___ceigvals_f32_gaudi2_o_end);
+    }
+    full3(out->outputTensorAccessPattern[0], n, 2);
+    full3(out->outputTensorAccessPattern[1], n, 2 * n);
+    full2(out->outputTensorAccessPattern[2], 2);
+    return copy_elf(out, _binary___ceig_f32_gaudi2_o_start, _binary___ceig_f32_gaudi2_o_end);
 }
 
 tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
@@ -1002,7 +1040,7 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 26 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 28 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
@@ -1031,6 +1069,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint3
         strcpy(guids[23].name, kCEighRefine);
         strcpy(guids[24].name, kCSvd);
         strcpy(guids[25].name, kCSvdvals);
+        strcpy(guids[26].name, kCEig);
+        strcpy(guids[27].name, kCEigvals);
     }
     if (kernelCount != nullptr)
     {
@@ -1145,6 +1185,14 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (strcmp(params->guid.name, kCSvdvals) == 0)
     {
         return csvd_defs(params, instance, true);
+    }
+    if (strcmp(params->guid.name, kCEig) == 0)
+    {
+        return ceig_defs(params, instance, false);
+    }
+    if (strcmp(params->guid.name, kCEigvals) == 0)
+    {
+        return ceig_defs(params, instance, true);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }

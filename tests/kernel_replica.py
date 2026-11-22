@@ -1215,3 +1215,461 @@ def csvd_op():
 def csvdvals_op():
     """Stand-in for ``torch.ops.linalg_tpc.jacobi_csvdvals``: S alone."""
     return _torch_op(lambda a: (csvd_kernel(a, compute_uv=False)[1],), 1)
+
+
+# ---- complex64 general eig / eigvals: MPS recipe (balance -> Hessenberg -> single-shift QR -> back-sub) ----------
+
+
+_EIG_EPS32 = F32(2.0 ** -23)
+_EIG_SMLNUM = F32((2.0 ** -126) / float(_EIG_EPS32))
+
+
+def _cabs1(re, im):
+    return add(np.abs(re), np.abs(im))
+
+
+def _cmul(ar, ai, br, bi):
+    return mac(sub(F32(0), ai), bi, mul(ar, br)), mac(ai, br, mul(ar, bi))
+
+
+def _cdiv(ar, ai, br, bi):
+    """Overflow/underflow-safe complex division a / b using pow2_scale + lut_free_recip."""
+    bm = F32(max(abs(float(br)), abs(float(bi))))
+    am = F32(max(abs(float(ar)), abs(float(ai))))
+    if bm == 0 or am == 0:
+        return F32(0), F32(0)
+    tb = _pow2_scale(bm)
+    btr, bti = mul(br, tb), mul(bi, tb)
+    den = mac(bti, bti, mul(btr, btr))
+    inv_den = recip(den, zero_to_inf=False)[0]
+    ta = _pow2_scale(am)
+    atr, ati = mul(ar, ta), mul(ai, ta)
+    nr = mac(ati, bti, mul(atr, btr))
+    ni = mac(sub(F32(0), atr), bti, mul(ati, btr))
+    qr, qi = mul(nr, inv_den), mul(ni, inv_den)
+    ea = (int(_u32(am)) >> 23) & 0xFF
+    eb = (int(_u32(bm)) >> 23) & 0xFF
+    ediff = ea - eb
+    exp_biased = 127 + ediff
+    if exp_biased >= 255:
+        e1 = ediff >> 1
+        e2 = ediff - e1
+        b1 = min(254, max(1, 127 + e1))
+        b2 = min(254, max(1, 127 + e2))
+        s1 = _f32(b1 << 23)
+        s2 = _f32(b2 << 23)
+        return mul(mul(qr, s1), s2), mul(mul(qi, s1), s2)
+    if exp_biased <= 0:
+        return F32(0), F32(0)
+    scale_q = _f32(exp_biased << 23)
+    return mul(qr, scale_q), mul(qi, scale_q)
+
+
+def _chypot(ar, ai):
+    m = F32(max(abs(float(ar)), abs(float(ai))))
+    if m == 0:
+        return F32(0)
+    t = _pow2_scale(m)
+    tr, ti = mul(ar, t), mul(ai, t)
+    n2 = mac(ti, ti, mul(tr, tr))
+    rn = F32(rsqrt_fine(n2))
+    return mul(mul(n2, rn), _pow2_unscale(m))
+
+
+def _csqrt(zr, zi):
+    """Overflow-safe LUT-free principal complex sqrt."""
+    m = F32(max(abs(float(zr)), abs(float(zi))))
+    if m == 0:
+        return F32(0), F32(0)
+    e = (int(_u32(m)) >> 23) & 0xFF
+    unb = (e - 127) & ~1
+    sc = _f32((127 - unb) << 23)
+    un_sqrt = _f32((127 + (unb >> 1)) << 23)
+    u, v = mul(zr, sc), mul(zi, sc)
+    n2 = mac(v, v, mul(u, u))
+    r = mul(n2, F32(rsqrt_fine(n2)))
+    if u >= 0:
+        s2 = mul(add(r, u), F32(0.5))
+        wr = mul(s2, F32(rsqrt_fine(s2)))
+        wi = mul(v, recip(mul(F32(2), wr), zero_to_inf=False)[0])
+    else:
+        s2 = mul(add(r, sub(F32(0), u)), F32(0.5))
+        wi = mul(s2, F32(rsqrt_fine(s2)))
+        if v < 0:
+            wi = sub(F32(0), wi)
+        wr = mul(v, recip(mul(F32(2), wi), zero_to_inf=False)[0])
+    return mul(wr, un_sqrt), mul(wi, un_sqrt)
+
+
+def _clartg(fr, fi, gr, gi):
+    """Complex Givens rotation: [[cs, sn], [-conj(sn), cs]] @ [f; g] = [r; 0] with real cs >= 0."""
+    fm = F32(max(abs(float(fr)), abs(float(fi))))
+    gm = F32(max(abs(float(gr)), abs(float(gi))))
+    if gm == 0:
+        return F32(1), F32(0), F32(0), fr, fi
+    mx = F32(max(float(fm), float(gm)))
+    t = _pow2_scale(mx)
+    un_t = _pow2_unscale(mx)
+    fsr, fsi = mul(fr, t), mul(fi, t)
+    gsr, gsi = mul(gr, t), mul(gi, t)
+    f2 = mac(fsi, fsi, mul(fsr, fsr))
+    g2 = mac(gsi, gsi, mul(gsr, gsr))
+    fg2 = add(f2, g2)
+    inv_fg = F32(rsqrt_fine(fg2))
+    if fm == 0:
+        g_abs = mul(mul(g2, inv_fg), un_t)
+        return F32(0), mul(gsr, inv_fg), mul(sub(F32(0), gsi), inv_fg), g_abs, F32(0)
+    inv_f = F32(rsqrt_fine(f2)) if f2 > 0 else F32(0)
+    f_abs_s = mul(f2, inv_f)
+    cs = mul(f_abs_s, inv_fg)
+    pfr, pfi = mul(fsr, inv_f), mul(fsi, inv_f)
+    snr = mul(mac(pfi, gsi, mul(pfr, gsr)), inv_fg)
+    sni = mul(mac(sub(F32(0), pfr), gsi, mul(pfi, gsr)), inv_fg)
+    r_abs = mul(mul(fg2, inv_fg), un_t)
+    return cs, snr, sni, mul(pfr, r_abs), mul(pfi, r_abs)
+
+
+def ceig_kernel(A, compute_vectors=True):
+    """``(W, V, info)`` of ``ceig_f32_gaudi2.c`` (``ceigvals_f32_gaudi2`` with ``compute_vectors=False``, where
+    ``V`` is ``None``) for one planar ``A[2n, n]`` (rows 0..n-1 real, n..2n-1 imag): ``W[2, n]`` eigenvalues
+    (row 0 real, row 1 imag), ``V[2n, n]`` unit-2-norm eigenvectors as columns (None if ``not compute_vectors``),
+    ``info[1]`` (0 if converged; >0 if QR iteration limit reached). Non-finite input: NaN W and V."""
+    with np.errstate(all="ignore"):
+        A = np.array(A, dtype=F32)
+        n = A.shape[1]
+        ar, ai = _ftz(A[:n].copy()), _ftz(A[n:].copy())
+        if _nonfinite(ar, ai):
+            return (np.full((2, n), np.nan, F32),
+                    np.full((2 * n, n), np.nan, F32) if compute_vectors else None,
+                    np.array([0.0], F32))
+
+        max_abs = F32(max(float(np.max(np.abs(ar))), float(np.max(np.abs(ai))))) if n > 0 else F32(0)
+        if max_abs == 0:
+            V0 = np.vstack([np.eye(n, dtype=F32), np.zeros((n, n), F32)]) if compute_vectors else None
+            return np.zeros((2, n), F32), V0, np.array([0.0], F32)
+
+        if n == 1:
+            W1 = np.array([[ar[0, 0]], [ai[0, 0]]], F32)
+            V1 = np.array([[1.0], [0.0]], F32) if compute_vectors else None
+            return W1, V1, np.array([0.0], F32)
+
+        # Entry prescaling by exact power of 2 so max(|ar|, |ai|) in [1, 2)
+        sc_entry = _pow2_scale(max_abs)
+        unsc_entry = _pow2_unscale(max_abs)
+        ar, ai = mul(ar, sc_entry), mul(ai, sc_entry)
+
+        # Stage 1: Parlett-Reinsch radix-2 diagonal balancing (16 sweeps, branchless binary-power steps)
+        d_scale = np.ones(n, dtype=F32)
+        SFMIN2 = F32(2.0 ** -101)
+        SFMAX2 = F32(2.0 ** 101)
+        P2S = [F32(2.0 ** p) for p in (64, 32, 16, 8, 4, 2, 1, 1)]
+        IP2S = [F32(2.0 ** -p) for p in (64, 32, 16, 8, 4, 2, 1, 1)]
+        for _ in range(16):
+            converged = True
+            for i in range(n):
+                row_a = np.zeros(32, dtype=F32)
+                col_a = np.zeros(32, dtype=F32)
+                for j in range(n):
+                    if j != i:
+                        row_a[j] = _cabs1(ar[i, j], ai[i, j])
+                        col_a[j] = _cabs1(ar[j, i], ai[j, i])
+                r = _red_add(row_a)
+                ra = F32(np.max(row_a))
+                c = _red_add(col_a)
+                ca = F32(np.max(col_a))
+                if c == 0 or r == 0:
+                    continue
+                g = mul(r, F32(0.5))
+                f, inv_f = F32(1), F32(1)
+                s0 = add(c, r)
+                for st in range(8):
+                    p, ip = P2S[st], IP2S[st]
+                    c_test = mul(c, p) if st < 7 else c
+                    g_test = mul(g, ip) if st < 7 else g
+                    f_n, inv_n = mul(f, p), mul(inv_f, ip)
+                    c_n, ca_n = mul(c, p), mul(ca, p)
+                    r_n, g_n, ra_n = mul(r, ip), mul(g, ip), mul(ra, ip)
+                    ok = (c_test < g_test and max(f, c, ca) < SFMAX2 and min(r, g, ra) > SFMIN2)
+                    if st < 7:
+                        ok = ok and max(f_n, c_n, ca_n) < SFMAX2 and min(r_n, g_n, ra_n) > SFMIN2
+                    if ok:
+                        f, inv_f = f_n, inv_n
+                        c, ca = c_n, ca_n
+                        r, g, ra = r_n, g_n, ra_n
+                g = mul(c, F32(0.5))
+                for st in range(8):
+                    p, ip = P2S[st], IP2S[st]
+                    g_test = mul(g, ip) if st < 7 else g
+                    r_test = mul(r, p) if st < 7 else r
+                    f_n, inv_n = mul(f, ip), mul(inv_f, p)
+                    r_n, ra_n = mul(r, p), mul(ra, p)
+                    c_n, g_n, ca_n = mul(c, ip), mul(g, ip), mul(ca, ip)
+                    ok = (g_test >= r_test and max(f, r, ra) < SFMAX2 and min(inv_f, c, g, ca) > SFMIN2)
+                    if st < 7:
+                        ok = ok and max(f_n, r_n, ra_n) < SFMAX2 and min(inv_n, c_n, g_n, ca_n) > SFMIN2
+                    if ok:
+                        f, inv_f = f_n, inv_n
+                        r, ra = r_n, ra_n
+                        c, g, ca = c_n, g_n, ca_n
+                if add(c, r) < mul(F32(0.95), s0):
+                    converged = False
+                    d_scale[i] = mul(d_scale[i], f)
+                    ar[i, :], ai[i, :] = mul(ar[i, :], inv_f), mul(ai[i, :], inv_f)
+                    ar[:, i], ai[:, i] = mul(ar[:, i], f), mul(ai[:, i], f)
+            if converged:
+                break
+
+        # Stage 2: Householder Hessenberg reduction H <- Q^H H Q (Q stored column-major)
+        if compute_vectors:
+            qr = np.eye(n, dtype=F32)
+            qi = np.zeros((n, n), dtype=F32)
+
+        for k in range(n - 2):
+            mx = F32(0)
+            for i in range(k + 1, n):
+                mx = max(mx, abs(ar[i, k]), abs(ai[i, k]))
+            if mx == 0:
+                continue
+            if not any(ar[i, k] != 0 or ai[i, k] != 0 for i in range(k + 2, n)):
+                continue
+            t = _pow2_scale(mx)
+            un_t = _pow2_unscale(mx)
+            sxr = np.zeros(32, dtype=F32)
+            sxi = np.zeros(32, dtype=F32)
+            sxr[k + 1:n] = mul(ar[k + 1:n, k], t)
+            sxi[k + 1:n] = mul(ai[k + 1:n, k], t)
+            sq = _red_add(mac(sxi, sxi, mul(sxr, sxr)))
+            xnorm = mul(mul(sq, F32(rsqrt_fine(sq))), un_t)
+            if xnorm == 0:
+                continue
+            alr, ali = ar[k + 1, k], ai[k + 1, k]
+            beta = sub(F32(0), xnorm) if alr >= 0 else xnorm
+            inv_beta = recip(beta, zero_to_inf=False)[0]
+            taur = sub(F32(1), mul(alr, inv_beta))
+            taui = sub(F32(0), mul(ali, inv_beta))
+            dr, di = sub(alr, beta), ali
+            vr = np.zeros(n, dtype=F32)
+            vi = np.zeros(n, dtype=F32)
+            vr[k + 1] = F32(1)
+            for i in range(k + 2, n):
+                vr[i], vi[i] = _cdiv(ar[i, k], ai[i, k], dr, di)
+            drr, dri = np.zeros(n, dtype=F32), np.zeros(n, dtype=F32)
+            for i in range(k + 1, n):
+                cvr, cvi = vr[i], sub(F32(0), vi[i])
+                drr[k + 1:] = add(drr[k + 1:], mac(sub(F32(0), cvi), ai[i, k + 1:], mul(cvr, ar[i, k + 1:])))
+                dri[k + 1:] = add(dri[k + 1:], mac(cvi, ar[i, k + 1:], mul(cvr, ai[i, k + 1:])))
+            ctaur, ctaui = taur, sub(F32(0), taui)
+            for i in range(k + 1, n):
+                mr, mi = _cmul(ctaur, ctaui, vr[i], vi[i])
+                ar[i, k + 1:] = mac(mi, dri[k + 1:], mac(sub(F32(0), mr), drr[k + 1:], ar[i, k + 1:]))
+                ai[i, k + 1:] = mac(sub(F32(0), mi), drr[k + 1:], mac(sub(F32(0), mr), dri[k + 1:], ai[i, k + 1:]))
+            ar[k + 1, k], ai[k + 1, k] = beta, F32(0)
+            ar[k + 2:, k], ai[k + 2:, k] = F32(0), F32(0)
+            vr_32 = np.pad(vr, (0, 32 - n))
+            vi_32 = np.pad(vi, (0, 32 - n))
+            for i in range(n):
+                ar_i = np.pad(ar[i], (0, 32 - n))
+                ai_i = np.pad(ai[i], (0, 32 - n))
+                sr = _red_add(mac(sub(F32(0), ai_i), vi_32, mul(ar_i, vr_32)))
+                si = _red_add(mac(ar_i, vi_32, mul(ai_i, vr_32)))
+                tsr, tsi = _cmul(taur, taui, sr, si)
+                ar[i, k + 1:] = mac(sub(F32(0), tsi), vi[k + 1:], mac(sub(F32(0), tsr), vr[k + 1:], ar[i, k + 1:]))
+                ai[i, k + 1:] = mac(tsr, vi[k + 1:], mac(sub(F32(0), tsi), vr[k + 1:], ai[i, k + 1:]))
+            if compute_vectors:
+                sr_v, si_v = np.zeros(n, dtype=F32), np.zeros(n, dtype=F32)
+                for j in range(k + 1, n):
+                    sr_v = mac(sub(F32(0), vi[j]), qi[j], mac(vr[j], qr[j], sr_v))
+                    si_v = mac(vi[j], qr[j], mac(vr[j], qi[j], si_v))
+                tsr_v = mac(sub(F32(0), taui), si_v, mul(taur, sr_v))
+                tsi_v = mac(taui, sr_v, mul(taur, si_v))
+                for j in range(k + 1, n):
+                    cvr, cvi = vr[j], sub(F32(0), vi[j])
+                    qr[j] = mac(tsi_v, cvi, mac(sub(F32(0), tsr_v), cvr, qr[j]))
+                    qi[j] = mac(sub(F32(0), tsi_v), cvr, mac(sub(F32(0), tsr_v), cvi, qi[j]))
+
+        # Stage 3: Explicit complex single-shift QR iteration (matches ceig_f32_gaudi2.c vector-predicated loop)
+        m = n - 1
+        prev_m = m
+        max_itn = 30 * max(10, n) if n > 1 else 0
+        exc_cnt = 0
+        sml = max(_EIG_SMLNUM, mul(F32(n), _EIG_SMLNUM))
+        for _step in range(max_itn):
+            defl = [False] * n
+            new_m = 0
+            for i in range(1, m + 1):
+                s_diag = add(_cabs1(ar[i - 1, i - 1], ai[i - 1, i - 1]), _cabs1(ar[i, i], ai[i, i]))
+                if _cabs1(ar[i, i - 1], ai[i, i - 1]) <= max(sml, mul(_EIG_EPS32, s_diag)):
+                    ar[i, i - 1] = F32(0)
+                    ai[i, i - 1] = F32(0)
+                    defl[i] = True
+                else:
+                    new_m = i
+            m = new_m
+            if m < 1:
+                break
+            if m != prev_m:
+                exc_cnt = 0
+                prev_m = m
+            exc_cnt += 1
+            lo = 0
+            for i in range(1, m):
+                if defl[i]:
+                    lo = i
+            if exc_cnt == 10:
+                exc_cnt = 0
+                s = _cabs1(ar[m, m - 1], ai[m, m - 1])
+                if m - 1 > lo:
+                    s = add(s, _cabs1(ar[m - 1, m - 2], ai[m - 1, m - 2]))
+                sigr = mac(F32(0.75), s, ar[m, m])
+                sigi = mac(F32(-0.4375), s, ai[m, m])
+            else:
+                tr, ti = ar[m, m], ai[m, m]
+                ur, ui = sub(ar[m - 1, m - 1], tr), sub(ai[m - 1, m - 1], ti)
+                br, bi = ar[m - 1, m], ai[m - 1, m]
+                cr, ci = ar[m, m - 1], ai[m, m - 1]
+                sm = max(abs(float(ur)), abs(float(ui)), abs(float(br)),
+                         abs(float(bi)), abs(float(cr)), abs(float(ci)))
+                if sm == 0.0:
+                    sigr, sigi = tr, ti
+                else:
+                    sm = F32(sm)
+                    sc, unsc = _pow2_scale(sm), _pow2_unscale(sm)
+                    xr, xi = mul(mul(ur, sc), F32(0.5)), mul(mul(ui, sc), F32(0.5))
+                    bsr, bsi = mul(br, sc), mul(bi, sc)
+                    csr, csi = mul(cr, sc), mul(ci, sc)
+                    vr_, vi_ = _cmul(bsr, bsi, csr, csi)
+                    x2r, x2i = _cmul(xr, xi, xr, xi)
+                    sr, si = _csqrt(add(x2r, vr_), add(x2i, vi_))
+                    if add(mul(xr, sr), mul(xi, si)) < 0:
+                        sr, si = sub(F32(0), sr), sub(F32(0), si)
+                    denr, deni = add(xr, sr), add(xi, si)
+                    if denr == 0 and deni == 0:
+                        sigr, sigi = tr, ti
+                    else:
+                        dr, di = _cdiv(vr_, vi_, denr, deni)
+                        sigr, sigi = sub(tr, mul(dr, unsc)), sub(ti, mul(di, unsc))
+
+            for k in range(lo, m):
+                if k == lo:
+                    fr, fi = sub(ar[lo, lo], sigr), sub(ai[lo, lo], sigi)
+                    gr, gi = ar[lo + 1, lo], ai[lo + 1, lo]
+                else:
+                    fr, fi = ar[k, k - 1], ai[k, k - 1]
+                    gr, gi = ar[k + 1, k - 1], ai[k + 1, k - 1]
+                cs, snr, sni, rr, ri = _clartg(fr, fi, gr, gi)
+                if k > lo:
+                    ar[k, k - 1], ai[k, k - 1] = rr, ri
+                    ar[k + 1, k - 1], ai[k + 1, k - 1] = F32(0), F32(0)
+                c_start, c_end = k, (n if compute_vectors else (m + 1))
+                r0r, r0i = ar[k, c_start:c_end].copy(), ai[k, c_start:c_end].copy()
+                r1r, r1i = ar[k + 1, c_start:c_end].copy(), ai[k + 1, c_start:c_end].copy()
+                ar[k, c_start:c_end] = mac(sub(F32(0), sni), r1i, mac(snr, r1r, mul(cs, r0r)))
+                ai[k, c_start:c_end] = mac(sni, r1r, mac(snr, r1i, mul(cs, r0i)))
+                nsnr, nsni = sub(F32(0), snr), sni
+                ar[k + 1, c_start:c_end] = mac(sub(F32(0), nsni), r0i, mac(nsnr, r0r, mul(cs, r1r)))
+                ai[k + 1, c_start:c_end] = mac(nsni, r0r, mac(nsnr, r0i, mul(cs, r1i)))
+                r_start, r_end = (0 if compute_vectors else lo), min(k + 3, m + 1)
+                csnr, csni = snr, sub(F32(0), sni)
+                nsr, nsi = sub(F32(0), snr), sub(F32(0), sni)
+                for i in range(r_start, r_end):
+                    ckr, cki = ar[i, k], ai[i, k]
+                    ck1r, ck1i = ar[i, k + 1], ai[i, k + 1]
+                    ar[i, k] = mac(sub(F32(0), csni), ck1i, mac(csnr, ck1r, mul(cs, ckr)))
+                    ai[i, k] = mac(csni, ck1r, mac(csnr, ck1i, mul(cs, cki)))
+                    ar[i, k + 1] = mac(sub(F32(0), nsi), cki, mac(nsr, ckr, mul(cs, ck1r)))
+                    ai[i, k + 1] = mac(nsi, ckr, mac(nsr, cki, mul(cs, ck1i)))
+                if compute_vectors:
+                    qk0r, qk0i = qr[k].copy(), qi[k].copy()
+                    qk1r, qk1i = qr[k + 1].copy(), qi[k + 1].copy()
+                    qr[k] = mac(sub(F32(0), csni), qk1i, mac(csnr, qk1r, mul(cs, qk0r)))
+                    qi[k] = mac(csni, qk1r, mac(csnr, qk1i, mul(cs, qk0i)))
+                    qr[k + 1] = mac(sub(F32(0), nsi), qk0i, mac(nsr, qk0r, mul(cs, qk1r)))
+                    qi[k + 1] = mac(nsi, qk0r, mac(nsr, qk0i, mul(cs, qk1i)))
+
+        final_m = 0
+        for i in range(1, m + 1):
+            s_diag = add(_cabs1(ar[i - 1, i - 1], ai[i - 1, i - 1]), _cabs1(ar[i, i], ai[i, i]))
+            if _cabs1(ar[i, i - 1], ai[i, i - 1]) <= max(sml, mul(_EIG_EPS32, s_diag)):
+                ar[i, i - 1] = F32(0)
+                ai[i, i - 1] = F32(0)
+            else:
+                final_m = i
+        info = (final_m + 1) if final_m >= 1 else 0
+
+        w_out = np.stack([mul(np.diag(ar), unsc_entry), mul(np.diag(ai), unsc_entry)]).astype(F32)
+        if not compute_vectors:
+            return w_out, None, np.array([float(info)], F32)
+
+        # Stage 4: Back-substitution on upper triangular T, Q @ Y, unbalance, unit 2-norm
+        norm_T = F32(0)
+        for i in range(n):
+            for j in range(i, n):
+                norm_T = max(norm_T, _cabs1(ar[i, j], ai[i, j]))
+        Vr_out = np.zeros((n, n), dtype=F32)
+        Vi_out = np.zeros((n, n), dtype=F32)
+        for k in range(n):
+            lam_r, lam_i = ar[k, k], ai[k, k]
+            smin = max(sml, mul(_EIG_EPS32, max(_cabs1(lam_r, lam_i), norm_T)))
+            yr, yi = np.zeros(n, dtype=F32), np.zeros(n, dtype=F32)
+            yr[k] = F32(1)
+            for i in range(k - 1, -1, -1):
+                tr_32 = np.zeros(32, dtype=F32)
+                ti_32 = np.zeros(32, dtype=F32)
+                yr_32 = np.zeros(32, dtype=F32)
+                yi_32 = np.zeros(32, dtype=F32)
+                tr_32[i + 1:k + 1] = ar[i, i + 1:k + 1]
+                ti_32[i + 1:k + 1] = ai[i, i + 1:k + 1]
+                yr_32[:k + 1] = yr[:k + 1]
+                yi_32[:k + 1] = yi[:k + 1]
+                sr = _red_add(mac(sub(F32(0), ti_32), yi_32, mul(tr_32, yr_32)))
+                si = _red_add(mac(ti_32, yr_32, mul(tr_32, yi_32)))
+                rhsr, rhsi = sub(F32(0), sr), sub(F32(0), si)
+                dr, di = sub(ar[i, i], lam_r), sub(ai[i, i], lam_i)
+                if _cabs1(dr, di) < smin:
+                    dr, di = smin, F32(0)
+                rm = max(abs(float(rhsr)), abs(float(rhsi)))
+                dm = max(abs(float(dr)), abs(float(di)))
+                if rm > (2.0 ** 28) * dm:
+                    sc = _pow2_scale(F32(rm))
+                    yr[i + 1:k + 1], yi[i + 1:k + 1] = mul(yr[i + 1:k + 1], sc), mul(yi[i + 1:k + 1], sc)
+                    rhsr, rhsi = mul(rhsr, sc), mul(rhsi, sc)
+                yr[i], yi[i] = _cdiv(rhsr, rhsi, dr, di)
+                ym = max(float(np.max(np.abs(yr[:k + 1]))), float(np.max(np.abs(yi[:k + 1]))))
+                if ym > 2.0 ** 28:
+                    sc = _pow2_scale(F32(ym))
+                    yr[:k + 1], yi[:k + 1] = mul(yr[:k + 1], sc), mul(yi[:k + 1], sc)
+            ym = max(float(np.max(np.abs(yr[:k + 1]))), float(np.max(np.abs(yi[:k + 1]))))
+            if ym > 0:
+                sc = _pow2_scale(F32(ym))
+                yr[:k + 1], yi[:k + 1] = mul(yr[:k + 1], sc), mul(yi[:k + 1], sc)
+            vr, vi = np.zeros(n, dtype=F32), np.zeros(n, dtype=F32)
+            for j in range(k + 1):
+                vr = mac(sub(F32(0), yi[j]), qi[j], mac(yr[j], qr[j], vr))
+                vi = mac(yi[j], qr[j], mac(yr[j], qi[j], vi))
+            vr, vi = mul(vr, d_scale), mul(vi, d_scale)
+            vm = max(float(np.max(np.abs(vr))), float(np.max(np.abs(vi))))
+            if vm > 0:
+                sc = _pow2_scale(F32(vm))
+                vsr = np.pad(mul(vr, sc), (0, 32 - n))
+                vsi = np.pad(mul(vi, sc), (0, 32 - n))
+                sq = _red_add(mac(vsi, vsi, mul(vsr, vsr)))
+                rn = F32(rsqrt_fine(sq))
+                vr, vi = mul(vsr[:n], rn), mul(vsi[:n], rn)
+            Vr_out[:, k], Vi_out[:, k] = vr, vi
+        return w_out, np.vstack([Vr_out, Vi_out]).astype(F32), np.array([float(info)], F32)
+
+
+def ceig_op(with_info=False):
+    """Stand-in for ``torch.ops.linalg_tpc.ceig``: planar A [b, 2n, n] -> (W [b, 2, n], V [b, 2n, n])
+    (or ``(W, V, info)`` when ``with_info=True``)."""
+    if with_info:
+        return _torch_op(lambda a: ceig_kernel(a, compute_vectors=True), 3)
+    return _torch_op(lambda a: ceig_kernel(a, compute_vectors=True)[:2], 2)
+
+
+def ceigvals_op(with_info=False):
+    """Stand-in for ``torch.ops.linalg_tpc.ceigvals``: planar A [b, 2n, n] -> W [b, 2, n]
+    (or ``(W, info)`` when ``with_info=True``)."""
+    if with_info:
+        return _torch_op(lambda a: (lambda r: (r[0], r[2]))(ceig_kernel(a, compute_vectors=False)), 2)
+    return _torch_op(lambda a: (ceig_kernel(a, compute_vectors=False)[0],), 1)

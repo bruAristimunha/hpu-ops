@@ -1,7 +1,7 @@
 """On a Gaudi card: the complex64 TPC kernels of ``hpu_ops.tpc.complex_linalg`` against their float32 replicas
 (``kernel_replica``) bit for bit, their error against complex128 next to torch's complex64 CPU error, CPU fallback
 counts, and the per-call time against torch's CPU complex route (copy to the host, the complex64 op, copy back).
-    PT_HPU_LAZY_MODE=0|1 python3 tests/check_complex_hpu.py [gj|eigh|svd|adv|all] [--time]
+    PT_HPU_LAZY_MODE=0|1 python3 tests/check_complex_hpu.py [gj|eigh|svd|eig|adv|all] [--time]
 One ``RESULT {json}`` per case; the last line is ``SUMMARY ok`` or ``SUMMARY MISMATCH``."""
 import json
 import math
@@ -363,6 +363,253 @@ def run_adv(emit, time_it):
         emit({"op": "adv", "case": "empty_batch", "error": str(e)[:300], "ok": False})
 
 
+def _linear_sum_assignment_np(cost):
+    """Exact O(n^3) Hungarian minimum-sum assignment for ``(n, n)`` cost matrix (no scipy)."""
+    cost = np.asarray(cost, dtype=np.float64)
+    n, m = cost.shape
+    assert n == m
+    if n == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    u = np.zeros(n + 1, dtype=np.float64)
+    v = np.zeros(n + 1, dtype=np.float64)
+    p = np.zeros(n + 1, dtype=np.int64)
+    way = np.zeros(n + 1, dtype=np.int64)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = np.full(n + 1, np.inf, dtype=np.float64)
+        used = np.zeros(n + 1, dtype=bool)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = np.inf
+            j1 = 0
+            for j in range(1, n + 1):
+                if not used[j]:
+                    cur = cost[i0 - 1, j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    col_ind = np.empty(n, dtype=np.int64)
+    for j in range(1, n + 1):
+        col_ind[p[j] - 1] = j - 1
+    return np.arange(n, dtype=np.int64), col_ind
+
+
+def _eig_match_err(w_cand, w_ref):
+    w1 = np.asarray(w_cand, dtype=np.complex128).ravel()
+    w2 = np.asarray(w_ref, dtype=np.complex128).ravel()
+    if w1.size == 0:
+        return 0.0
+    cost = np.abs(w1[:, None] - w2[None, :])
+    r, c = _linear_sum_assignment_np(cost)
+    max_diff = float(cost[r, c].max())
+    denom = float(np.abs(w2).max())
+    return max_diff if denom == 0.0 else max_diff / max(1e-30, denom)
+
+
+def _eig_res(A, w, V):
+    A128 = np.asarray(A, dtype=np.complex128)
+    w128 = np.asarray(w, dtype=np.complex128)
+    V128 = np.asarray(V, dtype=np.complex128)
+    res = float(np.linalg.norm(A128 @ V128 - V128 * w128[None, :], ord="fro"))
+    nrm = float(np.linalg.norm(A128, ord="fro"))
+    return res if nrm == 0.0 else res / nrm
+
+
+def eig_cases():
+    yield "zero_16", torch.zeros(2, 16, 16, dtype=C64), None
+    yield "eye_32", torch.eye(32, dtype=C64)[None], None
+    yield "diag_8", torch.diag(torch.tensor([1, -2, 3j, -4j, 1 + 2j, -1e-3, 1e3, 0], dtype=C64))[None], None
+    U = torch.triu(crandn(2, 12, 12, seed=21))
+    yield "upper_tri_12", U, None
+    yield "lower_tri_12", U.mT.contiguous(), None
+    C8 = torch.zeros(1, 8, 8, dtype=C64)
+    C8[0, 1:, :-1] = torch.eye(7, dtype=C64)
+    C8[0, 0, -1] = 1.0
+    yield "cyclic_8", C8, None
+    C16 = torch.zeros(1, 16, 16, dtype=C64)
+    C16[0, 1:, :-1] = torch.eye(15, dtype=C64)
+    C16[0, :, -1] = -0.2 * crandn(16, seed=22)
+    yield "companion_16", C16, None
+    J4 = torch.diag(torch.full((4,), 2.0 + 1j, dtype=C128))
+    for i in range(3):
+        J4[i, i + 1] = 1.0
+    Q4 = unitary(4, 23)
+    yield "jordan_4_sim", (Q4 @ J4 @ Q4.mH).to(C64)[None], 4
+    yield "near_def_2", torch.tensor([[[1.0, 1.0], [1e-6, 1.0 + 1e-6]]], dtype=C64), 2
+    rep = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0 + 1e-6, 2.0, -3j, 5.0 + 2j], dtype=C128)
+    Q8 = unitary(8, 24)
+    yield "repeated_8", (Q8 @ torch.diag(rep) @ Q8.mH).to(C64)[None], None
+    R6 = torch.zeros(1, 6, 6, dtype=C64)
+    for k, th in enumerate([0.3, 1.1, 2.5]):
+        R6[0, 2 * k:2 * k + 2, 2 * k:2 * k + 2] = torch.tensor(
+            [[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]], dtype=C64)
+    yield "real_rot_6", R6, None
+    D_bad = torch.diag((2.0 ** torch.linspace(-30, 30, 8, dtype=torch.float64))).to(C128)
+    M8 = crandn(8, 8, seed=25).to(C128)
+    yield "bad_scale_8", (D_bad @ M8 @ torch.linalg.inv(D_bad)).to(C64)[None], None
+    yield "tiny_1e-30", crandn(2, 6, 6, seed=26) * 1e-30, None
+    yield "huge_1e30", crandn(2, 6, 6, seed=27) * 1e30, None
+    yield "huge_3e37", crandn(2, 6, 6, seed=28) * 3e37, None
+    for n in (1, 2, 4, 8, 16, 22, 32):
+        yield f"randn_{n}", crandn(3, n, n, seed=100 + n), None
+    NF = crandn(3, 5, 5, seed=29)
+    NF[0, 2, 3] = complex(math.nan, 0.0)
+    NF[2, 1, 4] = complex(0.0, math.inf)
+    yield "nonfinite", NF, None
+
+
+def run_eig(emit, time_it):
+    from hpu_ops.tpc import complex_linalg as cl
+    eps32 = 2.0 ** -23
+    for name, A, jordan_m in eig_cases():
+        n = A.shape[-1]
+        a = planar(A)
+        with warnings.catch_warnings(record=True) as wrec:
+            warnings.simplefilter("always", UserWarning)
+            f0 = fallbacks()
+            raw_eig = cl._call(cl._ceig_op(), a.to("hpu"))
+            raw_ev = cl._call(cl._ceigvals_op(), a.to("hpu"))
+            w, Vp = cl.eig(pairs(A).to("hpu"))
+            wv = cl.eigvals(pairs(A).to("hpu"))
+            W_raw = raw_eig[0].cpu()
+            V_raw = raw_eig[1].cpu()
+            Wv_raw = (raw_ev[0] if isinstance(raw_ev, (tuple, list)) else raw_ev).cpu()
+            w, Vp, wv = w.cpu(), Vp.cpu(), wv.cpu()
+            fb = fallbacks() - f0
+        cpu_warns = sum(1 for m in wrec if "runs on the CPU" in str(m.message))
+
+        rep = [kr.ceig_kernel(x, compute_vectors=True) for x in a.numpy()]
+        repv = [kr.ceig_kernel(x, compute_vectors=False) for x in a.numpy()]
+        rW = torch.from_numpy(np.stack([r[0] for r in rep]))
+        rV = torch.from_numpy(np.stack([r[1] for r in rep]))
+        rWv = torch.from_numpy(np.stack([r[0] for r in repv]))
+        ndiff = int(sum((x.nan_to_num() != y.nan_to_num()).sum()
+                        for x, y in ((W_raw, rW), (V_raw, rV), (Wv_raw, rWv))))
+        ev_parity = bool(torch.equal(w.nan_to_num(), wv.nan_to_num())
+                         and torch.equal(w.isnan(), wv.isnan()))
+        row = {"op": "ceig", "case": name, "n": n, "bit_equal": ndiff == 0, "n_diff": ndiff,
+               "eigvals_parity": ev_parity, "fallbacks": fb, "cpu_route_warns": cpu_warns,
+               "ok": ndiff == 0 and ev_parity and fb == 0 and cpu_warns == 0}
+
+        if torch.isfinite(A).all():
+            w_c = cplx(w).numpy()
+            V_c = cplx(Vp).numpy()
+            w32_t, _ = torch.linalg.eig(A)
+            w128_t = torch.linalg.eigvals(A.to(C128))
+            max_res, max_vnorm_err, max_ew, max_ew32 = 0.0, 0.0, 0.0, 0.0
+            for b in range(A.shape[0]):
+                a_np = A[b].numpy()
+                max_res = max(max_res, _eig_res(a_np, w_c[b], V_c[b]))
+                v_norms = np.linalg.norm(V_c[b], axis=0)
+                max_vnorm_err = max(max_vnorm_err, float(np.max(np.abs(v_norms - 1.0))))
+                w128_np = w128_t[b].numpy()
+                max_ew = max(max_ew, _eig_match_err(w_c[b], w128_np))
+                max_ew32 = max(max_ew32, _eig_match_err(w32_t[b].numpy(), w128_np))
+            if jordan_m:
+                ew_tol = 2.0 * (eps32 ** (1.0 / jordan_m))
+            elif name.startswith("lower_tri"):
+                ew_tol = max(1e-5, 50.0 * n * eps32, 20.0 * max_ew32)
+            else:
+                ew_tol = max(1e-5, 20.0 * max_ew32)
+            row.update(res=max_res, vnorm_err=max_vnorm_err, err_w=max_ew, err_w_cpu32=max_ew32, ew_tol=ew_tol)
+            row["ok"] = row["ok"] and (max_res < 50 * n * eps32) and (max_vnorm_err < 1e-5) and (max_ew <= ew_tol)
+        else:
+            nan_ok = bool(w[0].isnan().all() and Vp[0].isnan().all() and wv[0].isnan().all()
+                          and w[2].isnan().all() and Vp[2].isnan().all() and wv[2].isnan().all()
+                          and w[1].isfinite().all() and Vp[1].isfinite().all() and wv[1].isfinite().all())
+            res1 = _eig_res(A[1].numpy(), cplx(w[1]).numpy(), cplx(Vp[1]).numpy())
+            vnorm1 = float(np.max(np.abs(np.linalg.norm(cplx(Vp[1]).numpy(), axis=0) - 1.0)))
+            row.update(nan_ok=nan_ok, clean_res=res1, clean_vnorm_err=vnorm1)
+            row["ok"] = row["ok"] and nan_ok and (res1 < 50 * n * eps32) and (vnorm1 < 1e-5)
+        emit(row)
+
+    # Layouts, non-contiguous views, unbatched, multi-dim & empty batch, lazy repeat
+    A4 = crandn(4, 6, 6, seed=60)
+    P4 = pairs(A4).to("hpu")
+    with warnings.catch_warnings(record=True) as wrec:
+        warnings.simplefilter("always", UserWarning)
+        f0 = fallbacks()
+        w_p, V_p = cl.eig(P4)
+        w_i, V_i = cl.eig(P4.reshape(4, 6, 12), layout="interleaved")
+        wv_i = cl.eigvals(P4.reshape(4, 6, 12), layout="interleaved")
+        view_checks = {
+            "interleaved": (
+                torch.equal(w_i.cpu(), w_p.cpu().reshape(4, 12))
+                and torch.equal(V_i.cpu(), V_p.cpu().reshape(4, 6, 12))
+                and torch.equal(wv_i.cpu(), w_i.cpu())
+            ),
+            "strided_batch": (lambda a, b: torch.equal(a[0].cpu(), b[0].cpu()) and torch.equal(a[1].cpu(), b[1].cpu()))(
+                cl.eig(P4[::2]), cl.eig(P4[::2].contiguous())),
+            "mT_view": (lambda a, b: torch.equal(a[0].cpu(), b[0].cpu()) and torch.equal(a[1].cpu(), b[1].cpu()))(
+                cl.eig(P4.transpose(1, 2)), cl.eig(pairs(A4.mT).to("hpu"))),
+            "conj_view": (lambda a, b: torch.equal(a[0].cpu(), b[0].cpu()) and torch.equal(a[1].cpu(), b[1].cpu()))(
+                cl.eig(torch.stack([P4[..., 0], -P4[..., 1]], dim=-1)),
+                cl.eig(pairs(A4.conj().resolve_conj()).to("hpu"))),
+            "unbatched": (lambda u, r: torch.equal(u[0].cpu(), r[0][1].cpu()) and torch.equal(u[1].cpu(), r[1][1].cpu()))(
+                cl.eig(P4[1]), (w_p, V_p)),
+            "eig_twice": (lambda a, b: torch.equal(a[0].cpu(), b[0].cpu()) and torch.equal(a[1].cpu(), b[1].cpu()))(
+                (w_p, V_p), (cl.eig(P4), cl.eig(P4))[1]),
+            "empty_batch": (
+                tuple(cl.eig(P4[:0])[0].shape) == (0, 6, 2)
+                and tuple(cl.eig(P4[:0])[1].shape) == (0, 6, 6, 2)
+                and tuple(cl.eigvals(P4[:0]).shape) == (0, 6, 2)
+            ),
+            "multidim_batch": (lambda m: tuple(m[0].shape) == (2, 2, 6, 2) and tuple(m[1].shape) == (2, 2, 6, 6, 2))(
+                cl.eig(P4.reshape(2, 2, 6, 6, 2))),
+        }
+        fb_adv = fallbacks() - f0
+    cpu_warns_adv = sum(1 for m in wrec if "runs on the CPU" in str(m.message))
+    for cname, cok in view_checks.items():
+        emit({"op": "ceig_adv", "case": cname, "fallbacks": fb_adv, "cpu_route_warns": cpu_warns_adv,
+              "ok": bool(cok) and fb_adv == 0 and cpu_warns_adv == 0})
+
+    if not time_it:
+        return
+    for n in (16, 22, 32):
+        Ah = pairs(crandn(32, n, n, seed=30 + n)).to("hpu")
+
+        def cpu_route_eig():
+            w_, V_ = torch.linalg.eig(torch.view_as_complex(Ah.cpu()))
+            return torch.view_as_real(w_).to("hpu"), torch.view_as_real(V_).to("hpu")
+
+        def cpu_route_eigvals():
+            return torch.view_as_real(torch.linalg.eigvals(torch.view_as_complex(Ah.cpu()))).to("hpu")
+
+        with warnings.catch_warnings(record=True) as wrec:
+            warnings.simplefilter("always", UserWarning)
+            f0 = fallbacks()
+            eig_ms = timed(lambda: cl.eig(Ah))
+            eigvals_ms = timed(lambda: cl.eigvals(Ah))
+            fb_t = fallbacks() - f0
+        cw_t = sum(1 for m in wrec if "runs on the CPU" in str(m.message))
+        row = {"op": "timing_eig", "n": n, "batch": 32,
+               "eig_ms": eig_ms, "eig_cpu_ms": timed(cpu_route_eig),
+               "eigvals_ms": eigvals_ms, "eigvals_cpu_ms": timed(cpu_route_eigvals),
+               "fallbacks_in_kernel_calls": fb_t, "cpu_route_warns": cw_t,
+               "ok": fb_t == 0 and cw_t == 0}
+        emit(row)
+
+
 def main():
     from hpu_ops import tpc
     tpc.install_kernel_path()
@@ -384,6 +631,8 @@ def main():
         run_eigh(emit, time_it)
     if which in ("svd", "all"):
         run_svd(emit, time_it)
+    if which in ("eig", "all"):
+        run_eig(emit, time_it)
     if which in ("adv", "all"):
         run_adv(emit, time_it)
     print("SUMMARY " + ("ok" if ok else "MISMATCH"), flush=True)
