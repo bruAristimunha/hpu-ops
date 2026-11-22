@@ -12,6 +12,8 @@ Root cause in ``habana_frameworks/torch/dynamo/compile_backend/``:
   partition after eager ``_linalg_eigh``, preserving its ``output_strides``-less metadata.
 - ``recipe_compiler.py:133`` (``get_input_symbolic``, under ``dynamic=True``) indexes
   ``input_node.meta["output_strides"]`` unconditionally and raises ``KeyError: 'output_strides'``.
+
+``PT_HPU_FORCE_STATIC_COMPILE=1`` (static recipes, so no ``get_input_symbolic``) avoids it: ``OK shape=(4, 4, 6)``.
 """
 import habana_frameworks.torch.core  # noqa: F401
 import habana_frameworks.torch.hpu as hthpu

@@ -24,9 +24,9 @@ at the tensor's pickling:
   FNIRSCNN1D, SAMBA, SignalJEPA_PostLocal now compile). Static shapes and eager keep Gaudi's kernel.
 - Symbolic ``expand`` and ``int64`` ``constant_pad_nd`` under compile (``dynshape``, #42): resolving ``-1`` dims in
   symbolic ``aten.expand.default`` fixes Habana's ``BroadcastOperator`` crash, and rewriting ``int64``
-  ``aten.constant_pad_nd.default`` avoids ``hpu.constant_pad_nd_ds`` ``synStatus 26`` (``NeuroRVQ``,
-  ``NeuroRVQTokenizer``, ``DIVER1``, and ``LaBraM`` now compile and run across ``16 <-> 128``). Static ``expand``,
-  non-``int64`` dtypes, and eager calls keep Gaudi's path.
+  ``aten.constant_pad_nd.default`` avoids ``hpu.constant_pad_nd_ds`` ``synStatus 26`` (inference of ``NeuroRVQ``,
+  ``NeuroRVQTokenizer``, ``DIVER1`` and ``LaBraM`` now compiles at ``16 <-> 128``; Habana's own dynamic-shape bugs
+  remain, see the README). Static ``expand``, non-``int64`` dtypes, and eager calls keep Gaudi's path.
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's
