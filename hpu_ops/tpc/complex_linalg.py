@@ -80,6 +80,24 @@ def _ceigvals_op():
     return torch.ops.linalg_tpc.ceigvals
 
 
+def _cqr_op():
+    """``torch.ops.linalg_tpc.cqr``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.cqr
+
+
+def _cqr_complete_op():
+    """``torch.ops.linalg_tpc.cqr_complete``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.cqr_complete
+
+
+def _cqr_r_op():
+    """``torch.ops.linalg_tpc.cqr_r``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.cqr_r
+
+
 # ---- layouts -------------------------------------------------------------------------------------------------------
 
 
@@ -119,6 +137,19 @@ def _planar(P, batch):
 def _unplanar(X, batch, r, c):
     """Planar ``(b, 2r, c)`` -> pairs ``(*batch, r, c, 2)`` (one transpose)."""
     return X.reshape(-1, 2, r, c).permute(0, 2, 3, 1).contiguous().reshape(*batch, r, c, 2)
+
+
+def _planar_t(P, batch):
+    """Pairs ``(*batch, r, c, 2)`` -> column-contiguous planar ``(b, 2c, r)`` (TPC ``[r, 2c, b]``):
+    planes 0..c-1 the real columns, c..2c-1 the imaginary columns."""
+    r, c = P.shape[-3], P.shape[-2]
+    P = P.expand(*batch, r, c, 2).reshape(-1, r, c, 2)
+    return _fresh(P.permute(0, 3, 2, 1).reshape(-1, 2 * c, r).contiguous())
+
+
+def _unplanar_t(X, batch, r, c):
+    """Column-contiguous planar ``(b, 2c, r)`` -> pairs ``(*batch, r, c, 2)``."""
+    return X.reshape(-1, 2, c, r).permute(0, 3, 2, 1).contiguous().reshape(*batch, r, c, 2)
 
 
 def _empty(batch):
@@ -385,3 +416,44 @@ def eigvals(A, layout="pairs"):
     W_raw, _ = _call(_ceigvals_op(), _planar(PA, batch))
     W = W_raw.transpose(-1, -2).contiguous().reshape(*batch, n, 2)
     return from_pairs(W, layout)
+
+
+# ---- Householder QR ------------------------------------------------------------------------------------------------
+
+
+def qr(A, mode="reduced", layout="pairs"):
+    """``torch.linalg.qr`` for complex64 ``A (..., m, n)`` with ``1 <= n <= m <= COMPLEX_MAXN``:
+    returns ``(Q, R)`` as float32 pairs in ``layout``. ``mode`` is ``"reduced"``, ``"complete"``, or ``"r"``
+    (for ``"r"``, ``Q`` is an empty 1D float32 tensor of shape ``(0,)``)."""
+    if not isinstance(mode, str) or mode not in ("reduced", "complete", "r"):
+        raise RuntimeError(
+            f"qr received unrecognized mode {mode!r} but expected one of 'reduced' (default), 'r', or 'complete'"
+        )
+    PA = as_pairs(A, layout)
+    if PA.dim() < 3:
+        raise ValueError(f"hpu_ops.tpc.complex_linalg.qr takes (..., m, n) matrices, got pairs {tuple(PA.shape)}")
+    m, n = PA.shape[-3], PA.shape[-2]
+    if n < 1 or m > COMPLEX_MAXN or m < n:
+        raise ValueError(
+            f"hpu_ops.tpc.complex_linalg.qr takes 1 <= n <= m <= {COMPLEX_MAXN}, got pairs {tuple(PA.shape)}"
+        )
+    batch = PA.shape[:-3]
+    if _empty(batch):
+        if mode == "r":
+            return PA.new_zeros(0), from_pairs(PA.new_zeros(*batch, n, n, 2), layout)
+        k_q = m if mode == "complete" else n
+        return (
+            from_pairs(PA.new_zeros(*batch, m, k_q, 2), layout),
+            from_pairs(PA.new_zeros(*batch, k_q, n, 2), layout),
+        )
+    a_t = _planar_t(PA, batch)
+    if mode == "r":
+        R_t = _call(_cqr_r_op(), a_t)
+        return PA.new_zeros(0), from_pairs(_unplanar_t(R_t, batch, n, n), layout)
+    op = _cqr_complete_op() if mode == "complete" else _cqr_op()
+    Q_t, R_t = _call(op, a_t)
+    k_q = m if mode == "complete" else n
+    return (
+        from_pairs(_unplanar_t(Q_t, batch, m, k_q), layout),
+        from_pairs(_unplanar_t(R_t, batch, k_q, n), layout),
+    )

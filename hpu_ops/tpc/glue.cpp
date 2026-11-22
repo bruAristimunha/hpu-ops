@@ -123,6 +123,12 @@ extern const char _binary___ceig_f32_gaudi2_o_start[];
 extern const char _binary___ceig_f32_gaudi2_o_end[];
 extern const char _binary___ceigvals_f32_gaudi2_o_start[];
 extern const char _binary___ceigvals_f32_gaudi2_o_end[];
+extern const char _binary___cqr_f32_gaudi2_o_start[];
+extern const char _binary___cqr_f32_gaudi2_o_end[];
+extern const char _binary___cqr_complete_f32_gaudi2_o_start[];
+extern const char _binary___cqr_complete_f32_gaudi2_o_end[];
+extern const char _binary___cqr_r_f32_gaudi2_o_start[];
+extern const char _binary___cqr_r_f32_gaudi2_o_end[];
 }
 
 namespace {
@@ -156,6 +162,9 @@ const char* kCSvd = "jacobi_csvd_f32_gaudi2";
 const char* kCSvdvals = "jacobi_csvdvals_f32_gaudi2";  // -DNO_UV
 const char* kCEig = "ceig_f32_gaudi2";
 const char* kCEigvals = "ceigvals_f32_gaudi2";  // -DNO_VECTORS
+const char* kCQr = "cqr_f32_gaudi2";
+const char* kCQrComplete = "cqr_complete_f32_gaudi2";  // -DFULL_Q
+const char* kCQrR = "cqr_r_f32_gaudi2";                // -DR_ONLY
 constexpr uint64_t kMaxComplexN = 32;  // MAXN of the complex kernels (n complex columns, 2n planar rows)
 constexpr uint64_t kMaxN = 64;      // MAXN of gj_solve and tri_solve
 constexpr uint64_t kMaxSmallN = 32; // MAXN of jacobi_svd, matrix_exp, lu_factor and lu_solve
@@ -506,6 +515,44 @@ tpc_lib_api::GlueCodeReturn ceig_defs(tpc_lib_api::HabanaKernelParams* in, tpc_l
     full3(out->outputTensorAccessPattern[1], n, 2 * n);
     full2(out->outputTensorAccessPattern[2], 2);
     return copy_elf(out, _binary___ceig_f32_gaudi2_o_start, _binary___ceig_f32_gaudi2_o_end);
+}
+
+// Complex64 Householder QR: A_t [m, 2n, batch] -> mode 0: (Q_t [m, 2n, batch], R_t [n, 2n, batch]),
+// mode 1 (-DFULL_Q): (Q_t [m, 2m, batch], R_t [m, 2n, batch]), mode 2 (-DR_ONLY): R_t [n, 2n, batch].
+tpc_lib_api::GlueCodeReturn cqr_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
+                                     int mode)
+{
+    auto status = check_io(in, 1, mode == 2 ? 1 : 2);
+    if (status != tpc_lib_api::GLUE_SUCCESS)
+    {
+        return status;
+    }
+    const uint64_t m = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t d1 = in->inputTensors[0].geometry.maxSizes[1];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    const uint64_t n = d1 / 2;
+    if (m < 1 || n < 1 || m > kMaxComplexN || n > kMaxComplexN || m < n || batch < 1 || d1 != 2 * n)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+    full3(out->inputTensorAccessPattern[0], m, 2 * n);
+    if (mode == 2)
+    {
+        full3(out->outputTensorAccessPattern[0], n, 2 * n);
+        return copy_elf(out, _binary___cqr_r_f32_gaudi2_o_start, _binary___cqr_r_f32_gaudi2_o_end);
+    }
+    if (mode == 1)
+    {
+        full3(out->outputTensorAccessPattern[0], m, 2 * m);
+        full3(out->outputTensorAccessPattern[1], m, 2 * n);
+        return copy_elf(out, _binary___cqr_complete_f32_gaudi2_o_start, _binary___cqr_complete_f32_gaudi2_o_end);
+    }
+    full3(out->outputTensorAccessPattern[0], m, 2 * n);
+    full3(out->outputTensorAccessPattern[1], n, 2 * n);
+    return copy_elf(out, _binary___cqr_f32_gaudi2_o_start, _binary___cqr_f32_gaudi2_o_end);
 }
 
 tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
@@ -1175,7 +1222,7 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 33 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 36 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
@@ -1211,6 +1258,9 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint3
         strcpy(guids[30].name, kHhQrYtau);
         strcpy(guids[31].name, kCEig);
         strcpy(guids[32].name, kCEigvals);
+        strcpy(guids[33].name, kCQr);
+        strcpy(guids[34].name, kCQrComplete);
+        strcpy(guids[35].name, kCQrR);
     }
     if (kernelCount != nullptr)
     {
@@ -1353,6 +1403,18 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (strcmp(params->guid.name, kCEigvals) == 0)
     {
         return ceig_defs(params, instance, true);
+    }
+    if (strcmp(params->guid.name, kCQr) == 0)
+    {
+        return cqr_defs(params, instance, 0);
+    }
+    if (strcmp(params->guid.name, kCQrComplete) == 0)
+    {
+        return cqr_defs(params, instance, 1);
+    }
+    if (strcmp(params->guid.name, kCQrR) == 0)
+    {
+        return cqr_defs(params, instance, 2);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }

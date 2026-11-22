@@ -463,6 +463,15 @@ def _red_add(v):
     return v[0]
 
 
+def _red_max_32(v):
+    """``reduce_max_half32`` of a 32-lane vector (every lane ends with the same max)."""
+    v = np.asarray(v, F32).copy()
+    idx = np.arange(32)
+    for sh in (16, 8, 4, 2, 1):
+        v = np.maximum(v, v[idx ^ sh]).astype(F32)
+    return v[0]
+
+
 def _rsqrt_newton(x, legacy=False, estimate=None):
     """``rsqrt_newton`` of jacobi_svd_f32_gaudi2.c: the hardware estimate (``hw_rsqrt``, or ``estimate``), then one
     Newton step in residual form, r + (r / 2) (1 - (x r) r) with an FMA; ``legacy``: the plain step r (1.5 - x r^2 / 2)
@@ -2091,3 +2100,178 @@ def ceigvals_op(with_info=False):
     if with_info:
         return _torch_op(_ceigvals_with_info, 2)
     return _torch_op(lambda a: (ceig_kernel(a, compute_vectors=False)[0],), 1)
+
+
+def cqr_kernel(A_t, mode="reduced"):
+    """Exact float32 FTZ replica of ``cqr_f32_gaudi2.c`` for ``A_t [2*n, m]`` (``1 <= n <= m <= 32``).
+
+    ``mode`` is ``"reduced"``, ``"complete"``, or ``"r"``.
+    """
+    A_t = _ftz(np.asarray(A_t, F32))
+    n = A_t.shape[0] // 2
+    m = A_t.shape[1]
+    k_q = m if mode == "complete" else n
+    k_r = m if mode == "complete" else n
+    if _nonfinite(A_t):
+        R_nan = np.full((2 * n, k_r), F32("nan"), F32)
+        if mode == "r":
+            return (R_nan,)
+        return np.full((2 * k_q, m), F32("nan"), F32), R_nan
+
+    lane = np.arange(32)
+    qr = np.zeros((32, 32), F32)
+    qi = np.zeros((32, 32), F32)
+    for j in range(n):
+        qr[j, :m] = A_t[j, :m]
+        qi[j, :m] = A_t[n + j, :m]
+    tau_r = np.zeros(32, F32)
+    tau_i = np.zeros(32, F32)
+
+    for i in range(n):
+        qir = qr[i].copy()
+        qii = qi[i].copy()
+        active_i = (lane >= i) & (lane < m)
+        xr = np.where(active_i, qir, F32(0))
+        xi = np.where(active_i, qii, F32(0))
+        mx = _red_max_32(np.maximum(np.abs(xr), np.abs(xi)))
+        sc = _ceig_pow2_scale(mx)
+        unsc = _ceig_pow2_unscale(mx)
+        xsr = mul(xr, sc)
+        xsi = mul(xi, sc)
+
+        tail_r = np.where(lane > i, xsr, F32(0))
+        tail_i = np.where(lane > i, xsi, F32(0))
+        sigma_rest = _red_add(mac(tail_i, tail_i, mul(tail_r, tail_r)))
+
+        xsr0, xsi0, orig_r = xsr[i], xsi[i], qir[i]
+        no_reflect = (mx == F32(0)) or (sigma_rest == F32(0) and xsi0 == F32(0))
+
+        if no_reflect:
+            tau_r_i = F32(0)
+            tau_i_i = F32(0)
+            r_ii_r = orig_r
+            vr = np.zeros(32, F32)
+            vi = np.zeros(32, F32)
+        else:
+            sq = mac(xsi0, xsi0, mac(xsr0, xsr0, sigma_rest))
+            inv_nrm = F32(_ceig_rsqrt_fine(sq))
+            nrm_xs = mul(sq, inv_nrm)
+            beta = sub(F32(0), nrm_xs) if xsr0 >= F32(0) else nrm_xs
+            inv_beta = recip(beta, zero_to_inf=False)[0]
+            tau_r_i = sub(F32(1), mul(xsr0, inv_beta))
+            tau_i_i = sub(F32(0), mul(xsi0, inv_beta))
+            r_ii_r = mul(beta, unsc)
+
+            u0r = sub(xsr0, beta)
+            u0i = xsi0
+            u0sq = mac(u0i, u0i, mul(u0r, u0r))
+            inv_u0sq = recip(u0sq, zero_to_inf=False)[0]
+            inv_u0_r = mul(u0r, inv_u0sq)
+            inv_u0_i = mul(sub(F32(0), u0i), inv_u0sq)
+
+            vr = mac(sub(F32(0), xsi), inv_u0_i, mul(xsr, inv_u0_r))
+            vi = mac(xsi, inv_u0_r, mul(xsr, inv_u0_i))
+            vr = np.where(lane < i, F32(0), vr)
+            vi = np.where(lane < i, F32(0), vi)
+            vr[i] = F32(1)
+            vi[i] = F32(0)
+
+        if mode == "r":
+            qr[i, i] = r_ii_r
+            qi[i, i] = F32(0)
+        else:
+            qr[i, i + 1:] = vr[i + 1:]
+            qi[i, i + 1:] = vi[i + 1:]
+            qr[i, i] = r_ii_r
+            qi[i, i] = F32(0)
+            tau_r[i] = tau_r_i
+            tau_i[i] = tau_i_i
+
+        if not no_reflect:
+            for j in range(i + 1, n):
+                qjr = qr[j].copy()
+                qji = qi[j].copy()
+                act_r = np.where(active_i, qjr, F32(0))
+                act_i = np.where(active_i, qji, F32(0))
+                mx_j = _red_max_32(np.maximum(np.abs(act_r), np.abs(act_i)))
+                sc_j = _ceig_pow2_scale(mx_j)
+                unsc_j = _ceig_pow2_unscale(mx_j)
+                qjr_sc = mul(act_r, sc_j)
+                qji_sc = mul(act_i, sc_j)
+
+                dr = _red_add(mac(vi, qji_sc, mul(vr, qjr_sc)))
+                di = _red_add(mac(sub(F32(0), vi), qjr_sc, mul(vr, qji_sc)))
+
+                cr_c = mac(tau_i_i, di, mul(tau_r_i, dr))
+                ci_c = mac(sub(F32(0), tau_i_i), dr, mul(tau_r_i, di))
+
+                upd_r = mul(mac(ci_c, vi, mac(sub(F32(0), cr_c), vr, qjr_sc)), unsc_j)
+                upd_i = mul(mac(sub(F32(0), ci_c), vr, mac(sub(F32(0), cr_c), vi, qji_sc)), unsc_j)
+
+                qr[j] = np.where(active_i, upd_r, qjr)
+                qi[j] = np.where(active_i, upd_i, qji)
+
+    R_t = np.zeros((2 * n, k_r), F32)
+    for j in range(n):
+        R_t[j, :j + 1] = qr[j, :j + 1]
+        R_t[n + j, :j + 1] = qi[j, :j + 1]
+    if mode == "r":
+        return (R_t,)
+
+    if mode == "complete":
+        for j in range(n, m):
+            qr[j] = F32(0)
+            qr[j, j] = F32(1)
+            qi[j] = F32(0)
+
+    for i in range(n - 1, -1, -1):
+        tau_r_i = tau_r[i]
+        tau_i_i = tau_i[i]
+        zero_tau = (tau_r_i == F32(0))
+        vr = np.where((lane > i) & (lane < m), qr[i], F32(0))
+        vi = np.where((lane > i) & (lane < m), qi[i], F32(0))
+        vr[i] = F32(1)
+        vi[i] = F32(0)
+
+        ntr = sub(F32(0), tau_r_i)
+        nti = sub(F32(0), tau_i_i)
+        ntv_r = mac(sub(F32(0), nti), vi, mul(ntr, vr))
+        ntv_i = mac(nti, vr, mul(ntr, vi))
+
+        if not zero_tau:
+            for j in range(i + 1, k_q):
+                qjr = qr[j].copy()
+                qji = qi[j].copy()
+                dr = _red_add(mac(vi, qji, mul(vr, qjr)))
+                di = _red_add(mac(sub(F32(0), vi), qjr, mul(vr, qji)))
+                qr[j] = mac(sub(F32(0), ntv_i), di, mac(ntv_r, dr, qjr))
+                qi[j] = mac(ntv_i, dr, mac(ntv_r, di, qji))
+
+        eir = np.zeros(32, F32)
+        eir[i] = F32(1)
+        if zero_tau:
+            qr[i] = eir
+            qi[i] = np.zeros(32, F32)
+        else:
+            qr[i] = add(eir, ntv_r)
+            qi[i] = ntv_i
+
+    Q_t = np.zeros((2 * k_q, m), F32)
+    Q_t[:k_q, :] = qr[:k_q, :m]
+    Q_t[k_q:, :] = qi[:k_q, :m]
+    return Q_t, R_t
+
+
+def cqr_op():
+    """Stand-in for ``torch.ops.linalg_tpc.cqr``: planar A_t [b, 2n, m] -> (Q_t [b, 2n, m], R_t [b, 2n, n])."""
+    return _torch_op(lambda a: cqr_kernel(a, mode="reduced"), 2)
+
+
+def cqr_complete_op():
+    """Stand-in for ``torch.ops.linalg_tpc.cqr_complete``: planar A_t [b, 2n, m] -> (Q_t [b, 2m, m], R_t [b, 2n, m])."""
+    return _torch_op(lambda a: cqr_kernel(a, mode="complete"), 2)
+
+
+def cqr_r_op():
+    """Stand-in for ``torch.ops.linalg_tpc.cqr_r``: planar A_t [b, 2n, m] -> R_t [b, 2n, n]."""
+    return _torch_op(lambda a: cqr_kernel(a, mode="r"), 1)
