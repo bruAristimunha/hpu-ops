@@ -598,8 +598,9 @@ def test_compile_eager_backend_inside_fwad_dual_level_linalg():
 
 
 def test_solve_backend_kernel_output_strides(monkeypatch):
-    """Bug 5: ``install_solve``'s ``backend_kernel`` must match ``aten._linalg_solve_ex``'s ``mT.contiguous().mT``
-    stride convention when ``left=True`` and ``X.dim() >= 2``, and row-major contiguous when ``left=False``."""
+    """Bug 5: ``SolveEx.compute_with_inverse`` (and thus both ``SolveEx.forward`` and ``backend_kernel``) must match
+    ``aten._linalg_solve_ex``'s ``mT.contiguous().mT`` stride convention when ``left=True`` and ``X.dim() >= 2``, and
+    row-major contiguous when ``left=False``."""
     monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
     monkeypatch.setattr(linalg, "_tpc_takes", lambda dt, fn, **kw: fn)
     groups = []
@@ -617,9 +618,12 @@ def test_solve_backend_kernel_output_strides(monkeypatch):
         (_general(2, n=6), torch.randn(2, 6), True),
         (_general(2, n=6), torch.randn(2, 3, 6), False),
     ]
-    with torch.inference_mode():
-        for A, B, left in cases:
-            want_X = torch.ops.aten._linalg_solve_ex.default(A, B, left=left)[0]
+    for A, B, left in cases:
+        want_X = torch.ops.aten._linalg_solve_ex.default(A, B, left=left)[0]
+        got_fwd_X = linalg.SolveEx.apply(A, B, left, False)[0]
+        assert got_fwd_X.stride() == want_X.stride(), (A.shape, B.shape, left, got_fwd_X.stride(), want_X.stride())
+        torch.testing.assert_close(got_fwd_X, want_X, rtol=1e-4, atol=1e-4)
+        with torch.inference_mode():
             got_X = backend_fn(A, B, left=left)[0]
             assert got_X.stride() == want_X.stride(), (A.shape, B.shape, left, got_X.stride(), want_X.stride())
             torch.testing.assert_close(got_X, want_X, rtol=1e-4, atol=1e-4)

@@ -964,7 +964,11 @@ class SolveEx(torch.autograd.Function):
             if check_errors:
                 torch.ops.aten._linalg_check_errors(info, "torch.linalg.solve_ex", is_matrix=A.dim() == 2)
             result = lu_solve(LU, pivots, rhs, left)
-        return (result.squeeze(-1) if vector else result), LU, pivots, info, Ainv
+        X = result.squeeze(-1) if vector else result
+        # Match aten._linalg_solve_ex's Meta/FakeTensor output strides so torch.compile(..., backend="hpu_backend")
+        # does not misread a row-major buffer with column-major strides on either SolveEx.forward or backend_kernel.
+        X = X.mT.contiguous().mT if left and X.dim() >= 2 else X.contiguous()
+        return X, LU, pivots, info, Ainv
 
     @staticmethod
     def forward(ctx, A, B, left, check_errors):
@@ -1053,12 +1057,8 @@ def install_solve(device_type):
         bound = _bind(op, args, kwargs)
         if _backend_solve_safe(bound) and takes(*args, **kwargs):
             count("solve")
-            out = SolveEx.compute(*bound)
-        else:
-            out = _on_cpu(op, args, kwargs)
-        X = out[0]
-        X = X.mT.contiguous().mT if bound[2] and X.dim() >= 2 else X.contiguous()
-        return (X, *out[1:])
+            return SolveEx.compute(*bound)
+        return _on_cpu(op, args, kwargs)
 
     entries = _kernels(device_type, op, "solve", SolveEx, takes, backend=False, traced=_TracedSolveEx)
     ag_op, ag_key, ag_orig = entries[0]
