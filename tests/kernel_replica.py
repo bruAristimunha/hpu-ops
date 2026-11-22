@@ -1224,6 +1224,22 @@ _EIG_EPS32 = F32(2.0 ** -23)
 _EIG_SMLNUM = F32((2.0 ** -126) / float(_EIG_EPS32))
 
 
+def _ceig_rsqrt_fine(x):
+    """``rsqrt_fine`` for ``ceig_kernel``: guards FTZ on ``e == 1`` (``< 2^-125``) and ``>= 2^120``."""
+    x = np.where(np.asarray(x, F32) == 0, F32(1), np.asarray(x, F32)).astype(F32)
+    need_up = x < F32(2.0 ** -125)
+    need_dn = x >= F32(2.0 ** 120)
+    sc = np.where(need_up, F32(4.0), np.where(need_dn, F32(2.0 ** -8), F32(1.0))).astype(F32)
+    out_m = np.where(need_up, F32(2.0), np.where(need_dn, F32(2.0 ** -4), F32(1.0))).astype(F32)
+    xs = mul(x, sc)
+    y = _f32((0x5F375A86 - (_u32(xs) >> 1)) & 0xFFFFFFFF)
+    hx = mul(xs, F32(-0.5))
+    for _ in range(2):
+        y = mul(y, mac(hx, mul(y, y), F32(1.5)))
+    e = mac(sub(F32(0), mul(xs, y)), y, F32(1))
+    return mul(mac(mul(y, F32(0.5)), e, y), out_m)
+
+
 def _ceig_pow2_scale(m):
     """``pow2_scale`` with exponent clamped to <= 253 so e == 254 ([2^127, FLT_MAX]) scales by 2^-126 into [2, 4)."""
     e = (_u32(m) >> 23) & 0xFF
@@ -1285,7 +1301,7 @@ def _chypot(ar, ai):
     t = _ceig_pow2_scale(m)
     tr, ti = mul(ar, t), mul(ai, t)
     n2 = mac(ti, ti, mul(tr, tr))
-    rn = F32(rsqrt_fine(n2))
+    rn = F32(_ceig_rsqrt_fine(n2))
     return mul(mul(n2, rn), _ceig_pow2_unscale(m))
 
 
@@ -1300,14 +1316,14 @@ def _csqrt(zr, zi):
     un_sqrt = _f32((127 + (unb >> 1)) << 23)
     u, v = mul(zr, sc), mul(zi, sc)
     n2 = mac(v, v, mul(u, u))
-    r = mul(n2, F32(rsqrt_fine(n2)))
+    r = mul(n2, F32(_ceig_rsqrt_fine(n2)))
     if u >= 0:
         s2 = mul(add(r, u), F32(0.5))
-        wr = mul(s2, F32(rsqrt_fine(s2)))
+        wr = mul(s2, F32(_ceig_rsqrt_fine(s2)))
         wi = mul(v, recip(mul(F32(2), wr), zero_to_inf=False)[0])
     else:
         s2 = mul(add(r, sub(F32(0), u)), F32(0.5))
-        wi = mul(s2, F32(rsqrt_fine(s2)))
+        wi = mul(s2, F32(_ceig_rsqrt_fine(s2)))
         if v < 0:
             wi = sub(F32(0), wi)
         wr = mul(v, recip(mul(F32(2), wi), zero_to_inf=False)[0])
@@ -1328,11 +1344,11 @@ def _clartg(fr, fi, gr, gi):
     if g2 == 0:
         return F32(1), F32(0), F32(0), fr, fi
     fg2 = add(f2, g2)
-    inv_fg = F32(rsqrt_fine(fg2))
+    inv_fg = F32(_ceig_rsqrt_fine(fg2))
     if f2 == 0:
         g_abs = mul(mul(g2, inv_fg), un_t)
         return F32(0), mul(gsr, inv_fg), mul(sub(F32(0), gsi), inv_fg), g_abs, F32(0)
-    inv_f = F32(rsqrt_fine(f2))
+    inv_f = F32(_ceig_rsqrt_fine(f2))
     f_abs_s = mul(f2, inv_f)
     cs = mul(f_abs_s, inv_fg)
     pfr, pfi = mul(fsr, inv_f), mul(fsi, inv_f)
@@ -1452,7 +1468,7 @@ def ceig_kernel(A, compute_vectors=True):
             sxr[k + 1:n] = mul(ar[k + 1:n, k], t)
             sxi[k + 1:n] = mul(ai[k + 1:n, k], t)
             sq = _red_add(mac(sxi, sxi, mul(sxr, sxr)))
-            xnorm = mul(mul(sq, F32(rsqrt_fine(sq))), un_t)
+            xnorm = mul(mul(sq, F32(_ceig_rsqrt_fine(sq))), un_t)
             if xnorm == 0:
                 continue
             alr, ali = ar[k + 1, k], ai[k + 1, k]
@@ -1666,7 +1682,7 @@ def ceig_kernel(A, compute_vectors=True):
                 vsr = np.pad(mul(vr, sc), (0, 32 - n))
                 vsi = np.pad(mul(vi, sc), (0, 32 - n))
                 sq = _red_add(mac(vsi, vsi, mul(vsr, vsr)))
-                rn = F32(rsqrt_fine(sq))
+                rn = F32(_ceig_rsqrt_fine(sq))
                 vr, vi = mul(vsr[:n], rn), mul(vsi[:n], rn)
             Vr_out[:, k], Vi_out[:, k] = vr, vi
         return w_out, np.vstack([Vr_out, Vi_out]).astype(F32), np.array([float(info)], F32)

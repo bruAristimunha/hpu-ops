@@ -481,6 +481,27 @@ def eig_cases():
         for j in range(max(0, i - 1), 16):
             F16[0, i, j] = float(16 - max(i, j))
     yield "frank_n16", F16, None
+    for cname, fv in (
+        ("clartg_f_1p1e-19", 1.1e-19),
+        ("clartg_f_1p2e-19", 1.2e-19),
+        ("clartg_f_1p3e-19", 1.3e-19),
+        ("clartg_f_1p4e-19", 1.4e-19),
+        ("clartg_f_1p5e-19", 1.5e-19),
+        ("clartg_f_1p2e-19_cpx", 1.2e-19 + 0.3e-19j),
+    ):
+        H = torch.tensor(
+            [[[fv, 0.2, 0.3, 0.4], [1.0, 0.5, 0.1, 0.2], [0.0, 0.5, 0.7, 0.0], [0.0, 0.0, 0.5, 0.0]]],
+            dtype=C64,
+        )
+        yield cname, H, None
+    yield (
+        "clartg_g_1p2e-19",
+        torch.tensor(
+            [[[1.0, 0.2, 0.3, 0.4], [1.2e-19, 0.5, 0.1, 0.2], [0.0, 0.5, 0.7, 0.0], [0.0, 0.0, 0.5, 0.0]]],
+            dtype=C64,
+        ),
+        None,
+    )
     for n in (1, 2, 4, 8, 16, 22, 32):
         yield f"randn_{n}", crandn(3, n, n, seed=100 + n), None
     NF = crandn(3, 5, 5, seed=29)

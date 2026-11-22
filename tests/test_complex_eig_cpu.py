@@ -233,6 +233,27 @@ def _adversarial_cases():
             F16[i, j] = float(16 - max(i, j))
     cases.append(("frank_n16", F16, None))
 
+    # 13. 4x4 upper Hessenberg matrices exercising clartg f2 in [2^-126, 2^-125) (rsqrt_fine e == 1 FTZ boundary)
+    hessenberg_e1_f = (
+        ("clartg_f_1p1e-19", 1.1e-19),
+        ("clartg_f_1p2e-19", 1.2e-19),
+        ("clartg_f_1p3e-19", 1.3e-19),
+        ("clartg_f_1p4e-19", 1.4e-19),
+        ("clartg_f_1p5e-19", 1.5e-19),
+        ("clartg_f_1p2e-19_cpx", 1.2e-19 + 0.3e-19j),
+    )
+    for cname, fv in hessenberg_e1_f:
+        H = np.array(
+            [[fv, 0.2, 0.3, 0.4], [1.0, 0.5, 0.1, 0.2], [0.0, 0.5, 0.7, 0.0], [0.0, 0.0, 0.5, 0.0]],
+            dtype=np.complex64,
+        )
+        cases.append((cname, H, None))
+    H_sym_g = np.array(
+        [[1.0, 0.2, 0.3, 0.4], [1.2e-19, 0.5, 0.1, 0.2], [0.0, 0.5, 0.7, 0.0], [0.0, 0.0, 0.5, 0.0]],
+        dtype=np.complex64,
+    )
+    cases.append(("clartg_g_1p2e-19", H_sym_g, None))
+
     return cases
 
 
@@ -427,6 +448,28 @@ def test_replica_clartg_underflow_and_pow2_e254():
         assert float(sc) > 0.0 and math.isfinite(float(sc))
         assert float(sc * unsc) == 1.0
         assert 2.0 <= float(m * sc) < 4.0
+
+
+def test_replica_rsqrt_fine_all_exponents_and_clartg_e1():
+    for exp in range(1, 255):
+        for mant in (0, 0x200000, 0x7FFFFF):
+            x = kr._f32((exp << 23) | mant)
+            got = float(kr._ceig_rsqrt_fine(x))
+            exact = 1.0 / math.sqrt(float(x))
+            assert math.isfinite(got) and abs(got - exact) / exact < 1e-6, (exp, float(x), got, exact)
+
+    for fv in (1.1e-19, 1.2e-19, 1.3e-19, 1.4e-19, 1.5e-19, 1.2e-19 + 0.3e-19j):
+        cs, snr, sni, rr, ri = kr._clartg(np.float32(fv.real), np.float32(fv.imag), np.float32(1.0), np.float32(0.0))
+        assert 0.0 <= float(cs) <= 1.0 + 1e-6
+        assert math.isclose(float(cs) ** 2 + float(snr) ** 2 + float(sni) ** 2, 1.0, rel_tol=1e-6)
+        assert math.isclose(math.hypot(float(rr), float(ri)), 1.0, rel_tol=1e-6)
+
+        cs_g, snr_g, sni_g, rr_g, ri_g = kr._clartg(
+            np.float32(1.0), np.float32(0.0), np.float32(fv.real), np.float32(fv.imag)
+        )
+        assert 0.0 <= float(cs_g) <= 1.0 + 1e-6
+        assert math.isclose(float(cs_g) ** 2 + float(snr_g) ** 2 + float(sni_g) ** 2, 1.0, rel_tol=1e-6)
+        assert math.isclose(math.hypot(float(rr_g), float(ri_g)), 1.0, rel_tol=1e-6)
 
 
 def test_cl_eig_invalid_inputs_raise(cl_eig_replica):

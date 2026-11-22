@@ -89,12 +89,17 @@ static inline float64 lut_free_recip(float64 x)
 static inline float64 rsqrt_fine(float64 x)
 {
     x = v_f32_sel_eq_f32_b(x, 0.0f, 1.0f, x);
+    float64 sc = v_f32_sel_less_f32_b(x, 0x1p-125f, 4.0f, 1.0f);
+    float64 out_m = v_f32_sel_less_f32_b(x, 0x1p-125f, 2.0f, 1.0f);
+    sc = v_f32_sel_geq_f32_b(x, 0x1p+120f, 0x1p-8f, sc);
+    out_m = v_f32_sel_geq_f32_b(x, 0x1p+120f, 0x1p-4f, out_m);
+    x = v_f32_mul_b(x, sc);
     float64 y = as_float64(0x5F375A86u - v_u32_shr_b(as_uint64(x), 1));
     float64 hx = v_f32_mul_b(x, -0.5f);
     y = v_f32_mul_b(y, v_f32_mac_b(hx, v_f32_mul_b(y, y), 1.5f));
     y = v_f32_mul_b(y, v_f32_mac_b(hx, v_f32_mul_b(y, y), 1.5f));
     float64 e = v_f32_mac_b(v_f32_sub_b(0.0f, v_f32_mul_b(x, y)), y, 1.0f);
-    return v_f32_mac_b(v_f32_mul_b(y, 0.5f), e, y);
+    return v_f32_mul_b(v_f32_mac_b(v_f32_mul_b(y, 0.5f), e, y), out_m);
 }
 
 static inline float64 pow2_scale(float64 m)
