@@ -98,6 +98,40 @@ def eig_residual(A, w, V):
     return res if nrm == 0.0 else res / nrm
 
 
+def eig_backward(A, w, V):
+    """The largest backward errors relative to ``||A||_2`` (complex128): ``sigma_min(A - w_k I)`` (``w_k`` is an exact
+    eigenvalue of ``A + E`` with ``||E||_2`` that) and ``||A v_k - w_k v_k|| / ||v_k||`` (the pair is exact for such
+    an ``A + E``)."""
+    A128 = np.asarray(A, dtype=np.complex128)
+    w128 = np.asarray(w, dtype=np.complex128)
+    V128 = np.asarray(V, dtype=np.complex128)
+    eye = np.eye(A128.shape[-1])
+    pseudo = max(np.linalg.svd(A128 - wk * eye, compute_uv=False)[-1] for wk in w128)
+    pair = np.max(np.linalg.norm(A128 @ V128 - V128 * w128[None, :], axis=0) / np.linalg.norm(V128, axis=0))
+    nrm = np.linalg.norm(A128, 2)
+    return float(pseudo / nrm), float(pair / nrm)
+
+
+def eig_first_order(A, w):
+    """First-order forward errors (complex128): ``err[i]`` the distance from the exact eigenvalue ``lam_i`` to its
+    matched computed one, ``bound[i] = kappa_i * n * EPS32 * ||A||_2`` (``kappa_i = ||x_i|| ||y_i|| / |y_i^H x_i|``)
+    the first-order change of ``lam_i`` under a backward error of ``n * EPS32 * ||A||_2``, and ``valid`` where that
+    theory applies: the bound under a quarter of the gap to the nearest other eigenvalue, and ``kappa`` resolved in
+    complex128 (``cond(X) <= 1e12``)."""
+    A128 = np.asarray(A, dtype=np.complex128)
+    n = A128.shape[-1]
+    lam, X = np.linalg.eig(A128)
+    kappa = np.linalg.norm(X, axis=0) * np.linalg.norm(np.linalg.inv(X), axis=1)
+    bound = kappa * n * EPS32 * np.linalg.norm(A128, 2)
+    dist = np.abs(lam[:, None] - lam[None, :]) + np.diag(np.full(n, np.inf))
+    valid = (bound < 0.25 * dist.min(axis=1)) & (np.linalg.cond(X) <= 1e12)
+    cost = np.abs(np.asarray(w, dtype=np.complex128)[:, None] - lam[None, :])
+    r, c = linear_sum_assignment_np(cost)
+    err = np.empty(n)
+    err[c] = cost[r, c]
+    return err, bound, valid
+
+
 def planar_to_complex(W_planar, V_planar=None):
     w = (W_planar[0] + 1j * W_planar[1]).astype(np.complex64)
     if V_planar is None:
@@ -419,6 +453,21 @@ def test_replica_adversarial_classes(name, A, jordan_m):
     w32 = np.linalg.eigvals(A)
     ew = eig_match_err(w, w128)
     ew32 = eig_match_err(w32, w128)
+    if n > 32 and not name.startswith("zero_"):
+        # ceig_big is backward stable at n * eps32 * ||A||_2 (largest seen: 0.45x for the eigenvalues, 0.49x for the
+        # pairs), and every eigenvalue where first-order theory applies is within kappa_i times that of the exact one
+        # (largest seen: 0.45x of the bound).
+        pseudo, pair = eig_backward(A, w, V)
+        assert pseudo <= n * EPS32 and pair <= n * EPS32, f"{name}: backward errors {pseudo}, {pair} > n * eps32"
+        err, bound, valid = eig_first_order(A, w)
+        assert np.all(err[valid] <= bound[valid]), f"{name}: first-order ratio {np.max(err[valid] / bound[valid])}"
+        if name.startswith(("lower_tri", "illcond_1e5_")):
+            # Nothing tighter holds here. lower_tri_64: cond(X) = 1.5e17, kappa_i is not resolved in complex128; the
+            # kernel is off by 0.43 max|lam| at backward errors of 0.11 n eps32 (torch's CPU route gets these
+            # eigenvalues exactly from cgebal's permutation, which the kernel does not do). illcond_1e5_*: kappa_i up
+            # to 4e7; the kernel is off by 8.9e-3 and 4.3e-2 of max|lam| at n = 33 and 64, torch's complex64 CPU eig
+            # by 1.1e-2 and 4.0e-2 (torch 2.6); ew32 is numpy's, computed in complex128, so it is no bar here.
+            return
     if name.startswith("zero_"):
         assert np.all(w == 0)
         assert np.array_equal(V, np.eye(n, dtype=np.complex64))
@@ -427,16 +476,11 @@ def test_replica_adversarial_classes(name, A, jordan_m):
         assert ew <= tol, f"{name}: jordan ew={ew} > {tol}"
     elif name.startswith("lower_tri"):
         # Without cgebal permutation (JOB='P'), lower triangular matrices go through Hessenberg+QR
-        # (cpu32 gets 0.0 via permutation). At n=12 error is O(100*n*eps32); at n=64 cond(V)~1e17
-        # so 1*eps32 perturbation already shifts eigenvalues by ~0.43 (backward residual stays < 50*n*eps32).
-        tol = 1.0 if n > 32 else max(1e-5, 100.0 * n * EPS32, 20.0 * ew32)
-        assert ew <= tol, f"{name}: ew={ew} cpu32={ew32}"
+        # (cpu32 gets 0.0 via permutation): at n=12 the error is O(100*n*eps32).
+        assert ew <= max(1e-5, 100.0 * n * EPS32, 20.0 * ew32), f"{name}: ew={ew} cpu32={ew32}"
     elif name.startswith("frank"):
         # Graded Frank matrices have ill-conditioned small eigenvalues (cond ~ 10^5 at n=16); residual is O(n*eps32).
         assert ew <= 0.02, f"{name}: ew={ew} cpu32={ew32}"
-    elif name.startswith("illcond_1e5_"):
-        # Non-normal ill-conditioned matrices (cond(V) ~ 1e8) shift eigenvalues by ~0.01-0.05 under 1*eps32.
-        assert ew <= 0.1, f"{name}: ew={ew} cpu32={ew32}"
     else:
         assert ew <= max(1e-5, 20.0 * ew32), f"{name}: ew={ew} cpu32={ew32}"
 

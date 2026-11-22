@@ -394,7 +394,13 @@ def eig(A, layout="pairs"):
     """``torch.linalg.eig`` for a general complex64 matrix A (``1 <= n <= CEIG_MAXN``): returns
     ``(eigenvalues, eigenvectors)`` as float32 pairs in ``layout`` (``(..., n, 2)`` / ``(..., 2n)`` and
     ``(..., n, n, 2)`` / ``(..., n, 2n)``). Column ``k`` of ``eigenvectors`` has unit 2-norm and satisfies
-    ``A V = V diag(W)``. Non-finite inputs produce ``NaN`` outputs."""
+    ``A V = V diag(W)``. Non-finite inputs produce ``NaN`` outputs.
+
+    Past ``COMPLEX_MAXN`` it runs ``ceig_big``, which is slower than torch's CPU route (copy to the host, complex64
+    eig, copy back) at every batch measured (Gaudi2, bridge 1.21.4, eager; lazy alike): n = 64, 191 ms against 5.5
+    at batch 1, 759 against 205 at batch 96 (``ceig`` at n = 32: 32 against 2.0, 123 against 57). Both kernels run a
+    fixed 30 n QR steps, where random matrices converge in about 2.6 n. Callers should send n > ``COMPLEX_MAXN`` here
+    only when asked to keep everything on the card."""
     PA = as_pairs(A, layout)
     n = _square(PA, limit=CEIG_MAXN)
     batch = PA.shape[:-3]
@@ -419,7 +425,8 @@ def eig(A, layout="pairs"):
 
 def eigvals(A, layout="pairs"):
     """``torch.linalg.eigvals`` for a general complex64 matrix A (``1 <= n <= CEIG_MAXN``): returns
-    ``eigenvalues`` as float32 pairs in ``layout`` (``(..., n, 2)`` or ``(..., 2n)``), without accumulating Q or V."""
+    ``eigenvalues`` as float32 pairs in ``layout`` (``(..., n, 2)`` or ``(..., 2n)``), without accumulating Q or V.
+    Slower than the CPU route as ``eig`` (n = 64: 189 ms against 2.2 at batch 1, 749 against 116 at batch 96)."""
     PA = as_pairs(A, layout)
     n = _square(PA, limit=CEIG_MAXN)
     batch = PA.shape[:-3]

@@ -435,6 +435,35 @@ def _eig_res(A, w, V):
     return res if nrm == 0.0 else res / nrm
 
 
+def _eig_backward(A, w, V):
+    """Largest backward errors relative to ||A||_2: sigma_min(A - w_k I) and ||A v_k - w_k v_k|| / ||v_k||."""
+    A128 = np.asarray(A, dtype=np.complex128)
+    w128 = np.asarray(w, dtype=np.complex128)
+    V128 = np.asarray(V, dtype=np.complex128)
+    eye = np.eye(A128.shape[-1])
+    pseudo = max(np.linalg.svd(A128 - wk * eye, compute_uv=False)[-1] for wk in w128)
+    pair = np.max(np.linalg.norm(A128 @ V128 - V128 * w128[None, :], axis=0) / np.linalg.norm(V128, axis=0))
+    nrm = np.linalg.norm(A128, 2)
+    return float(pseudo / nrm), float(pair / nrm)
+
+
+def _eig_first_order(A, w, eps32):
+    """The largest err_i / (kappa_i * n * eps32 * ||A||_2) over the eigenvalues where first-order theory applies (the
+    bound under a quarter of the gap to the nearest other eigenvalue, cond(X) <= 1e12); 0.0 if there are none."""
+    A128 = np.asarray(A, dtype=np.complex128)
+    n = A128.shape[-1]
+    lam, X = np.linalg.eig(A128)
+    kappa = np.linalg.norm(X, axis=0) * np.linalg.norm(np.linalg.inv(X), axis=1)
+    bound = kappa * n * eps32 * np.linalg.norm(A128, 2)
+    dist = np.abs(lam[:, None] - lam[None, :]) + np.diag(np.full(n, np.inf))
+    valid = (bound < 0.25 * dist.min(axis=1)) & (np.linalg.cond(X) <= 1e12)
+    cost = np.abs(np.asarray(w, dtype=np.complex128)[:, None] - lam[None, :])
+    r, c = _linear_sum_assignment_np(cost)
+    err = np.empty(n)
+    err[c] = cost[r, c]
+    return float(np.max(err[valid] / bound[valid])) if valid.any() else 0.0
+
+
 def eig_cases():
     yield "zero_16", torch.zeros(2, 16, 16, dtype=C64), None
     yield "eye_32", torch.eye(32, dtype=C64)[None], None
@@ -608,11 +637,19 @@ def run_eig(emit, time_it):
             elif name.startswith("frank"):
                 ew_tol = 0.02
             elif name.startswith("illcond_1e5_"):
-                ew_tol = 0.1
+                ew_tol = math.inf  # non-normal: only the first-order test below bounds it
             else:
                 ew_tol = max(1e-5, 20.0 * max_ew32)
             row.update(res=max_res, vnorm_err=max_vnorm_err, err_w=max_ew, err_w_cpu32=max_ew32, ew_tol=ew_tol)
             row["ok"] = row["ok"] and (max_res < 50 * n * eps32) and (max_vnorm_err < 1e-5) and (max_ew <= ew_tol)
+            if n > cl.COMPLEX_MAXN and A.abs().max() > 0:
+                # ceig_big: backward errors at most n * eps32 * ||A||_2 (eigenvalues and pairs), and each eigenvalue
+                # where first-order theory applies within kappa_i times that of the exact one.
+                bw = [_eig_backward(A[b].numpy(), w_c[b], V_c[b]) for b in range(A.shape[0])]
+                pseudo, pair = max(x[0] for x in bw), max(x[1] for x in bw)
+                fo = max(_eig_first_order(A[b].numpy(), w_c[b], eps32) for b in range(A.shape[0]))
+                row.update(pseudo_n_eps=pseudo / (n * eps32), pair_n_eps=pair / (n * eps32), first_order=fo)
+                row["ok"] = row["ok"] and pseudo <= n * eps32 and pair <= n * eps32 and fo <= 1.0
         else:
             nan_ok = bool(w[0].isnan().all() and Vp[0].isnan().all() and wv[0].isnan().all()
                           and w[2].isnan().all() and Vp[2].isnan().all() and wv[2].isnan().all()
