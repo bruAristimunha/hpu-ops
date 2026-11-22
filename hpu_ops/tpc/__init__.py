@@ -258,6 +258,9 @@ static bool registered_complex = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::cqr_complete", "cqr_complete_f32_gaudi2", cqr_complete_meta,
                                           nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::cqr_r", "cqr_r_f32_gaudi2", cqr_r_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::ceig_big", "ceig_big_f32_gaudi2", ceig_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::ceigvals_big", "ceigvals_big_f32_gaudi2", ceigvals_meta,
+                                          nullptr);
   return true;
 }();
 static bool registered = [] {
@@ -364,6 +367,18 @@ at::Tensor cqr_r(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::cqr_r");
   return desc.execute(inputs)[0];
+}
+std::tuple<at::Tensor, at::Tensor, at::Tensor> ceig_big(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::ceig_big");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+std::tuple<at::Tensor, at::Tensor> ceigvals_big(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::ceigvals_big");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
 }
 std::tuple<at::Tensor, at::Tensor, at::Tensor> cgj_inv(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
@@ -507,6 +522,8 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("cqr(Tensor a) -> (Tensor, Tensor)");
   m.def("cqr_complete(Tensor a) -> (Tensor, Tensor)");
   m.def("cqr_r(Tensor a) -> Tensor");
+  m.def("ceig_big(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("ceigvals_big(Tensor a) -> (Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svdvals(Tensor a) -> Tensor");
@@ -545,6 +562,8 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("cqr", cqr);
   m.impl("cqr_complete", cqr_complete);
   m.impl("cqr_r", cqr_r);
+  m.impl("ceig_big", ceig_big);
+  m.impl("ceigvals_big", ceigvals_big);
   m.impl("jacobi_svd", jacobi_svd);
   m.impl("jacobi_svd_full", jacobi_svd_full);
   m.impl("jacobi_svdvals", jacobi_svdvals);
@@ -611,6 +630,14 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("cqr_r", [](at::Tensor a) {
     auto b = a.size(0), n = a.size(1) / 2;
     return a.new_empty({b, 2 * n, n});
+  });
+  m.impl("ceig_big", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(2);
+    return std::make_tuple(a.new_empty({b, 2, n}), a.new_empty(a.sizes()), a.new_empty({b, 2}));
+  });
+  m.impl("ceigvals_big", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(2);
+    return std::make_tuple(a.new_empty({b, 2, n}), a.new_empty({b, 2}));
   });
   m.impl("cgj_inv", [](at::Tensor a) {
     return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), 3, a.size(2)}), a.new_empty({a.size(0), 4}));
@@ -801,6 +828,8 @@ static bool registered_cjacobi = [] {
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::cqr_complete", "cqr_complete_f32_gaudi2", in1, o_cqr_c, nullptr);
   std::vector<habana::custom_op::OutputDesc> o_cqr_r{{0, c10::ScalarType::Float, cqr_rshape}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::cqr_r", "cqr_r_f32_gaudi2", in1, o_cqr_r, nullptr);
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::ceig_big", "ceig_big_f32_gaudi2", in1, o_ceig, nullptr);
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::ceigvals_big", "ceigvals_big_f32_gaudi2", in1, o_ceigvals, nullptr);
   return true;
 }();
 static bool registered_inv = [] {
@@ -1021,6 +1050,18 @@ at::Tensor cqr_r(at::Tensor a) {
   auto desc = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::cqr_r");
   return desc.execute(inputs)[0];
 }
+std::tuple<at::Tensor, at::Tensor, at::Tensor> ceig_big(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::ceig_big");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+std::tuple<at::Tensor, at::Tensor> ceigvals_big(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::ceigvals_big");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
+}
 std::tuple<at::Tensor, at::Tensor, at::Tensor> cgj_inv(at::Tensor a) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::cgj_inv");
   std::vector<c10::IValue> inputs{a};
@@ -1162,6 +1203,8 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("cqr(Tensor a) -> (Tensor, Tensor)");
   m.def("cqr_complete(Tensor a) -> (Tensor, Tensor)");
   m.def("cqr_r(Tensor a) -> Tensor");
+  m.def("ceig_big(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("ceigvals_big(Tensor a) -> (Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svdvals(Tensor a) -> Tensor");
@@ -1200,6 +1243,8 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("cqr", cqr);
   m.impl("cqr_complete", cqr_complete);
   m.impl("cqr_r", cqr_r);
+  m.impl("ceig_big", ceig_big);
+  m.impl("ceigvals_big", ceigvals_big);
   m.impl("jacobi_svd", jacobi_svd);
   m.impl("jacobi_svd_full", jacobi_svd_full);
   m.impl("jacobi_svdvals", jacobi_svdvals);

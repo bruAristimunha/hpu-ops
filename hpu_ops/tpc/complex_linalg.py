@@ -30,6 +30,7 @@ from . import _load
 from ..extrema import internal_sort
 
 COMPLEX_MAXN = 32  # MAXN of the complex kernels: a row of each plane is one 64-lane vector, 4 planes in 32 KB
+CEIG_MAXN = 64     # MAXN of ceig_big / ceigvals_big (direct V_t output, 64 KB VLM)
 
 
 def _cgj_op():
@@ -96,6 +97,18 @@ def _cqr_r_op():
     """``torch.ops.linalg_tpc.cqr_r``, built on first use."""
     _load()
     return torch.ops.linalg_tpc.cqr_r
+
+
+def _ceig_big_op():
+    """``torch.ops.linalg_tpc.ceig_big``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.ceig_big
+
+
+def _ceigvals_big_op():
+    """``torch.ops.linalg_tpc.ceigvals_big``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.ceigvals_big
 
 
 # ---- layouts -------------------------------------------------------------------------------------------------------
@@ -378,12 +391,12 @@ def svdvals(A, layout="pairs"):
 
 
 def eig(A, layout="pairs"):
-    """``torch.linalg.eig`` for a general complex64 matrix A (``1 <= n <= COMPLEX_MAXN``): returns
+    """``torch.linalg.eig`` for a general complex64 matrix A (``1 <= n <= CEIG_MAXN``): returns
     ``(eigenvalues, eigenvectors)`` as float32 pairs in ``layout`` (``(..., n, 2)`` / ``(..., 2n)`` and
     ``(..., n, n, 2)`` / ``(..., n, 2n)``). Column ``k`` of ``eigenvectors`` has unit 2-norm and satisfies
     ``A V = V diag(W)``. Non-finite inputs produce ``NaN`` outputs."""
     PA = as_pairs(A, layout)
-    n = _square(PA)
+    n = _square(PA, limit=CEIG_MAXN)
     batch = PA.shape[:-3]
     if _empty(batch):
         return from_pairs(PA.new_zeros(*batch, n, 2), layout), from_pairs(PA.new_zeros(PA.shape), layout)
@@ -394,17 +407,21 @@ def eig(A, layout="pairs"):
         v = torch.stack([torch.ones_like(w[..., :1]), torch.zeros_like(w[..., :1])], -1)
         v = torch.where(bad[..., None], float("nan"), v)
         return from_pairs(w, layout), from_pairs(v, layout)
-    W_raw, V_raw, _ = _call(_ceig_op(), _planar(PA, batch))
+    if n <= COMPLEX_MAXN:
+        W_raw, V_raw, _ = _call(_ceig_op(), _planar(PA, batch))
+        V = _unplanar(V_raw, batch, n, n)
+    else:
+        W_raw, V_raw, _ = _call(_ceig_big_op(), _planar(PA, batch))
+        V = _unplanar_t(V_raw, batch, n, n)
     W = W_raw.transpose(-1, -2).contiguous().reshape(*batch, n, 2)
-    V = _unplanar(V_raw, batch, n, n)
     return from_pairs(W, layout), from_pairs(V, layout)
 
 
 def eigvals(A, layout="pairs"):
-    """``torch.linalg.eigvals`` for a general complex64 matrix A (``1 <= n <= COMPLEX_MAXN``): returns
+    """``torch.linalg.eigvals`` for a general complex64 matrix A (``1 <= n <= CEIG_MAXN``): returns
     ``eigenvalues`` as float32 pairs in ``layout`` (``(..., n, 2)`` or ``(..., 2n)``), without accumulating Q or V."""
     PA = as_pairs(A, layout)
-    n = _square(PA)
+    n = _square(PA, limit=CEIG_MAXN)
     batch = PA.shape[:-3]
     if _empty(batch):
         return from_pairs(PA.new_zeros(*batch, n, 2), layout)
@@ -413,7 +430,8 @@ def eigvals(A, layout="pairs"):
         bad = ~torch.isfinite(w).all(-1, keepdim=True)
         w = torch.where(bad, float("nan"), w)
         return from_pairs(w, layout)
-    W_raw, _ = _call(_ceigvals_op(), _planar(PA, batch))
+    op = _ceigvals_op() if n <= COMPLEX_MAXN else _ceigvals_big_op()
+    W_raw, _ = _call(op, _planar(PA, batch))
     W = W_raw.transpose(-1, -2).contiguous().reshape(*batch, n, 2)
     return from_pairs(W, layout)
 

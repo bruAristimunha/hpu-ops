@@ -129,6 +129,10 @@ extern const char _binary___cqr_complete_f32_gaudi2_o_start[];
 extern const char _binary___cqr_complete_f32_gaudi2_o_end[];
 extern const char _binary___cqr_r_f32_gaudi2_o_start[];
 extern const char _binary___cqr_r_f32_gaudi2_o_end[];
+extern const char _binary___ceig_big_f32_gaudi2_o_start[];
+extern const char _binary___ceig_big_f32_gaudi2_o_end[];
+extern const char _binary___ceigvals_big_f32_gaudi2_o_start[];
+extern const char _binary___ceigvals_big_f32_gaudi2_o_end[];
 }
 
 namespace {
@@ -165,7 +169,10 @@ const char* kCEigvals = "ceigvals_f32_gaudi2";  // -DNO_VECTORS
 const char* kCQr = "cqr_f32_gaudi2";
 const char* kCQrComplete = "cqr_complete_f32_gaudi2";  // -DFULL_Q
 const char* kCQrR = "cqr_r_f32_gaudi2";                // -DR_ONLY
+const char* kCEigBig = "ceig_big_f32_gaudi2";
+const char* kCEigvalsBig = "ceigvals_big_f32_gaudi2";  // -DNO_VECTORS
 constexpr uint64_t kMaxComplexN = 32;  // MAXN of the complex kernels (n complex columns, 2n planar rows)
+constexpr uint64_t kMaxComplexEigN = 64;  // MAXN of ceig_big / ceigvals_big
 constexpr uint64_t kMaxN = 64;      // MAXN of gj_solve and tri_solve
 constexpr uint64_t kMaxSmallN = 32; // MAXN of jacobi_svd, matrix_exp, lu_factor and lu_solve
 constexpr uint64_t kMaxHH = 64;     // MAXHH of householder_product
@@ -553,6 +560,39 @@ tpc_lib_api::GlueCodeReturn cqr_defs(tpc_lib_api::HabanaKernelParams* in, tpc_li
     full3(out->outputTensorAccessPattern[0], m, 2 * n);
     full3(out->outputTensorAccessPattern[1], n, 2 * n);
     return copy_elf(out, _binary___cqr_f32_gaudi2_o_start, _binary___cqr_f32_gaudi2_o_end);
+}
+
+// General complex64 eig / eigvals (32 < n <= 64): A [n, 2n, batch] -> W [n, 2, batch], V_t [n, 2n, batch],
+// S [2, batch] (or W, S only under -DNO_VECTORS).
+tpc_lib_api::GlueCodeReturn ceig_big_defs(tpc_lib_api::HabanaKernelParams* in,
+                                          tpc_lib_api::HabanaKernelInstantiation* out, bool vals)
+{
+    auto status = check_io(in, 1, vals ? 2 : 3);
+    if (status != tpc_lib_api::GLUE_SUCCESS)
+    {
+        return status;
+    }
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    if (n <= kMaxComplexN || n > kMaxComplexEigN || in->inputTensors[0].geometry.maxSizes[1] != 2 * n)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+    full3(out->inputTensorAccessPattern[0], n, 2 * n);
+    if (vals)
+    {
+        full3(out->outputTensorAccessPattern[0], n, 2);
+        full2(out->outputTensorAccessPattern[1], 2);
+        return copy_elf(out, _binary___ceigvals_big_f32_gaudi2_o_start,
+                        _binary___ceigvals_big_f32_gaudi2_o_end);
+    }
+    full3(out->outputTensorAccessPattern[0], n, 2);
+    full3(out->outputTensorAccessPattern[1], n, 2 * n);
+    full2(out->outputTensorAccessPattern[2], 2);
+    return copy_elf(out, _binary___ceig_big_f32_gaudi2_o_start, _binary___ceig_big_f32_gaudi2_o_end);
 }
 
 tpc_lib_api::GlueCodeReturn eigh_defs(tpc_lib_api::HabanaKernelParams* in, tpc_lib_api::HabanaKernelInstantiation* out,
@@ -1222,7 +1262,7 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 36 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 38 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
@@ -1261,6 +1301,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint3
         strcpy(guids[33].name, kCQr);
         strcpy(guids[34].name, kCQrComplete);
         strcpy(guids[35].name, kCQrR);
+        strcpy(guids[36].name, kCEigBig);
+        strcpy(guids[37].name, kCEigvalsBig);
     }
     if (kernelCount != nullptr)
     {
@@ -1415,6 +1457,14 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (strcmp(params->guid.name, kCQrR) == 0)
     {
         return cqr_defs(params, instance, 2);
+    }
+    if (strcmp(params->guid.name, kCEigBig) == 0)
+    {
+        return ceig_big_defs(params, instance, false);
+    }
+    if (strcmp(params->guid.name, kCEigvalsBig) == 0)
+    {
+        return ceig_big_defs(params, instance, true);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }

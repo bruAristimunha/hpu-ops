@@ -146,6 +146,10 @@ def cl_eig_replica(monkeypatch):
     monkeypatch.setenv("PT_HPU_LAZY_MODE", "0")
     monkeypatch.setattr(cl, "_ceig_op", lambda: kr.ceig_op(with_info=_ceig_needs_info()))
     monkeypatch.setattr(cl, "_ceigvals_op", lambda: kr.ceigvals_op(with_info=_ceigvals_needs_info()))
+    if hasattr(cl, "_ceig_big_op"):
+        monkeypatch.setattr(cl, "_ceig_big_op", lambda: kr.ceig_big_op(with_info=_ceig_needs_info()))
+    if hasattr(cl, "_ceigvals_big_op"):
+        monkeypatch.setattr(cl, "_ceigvals_big_op", lambda: kr.ceigvals_big_op(with_info=_ceig_needs_info()))
 
 
 # ---- Test cases ----------------------------------------------------------------------------------------------------
@@ -160,14 +164,40 @@ def _jordan_sim(m, lam, seed):
     return (Q @ J @ Q.conj().T).astype(np.complex64)
 
 
+def _embed_jordan4(n, lam, seed):
+    rng = np.random.default_rng(seed)
+    J = np.diag(np.concatenate([np.full(4, lam, dtype=np.complex128), np.arange(5, n + 1, dtype=np.complex128)]))
+    for i in range(3):
+        J[i, i + 1] = 1.0
+    Q, _ = np.linalg.qr(rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n)))
+    return (Q @ J @ Q.conj().T).astype(np.complex64)
+
+
+def _illcond_nonnormal(n, cond=1e5, seed=0):
+    rng = np.random.default_rng(seed)
+    Q, _ = np.linalg.qr(rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n)))
+    T = np.diag(np.geomspace(1.0, 1.0 / cond, n).astype(np.complex128))
+    iu = np.triu_indices(n, 1)
+    T[iu] = 0.05 * (rng.normal(size=len(iu[0])) + 1j * rng.normal(size=len(iu[0])))
+    return (Q @ T @ Q.conj().T).astype(np.complex64)
+
+
 def _adversarial_cases():
     rng = np.random.default_rng(123)
     cases = []
 
-    # 1. Zero & identity across sizes
-    for n in (1, 4, 16, 32):
+    # 1. Zero & identity across sizes (n <= 32 and 32 < n <= 64)
+    for n in (1, 4, 16, 32, 33, 48, 64):
         cases.append((f"zero_{n}", np.zeros((n, n), dtype=np.complex64), None))
         cases.append((f"eye_{n}", np.eye(n, dtype=np.complex64), None))
+
+    # 1b. Subnormal matrix at n=64 (FTZ contract: flushes to zero -> W=0, V=I)
+    cases.append(("subnormal_64", (rng.normal(size=(64, 64)) * 1e-40).astype(np.complex64), None))
+
+    # 1c. Real float32 non-Hermitian (R, 0) for 32 < n <= 64
+    for n in (33, 48, 64):
+        R_real = rng.normal(size=(n, n)).astype(np.float32)
+        cases.append((f"rand_real_{n}", R_real.astype(np.complex64), None))
 
     # 2. Diagonal with zero & complex entries
     cases.append(("diag_8", np.diag(np.array([1, -2, 3j, -4j, 1 + 2j, -1e-3, 1e3, 0], dtype=np.complex64)), None))
@@ -254,6 +284,45 @@ def _adversarial_cases():
     )
     cases.append(("clartg_g_1p2e-19", H_sym_g, None))
 
+    # 14. 32 < n <= 64 adversarial classes (ceig_big)
+    U64 = np.triu(rng.normal(size=(64, 64)) + 1j * rng.normal(size=(64, 64))).astype(np.complex64)
+    cases.append(("upper_tri_64", U64, None))
+    cases.append(("lower_tri_64", U64.T.copy(), None))
+
+    C64 = np.zeros((64, 64), dtype=np.complex64)
+    C64[1:, :-1] = np.eye(63)
+    C64[0, -1] = 1.0
+    cases.append(("cyclic_64", C64, None))
+
+    for n in (33, 48, 64):
+        rep_n = np.concatenate([
+            np.array([0.0, 0.0, 0.0, 1.0, 1.0 + 1e-6, -3j, 5.0 + 2j], dtype=np.complex64),
+            np.arange(10, 10 + n - 7, dtype=np.complex64),
+        ])
+        Qn, _ = np.linalg.qr(rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n)))
+        cases.append((f"repeated_sim_{n}", (Qn @ np.diag(rep_n.astype(np.complex128)) @ Qn.conj().T).astype(np.complex64), None))
+        cases.append((f"jordan_4_sim_{n}", _embed_jordan4(n, 2.0 + 1.0j, 210 + n), 4))
+        D_bad_n = np.diag(2.0 ** np.linspace(-30, 30, n))
+        Mn = rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n))
+        cases.append((f"bad_scale_{n}", (D_bad_n @ Mn @ np.linalg.inv(D_bad_n)).astype(np.complex64), None))
+
+    cases.append(("illcond_1e5_33", _illcond_nonnormal(33, 1e5, seed=310), None))
+    cases.append(("illcond_1e5_64", _illcond_nonnormal(64, 1e5, seed=311), None))
+    Q_n64, _ = np.linalg.qr(rng.normal(size=(64, 64)) + 1j * rng.normal(size=(64, 64)))
+    D_n64 = np.diag(np.geomspace(1.0, 1e-5, 64).astype(np.complex128))
+    cases.append(("illcond_norm_1e5_64", (Q_n64 @ D_n64 @ Q_n64.conj().T).astype(np.complex64), None))
+
+    for fn in (48, 64):
+        Fo = np.diag(np.ones(fn - 1, dtype=np.complex64), 1)
+        Fo[fn - 1, 0] = np.float32(0.1)
+        cases.append((f"forsythe_n{fn}_eps0.1", Fo, None))
+
+    base64 = (rng.normal(size=(64, 64)) + 1j * rng.normal(size=(64, 64))).astype(np.complex64)
+    cases.append(("tiny_1e-30_64", (base64 * np.float32(1e-30)).astype(np.complex64), None))
+    cases.append(("huge_1e30_64", (base64 * np.float32(1e30)).astype(np.complex64), None))
+    Q64, _ = np.linalg.qr(rng.normal(size=(64, 64)) + 1j * rng.normal(size=(64, 64)))
+    cases.append(("huge_2p5e38_64", (Q64 * 2.5e38).astype(np.complex64), None))
+
     return cases
 
 
@@ -294,16 +363,52 @@ def test_replica_random_sizes(n):
         assert ew <= max(1e-5, 20.0 * ew32), f"n={n} b={b} ew={ew} cpu32={ew32}"
 
 
+@pytest.mark.parametrize("n", [33, 48, 64])
+def test_replica_big_random_sizes(n):
+    A = crandn(2, n, n, seed=100 + n).numpy()
+    for b in range(A.shape[0]):
+        a = A[b]
+        Wp, Vtp, info = kr.ceig_big_kernel(complex_to_planar(a), compute_vectors=True)
+        Wvp, Vvp, infov = kr.ceig_big_kernel(complex_to_planar(a), compute_vectors=False)
+        assert float(info[0]) == 0.0 and float(infov[0]) == 0.0
+        assert Vvp is None
+        assert np.array_equal(Wp, Wvp), "eigvals_big must be bit-identical to eig_big"
+
+        Vp = Vtp.reshape(2, n, n).transpose(0, 2, 1).reshape(2 * n, n)
+        w, V = planar_to_complex(Wp, Vp)
+        res = eig_residual(a, w, V)
+        assert res < 50 * n * EPS32, f"n={n} b={b} residual {res}"
+
+        v_norms = np.linalg.norm(V, axis=0)
+        assert np.max(np.abs(v_norms - 1.0)) < 1e-5, f"n={n} b={b} norms {v_norms}"
+
+        w128 = np.linalg.eigvals(a.astype(np.complex128))
+        w32 = np.linalg.eigvals(a)
+        ew = eig_match_err(w, w128)
+        ew32 = eig_match_err(w32, w128)
+        assert ew <= max(1e-5, 20.0 * ew32), f"n={n} b={b} ew={ew} cpu32={ew32}"
+
+
 @pytest.mark.parametrize("name,A,jordan_m", _adversarial_cases())
 def test_replica_adversarial_classes(name, A, jordan_m):
     n = A.shape[-1]
-    Wp, Vp, info = kr.ceig_kernel(complex_to_planar(A), compute_vectors=True)
-    Wvp, Vvp, infov = kr.ceig_kernel(complex_to_planar(A), compute_vectors=False)
+    if n > 32:
+        Wp, Vtp, info = kr.ceig_big_kernel(complex_to_planar(A), compute_vectors=True)
+        Wvp, Vvp, infov = kr.ceig_big_kernel(complex_to_planar(A), compute_vectors=False)
+        Vp = Vtp.reshape(2, n, n).transpose(0, 2, 1).reshape(2 * n, n)
+    else:
+        Wp, Vp, info = kr.ceig_kernel(complex_to_planar(A), compute_vectors=True)
+        Wvp, Vvp, infov = kr.ceig_kernel(complex_to_planar(A), compute_vectors=False)
     assert float(info[0]) == 0.0 and float(infov[0]) == 0.0
     assert Vvp is None
     assert np.array_equal(Wp, Wvp), f"{name}: eigvals parity mismatch"
 
     w, V = planar_to_complex(Wp, Vp)
+    if name.startswith("subnormal_"):
+        assert np.all(w == 0)
+        assert np.array_equal(V, np.eye(n, dtype=np.complex64))
+        return
+
     res = eig_residual(A, w, V)
     assert res < 50 * n * EPS32, f"{name}: residual {res}"
 
@@ -322,11 +427,16 @@ def test_replica_adversarial_classes(name, A, jordan_m):
         assert ew <= tol, f"{name}: jordan ew={ew} > {tol}"
     elif name.startswith("lower_tri"):
         # Without cgebal permutation (JOB='P'), lower triangular matrices go through Hessenberg+QR
-        # (cpu32 gets 0.0 via permutation), so backward-stable error is O(100 * n * eps32).
-        assert ew <= max(1e-5, 100.0 * n * EPS32, 20.0 * ew32), f"{name}: ew={ew} cpu32={ew32}"
+        # (cpu32 gets 0.0 via permutation). At n=12 error is O(100*n*eps32); at n=64 cond(V)~1e17
+        # so 1*eps32 perturbation already shifts eigenvalues by ~0.43 (backward residual stays < 50*n*eps32).
+        tol = 1.0 if n > 32 else max(1e-5, 100.0 * n * EPS32, 20.0 * ew32)
+        assert ew <= tol, f"{name}: ew={ew} cpu32={ew32}"
     elif name.startswith("frank"):
         # Graded Frank matrices have ill-conditioned small eigenvalues (cond ~ 10^5 at n=16); residual is O(n*eps32).
         assert ew <= 0.02, f"{name}: ew={ew} cpu32={ew32}"
+    elif name.startswith("illcond_1e5_"):
+        # Non-normal ill-conditioned matrices (cond(V) ~ 1e8) shift eigenvalues by ~0.01-0.05 under 1*eps32.
+        assert ew <= 0.1, f"{name}: ew={ew} cpu32={ew32}"
     else:
         assert ew <= max(1e-5, 20.0 * ew32), f"{name}: ew={ew} cpu32={ew32}"
 
@@ -360,26 +470,66 @@ def test_replica_ceig_op_interface_and_batch_dims():
     assert info3.shape == (5, 1) and info2.shape == (5, 1) and torch.all(info3 == 0) and torch.all(info2 == 0)
 
 
+def test_replica_ceig_big_op_interface_and_batch_dims():
+    A = crandn(3, 48, 48, seed=302).numpy()
+    planar_batch = torch.from_numpy(np.stack([complex_to_planar(x) for x in A]))
+    W, V_t = kr.ceig_big_op()(planar_batch)
+    Wv = kr.ceigvals_big_op()(planar_batch)
+    assert W.shape == (3, 2, 48) and V_t.shape == (3, 96, 48) and Wv.shape == (3, 2, 48)
+    assert torch.equal(W, Wv)
+    W3, V3, info3 = kr.ceig_big_op(with_info=True)(planar_batch)
+    Wv2, info2 = kr.ceigvals_big_op(with_info=True)(planar_batch)
+    assert torch.equal(W3, W) and torch.equal(V3, V_t) and torch.equal(Wv2, Wv)
+    assert info3.shape == (3, 1) and info2.shape == (3, 1) and torch.all(info3 == 0) and torch.all(info2 == 0)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_replica_big_nonfinite_poisoning_per_batch(bad):
+    A = crandn(3, 48, 48, seed=303).numpy()
+    A[0, 10, 35] = complex(bad, 0.0)
+    A[2, 33, 12] = complex(0.0, bad)
+    planar_batch = torch.from_numpy(np.stack([complex_to_planar(x) for x in A]))
+    W, V_t = kr.ceig_big_op()(planar_batch)
+    Wv = kr.ceigvals_big_op()(planar_batch)
+    assert torch.equal(W.nan_to_num(), Wv.nan_to_num())
+    assert torch.isnan(W[0]).all() and torch.isnan(V_t[0]).all() and torch.isnan(Wv[0]).all()
+    assert torch.isnan(W[2]).all() and torch.isnan(V_t[2]).all() and torch.isnan(Wv[2]).all()
+    assert torch.isfinite(W[1]).all() and torch.isfinite(V_t[1]).all() and torch.isfinite(Wv[1]).all()
+    V1_p = V_t[1].numpy().reshape(2, 48, 48).transpose(0, 2, 1).reshape(96, 48)
+    w1, V1 = planar_to_complex(W[1].numpy(), V1_p)
+    assert eig_residual(A[1], w1, V1) < 50 * 48 * EPS32
+
+
 # ---- hpu_ops.tpc.complex_linalg API tests (run automatically once cl.eig / cl.eigvals exist) ----------------------
 
 
-@pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 8, 16, 22, 32])
+def test_cl_eig_constants_preserved(cl_eig_replica):
+    assert cl.CEIG_MAXN == 64
+    assert cl.COMPLEX_MAXN == 32
+    with pytest.raises(ValueError):
+        cl.inv(torch.zeros(1, 33, 33, 2))
+    with pytest.raises(ValueError):
+        cl.eigh(torch.zeros(1, 33, 33, 2))
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 8, 16, 22, 32, 33, 48, 64])
 def test_cl_eig_sizes_and_layouts(cl_eig_replica, n):
-    A = crandn(3, n, n, seed=400 + n)
+    bs = 1 if n > 32 else 3
+    A = crandn(bs, n, n, seed=400 + n)
     W_p, V_p = cl.eig(pairs(A), layout="pairs")
-    assert W_p.shape == (3, n, 2) and V_p.shape == (3, n, n, 2)
+    assert W_p.shape == (bs, n, 2) and V_p.shape == (bs, n, n, 2)
     Wv_p = cl.eigvals(pairs(A), layout="pairs")
-    assert Wv_p.shape == (3, n, 2)
+    assert Wv_p.shape == (bs, n, 2)
     assert torch.equal(W_p, Wv_p)
 
     # Interleaved layout
-    Ai = pairs(A).reshape(3, n, 2 * n)
+    Ai = pairs(A).reshape(bs, n, 2 * n)
     W_i, V_i = cl.eig(Ai, layout="interleaved")
     Wv_i = cl.eigvals(Ai, layout="interleaved")
-    assert W_i.shape == (3, 2 * n) and V_i.shape == (3, n, 2 * n) and Wv_i.shape == (3, 2 * n)
-    assert torch.equal(W_i, W_p.reshape(3, 2 * n))
-    assert torch.equal(V_i, V_p.reshape(3, n, 2 * n))
-    assert torch.equal(Wv_i, Wv_p.reshape(3, 2 * n))
+    assert W_i.shape == (bs, 2 * n) and V_i.shape == (bs, n, 2 * n) and Wv_i.shape == (bs, 2 * n)
+    assert torch.equal(W_i, W_p.reshape(bs, 2 * n))
+    assert torch.equal(V_i, V_p.reshape(bs, n, 2 * n))
+    assert torch.equal(Wv_i, Wv_p.reshape(bs, 2 * n))
 
     # complex64 tensor input directly
     W_c, V_c = cl.eig(A)
@@ -389,7 +539,7 @@ def test_cl_eig_sizes_and_layouts(cl_eig_replica, n):
     # Accuracy & unit norms
     w_c = cplx(W_p).numpy()
     V_c_np = cplx(V_p).numpy()
-    for b in range(3):
+    for b in range(bs):
         a_np = A[b].numpy()
         assert eig_residual(a_np, w_c[b], V_c_np[b]) < 50 * n * EPS32
         assert np.max(np.abs(np.linalg.norm(V_c_np[b], axis=0) - 1.0)) < 1e-5
@@ -486,9 +636,13 @@ def test_cl_eig_invalid_inputs_raise(cl_eig_replica):
     with pytest.raises(ValueError):
         cl.eigvals(torch.zeros(2, 0, 0, 2))
     with pytest.raises(ValueError):
-        cl.eig(torch.zeros(1, 33, 33, 2))
+        cl.eig(torch.zeros(1, 65, 65, 2))
     with pytest.raises(ValueError):
-        cl.eigvals(torch.zeros(1, 33, 33, 2))
+        cl.eigvals(torch.zeros(1, 65, 65, 2))
+    with pytest.raises(ValueError):
+        cl.eig(torch.zeros(1, 65, 65, dtype=torch.complex64))
+    with pytest.raises(ValueError):
+        cl.eigvals(torch.zeros(1, 65, 65, dtype=torch.complex64))
     with pytest.raises(ValueError):
         cl.eig(torch.zeros(2, 3, 3, 2, dtype=torch.float64))
     with pytest.raises(ValueError):
@@ -509,3 +663,56 @@ def test_cl_eig_nonfinite(cl_eig_replica, bad):
     Wv = cl.eigvals(pairs(A))
     assert torch.isnan(W[0]).all() and torch.isnan(V[0]).all() and torch.isnan(Wv[0]).all()
     assert torch.isfinite(W[1]).all() and torch.isfinite(V[1]).all() and torch.isfinite(Wv[1]).all()
+
+
+@pytest.mark.parametrize("n", [33, 48, 64])
+def test_cl_eig_real_float32_pairs(cl_eig_replica, n):
+    g = torch.Generator().manual_seed(600 + n)
+    R = torch.randn(2, n, n, generator=g, dtype=torch.float32)
+    P_real = torch.stack([R, torch.zeros_like(R)], dim=-1)
+    W_p, V_p = cl.eig(P_real)
+    Wv_p = cl.eigvals(P_real)
+    assert torch.equal(W_p, Wv_p)
+    w_c = cplx(W_p).numpy()
+    V_c = cplx(V_p).numpy()
+    for b in range(2):
+        a_np = R[b].numpy().astype(np.complex64)
+        assert eig_residual(a_np, w_c[b], V_c[b]) < 50 * n * EPS32
+        assert np.max(np.abs(np.linalg.norm(V_c[b], axis=0) - 1.0)) < 1e-5
+        w128 = np.linalg.eigvals(R[b].double().numpy())
+        w32 = np.linalg.eigvals(R[b].numpy())
+        assert eig_match_err(w_c[b], w128) <= max(1e-5, 20.0 * eig_match_err(w32, w128))
+
+
+def test_cl_eig_big_unbatched_multidim_empty_views_and_nonfinite(cl_eig_replica):
+    A1 = crandn(33, 33, seed=700)
+    w_u, V_u = cl.eig(pairs(A1))
+    assert w_u.shape == (33, 2) and V_u.shape == (33, 33, 2)
+    assert torch.equal(cl.eigvals(pairs(A1)), w_u)
+    assert eig_residual(A1.numpy(), cplx(w_u).numpy(), cplx(V_u).numpy()) < 50 * 33 * EPS32
+
+    Am = crandn(2, 1, 33, 33, seed=701)
+    Wm, Vm = cl.eig(pairs(Am))
+    assert Wm.shape == (2, 1, 33, 2) and Vm.shape == (2, 1, 33, 33, 2)
+    assert torch.equal(cl.eigvals(pairs(Am)), Wm)
+
+    We, Ve = cl.eig(pairs(Am)[0, :0])
+    assert We.shape == (0, 33, 2) and Ve.shape == (0, 33, 33, 2)
+    assert cl.eigvals(pairs(Am)[0, :0]).shape == (0, 33, 2)
+
+    A4 = crandn(4, 33, 33, seed=702)
+    P4 = torch.view_as_real(A4)
+    W_s, V_s = cl.eig(P4[::2])
+    W_s_ref, V_s_ref = cl.eig(P4[::2].contiguous())
+    assert torch.equal(W_s, W_s_ref) and torch.equal(V_s, V_s_ref)
+
+    W_t, V_t = cl.eig(A4[:2].mT)
+    W_t_ref, V_t_ref = cl.eig(A4[:2].mT.contiguous())
+    assert torch.equal(W_t, W_t_ref) and torch.equal(V_t, V_t_ref)
+
+    A3 = A4[:3].clone()
+    A3[0, 20, 10] = complex(math.nan, 0.0)
+    Wn, Vn = cl.eig(pairs(A3))
+    Wvn = cl.eigvals(pairs(A3))
+    assert torch.isnan(Wn[0]).all() and torch.isnan(Vn[0]).all() and torch.isnan(Wvn[0]).all()
+    assert torch.isfinite(Wn[1:]).all() and torch.isfinite(Vn[1:]).all() and torch.isfinite(Wvn[1:]).all()
