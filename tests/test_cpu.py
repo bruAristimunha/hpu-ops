@@ -1768,16 +1768,25 @@ def test_enable_is_a_no_op_off_gaudi(monkeypatch):
 
 @pytest.mark.parametrize("row", [[float("inf"), 100.0, 0.0], [3e38, 3e38, 0.0]])
 def test_logsumexp_keeps_aten_gradient_with_every_fix_in_lazy_mode(monkeypatch, row):
-    """Issue #21's lazy logsumexp composite was dropped (round 2: no gain in a training step, and a NaN gradient next
-    to +inf / a softmax gradient where the result rounds to the max). No fix may register logsumexp, in lazy mode too."""
-    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    """Lazy-mode ``install_logsumexp`` uses ``_LseFn`` with ATen-matching non-finite/overflow gradients; eager mode
+    leaves ``aten::logsumexp`` native and unregistered."""
     x = torch.tensor([row], requires_grad=True)
     (want,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
+
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    monkeypatch.setattr(hpu_ops.small, "_lazy", lambda: True)
+    with cpu_as_hpu(hpu_ops._install) as calls:
+        (got_lazy,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
+    assert calls.get("logsumexp") == 1
+    torch.testing.assert_close(got_lazy, want, equal_nan=True)
+
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "0")
+    monkeypatch.setattr(hpu_ops.small, "_lazy", lambda: False)
     with cpu_as_hpu(hpu_ops._install) as calls:
         assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::logsumexp", "AutogradCPU")
-        (got,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
+        (got_eager,) = torch.autograd.grad(torch.logsumexp(x, -1).sum(), x)
     assert not calls.get("logsumexp")
-    torch.testing.assert_close(got, want, equal_nan=True)
+    torch.testing.assert_close(got_eager, want, equal_nan=True)
 
 
 # ---- Tensor.unfold: as_strided with ATen's sizes and strides (lazy mode has no HPU kernel; the CPU stands in)

@@ -333,18 +333,30 @@ One card, seconds per training step on synthetic inputs (3 micro-batches of 100 
 
 ### Small ops slower than one CPU core (#21)
 
-Measured per call on Gaudi2 (bridge 1.21.4) in one process against Habana's kernel, eager and lazy, isolated synced
-calls and a batch of 30 calls (`tests/bench_small_ops2.py`, `tests/bench_small_dispatch.py`). Only `bincount` of large
-inputs is rewritten (see the table above). The rest keeps Habana's kernel:
+Measured per call on Gaudi2 (bridge 1.21.4) through the dispatcher in alternating A/B rounds against Habana's kernel (`tests/bench_m6a_21.py`, `tests/bench_small_dispatch.py`), isolated synced calls and 20–30-call batches, with 0 CPU fallbacks for `hpu_ops`.
 
-| op, size | best rewrite | eager iso / batch | lazy iso / batch | why not |
+**Rewritten in `hpu_ops.small` (verified Gaudi2 winners, 0 fallbacks):**
+
+| op, size / scope | rewrite | eager iso / batch | lazy iso / batch | compile (`hpu_backend`) |
 |---|---|---|---|---|
-| `cumsum` 64x22x22, last dim | `x @ triu(ones)` | 1.03-1.22x / 1.42-1.45x | 1.07-1.15x / 1.06-1.08x | turns `[1, inf]` into `[nan, inf]` (`inf * 0`); the exact variants (a `where` select, or the matmul plus an inf/NaN code) 0.02-0.45x |
-| `cumsum` 4096, 1-D | blocked matmuls | 0.86-1.19x / 0.36-0.49x | 0.32-0.55x / 0.19-0.35x | slower |
-| `logsumexp` 64x22x22, one dim, fwd / fwd+bwd | ATen's composite in one graph | not faster (five launches against one) | fwd 1.24-1.61x / 1.79-1.87x, fwd+bwd 0.86-1.06x / 1.05-1.21x | eager not faster; lazy backward and calls past ~40k elements slower |
-| `index_add` (64,22) <- (4096,22) | one-hot `addmm` | 1.21x / 0.86x | 1.66x / 1.22x | eager batch slower; `inf * 0` |
-| `scatter_add` 64x22x22, last dim | one-hot `baddbmm` / `where` | 1.08-1.16x / 0.10-0.49x | 0.56-0.57x / 0.42-0.46x | slower |
-| `bincount` 4096, 64 bins | a min/max read + `histc` (four exact variants) | 0.73-0.95x / 0.56-0.84x | 0.56-1.08x / 0.79-1.20x | the host read costs as much as Habana's kernel |
+| `bincount` (`>= 65536` elems, `<= 4096` bins) | `aminmax` + 256-bin `histc` chunks + `pad` | 1.04–43x (`409600 x 1000b`: **42.3x / 52.3x**) | 1.9–59x (`409600 x 1000b`: **47.5x / 53.7x**) | native (unless `uint8`) |
+| `bincount` (`4096..65535`, `minlength >= 256` eager / `>= 128` lazy) | `aminmax` + `histc` + `pad` (no sync for `uint8 >= 256`) | **1.42–16.0x** (`40960 x 512b`: **11.6x / 16.0x**) | **2.45–22.1x** (`40960 x 512b`: **16.6x / 22.1x**) | — |
+| `bincount` (`torch.compile`, `uint8`, `minlength >= 256`) | `F.one_hot(x.long(), 256).float().sum(0).long()` + `pad` | — | — | **8.58–62.0x** (0 fallbacks vs 120 baseline fallbacks) |
+| `logsumexp` (lazy mode, `numel <= 2**19`) | `lse_safe` (`amax` + `where` + `reshape`, no `squeeze`) + `_LseFn` analytical bwd | native (unregistered) | fwd **1.11–1.51x**, fwdbwd **1.07–1.12x** batch (`0.94–1.02x` iso) | native (0.46–1.00x) |
+| `index_add` (lazy mode, `not grad_enabled`, `dim == 0`, `rows >= 40960`) | `index_put(..., accumulate=True)` | native (unregistered) | `(64,22)<-(40960,22)` **1.37x / 2.52x**; `(1024,22)` `0.72x / 1.50x`; `<-409600` **3.38x / 10.71x** | native (unregistered) |
+
+**Measured and left native (native Habana wins, parity, or no exact speedup):**
+
+| op, size | best candidate tested | eager iso / batch | lazy iso / batch | why left native |
+|---|---|---|---|---|
+| `trace` 2-D (`1536x1536..4096x4096`) | `self.diagonal().sum()` | 0.91–0.96x iso | 0.78–0.98x through dispatcher | Python dispatcher overhead (~0.03 ms) exceeds kernel gain on 0.04–0.20 ms op |
+| `scatter_add` (`64x22x22` / `64<-(40960)`) | one-hot `bmm` / `einsum` | 0.15–0.96x | 0.41–0.99x | slower in all modes, plus `inf * 0` NaN |
+| `cumsum` (`64x22x22`, `4096`) | `x @ triu(ones)` | 1.03–1.22x / 1.42–1.45x | 1.07–1.15x / 1.06–1.08x | turns `[1, inf]` into `[nan, inf]` (`inf * 0`); exact variants 0.02–0.45x |
+| `cumprod` (`64x22x22`) | — | 0.295 / 0.077 ms | 0.321 / 0.387 ms | no exact card composite faster than native |
+| `torch.where` (`640x22x22`) | `F.relu` (special case) | 0.337 / 0.117 ms (0.06–0.17x CPU) | 0.212 / 1.063 ms | native already 6–17x faster than CPU; `relu` differs on `NaN` |
+| `lerp` (`640x22x22`) | `a + w * (b - a)` | 0.517 / 0.094 ms (`batch` 0.52x) | 0.43–0.87x slower | native already beats fused arithmetic |
+| `allclose` (`4096..409600`) | `(a - b).abs() <= atol + rtol * b.abs()` | 1.36–1.44x | 1.08–1.13x | causes Dynamo `.item()` graph break; native already 0.30–0.41 ms lazy |
+| `matmul`, `topk`, `median`, `histc`, `nonzero`, `boolean_index_read`, `index_put_bool_mask` | native / existing `hpu_ops` | native / `hpu_ops` | native / `hpu_ops` | already rewritten (`histc`, `indexing`) or native is optimal / host-sync bound |
 
 Habana bugs found on the way (bridge 1.21.4, eager and lazy unless noted): `amax` / `max` drop NaN (`[nan, 1, 2]` gives
 `-inf`; `repro/amax_nan.py`); `bincount` counts negative values instead of raising (`repro/bincount_negative.py`);
