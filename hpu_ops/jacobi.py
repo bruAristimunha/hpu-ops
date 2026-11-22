@@ -244,20 +244,24 @@ def block_svd_gram_free(A, compute_uv=True, full_matrices=False, sweeps=None, po
             return A.new_empty(0), S, A.new_empty(0)
         return Vh_t.mT, S, U_t.mT
 
+    bad = ~torch.isfinite(A).all(dim=(-2, -1))
+    A_work = torch.where(bad[..., None, None], 0.0, A)
+
     _svd_big, _svdvals_big, _tsqr_r, _tsqr_qr, _block_qr, maxn, maxm, _vals_maxn, vals_maxm = _svd_solvers(
         A.device, svd_big, svdvals_big, tsqr_r, tsqr_qr, block_qr)
 
-    sigma = A.abs().amax(dim=(-2, -1), keepdim=True)
+    sigma = A_work.abs().amax(dim=(-2, -1), keepdim=True)
     safe_sigma = torch.where(sigma > 0, sigma, torch.ones_like(sigma))
-    As = A / safe_sigma
+    As = A_work / safe_sigma
 
     def rescale(s):
         return torch.where(sigma.squeeze(-1) == 0, 0.0, s * safe_sigma.squeeze(-1))
 
+    nan = float("nan")
     if n <= maxn:
         if not compute_uv:
-            S = _svdvals_big(As if m <= vals_maxm else _tsqr_r(As))
-            return A.new_empty(0), rescale(S), A.new_empty(0)
+            S = rescale(_svdvals_big(As if m <= vals_maxm else _tsqr_r(As)))
+            return A.new_empty(0), torch.where(bad[..., None], nan, S), A.new_empty(0)
         if m <= maxm:
             U, S, Vh = _svd_big(As)
         else:
@@ -269,7 +273,9 @@ def block_svd_gram_free(A, compute_uv=True, full_matrices=False, sweeps=None, po
             from .linalg import _complete_orthogonal
 
             U = _complete_orthogonal(U, S)
-        return U, S, Vh
+        return (torch.where(bad[..., None, None], nan, U),
+                torch.where(bad[..., None], nan, S),
+                torch.where(bad[..., None, None], nan, Vh))
 
     if m > n:
         Q0, R0 = _block_qr(As)
@@ -309,7 +315,7 @@ def block_svd_gram_free(A, compute_uv=True, full_matrices=False, sweeps=None, po
     S_norm = S_all[..., p - n:]
     S = rescale(S_norm.reshape(*batch, n))
     if not compute_uv:
-        return A.new_empty(0), S, A.new_empty(0)
+        return A.new_empty(0), torch.where(bad[..., None], nan, S), A.new_empty(0)
 
     tiny = torch.finfo(X.dtype).tiny
     U_raw = torch.where(S_norm.unsqueeze(-2) == 0, 0.0, X / S_norm.clamp_min(tiny).unsqueeze(-2))
@@ -322,4 +328,6 @@ def block_svd_gram_free(A, compute_uv=True, full_matrices=False, sweeps=None, po
         from .linalg import _complete_orthogonal
 
         U = _complete_orthogonal(U, S)
-    return U, S, Vh
+    return (torch.where(bad[..., None, None], nan, U),
+            torch.where(bad[..., None], nan, S),
+            torch.where(bad[..., None, None], nan, Vh))

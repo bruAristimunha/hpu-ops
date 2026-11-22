@@ -30,7 +30,7 @@ except ImportError:
 import torch
 
 import hpu_ops
-from hpu_ops import jacobi, linalg, tpc
+from hpu_ops import linalg, tpc
 
 L = torch.linalg
 
@@ -210,6 +210,7 @@ def test_svd_gt32_extreme_scales_zero_rank_and_nan_inf_cpu():
     ((72, 72), False),
     ((160, 40), False),
     ((40, 20), True),
+    ((20, 40), True),
 ])
 def test_svd_gt32_batched_mixed_nan_inf_isolation_cpu(shape, full_matrices):
     g = torch.Generator().manual_seed(29 + sum(shape))
@@ -217,9 +218,11 @@ def test_svd_gt32_batched_mixed_nan_inf_isolation_cpu(shape, full_matrices):
     A_fin = torch.randn(m, n, generator=g, dtype=torch.float32)
     A_nan = torch.randn(m, n, generator=g, dtype=torch.float32)
     A_nan[3, 7] = float("nan")
-    A_inf = torch.randn(m, n, generator=g, dtype=torch.float32)
-    A_inf[0, 0] = float("inf")
-    A = torch.stack([A_fin, A_nan, A_inf])
+    A_pinf = torch.randn(m, n, generator=g, dtype=torch.float32)
+    A_pinf[0, 0] = float("inf")
+    A_ninf = torch.randn(m, n, generator=g, dtype=torch.float32)
+    A_ninf[0, 0] = float("-inf")
+    A = torch.stack([A_fin, A_nan, A_pinf, A_ninf])
     S_ref = L.svdvals(A_fin.double())
 
     with _cpu_as_hpu(linalg.install_svd) as calls:
@@ -228,14 +231,24 @@ def test_svd_gt32_batched_mixed_nan_inf_isolation_cpu(shape, full_matrices):
     assert torch.isfinite(U[0]).all() and torch.isfinite(S[0]).all() and torch.isfinite(Vh[0]).all()
     assert _rel_err(S[0], S_ref) < 1e-5
     _check_svd_factors(U[0], S[0], Vh[0], A_fin, full_matrices, tol=1e-4)
-    for idx in (1, 2):
+    for idx in (1, 2, 3):
         assert U[idx].isnan().all() and S[idx].isnan().all() and Vh[idx].isnan().all()
 
     with _cpu_as_hpu(linalg.install_svd) as calls:
         Sv = L.svdvals(A)
         assert calls["svd"] >= 1
     assert torch.isfinite(Sv[0]).all() and _rel_err(Sv[0], S_ref) < 1e-5
-    assert Sv[1].isnan().all() and Sv[2].isnan().all()
+    for idx in (1, 2, 3):
+        assert Sv[idx].isnan().all()
+
+    for ord_ in (2, -2, "nuc"):
+        n_ref = L.matrix_norm(A_fin.double(), ord=ord_)
+        with _cpu_as_hpu(linalg.install_svd) as calls:
+            Nm = L.matrix_norm(A, ord=ord_)
+            assert calls["svd"] >= 1
+        assert torch.isfinite(Nm[0]) and _rel_err(Nm[0], n_ref) < 1e-5
+        for idx in (1, 2, 3):
+            assert Nm[idx].isnan()
 
 
 def test_svd_gt32_autograd_and_double_backward_cpu(svd_gt32_hook):
@@ -637,6 +650,79 @@ def _run_gaudi_suite():
     check_case("svdvals_inf_40", L.svdvals,
                lambda: [(lambda m: (m.__setitem__((0, 0), float("inf")), m)[1])(torch.randn(40, 40))],
                verify=lambda g, _r, _: [] if not torch.isfinite(g.cpu()).all() else ["expected non-finite output"])
+
+    def _make_mixed_nonfinite(shape):
+        m, n = shape
+        lg = torch.Generator().manual_seed(460 + m + n)
+        a_fin = torch.randn(m, n, generator=lg, dtype=torch.float32) + 0.2 * torch.eye(m, n, dtype=torch.float32)
+        a_nan = torch.randn(m, n, generator=lg, dtype=torch.float32)
+        a_nan[1, 2] = float("nan")
+        a_pinf = torch.randn(m, n, generator=lg, dtype=torch.float32)
+        a_pinf[0, 0] = float("inf")
+        a_ninf = torch.randn(m, n, generator=lg, dtype=torch.float32)
+        a_ninf[0, 0] = float("-inf")
+        return [torch.stack([a_fin, a_nan, a_pinf, a_ninf])]
+
+    def _verify_mixed_svd(full):
+        def _v(got, _ref, ins):
+            U, S, Vh = (t.cpu() for t in got)
+            a_fin = ins[0][0]
+            probs = []
+            if not (torch.isfinite(U[0]).all() and torch.isfinite(S[0]).all() and torch.isfinite(Vh[0]).all()):
+                probs.append("finite slice became non-finite")
+            else:
+                try:
+                    _check_svd_factors(U[0], S[0], Vh[0], a_fin, full, tol=1e-4)
+                except AssertionError as e:
+                    probs.append(str(e))
+            for idx in (1, 2, 3):
+                if not (U[idx].isnan().all() and S[idx].isnan().all() and Vh[idx].isnan().all()):
+                    probs.append(f"slice {idx} not all-NaN (U={U[idx].isnan().all().item()}, "
+                                 f"S={S[idx].isnan().all().item()}, Vh={Vh[idx].isnan().all().item()})")
+            return probs
+        return _v
+
+    def _verify_mixed_vals(got, _ref, ins):
+        g = got.cpu()
+        a_fin = ins[0][0]
+        s_ref = L.svdvals(a_fin.double())
+        probs = []
+        if not torch.isfinite(g[0]).all() or _rel_err(g[0], s_ref) >= 1e-5:
+            probs.append("finite slice mismatch")
+        for idx in (1, 2, 3):
+            if not g[idx].isnan().all():
+                probs.append(f"slice {idx} not all-NaN")
+        return probs
+
+    def _verify_mixed_norm(ord_):
+        def _v(got, _ref, ins):
+            g = got.cpu()
+            a_fin = ins[0][0]
+            n_ref = L.matrix_norm(a_fin.double(), ord=ord_)
+            probs = []
+            if not torch.isfinite(g[0]).all() or _rel_err(g[0], n_ref) >= 1e-5:
+                probs.append("finite slice mismatch")
+            for idx in (1, 2, 3):
+                if not g[idx].isnan().all():
+                    probs.append(f"slice {idx} not NaN")
+            return probs
+        return _v
+
+    for shape, full in (((40, 40), False), ((40, 20), True), ((160, 40), False), ((72, 72), False)):
+        tag = f"{shape[0]}x{shape[1]}_{'full' if full else 'thin'}"
+        check_case(f"svd_mixed_nonfinite_{tag}",
+                   lambda x, _f=full: L.svd(x, full_matrices=_f),
+                   lambda _sh=shape: _make_mixed_nonfinite(_sh),
+                   verify=_verify_mixed_svd(full))
+        check_case(f"svdvals_mixed_nonfinite_{tag}",
+                   L.svdvals,
+                   lambda _sh=shape: _make_mixed_nonfinite(_sh),
+                   verify=_verify_mixed_vals)
+        for ord_ in (2, -2, "nuc"):
+            check_case(f"matrix_norm_{ord_}_mixed_nonfinite_{tag}",
+                       lambda x, _o=ord_: L.matrix_norm(x, ord=_o),
+                       lambda _sh=shape: _make_mixed_nonfinite(_sh),
+                       verify=_verify_mixed_norm(ord_))
 
     # 3. Backward + double backward + matrix_rank + inference_mode
     w_s_cpu = {n: torch.linspace(1.0, 2.0, n, dtype=torch.float64) for n in (28, 48)}
