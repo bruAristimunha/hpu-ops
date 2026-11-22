@@ -1077,32 +1077,39 @@ def _det_backward(A, det, grad, inverse):
     """``g det A^-H`` with ``inverse(A)``; in grad mode (double backward) a singular A takes torch's SVD formula. A
     det of exactly 0 gives a zero first-backward cofactor, as torch's: LAPACK's inverse of a singular matrix is
     non-finite, and 0 * inf was NaN (the traced det declined to LAPACK, float64 on ``hpu``)."""
-    cofactor = (grad * det)[..., None, None] * inverse(A).mH
     if not torch.is_grad_enabled():
+        cofactor = (grad * det)[..., None, None] * inverse(A).mH
         return torch.where(det[..., None, None] == 0, 0.0, cofactor)
-    if torch.is_grad_enabled():
-        # torch's derivative in grad mode (double backward): the SVD formula for |det| < 100 eps, whose cofactor
-        # is right on a singular matrix, where det * A^-H is 0. The check is a host sync, in grad mode only.
-        singular = det.abs() < 100 * torch.finfo(A.dtype).eps
-        if _tracing(A):
-            # no host read in a traced graph: both formulas, selected per matrix; the cofactor of a singular matrix
-            # is taken on the identity instead, so its non-finite inverse does not reach where's derivative
-            mask = singular[..., None, None]
-            safe = torch.where(mask, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device), A)
-            cofactor = (grad * det)[..., None, None] * inverse(safe).mH
-            return torch.where(mask, _det_grad_singular(A, grad), cofactor)
-        with _strict.host_read("linalg_det double backward: singular check", singular):
-            any_singular = bool(singular.any())
-        if any_singular:
-            return torch.where(singular[..., None, None], _det_grad_singular(A, grad), cofactor)
-    return cofactor
+    if grad.dim() == 0 and A.device.type == "hpu":
+        # Habana lazy mode: det.sum() on a 0-D det gives an expand(()) SumBackward0 view whose 2nd backward
+        # fails in synapse with `slice_insert synStatus 1`; reshape(1).squeeze(0) clears the 0-D expand.
+        grad = grad.reshape(1).squeeze(0)
+    singular = det.abs() < 100 * torch.finfo(A.dtype).eps
+    if _tracing(A):
+        # no host read in a traced graph: both formulas, selected per matrix; the cofactor of a singular matrix
+        # is taken on the identity instead, so its non-finite inverse does not reach where's derivative
+        mask = singular[..., None, None]
+        safe = torch.where(mask, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device), A)
+        cofactor = (grad * det)[..., None, None] * inverse(safe).mH
+        return torch.where(mask, _det_grad_singular(A, grad), cofactor)
+    with _strict.host_read("linalg_det double backward: singular check", singular):
+        any_singular = bool(singular.any())
+        all_singular = any_singular and (A.dim() == 2 or bool(singular.all()))
+    if all_singular:
+        return _det_grad_singular(A, grad)
+    if any_singular:
+        mask = singular[..., None, None]
+        safe = torch.where(mask, torch.eye(A.shape[-1], dtype=A.dtype, device=A.device), A)
+        cofactor = (grad * det)[..., None, None] * inverse(safe).mH
+        return torch.where(mask, _det_grad_singular(A, grad), cofactor)
+    return (grad * det)[..., None, None] * inverse(A).mH
 
 
 def _det_grad_singular(A, grad):
     """torch's ``linalg_det_backward`` for singular ``A`` in grad mode: with ``A = U S V^H``, ``det(U) det(V^H) U
     diag(g prod_{j != i} s_j) V^H``, the products without a division (exclusive cumulative products). The SVD is
-    the public op: on HPU hpu-ops' own (``install_svd``: the Jacobi kernel, differentiable, on the card) up to
-    ``tpc.SMALL_MAXN``, main's route past it (SVD_GRAM_NOTE)."""
+    the public op: on HPU hpu-ops' own (``install_svd``: the Jacobi kernel up to ``tpc.SMALL_MAXN`` and Gram-free
+    block Jacobi past it, differentiable, on the card)."""
     U, S, Vh = torch.linalg.svd(A)
     alpha = torch.linalg.det(U) * torch.linalg.det(Vh)
     ones = torch.ones_like(S[..., :1])
@@ -1263,8 +1270,6 @@ def _svd_takes(device_type, name="svd"):
             return False
         if A.dim() < 2:
             return False
-        if max(A.shape[-2:]) > tpc.SMALL_MAXN:
-            return False  # main's route past the Jacobi SVD kernel (SVD_GRAM_NOTE)
         return device_type != "hpu" or tpc.ready()
 
     return takes
@@ -1278,8 +1283,6 @@ def _pinv_takes(device_type, name="pinv"):
             return False
         if A.dim() < 2:
             return False
-        if max(A.shape[-2:]) > tpc.SMALL_MAXN:
-            return False  # main's route past the Jacobi SVD kernel (SVD_GRAM_NOTE)
         if device_type == "hpu" and not tpc.ready():
             return False
         for tol in (atol, rtol):
@@ -1304,8 +1307,6 @@ def _lstsq_takes(device_type, name="lstsq"):
             return False
         if A.dim() < 2:
             return False
-        if max(A.shape[-2:]) > tpc.SMALL_MAXN:
-            return False  # main's route past the Jacobi SVD kernel (SVD_GRAM_NOTE)
         if device_type == "hpu" and not tpc.ready():
             return False
         if B.dim() == A.dim() - 1:
@@ -1320,11 +1321,6 @@ def _lstsq_takes(device_type, name="lstsq"):
 
     return takes
 
-
-# SVD_GRAM_NOTE: the SVD family (svd, svdvals, pinv, lstsq, matrix_norm 2 / -2 / nuc, matrix_rank) takes matrices of
-# both sides <= tpc.SMALL_MAXN only (the Jacobi SVD kernel); past it main's route. A block Jacobi on column pairs' Gram
-# matrices, tried on this branch, squares the condition number: svdvals of a 512 x 512 matrix of spectrum 1 to 1e-5 had
-# 6.9e-3 error (CPU float32 7.5e-7), lstsq 40 x 20 at condition 1e4 4.6e-2 (CPU 1.8e-4; code review of #51).
 
 # The block Jacobi hook for the CPU tests: ``(A[B, 2b, 2b]) -> (w, V)``, the eigh the block Jacobi eigh calls on its
 # pairs past tpc.BIG_EIGH_MAXN. None means ``tpc.eigh_big`` on HPU (2b = 128).
@@ -1341,18 +1337,53 @@ def _run_svd(A, compute_uv, full_matrices=False, sort=True, flush=True):
     if _SVD is not None:
         return _SVD(A.detach(), compute_uv)
     if A.device.type == "hpu":
-        if compute_uv:
-            return tpc.jacobi_svd(A, full_matrices=full_matrices, sort=sort, flush=flush)
-        return A.new_empty(0), tpc.jacobi_svdvals(A, sort=sort, flush=flush), A.new_empty(0)
-    return tpc.svd_reference(A, compute_uv=compute_uv, full_matrices=full_matrices)
+        if max(A.shape[-2:]) <= tpc.SMALL_MAXN:
+            if compute_uv:
+                return tpc.jacobi_svd(A, full_matrices=full_matrices, sort=sort, flush=flush)
+            return A.new_empty(0), tpc.jacobi_svdvals(A, sort=sort, flush=flush), A.new_empty(0)
+        from . import jacobi
+
+        return jacobi.block_svd_gram_free(A, compute_uv=compute_uv, full_matrices=full_matrices)
+    if max(A.shape[-2:]) <= tpc.SMALL_MAXN:
+        return tpc.svd_reference(A, compute_uv=compute_uv, full_matrices=full_matrices)
+    from . import jacobi
+
+    return jacobi.block_svd_gram_free(A, compute_uv=compute_uv, full_matrices=full_matrices)
 
 
 def _complete_orthogonal(U, S):
     m, k = U.shape[-2], U.shape[-1]
     eye = torch.eye(m, dtype=U.dtype, device=U.device)
     P = eye - U @ U.mT
-    unull = _run_svd(P, True)[0]
-    return torch.cat([U, unull[..., :m - k]], -1)
+    if m <= tpc.SMALL_MAXN:
+        unull = _run_svd(P, True)[0]
+        return torch.cat([U, unull[..., :m - k]], -1)
+    P_sym = (P + P.mT) / 2
+    from . import eigh, jacobi
+
+    if U.device.type == "hpu":
+        if m <= tpc.BIG_EIGH_MAXN:
+            unull = eigh.Eigh.compute(P_sym, "L", True)[1][..., k:]
+        else:
+            unull = jacobi.block_eigh(P_sym, _block_eigh_solver(U.device), compute_v=True,
+                                      sweeps=jacobi.SWEEPS)[1][..., k:]
+    elif _BLOCK_EIGH is not None:
+        unull = jacobi.block_eigh(P_sym, _BLOCK_EIGH, compute_v=True, sweeps=jacobi.SWEEPS)[1][..., k:]
+    elif eigh._EIGH_BIG is not None and m <= tpc.BIG_EIGH_MAXN:
+        unull = eigh.Eigh.compute(P_sym, "L", True)[1][..., k:]
+    else:
+        bad = ~torch.isfinite(P_sym).all(dim=(-2, -1))
+        with torch._C._AutoDispatchBelowAutograd():
+            if not bad.any():
+                unull = torch.linalg.eigh(P_sym)[1][..., k:]
+            else:
+                safe = torch.where(bad[..., None, None], 0.0, P_sym)
+                vecs = torch.linalg.eigh(safe)[1][..., k:]
+                nan = torch.tensor(float("nan"), dtype=U.dtype, device=U.device)
+                unull = torch.where(bad[..., None, None], nan, vecs)
+    unull = unull - U @ (U.mT @ unull)
+    unull = 1.5 * unull - 0.5 * unull @ (unull.mT @ unull)
+    return torch.cat([U, unull], -1)
 
 
 @_function
@@ -1422,8 +1453,36 @@ class Svd(torch.autograd.Function):
 _CIA_BACKENDS_ON_CPU = False
 
 
+def _install_lazy_matmul(device_type):
+    """In Habana lazy mode, ``aten::matmul`` registers an ``AutogradHPU`` kernel that drops ``grad_fn`` under
+    ``create_graph=True``. Route grad-tracking calls through ``CompositeImplicitAutograd`` (``mm``/``bmm``/``mv``/
+    ``dot``) so higher-order autograd works, and non-grad calls to the native ``HPU`` kernel."""
+    op = aten.matmul.default
+    key = f"Autograd{device_type.upper()}"
+    if device_type != "hpu" or not torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), key):
+        return lambda: None
+    library = torch.library.Library("aten", "IMPL")
+
+    def matmul_ag(self, other):
+        if torch.is_grad_enabled() and (self.requires_grad or other.requires_grad):
+            return op._op_dk(DispatchKey.CompositeImplicitAutograd, self, other)
+        return op._op_dk(DispatchKey.HPU, self, other)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*[Oo]verrid.*")
+        library.impl(op, matmul_ag, key)
+    op._dispatch_cache.clear()
+
+    def undo():
+        library._destroy()
+        op._dispatch_cache.clear()
+
+    return undo
+
+
 def install_svd(device_type):
     """``linalg.svd``, ``svdvals`` and ``matrix_norm(2/-2/'nuc')`` via ``aten._linalg_svd``. Returns an undo."""
+    undo_matmul = _install_lazy_matmul(device_type)
     takes = _svd_takes(device_type)
     entries = _kernels(device_type, aten._linalg_svd.default, "svd", Svd, takes)
 
@@ -1499,9 +1558,8 @@ def install_svd(device_type):
             def ag(*args, **kwargs):
                 A, ord_, dim, keepdim, dtype = _bind(op_, args, kwargs)
                 dims = _norm_dims(A, dim) if dtype is None and pred_(ord_) else None
-                small = dims is not None and max(A.shape[dims[0]], A.shape[dims[1]]) <= tpc.SMALL_MAXN
                 if dims is not None and not _transformed() and _takes_tensors(device_type, "svd", [A]) and \
-                        small and (device_type != "hpu" or tpc.ready()):
+                        (device_type != "hpu" or tpc.ready()):
                     return _norm_run(A, ord_, dims[0], dims[1], keepdim)
                 return op_._op_dk(DispatchKey.CompositeImplicitAutograd, *args, **kwargs)
 
@@ -1512,7 +1570,7 @@ def install_svd(device_type):
         # 0.03 ms per call of Python dispatch (Gaudi2, bridge 1.21.4: 0.78-0.88x of the decomposition).
         entries.append((norm_op, "Autograd{}", _make_norm(norm_op, check_ord)))
 
-    return register_kernels(device_type, entries)
+    return _dispatch.chain([undo_matmul, register_kernels(device_type, entries)])
 
 
 def _greater(x, t):
@@ -1619,41 +1677,42 @@ def _lstsq_eval(A, B, rcond, driver):
     m, n = A.shape[-2], A.shape[-1]
     k = min(m, n)
     need_sort = driver in ("gelsd", "gelss")
-    U, S, Vh = Svd.compute(A.detach(), False, True, sort=need_sort)
-    eps = torch.finfo(S.dtype).eps
-    rtol_val = max(m, n) * eps if (rcond is None or rcond < 0) else (
-        0.5 * eps if rcond == 0 and driver == "gelsd" else float(rcond))
-    S_max = S[..., :1] if need_sort else S.amax(-1, keepdim=True)
-    if traced:
-        # traced gels only (the others declined above): gels ignores rcond and assumes full rank, as in eager, where
-        # a rank-deficient input is declined to torch's gels (codex review #11). An exactly zero singular value (a
-        # zero or repeated column) would give NaN and inf; torch's gels raises there, compiled or not, so the graph
-        # checks it (``_lstsq_full_rank``, one host read when the graph runs; its result is added to S so the check
-        # is not dropped as dead code, as ``aten._linalg_check_errors`` is in a compiled graph).
-        S = S + _lstsq_full_rank(S.detach())
-        S_inv = S.reciprocal()
-        bad = None
-    else:
-        S_min = S[..., -1:] if need_sort else S.amin(-1, keepdim=True)
-        bad = (S_min <= S_max * rtol_val).any()
-        S_inv = S.reciprocal()
-    vector = B.dim() == A.dim() - 1
-    B_mat = B.unsqueeze(-1) if vector else B
-    sol_mat = Vh.mH @ (S_inv.unsqueeze(-1) * (U.mH @ B_mat))
-    sol = sol_mat.squeeze(-1) if vector else sol_mat
-    if m > n and driver in ("gels", "gelsd", "gelss"):
-        residuals = (B_mat - A @ sol_mat).square().sum(-2)
-    else:
-        residuals = A.new_empty(0)
-    # a fresh tensor (torch's rank owns its storage; a stride-0 expand breaks in-place use and lazy-mode views)
-    rank_out = A.new_empty(0, dtype=torch.int64) if driver == "gels" else A.new_full(
-        A.shape[:-2], k, dtype=torch.int64)
-    sv_out = S if driver in ("gelsd", "gelss") else A.new_empty(0)
-    if bad is not None:
-        with _strict.host_read("linalg_lstsq: rank check", bad):
-            bad = bool(bad)
-    if bad:
-        return None
+    with torch.no_grad():
+        U, S, Vh = Svd.compute(A.detach(), False, True, sort=need_sort)
+        eps = torch.finfo(S.dtype).eps
+        rtol_val = max(m, n) * eps if (rcond is None or rcond < 0) else (
+            0.5 * eps if rcond == 0 and driver == "gelsd" else float(rcond))
+        S_max = S[..., :1] if need_sort else S.amax(-1, keepdim=True)
+        if traced:
+            # traced gels only (the others declined above): gels ignores rcond and assumes full rank, as in eager, where
+            # a rank-deficient input is declined to torch's gels (codex review #11). An exactly zero singular value (a
+            # zero or repeated column) would give NaN and inf; torch's gels raises there, compiled or not, so the graph
+            # checks it (``_lstsq_full_rank``, one host read when the graph runs; its result is added to S so the check
+            # is not dropped as dead code, as ``aten._linalg_check_errors`` is in a compiled graph).
+            S = S + _lstsq_full_rank(S.detach())
+            S_inv = S.reciprocal()
+            bad = None
+        else:
+            S_min = S[..., -1:] if need_sort else S.amin(-1, keepdim=True)
+            bad = (S_min <= S_max * rtol_val).any()
+            S_inv = S.reciprocal()
+        vector = B.dim() == A.dim() - 1
+        B_mat = B.unsqueeze(-1) if vector else B
+        sol_mat = Vh.mH @ (S_inv.unsqueeze(-1) * (U.mH @ B_mat))
+        sol = sol_mat.squeeze(-1) if vector else sol_mat
+        if m > n and driver in ("gels", "gelsd", "gelss"):
+            residuals = (B_mat - A.detach() @ sol_mat).square().sum(-2)
+        else:
+            residuals = A.new_empty(0)
+        # a fresh tensor (torch's rank owns its storage; a stride-0 expand breaks in-place use and lazy-mode views)
+        rank_out = A.new_empty(0, dtype=torch.int64) if driver == "gels" else A.new_full(
+            A.shape[:-2], k, dtype=torch.int64)
+        sv_out = S if driver in ("gelsd", "gelss") else A.new_empty(0)
+        if bad is not None:
+            with _strict.host_read("linalg_lstsq: rank check", bad):
+                bad = bool(bad)
+        if bad:
+            return None
     return sol, U, S, Vh, residuals, rank_out, sv_out, rtol_val, vector
 
 

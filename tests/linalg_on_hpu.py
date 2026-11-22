@@ -66,11 +66,7 @@ tpc_maxn = 64  # hpu_ops.tpc.MAXN, set in main
 large_maxn = 512  # hpu_ops.tpc.LARGE_MAXN (solve, inv, det, slogdet), set in main
 LARGE_OPS = ("linalg.solve", "linalg.inv", "linalg.det", "linalg.slogdet")  # and their variants, not solve_triangular
 eigh_maxn = 32  # hpu_ops.tpc.EIGH_MAXN, set in main
-small_maxn = 32  # hpu_ops.tpc.SMALL_MAXN (SVD family, matrix_exp, LU ops), set in main
-# the SVD family: past small_maxn main's route (hpu_ops.linalg.SVD_GRAM_NOTE), recorded as "fallback", not failed
-SVD_OPS = ("linalg.svd", "linalg.svdvals", "linalg.pinv", "linalg.lstsq", "linalg.matrix_norm", "linalg.matrix_rank")
-# Codex rows whose SVD past small_maxn takes main's route by design (the singular det double backward's SVD at n = 33)
-SVD_ROUTE_ROWS = ("codex8.det_double_backward_singular",)
+small_maxn = 32  # hpu_ops.tpc.SMALL_MAXN (matrix_exp, LU ops), set in main
 SMALL_OPS = ("linalg.svd", "linalg.svdvals", "linalg.pinv", "linalg.lstsq", "linalg.matrix_norm", "linalg.matrix_rank",
              "linalg.matrix_exp", "linalg.lu", "lu_unpack")
 SINGULAR_N = 22
@@ -653,10 +649,8 @@ def run_case(case, n, timed=True):
             notes += note
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         hard.append(f"exception {e!r}"[:300])
-    # fallbacks recorded, not failed: baseline, and the SVD family past the Jacobi SVD kernel's sizes, which takes
-    # main's route by design (hpu_ops.linalg's SVD_GRAM_NOTE: the Gram route on the card squared the condition number);
-    # every other size stays on the card
-    expected = BASELINE or (case.name.startswith(SVD_OPS) and n > small_maxn)
+    # fallbacks recorded, not failed: baseline only; every size (including SVD family n > 32) stays on the card
+    expected = BASELINE
     problems = hard + ([] if expected else soft)
     row.update(status="fail" if problems else "fallback" if soft else "ok", problems=hard + soft, notes=notes)
     if problems and os.environ.get("LINALG_ON_HPU_DUMP"):  # the failing inputs, for a reproducer
@@ -1016,7 +1010,7 @@ def run_codex_case(name, fn, ins, expect):
             problems += [f"error {err:.3g} > 1e-6"] * (not err <= 1e-6)
         # hpu-ops' CPU route is judged below: allowed only where torch raises (it reproduces torch's error there)
         problems += ["fell back"] * bool(rec["fallback"]) + cpu_warnings({**rec, "cpu_route": 0})
-        routed = row["cpu_route"] and want_err is None and expect != "raise" and not name.startswith(SVD_ROUTE_ROWS)
+        routed = row["cpu_route"] and want_err is None and expect != "raise"
         problems += [f"took hpu-ops' CPU route {row['cpu_route']}x"] * bool(routed)
     except Exception as e:  # noqa: BLE001  (a failing case is a row, not a crash)
         problems.append(f"exception {e!r}"[:300])
@@ -1206,15 +1200,28 @@ def run_svd_edges():
     check("decline_lstsq_rank_deficient", lambda a, b: L.lstsq(a, b),
           [rank1[0], torch.randn(BATCH, n, 3)], err_lstsq, expect_fb=True)
 
-    def svd_out_decline(x):
+    def svd_out_n34(x, driver=None):
         u = torch.zeros(BATCH, 4, 4, device=x.device, dtype=x.dtype)
         s = torch.zeros(BATCH, 4, device=x.device, dtype=x.dtype)
         vh = torch.zeros(BATCH, 4, 34, device=x.device, dtype=x.dtype)
-        L.svd(x, full_matrices=False, out=(u, s, vh))
+        L.svd(x, full_matrices=False, driver=driver, out=(u, s, vh))
         return u, s, vh
 
-    check("decline_svd_out_big_n", svd_out_decline, [torch.randn(BATCH, 4, 34, dtype=torch.float32)], err_svd,
+    check("svd_out_n34", svd_out_n34, [torch.randn(BATCH, 4, 34, dtype=torch.float32)], err_svd)
+    check("decline_svd_out_float64", svd_out_n34, [torch.randn(BATCH, 4, 34, dtype=torch.float64)], err_svd,
           expect_fb=True)
+    # n > 32 tall/wide/ill-conditioned/zeros edge cases (on-card, 0 fallbacks, 0 CPU routes)
+    check("zeros_svd_n64", lambda x: L.svd(x, full_matrices=False), [torch.zeros(4, 64, 64)], err_svd)
+    check("tall_svd_full_n72x40", lambda x: L.svd(x, full_matrices=True), [torch.randn(4, 72, 40)], err_svd)
+    check("wide_svd_n40x96", lambda x: L.svd(x, full_matrices=False), [torch.randn(4, 40, 96)], err_svd)
+    q1_64, _ = L.qr(torch.randn(4, 64, 64, dtype=torch.float64))
+    q2_64, _ = L.qr(torch.randn(4, 64, 64, dtype=torch.float64))
+    cond1e4_64 = [((q1_64 * torch.logspace(0, -4, 64, dtype=torch.float64).expand(4, 64).unsqueeze(-2)) @ q2_64.mT).float()]
+    check("cond1e4_svd_n64", lambda x: L.svd(x, full_matrices=False), cond1e4_64, err_svd, grad_fn=loss_svd)
+    q1_128, _ = L.qr(torch.randn(2, 128, 128, dtype=torch.float64))
+    q2_128, _ = L.qr(torch.randn(2, 128, 128, dtype=torch.float64))
+    cond1e4_128 = [((q1_128 * torch.logspace(0, -4, 128, dtype=torch.float64).expand(2, 128).unsqueeze(-2)) @ q2_128.mT).float()]
+    check("cond1e4_svdvals_n128", lambda x: L.svdvals(x), cond1e4_128, grad_fn=loss_sum)
     return out_results
 
 

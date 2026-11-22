@@ -65,6 +65,12 @@ SMALL_MAXN = 32  # MAXN of jacobi_svd, matrix_exp, lu_factor, lu_perm and lu_sol
 MAXHH = 64
 LARGE_MAXN = 512  # NMAX of gj_large_f32_gaudi2.c: the square in-place kernel; past it the blocked route (any n)
 EIGH_MAXN = 32  # MAXN of jacobi_eigh_f32_gaudi2.c
+BIG_SVD_MAXN = 64  # MAXN of jacobi_svd_big (m <= 128, n <= 64)
+BIG_SVD_MAXM = 128
+BIG_SVDVALS_MAXN = 128  # MAXN of jacobi_svdvals_big (m <= 128, n <= 128)
+BIG_SVDVALS_MAXM = 128
+HH_QR_MAXN = 64  # MAXN of hh_qr (m <= 256, n <= 64)
+HH_QR_MAXM = 256
 LIB = pathlib.Path(__file__).with_name("liblinalg_tpc.so")
 DEFAULT_KERNELS = "/usr/lib/habanalabs/libtpc_kernels.so"
 LATE_WARNING = ("hpu_ops: the HPU was used before hpu_ops.enable(); TPC linalg kernels are off for this process "
@@ -119,6 +125,23 @@ static habana::PartialOutputMetaDataVector svd_full_meta(const at::Stack& inputs
 static habana::PartialOutputMetaDataVector svdvals_meta(const at::Stack& inputs) {
   auto a = inputs[0].toTensor();
   return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1)}}};
+}
+static habana::PartialOutputMetaDataVector hh_qr_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto b = a.size(0), n = a.size(1), m = a.size(2), k = std::min(m, n);
+  return {habana::PartialOutputMetaData{a.scalar_type(), {b, k, m}},
+          habana::PartialOutputMetaData{a.scalar_type(), {b, n, k}}};
+}
+static habana::PartialOutputMetaDataVector hh_qr_r_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto b = a.size(0), n = a.size(1), m = a.size(2), k = std::min(m, n);
+  return {habana::PartialOutputMetaData{a.scalar_type(), {b, n, k}}};
+}
+static habana::PartialOutputMetaDataVector hh_qr_ytau_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto b = a.size(0), n = a.size(1), m = a.size(2), k = std::min(m, n);
+  return {habana::PartialOutputMetaData{a.scalar_type(), {b, n, m}},
+          habana::PartialOutputMetaData{a.scalar_type(), {b, k}}};
 }
 static habana::PartialOutputMetaDataVector hh_meta(const at::Stack& inputs) {
   auto a = inputs[0].toTensor();
@@ -190,6 +213,19 @@ static habana::PartialOutputMetaDataVector csvdvals_meta(const at::Stack& inputs
   auto a = inputs[0].toTensor();
   return {habana::PartialOutputMetaData{a.scalar_type(), {a.size(0), a.size(1) / 2}}};
 }
+static habana::PartialOutputMetaDataVector ceig_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto b = a.size(0), n = a.size(2);
+  return {habana::PartialOutputMetaData{a.scalar_type(), {b, 2, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), a.sizes().vec()},
+          habana::PartialOutputMetaData{a.scalar_type(), {b, 2}}};
+}
+static habana::PartialOutputMetaDataVector ceigvals_meta(const at::Stack& inputs) {
+  auto a = inputs[0].toTensor();
+  auto b = a.size(0), n = a.size(2);
+  return {habana::PartialOutputMetaData{a.scalar_type(), {b, 2, n}},
+          habana::PartialOutputMetaData{a.scalar_type(), {b, 2}}};
+}
 static bool registered_complex = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_ceigh", "jacobi_ceigh_f32_gaudi2", ceigh_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_ceigh_refine", "jacobi_ceigh_refine_f32_gaudi2",
@@ -199,6 +235,8 @@ static bool registered_complex = [] {
                                           nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::cgj_solve", "cgj_solve_f32_gaudi2", csolve_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::cgj_inv", "cgj_inv_f32_gaudi2", cinv_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::ceig", "ceig_f32_gaudi2", ceig_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::ceigvals", "ceigvals_f32_gaudi2", ceigvals_meta, nullptr);
   return true;
 }();
 static bool registered = [] {
@@ -215,6 +253,12 @@ static bool registered = [] {
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_svd_full", "jacobi_svd_full_f32_gaudi2", svd_full_meta,
                                           nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_svdvals", "jacobi_svdvals_f32_gaudi2", svdvals_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_svd_big", "jacobi_svd_big_f32_gaudi2", svd_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::jacobi_svdvals_big", "jacobi_svdvals_big_f32_gaudi2",
+                                          svdvals_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::hh_qr", "hh_qr_f32_gaudi2", hh_qr_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::hh_qr_r", "hh_qr_r_f32_gaudi2", hh_qr_r_meta, nullptr);
+  habana::custom_op::registerUserCustomOp("linalg_tpc::hh_qr_ytau", "hh_qr_ytau_f32_gaudi2", hh_qr_ytau_meta, nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::householder_product", "householder_product_f32_gaudi2", hh_meta,
                                           nullptr);
   habana::custom_op::registerUserCustomOp("linalg_tpc::matrix_exp", "matrix_exp_f32_gaudi2", hh_meta, nullptr);
@@ -271,6 +315,18 @@ at::Tensor jacobi_csvdvals(at::Tensor a) {
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_csvdvals");
   return desc.execute(inputs)[0];
 }
+std::tuple<at::Tensor, at::Tensor, at::Tensor> ceig(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::ceig");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+std::tuple<at::Tensor, at::Tensor> ceigvals(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::ceigvals");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
+}
 std::tuple<at::Tensor, at::Tensor, at::Tensor> cgj_inv(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::cgj_inv");
@@ -301,6 +357,36 @@ at::Tensor jacobi_svdvals(at::Tensor a) {
   auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_svdvals");
   auto out = desc.execute(inputs);
   return out[0];
+}
+std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd_big(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_svd_big");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+at::Tensor jacobi_svdvals_big(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::jacobi_svdvals_big");
+  auto out = desc.execute(inputs);
+  return out[0];
+}
+std::tuple<at::Tensor, at::Tensor> hh_qr(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::hh_qr");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
+}
+at::Tensor hh_qr_r(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::hh_qr_r");
+  auto out = desc.execute(inputs);
+  return out[0];
+}
+std::tuple<at::Tensor, at::Tensor> hh_qr_ytau(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::UserCustomOpDescriptor::getUserCustomOpDescriptor("linalg_tpc::hh_qr_ytau");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
 }
 at::Tensor householder_product(at::Tensor a, at::Tensor tau) {
   std::vector<c10::IValue> inputs{a, tau};
@@ -378,6 +464,8 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("jacobi_ceigh_refine(Tensor h, Tensor v1) -> (Tensor, Tensor)");
   m.def("jacobi_csvd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_csvdvals(Tensor a) -> Tensor");
+  m.def("ceig(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("ceigvals(Tensor a) -> (Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svdvals(Tensor a) -> Tensor");
@@ -395,6 +483,11 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
   m.def("jacobi_big(Tensor s0) -> Tensor");
   m.def("jacobi_big_refine(Tensor s0) -> Tensor");
+  m.def("jacobi_svd_big(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_svdvals_big(Tensor a) -> Tensor");
+  m.def("hh_qr(Tensor a) -> (Tensor, Tensor)");
+  m.def("hh_qr_r(Tensor a) -> Tensor");
+  m.def("hh_qr_ytau(Tensor a) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_large", gj_large);
@@ -406,6 +499,8 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("jacobi_ceigh_refine", jacobi_ceigh_refine);
   m.impl("jacobi_csvd", jacobi_csvd);
   m.impl("jacobi_csvdvals", jacobi_csvdvals);
+  m.impl("ceig", ceig);
+  m.impl("ceigvals", ceigvals);
   m.impl("jacobi_svd", jacobi_svd);
   m.impl("jacobi_svd_full", jacobi_svd_full);
   m.impl("jacobi_svdvals", jacobi_svdvals);
@@ -423,6 +518,11 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
   m.impl("jacobi_big", jacobi_big);
   m.impl("jacobi_big_refine", jacobi_big_refine);
+  m.impl("jacobi_svd_big", jacobi_svd_big);
+  m.impl("jacobi_svdvals_big", jacobi_svdvals_big);
+  m.impl("hh_qr", hh_qr);
+  m.impl("hh_qr_r", hh_qr_r);
+  m.impl("hh_qr_ytau", hh_qr_ytau);
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   m.impl("gj_large", [](at::Tensor a) {
@@ -448,6 +548,14 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
     return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({b, k2 / 2}), a.new_empty({b, k2, k2 / 2}));
   });
   m.impl("jacobi_csvdvals", [](at::Tensor a) { return a.new_empty({a.size(0), a.size(1) / 2}); });
+  m.impl("ceig", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(2);
+    return std::make_tuple(a.new_empty({b, 2, n}), a.new_empty(a.sizes()), a.new_empty({b, 2}));
+  });
+  m.impl("ceigvals", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(2);
+    return std::make_tuple(a.new_empty({b, 2, n}), a.new_empty({b, 2}));
+  });
   m.impl("cgj_inv", [](at::Tensor a) {
     return std::make_tuple(a.new_empty(a.sizes()), a.new_empty({a.size(0), 3, a.size(2)}), a.new_empty({a.size(0), 4}));
   });
@@ -492,6 +600,25 @@ TORCH_LIBRARY_IMPL(linalg_tpc, Meta, m) {
   });
   m.impl("jacobi_big", [](at::Tensor s0) { return s0.new_empty(s0.sizes()); });
   m.impl("jacobi_big_refine", [](at::Tensor s0) { return s0.new_empty(s0.sizes()); });
+  m.impl("jacobi_svd_big", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(1), m = a.size(2);
+    return std::make_tuple(a.new_empty({b, n, m}), a.new_empty({b, n}), a.new_empty({b, n, n}));
+  });
+  m.impl("jacobi_svdvals_big", [](at::Tensor a) {
+    return a.new_empty({a.size(0), a.size(1)});
+  });
+  m.impl("hh_qr", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(1), m = a.size(2), k = std::min(m, n);
+    return std::make_tuple(a.new_empty({b, k, m}), a.new_empty({b, n, k}));
+  });
+  m.impl("hh_qr_r", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(1), m = a.size(2), k = std::min(m, n);
+    return a.new_empty({b, n, k});
+  });
+  m.impl("hh_qr_ytau", [](at::Tensor a) {
+    auto b = a.size(0), n = a.size(1), m = a.size(2), k = std::min(m, n);
+    return std::make_tuple(a.new_empty({b, n, m}), a.new_empty({b, k}));
+  });
 }
 """
 CPP_LAZY = r"""
@@ -573,6 +700,10 @@ static auto cjshape = [](const at::Stack& s) {
   auto a = s[0].toTensor();
   return std::vector<int64_t>{a.size(0), a.size(1), a.size(1) / 2};
 };
+static auto ceig_wshape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  return std::vector<int64_t>{a.size(0), 2, a.size(2)};
+};
 static bool registered_cjacobi = [] {
   std::vector<habana::custom_op::InputDesc> in1{{habana::custom_op::input_type::TENSOR, 0}};
   std::vector<habana::custom_op::InputDesc> in2{{habana::custom_op::input_type::TENSOR, 0},
@@ -589,6 +720,13 @@ static bool registered_cjacobi = [] {
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_csvd", "jacobi_csvd_f32_gaudi2", in1, o_svd, nullptr);
   std::vector<habana::custom_op::OutputDesc> o_vals{{0, c10::ScalarType::Float, csshape_svd}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_csvdvals", "jacobi_csvdvals_f32_gaudi2", in1, o_vals, nullptr);
+  std::vector<habana::custom_op::OutputDesc> o_ceig{{0, c10::ScalarType::Float, ceig_wshape},
+                                                    {1, c10::ScalarType::Float, xshape_a},
+                                                    {2, c10::ScalarType::Float, sshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::ceig", "ceig_f32_gaudi2", in1, o_ceig, nullptr);
+  std::vector<habana::custom_op::OutputDesc> o_ceigvals{{0, c10::ScalarType::Float, ceig_wshape},
+                                                        {1, c10::ScalarType::Float, sshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::ceigvals", "ceigvals_f32_gaudi2", in1, o_ceigvals, nullptr);
   return true;
 }();
 static bool registered_inv = [] {
@@ -619,6 +757,39 @@ static bool registered_svdvals = [] {
   std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
   std::vector<habana::custom_op::OutputDesc> out{{0, c10::ScalarType::Float, dshape}};
   REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_svdvals", "jacobi_svdvals_f32_gaudi2", in, out, nullptr);
+  return true;
+}();
+static auto hhq_shape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  auto k = std::min(a.size(1), a.size(2));
+  return std::vector<int64_t>{a.size(0), k, a.size(2)};
+};
+static auto hhr_shape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  auto k = std::min(a.size(1), a.size(2));
+  return std::vector<int64_t>{a.size(0), a.size(1), k};
+};
+static auto hht_shape = [](const at::Stack& s) {
+  auto a = s[0].toTensor();
+  auto k = std::min(a.size(1), a.size(2));
+  return std::vector<int64_t>{a.size(0), k};
+};
+static bool registered_svd_big = [] {
+  std::vector<habana::custom_op::InputDesc> in{{habana::custom_op::input_type::TENSOR, 0}};
+  std::vector<habana::custom_op::OutputDesc> o_svd{{0, c10::ScalarType::Float, xshape_a},
+                                                   {1, c10::ScalarType::Float, dshape},
+                                                   {2, c10::ScalarType::Float, vhshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_svd_big", "jacobi_svd_big_f32_gaudi2", in, o_svd, nullptr);
+  std::vector<habana::custom_op::OutputDesc> o_vals{{0, c10::ScalarType::Float, dshape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::jacobi_svdvals_big", "jacobi_svdvals_big_f32_gaudi2", in, o_vals, nullptr);
+  std::vector<habana::custom_op::OutputDesc> o_qr{{0, c10::ScalarType::Float, hhq_shape},
+                                                  {1, c10::ScalarType::Float, hhr_shape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::hh_qr", "hh_qr_f32_gaudi2", in, o_qr, nullptr);
+  std::vector<habana::custom_op::OutputDesc> o_qrr{{0, c10::ScalarType::Float, hhr_shape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::hh_qr_r", "hh_qr_r_f32_gaudi2", in, o_qrr, nullptr);
+  std::vector<habana::custom_op::OutputDesc> o_yt{{0, c10::ScalarType::Float, xshape_a},
+                                                  {1, c10::ScalarType::Float, hht_shape}};
+  REGISTER_CUSTOM_OP_ATTRIBUTES("linalg_tpc::hh_qr_ytau", "hh_qr_ytau_f32_gaudi2", in, o_yt, nullptr);
   return true;
 }();
 static bool registered_hh = [] {
@@ -747,6 +918,18 @@ at::Tensor jacobi_csvdvals(at::Tensor a) {
   auto desc = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_csvdvals");
   return desc.execute(inputs)[0];
 }
+std::tuple<at::Tensor, at::Tensor, at::Tensor> ceig(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::ceig");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+std::tuple<at::Tensor, at::Tensor> ceigvals(at::Tensor a) {
+  std::vector<c10::IValue> inputs{a};
+  auto desc = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::ceigvals");
+  auto out = desc.execute(inputs);
+  return {out[0], out[1]};
+}
 std::tuple<at::Tensor, at::Tensor, at::Tensor> cgj_inv(at::Tensor a) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::cgj_inv");
   std::vector<c10::IValue> inputs{a};
@@ -777,6 +960,36 @@ at::Tensor jacobi_svdvals(at::Tensor a) {
   std::vector<c10::IValue> inputs{a};
   auto out = op.execute(inputs);
   return out[0];
+}
+std::tuple<at::Tensor, at::Tensor, at::Tensor> jacobi_svd_big(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_svd_big");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1], out[2]};
+}
+at::Tensor jacobi_svdvals_big(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::jacobi_svdvals_big");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return out[0];
+}
+std::tuple<at::Tensor, at::Tensor> hh_qr(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::hh_qr");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1]};
+}
+at::Tensor hh_qr_r(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::hh_qr_r");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return out[0];
+}
+std::tuple<at::Tensor, at::Tensor> hh_qr_ytau(at::Tensor a) {
+  auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::hh_qr_ytau");
+  std::vector<c10::IValue> inputs{a};
+  auto out = op.execute(inputs);
+  return {out[0], out[1]};
 }
 at::Tensor householder_product(at::Tensor a, at::Tensor tau) {
   auto op = habana::custom_op::HabanaCustomOpDescriptor::getCustomOpDescriptor("linalg_tpc::householder_product");
@@ -853,6 +1066,8 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("jacobi_ceigh_refine(Tensor h, Tensor v1) -> (Tensor, Tensor)");
   m.def("jacobi_csvd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_csvdvals(Tensor a) -> Tensor");
+  m.def("ceig(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("ceigvals(Tensor a) -> (Tensor, Tensor)");
   m.def("jacobi_svd(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svd_full(Tensor a) -> (Tensor, Tensor, Tensor)");
   m.def("jacobi_svdvals(Tensor a) -> Tensor");
@@ -870,6 +1085,11 @@ TORCH_LIBRARY(linalg_tpc, m) {
   m.def("jacobi_eigh_refine(Tensor a, Tensor v1) -> (Tensor, Tensor)");
   m.def("jacobi_big(Tensor s0) -> Tensor");
   m.def("jacobi_big_refine(Tensor s0) -> Tensor");
+  m.def("jacobi_svd_big(Tensor a) -> (Tensor, Tensor, Tensor)");
+  m.def("jacobi_svdvals_big(Tensor a) -> Tensor");
+  m.def("hh_qr(Tensor a) -> (Tensor, Tensor)");
+  m.def("hh_qr_r(Tensor a) -> Tensor");
+  m.def("hh_qr_ytau(Tensor a) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("gj_large", gj_large);
@@ -881,6 +1101,8 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("jacobi_ceigh_refine", jacobi_ceigh_refine);
   m.impl("jacobi_csvd", jacobi_csvd);
   m.impl("jacobi_csvdvals", jacobi_csvdvals);
+  m.impl("ceig", ceig);
+  m.impl("ceigvals", ceigvals);
   m.impl("jacobi_svd", jacobi_svd);
   m.impl("jacobi_svd_full", jacobi_svd_full);
   m.impl("jacobi_svdvals", jacobi_svdvals);
@@ -898,6 +1120,11 @@ TORCH_LIBRARY_IMPL(linalg_tpc, HPU, m) {
   m.impl("jacobi_eigh_refine", jacobi_eigh_refine);
   m.impl("jacobi_big", jacobi_big);
   m.impl("jacobi_big_refine", jacobi_big_refine);
+  m.impl("jacobi_svd_big", jacobi_svd_big);
+  m.impl("jacobi_svdvals_big", jacobi_svdvals_big);
+  m.impl("hh_qr", hh_qr);
+  m.impl("hh_qr_r", hh_qr_r);
+  m.impl("hh_qr_ytau", hh_qr_ytau);
 }
 """
 
@@ -1153,6 +1380,36 @@ def _svdvals_op():
     """``torch.ops.linalg_tpc.jacobi_svdvals``, built on first use."""
     _load()
     return torch.ops.linalg_tpc.jacobi_svdvals
+
+
+def _svd_big_op():
+    """``torch.ops.linalg_tpc.jacobi_svd_big``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_svd_big
+
+
+def _svdvals_big_op():
+    """``torch.ops.linalg_tpc.jacobi_svdvals_big``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.jacobi_svdvals_big
+
+
+def _hh_qr_op():
+    """``torch.ops.linalg_tpc.hh_qr``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.hh_qr
+
+
+def _hh_qr_r_op():
+    """``torch.ops.linalg_tpc.hh_qr_r``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.hh_qr_r
+
+
+def _hh_qr_ytau_op():
+    """``torch.ops.linalg_tpc.hh_qr_ytau``, built on first use."""
+    _load()
+    return torch.ops.linalg_tpc.hh_qr_ytau
 
 
 def _hh_op():
@@ -1817,6 +2074,307 @@ def jacobi_svdvals(A, sort=True, flush=True):
     A_t = _fresh((A if no_t else A.mT).reshape(-1, k, max(m, n)).to(torch.float32).contiguous())
     S = (_call(_svdvals_op(), A_t) if flush else _svdvals_op()(A_t)).reshape(*batch, k)
     return _sort(S, descending=True)[0] if sort else S
+
+
+def jacobi_svd_big(A, sort=True, flush=True):
+    """Thin SVD ``(U, S, Vh)`` for ``A[..., m, n]`` (float32, ``min(m, n) <= BIG_SVD_MAXN``,
+    ``max(m, n) <= BIG_SVD_MAXM``) from the LUT-free one-sided Jacobi kernel (wide ``m < n`` via ``.mT``)."""
+    if A.dim() < 2:
+        raise ValueError(f"hpu_ops.tpc.jacobi_svd_big takes 2D+ A, got {tuple(A.shape)}")
+    _float32(A)
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k, big = min(m, n), max(m, n)
+    if k > BIG_SVD_MAXN or big > BIG_SVD_MAXM:
+        raise ValueError(
+            f"hpu_ops.tpc.jacobi_svd_big takes min(m, n) <= {BIG_SVD_MAXN}, max(m, n) <= {BIG_SVD_MAXM}, "
+            f"got {tuple(A.shape)}"
+        )
+    if A.numel() == 0:
+        return (A.new_empty(*batch, m, k, dtype=torch.float32),
+                A.new_empty(*batch, k, dtype=torch.float32),
+                A.new_empty(*batch, k, n, dtype=torch.float32))
+    swap = m < n or (m == n and A.is_contiguous())
+    A_t = _fresh((A if swap else A.mT).reshape(-1, k, big).to(torch.float32).contiguous())
+    op = _svd_big_op()
+    Ut, S, Vh = _call(op, A_t) if flush else op(A_t)
+    eye = torch.eye(k, dtype=torch.float32, device=A.device)
+    Ut = (1.5 * eye - 0.5 * (Ut @ Ut.mT)) @ Ut
+    Vh = (1.5 * eye - 0.5 * (Vh @ Vh.mT)) @ Vh
+    if swap:
+        U, Vh = Vh.mT.reshape(*batch, m, k), Ut.reshape(*batch, k, n)
+    else:
+        U, Vh = Ut.mT.reshape(*batch, m, k), Vh.reshape(*batch, k, n)
+    S = S.reshape(*batch, k)
+    if not sort:
+        return U, S, Vh
+    S, order = _sort(S, descending=True)
+    return U.gather(-1, order[..., None, :].expand_as(U)), S, Vh.gather(-2, order[..., :, None].expand_as(Vh))
+
+
+def jacobi_svdvals_big(A, sort=True, flush=True):
+    """Singular values ``S`` for ``A[..., m, n]`` (float32, ``m, n <= 128`` directly, or ``m <= 256, n <= 64`` /
+    ``m <= 64, n <= 256`` via ``hh_qr`` + ``jacobi_svdvals_big``)."""
+    if A.dim() < 2:
+        raise ValueError(f"hpu_ops.tpc.jacobi_svdvals_big takes 2D+ A, got {tuple(A.shape)}")
+    _float32(A)
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k, big = min(m, n), max(m, n)
+    if A.numel() == 0:
+        return A.new_empty(*batch, k, dtype=torch.float32)
+    if big <= BIG_SVDVALS_MAXM and k <= BIG_SVDVALS_MAXN:
+        no_t = m < n or (m == n and A.is_contiguous())
+        A_t = _fresh((A if no_t else A.mT).reshape(-1, k, big).to(torch.float32).contiguous())
+        op = _svdvals_big_op()
+        S = (_call(op, A_t) if flush else op(A_t)).reshape(*batch, k)
+        return _sort(S, descending=True)[0] if sort else S
+    if k <= HH_QR_MAXN and big <= HH_QR_MAXM:
+        R = hh_qr(A if m >= n else A.mT, r_only=True, flush=flush)
+        return jacobi_svdvals_big(R, sort=sort, flush=flush)
+    raise ValueError(
+        f"hpu_ops.tpc.jacobi_svdvals_big takes m, n <= {BIG_SVDVALS_MAXN} or min(m, n) <= {HH_QR_MAXN} "
+        f"with max(m, n) <= {HH_QR_MAXM}, got {tuple(A.shape)}"
+    )
+
+
+def hh_qr(A, r_only=False, flush=True):
+    """Householder QR for ``A[..., m, n]`` (float32, ``m <= HH_QR_MAXM``, ``n <= HH_QR_MAXN``).
+    Returns ``R (..., k, n)`` if ``r_only=True``, else ``(Q (..., m, k), R (..., k, n))``, ``k = min(m, n)``."""
+    if A.dim() < 2:
+        raise ValueError(f"hpu_ops.tpc.hh_qr takes 2D+ A, got {tuple(A.shape)}")
+    _float32(A)
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k = min(m, n)
+    if m > HH_QR_MAXM or n > HH_QR_MAXN:
+        raise ValueError(f"hpu_ops.tpc.hh_qr takes m <= {HH_QR_MAXM}, n <= {HH_QR_MAXN}, got {tuple(A.shape)}")
+    if A.numel() == 0:
+        R_empty = A.new_empty(*batch, k, n, dtype=torch.float32)
+        return R_empty if r_only else (A.new_empty(*batch, m, k, dtype=torch.float32), R_empty)
+    A_t = _fresh(A.mT.reshape(-1, n, m).to(torch.float32).contiguous())
+    if r_only:
+        op = _hh_qr_r_op()
+        R_t = _call(op, A_t) if flush else op(A_t)
+        return R_t.mT.reshape(*batch, k, n)
+    op = _hh_qr_op()
+    Q_t, R_t = _call(op, A_t) if flush else op(A_t)
+    return Q_t.mT.reshape(*batch, m, k), R_t.mT.reshape(*batch, k, n)
+
+
+def _hh_qr_ytau(A, flush=True):
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k = min(m, n)
+    A_t = _fresh(A.mT.reshape(-1, n, m).to(torch.float32).contiguous())
+    op = _hh_qr_ytau_op()
+    YR_t, tau = _call(op, A_t) if flush else op(A_t)
+    return YR_t.mT.reshape(*batch, m, n), tau.reshape(*batch, k)
+
+
+def tsqr_r(A, flush=True):
+    """Tall-skinny QR returning ``R (..., min(m, n), n)`` for arbitrary ``m`` and ``n <= HH_QR_MAXN``."""
+    if A.dim() < 2:
+        raise ValueError(f"hpu_ops.tpc.tsqr_r takes 2D+ A, got {tuple(A.shape)}")
+    _float32(A)
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    if n > HH_QR_MAXN:
+        raise ValueError(f"hpu_ops.tpc.tsqr_r takes n <= {HH_QR_MAXN}, got {tuple(A.shape)}")
+    k = min(m, n)
+    if A.numel() == 0:
+        return A.new_empty(*batch, k, n, dtype=torch.float32)
+    if m <= HH_QR_MAXM:
+        return hh_qr(A, r_only=True, flush=flush)
+    flat = A.reshape(-1, m, n).to(torch.float32)
+    b = flat.shape[0]
+    while flat.shape[-2] > HH_QR_MAXM:
+        cur_m = flat.shape[-2]
+        n_full, rem = divmod(cur_m, HH_QR_MAXM)
+        parts = []
+        if n_full:
+            chunks = flat[:, :n_full * HH_QR_MAXM].reshape(b * n_full, HH_QR_MAXM, n)
+            r_full = hh_qr(chunks, r_only=True, flush=flush)
+            parts.append(r_full.reshape(b, n_full * min(HH_QR_MAXM, n), n))
+        if rem:
+            parts.append(hh_qr(flat[:, n_full * HH_QR_MAXM:], r_only=True, flush=flush))
+        flat = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-2)
+    return hh_qr(flat, r_only=True, flush=flush).reshape(*batch, k, n)
+
+
+def _tsqr_qr_flat(flat, flush=True):
+    b, m, n = flat.shape
+    if m <= HH_QR_MAXM:
+        return hh_qr(flat, r_only=False, flush=flush)
+    n_full, rem = divmod(m, HH_QR_MAXM)
+    k_full = min(HH_QR_MAXM, n)
+    chunks = flat[:, :n_full * HH_QR_MAXM].reshape(b * n_full, HH_QR_MAXM, n)
+    Q_full, R_full = hh_qr(chunks, r_only=False, flush=flush)
+    Q_full = Q_full.reshape(b, n_full, HH_QR_MAXM, k_full)
+    R_full = R_full.reshape(b, n_full * k_full, n)
+    if rem:
+        Q_rem, R_rem = hh_qr(flat[:, n_full * HH_QR_MAXM:], r_only=False, flush=flush)
+        R_stack = torch.cat([R_full, R_rem], dim=-2)
+    else:
+        Q_rem = None
+        R_stack = R_full
+    Q_top, R = _tsqr_qr_flat(R_stack, flush=flush)
+    k = R.shape[-2]
+    q_parts = [
+        (Q_full @ Q_top[:, :n_full * k_full].reshape(b, n_full, k_full, k)).reshape(b, n_full * HH_QR_MAXM, k)
+    ]
+    if Q_rem is not None:
+        q_parts.append(Q_rem @ Q_top[:, n_full * k_full:])
+    Q = q_parts[0] if len(q_parts) == 1 else torch.cat(q_parts, dim=-2)
+    return Q, R
+
+
+def tsqr_qr(A, flush=True):
+    """Tall-skinny QR returning ``(Q (..., m, k), R (..., k, n))`` for arbitrary ``m`` and ``n <= HH_QR_MAXN``."""
+    if A.dim() < 2:
+        raise ValueError(f"hpu_ops.tpc.tsqr_qr takes 2D+ A, got {tuple(A.shape)}")
+    _float32(A)
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    if n > HH_QR_MAXN:
+        raise ValueError(f"hpu_ops.tpc.tsqr_qr takes n <= {HH_QR_MAXN}, got {tuple(A.shape)}")
+    k = min(m, n)
+    if A.numel() == 0:
+        return A.new_empty(*batch, m, k, dtype=torch.float32), A.new_empty(*batch, k, n, dtype=torch.float32)
+    if m <= HH_QR_MAXM:
+        return hh_qr(A, r_only=False, flush=flush)
+    Q, R = _tsqr_qr_flat(A.reshape(-1, m, n).to(torch.float32), flush=flush)
+    return Q.reshape(*batch, m, k), R.reshape(*batch, k, n)
+
+
+def _unit_triu_inv_tpc(U):
+    """Inverse of unit upper-triangular ``U[..., k, k]``."""
+    k = U.shape[-1]
+    if k <= 1:
+        return torch.ones_like(U)
+    if k == 2:
+        return torch.eye(2, dtype=U.dtype, device=U.device) - torch.triu(U, 1)
+    p = 1 << (k - 1).bit_length()
+    Ip = torch.eye(p, dtype=U.dtype, device=U.device)
+    U_pad = torch.nn.functional.pad(torch.triu(U, 1), (0, p - k, 0, p - k)) + Ip if p > k else torch.triu(U, 1) + Ip
+    b = p >> 1
+    U2 = torch.diagonal(U_pad.unflatten(-2, (b, 2)).unflatten(-1, (b, 2)), dim1=-4, dim2=-2).movedim(-1, -3)
+    X = 2.0 * torch.eye(2, dtype=U.dtype, device=U.device) - U2
+    s = 2
+    while s < p:
+        nb = p // (2 * s)
+        blocks = torch.diagonal(
+            U_pad.unflatten(-2, (nb, 2 * s)).unflatten(-1, (nb, 2 * s)), dim1=-4, dim2=-2
+        ).movedim(-1, -3)
+        C = blocks[..., :s, s:]
+        Xa, Xd = X[..., 0::2, :, :], X[..., 1::2, :, :]
+        ur = -(Xa @ C @ Xd)
+        X = torch.cat([torch.cat([Xa, ur], -1), torch.nn.functional.pad(Xd, (s, 0))], -2)
+        s *= 2
+    return X[..., 0, :k, :k]
+
+
+def _wy_yt(YR, tau):
+    r, c = YR.shape[-2], tau.shape[-1]
+    Y = torch.tril(YR[..., :c], -1) + torch.eye(r, c, dtype=YR.dtype, device=YR.device)
+    S = torch.triu(Y.mT @ Y, 1)
+    tS = tau.unsqueeze(-1) * S
+    U = torch.eye(c, dtype=YR.dtype, device=YR.device) + torch.where((tau.unsqueeze(-1) == 0) & S.isinf(), 0.0, tS)
+    T = _unit_triu_inv_tpc(U) * tau.unsqueeze(-2)
+    return Y, T
+
+
+def block_qr(A, flush=True):
+    """Block Householder QR returning ``(Q (..., m, k), R (..., k, n))`` for arbitrary ``m, n``, ``k = min(m, n)``."""
+    if A.dim() < 2:
+        raise ValueError(f"hpu_ops.tpc.block_qr takes 2D+ A, got {tuple(A.shape)}")
+    _float32(A)
+    batch, m, n = A.shape[:-2], A.shape[-2], A.shape[-1]
+    k = min(m, n)
+    if A.numel() == 0:
+        return A.new_empty(*batch, m, k, dtype=torch.float32), A.new_empty(*batch, k, n, dtype=torch.float32)
+    if n <= HH_QR_MAXN:
+        return tsqr_qr(A, flush=flush)
+    if m < n:
+        Q, R_left = block_qr(A[..., :, :m], flush=flush)
+        R_right = Q.mT @ A[..., :, m:]
+        return Q, torch.cat([R_left, R_right], dim=-1)
+
+    M = A.reshape(-1, m, n).to(torch.float32).clone()
+    b = M.shape[0]
+    bs = HH_QR_MAXN
+    steps = []  # list of (row_ids_or_None, s_start, Y, T)
+    r_blocks = []
+
+    for s in range(0, n, bs):
+        e = min(s + bs, n)
+        c = e - s
+        r = m - s
+        if r <= HH_QR_MAXM:
+            YR, tau = _hh_qr_ytau(_fresh(M[:, s:, s:e].contiguous()), flush=flush)
+            Y, T = _wy_yt(YR, tau)
+            r_diag = torch.triu(YR[:, :c, :])
+            r_col = torch.cat([M[:, :s, s:e], r_diag], dim=-2) if s else r_diag
+            r_blocks.append(torch.nn.functional.pad(r_col, (0, 0, 0, n - e)))
+            if e < n:
+                trail = M[:, s:, e:]
+                M[:, s:, e:] = trail - Y @ (T.mT @ (Y.mT @ trail))
+            steps.append((None, s, Y, T))
+        else:
+            # Hierarchical Householder tree reduction over chunks <= HH_QR_MAXM
+            cur_X = M[:, s:, s:e]
+            cur_trail = M[:, s:, e:] if e < n else None
+            cur_rows = list(range(s, m))
+            levels = []  # [(sizes, trail_rests)] for reassembly of M[:, s:, e:]
+            while cur_X.shape[-2] > HH_QR_MAXM:
+                cur_r = cur_X.shape[-2]
+                n_ch = -(-cur_r // HH_QR_MAXM)
+                q_sz, rem_sz = divmod(cur_r, n_ch)
+                sizes = [q_sz + (i < rem_sz) for i in range(n_ch)]
+                next_X, next_trail, next_rows, trail_rests = [], [], [], []
+                off = 0
+                for sz in sizes:
+                    X_ch = cur_X[:, off:off + sz, :]
+                    rows_ch = cur_rows[off:off + sz]
+                    YR_ch, tau_ch = _hh_qr_ytau(_fresh(X_ch.contiguous()), flush=flush)
+                    Y_ch, T_ch = _wy_yt(YR_ch, tau_ch)
+                    if cur_trail is not None:
+                        tr_ch = cur_trail[:, off:off + sz, :]
+                        tr_ch = tr_ch - Y_ch @ (T_ch.mT @ (Y_ch.mT @ tr_ch))
+                        next_trail.append(tr_ch[:, :c, :])
+                        trail_rests.append(tr_ch[:, c:, :])
+                    steps.append((rows_ch, s, Y_ch, T_ch))
+                    next_X.append(torch.triu(YR_ch[:, :c, :]))
+                    next_rows.extend(rows_ch[:c])
+                    off += sz
+                levels.append((sizes, trail_rests))
+                cur_X = torch.cat(next_X, dim=-2)
+                cur_trail = torch.cat(next_trail, dim=-2) if cur_trail is not None else None
+                cur_rows = next_rows
+
+            YR_top, tau_top = _hh_qr_ytau(_fresh(cur_X.contiguous()), flush=flush)
+            Y_top, T_top = _wy_yt(YR_top, tau_top)
+            if cur_trail is not None:
+                cur_trail = cur_trail - Y_top @ (T_top.mT @ (Y_top.mT @ cur_trail))
+                for sizes, trail_rests in reversed(levels):
+                    reassembled = []
+                    off = 0
+                    for rest in trail_rests:
+                        reassembled.append(cur_trail[:, off:off + c, :])
+                        reassembled.append(rest)
+                        off += c
+                    cur_trail = torch.cat(reassembled, dim=-2)
+                M[:, s:, e:] = cur_trail
+            steps.append((cur_rows, s, Y_top, T_top))
+            r_diag = torch.triu(YR_top[:, :c, :])
+            r_col = torch.cat([M[:, :s, s:e], r_diag], dim=-2) if s else r_diag
+            r_blocks.append(torch.nn.functional.pad(r_col, (0, 0, 0, n - e)))
+
+    R = torch.cat(r_blocks, dim=-1)
+    Q = torch.eye(m, n, dtype=M.dtype, device=M.device).expand(b, m, n).clone()
+    for rows, s, Y, T in reversed(steps):
+        if rows is None:
+            Q_sub = Q[:, s:, s:]
+            Q[:, s:, s:] = Q_sub - Y @ (T @ (Y.mT @ Q_sub))
+        else:
+            idx = torch.tensor(rows, dtype=torch.long, device=M.device)
+            Q_sub = Q[:, idx, s:]
+            Q[:, idx, s:] = Q_sub - Y @ (T @ (Y.mT @ Q_sub))
+    return Q.reshape(*batch, m, n), R.reshape(*batch, n, n)
 
 
 def _ftz32(t):

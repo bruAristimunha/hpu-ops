@@ -152,3 +152,67 @@ foreach(KERNEL jacobi_ceigh_f32_gaudi2 jacobi_ceigh_refine_f32_gaudi2 jacobi_csv
     set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
     target_link_libraries(linalg_tpc ${KERNEL})
 endforeach()
+
+# LUT-free 80 KB VLM SVD >32: jacobi_svd_big{1,2} (m <= 128, n <= 64 -> Ut, S, Vt) and
+# jacobi_svdvals_big{1,2} (-DNO_UV, m <= 128, n <= 128 -> S).
+foreach(KERNEL
+        jacobi_svd_big1_f32_gaudi2 jacobi_svd_big2_f32_gaudi2
+        jacobi_svdvals_big1_f32_gaudi2 jacobi_svdvals_big2_f32_gaudi2)
+    set(DEFINES "")
+    if(KERNEL MATCHES "^jacobi_svd_big([0-9])_")
+        set(DEFINES -DVA=${CMAKE_MATCH_1})
+    elseif(KERNEL MATCHES "^jacobi_svdvals_big([0-9])_")
+        set(DEFINES -DVA=${CMAKE_MATCH_1} -DNO_UV)
+    endif()
+    add_custom_command(
+        OUTPUT ${KERNEL}_x86.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/jacobi_svd_big_f32_gaudi2.c
+        COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/jacobi_svd_big_f32_gaudi2.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
+        COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 ${DEFINES} -I${TPC_INCLUDE_DIR}/ ./${KERNEL}.c -c
+        COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
+    add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
+    set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
+    target_link_libraries(linalg_tpc ${KERNEL})
+endforeach()
+
+# LUT-free 80 KB VLM Householder QR: hh_qr{1..4} (Q_t, R_t), hh_qr_r{1..4} (-DR_ONLY), hh_qr_ytau{1..4} (-DY_TAU).
+foreach(KERNEL
+        hh_qr1_f32_gaudi2 hh_qr2_f32_gaudi2 hh_qr3_f32_gaudi2 hh_qr4_f32_gaudi2
+        hh_qr_r1_f32_gaudi2 hh_qr_r2_f32_gaudi2 hh_qr_r3_f32_gaudi2 hh_qr_r4_f32_gaudi2
+        hh_qr_ytau1_f32_gaudi2 hh_qr_ytau2_f32_gaudi2 hh_qr_ytau3_f32_gaudi2 hh_qr_ytau4_f32_gaudi2)
+    set(DEFINES "")
+    if(KERNEL MATCHES "^hh_qr([0-9])_")
+        set(DEFINES -DVA=${CMAKE_MATCH_1})
+    elseif(KERNEL MATCHES "^hh_qr_r([0-9])_")
+        set(DEFINES -DVA=${CMAKE_MATCH_1} -DR_ONLY)
+    elseif(KERNEL MATCHES "^hh_qr_ytau([0-9])_")
+        set(DEFINES -DVA=${CMAKE_MATCH_1} -DY_TAU)
+    endif()
+    add_custom_command(
+        OUTPUT ${KERNEL}_x86.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hh_qr_f32_gaudi2.c
+        COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/hh_qr_f32_gaudi2.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
+        COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 ${DEFINES} -I${TPC_INCLUDE_DIR}/ ./${KERNEL}.c -c
+        COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
+    add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
+    set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
+    target_link_libraries(linalg_tpc ${KERNEL})
+endforeach()
+
+# complex64 general eig / eigvals (MPS recipe): ceig and ceigvals (-DNO_VECTORS) share ceig_f32_gaudi2.c.
+set(CEIG_SOURCE ceig_f32_gaudi2)
+foreach(KERNEL ceig_f32_gaudi2 ceigvals_f32_gaudi2)
+    set(DEFINES "")
+    if(KERNEL STREQUAL "ceigvals_f32_gaudi2")
+        set(DEFINES -DNO_VECTORS)
+    endif()
+    add_custom_command(
+        OUTPUT ${KERNEL}_x86.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${CEIG_SOURCE}.c
+        COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${CEIG_SOURCE}.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
+        COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 ${DEFINES} -I${TPC_INCLUDE_DIR}/ ./${KERNEL}.c -c
+        COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
+    add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
+    set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
+    target_link_libraries(linalg_tpc ${KERNEL})
+endforeach()
