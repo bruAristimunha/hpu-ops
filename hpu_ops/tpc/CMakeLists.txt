@@ -7,7 +7,8 @@ set(TPC_INCLUDE_DIR "/usr/lib/habanatools/include" CACHE STRING "TPC includes")
 add_library(linalg_tpc SHARED glue.cpp)
 target_include_directories(linalg_tpc PRIVATE ${TPC_INCLUDE_DIR})
 
-# gj_solve (A, B) and gj_inv (A alone, B = identity, -DIDENTITY_B) share one source;
+# gj_solve (A, B) and gj_inv (A alone, B = identity, -DIDENTITY_B) share one source, and so do their complex64
+# versions cgj_solve and cgj_inv (planar re/im rows);
 # jacobi_eigh and jacobi_eigh_refine (Pass 2 adaptive-shift refinement, -DREFINE_PASS) share one source;
 # gj_large{2..8} (in-place inverse, 64 < n <= 512, -DVA = ceil(n / 64)) and gj_tall{2..8} (-DTALL: n columns,
 # up to 2048 rows) share gj_large_f32_gaudi2.c;
@@ -20,11 +21,15 @@ foreach(KERNEL
         gj_large6_f32_gaudi2 gj_large7_f32_gaudi2 gj_large8_f32_gaudi2
         gj_tall2_f32_gaudi2 gj_tall3_f32_gaudi2 gj_tall4_f32_gaudi2 gj_tall5_f32_gaudi2
         gj_tall6_f32_gaudi2 gj_tall7_f32_gaudi2 gj_tall8_f32_gaudi2
-        jacobi_big1_f32_gaudi2 jacobi_big2_f32_gaudi2 jacobi_big1r_f32_gaudi2 jacobi_big2r_f32_gaudi2)
+        jacobi_big1_f32_gaudi2 jacobi_big2_f32_gaudi2 jacobi_big1r_f32_gaudi2 jacobi_big2r_f32_gaudi2
+        cgj_solve_f32_gaudi2 cgj_inv_f32_gaudi2)
     set(SOURCE ${KERNEL})
     set(DEFINES "")
     if(KERNEL STREQUAL "gj_inv_f32_gaudi2")
         set(SOURCE gj_solve_f32_gaudi2)
+        set(DEFINES -DIDENTITY_B)
+    elseif(KERNEL STREQUAL "cgj_inv_f32_gaudi2")
+        set(SOURCE cgj_solve_f32_gaudi2)
         set(DEFINES -DIDENTITY_B)
     elseif(KERNEL MATCHES "^gj_large([0-9])_")
         set(SOURCE gj_large_f32_gaudi2)
@@ -118,6 +123,30 @@ foreach(KERNEL matrix_exp_f32_gaudi2 matrix_exp_frechet_f32_gaudi2)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${EXPM_SOURCE}.c
         COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${EXPM_SOURCE}.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
         COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 ${OPT} ${DEFINES} -I${TPC_INCLUDE_DIR}/ ./${KERNEL}.c -c
+        COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
+    add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
+    set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
+    target_link_libraries(linalg_tpc ${KERNEL})
+endforeach()
+
+# complex64 Jacobi: jacobi_ceigh (pass 1) and jacobi_ceigh_refine (-DREFINE_PASS) share jacobi_ceigh_f32_gaudi2.c;
+# jacobi_csvd and jacobi_csvdvals (-DNO_UV) share jacobi_csvd_f32_gaudi2.c; both include jacobi_cjacobi_common.h.
+foreach(KERNEL jacobi_ceigh_f32_gaudi2 jacobi_ceigh_refine_f32_gaudi2 jacobi_csvd_f32_gaudi2 jacobi_csvdvals_f32_gaudi2)
+    set(SOURCE ${KERNEL})
+    set(DEFINES "")
+    if(KERNEL STREQUAL "jacobi_ceigh_refine_f32_gaudi2")
+        set(SOURCE jacobi_ceigh_f32_gaudi2)
+        set(DEFINES -DREFINE_PASS)
+    elseif(KERNEL STREQUAL "jacobi_csvdvals_f32_gaudi2")
+        set(SOURCE jacobi_csvd_f32_gaudi2)
+        set(DEFINES -DNO_UV)
+    endif()
+    add_custom_command(
+        OUTPUT ${KERNEL}_x86.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE}.c ${CMAKE_CURRENT_SOURCE_DIR}/jacobi_cjacobi_common.h
+        COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE}.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
+        COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 ${DEFINES} -I${TPC_INCLUDE_DIR}/
+                -I${CMAKE_CURRENT_SOURCE_DIR} ./${KERNEL}.c -c
         COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
     add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
     set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)

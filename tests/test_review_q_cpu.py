@@ -69,11 +69,13 @@ def test_lu_solve_uses_the_factors(left, adjoint, lu_kernels):
     B = torch.ones(n, 1) if left else torch.ones(1, n)
     A = W.double().mH if adjoint else W.double()
     exact = torch.linalg.solve(A, B.double(), left=left)
-    want = torch.linalg.lu_solve(LU, pivots, B, left=left, adjoint=adjoint)
+    # the solve with these very factors, in float64: torch's float32 lu_solve is the platform LAPACK's (on Linux
+    # MKL / OpenBLAS: 0.34 off at n = 26, Wilkinson's growth; macOS Accelerate: within 1e-6), not a reference
+    want = torch.linalg.lu_solve(LU.double(), pivots, B.double(), left=left, adjoint=adjoint)
     with cpu_as_hpu(linalg.install_lu):
         got = torch.linalg.lu_solve(LU, pivots, B, left=left, adjoint=adjoint)
     torch.testing.assert_close(got.double(), exact, rtol=0, atol=1e-6)
-    torch.testing.assert_close(got, want, rtol=0, atol=1e-6)
+    torch.testing.assert_close(got.double(), want, rtol=0, atol=1e-6)
     assert "tri" in lu_kernels and "getrs" not in lu_kernels
 
 

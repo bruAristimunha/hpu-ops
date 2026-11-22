@@ -302,6 +302,17 @@ def test_review_check_script_judges_the_inverse(replica):
     assert not chk.verdict({**base, **chk.accuracy(A, X.fill_(float("nan")), D, S)})
 
 
+def _inv_info_as_bridge_torch():
+    """Whether the installed torch's ``inv_ex`` reports exact singularity as torch 2.6 to 2.8 (the Gaudi bridges'
+    torch) do: LAPACK's factorization of A^T, where ``[[2^100, 2^100], [2^-100, 2^-100]]`` ties and cancels (info 2).
+    torch 2.15 returns info 0 there (and for ``[[1, inf], [0, 1]]``); the kernels' info is checked against the
+    bridges' torch, read from the parameters, on every torch."""
+    return int(torch.linalg.inv_ex(torch.tensor([[2.0 ** 100, 2.0 ** 100], [2.0 ** -100, 2.0 ** -100]])).info) == 2
+
+
+INV_INFO_AS_BRIDGE_TORCH = _inv_info_as_bridge_torch()
+
+
 @pytest.mark.parametrize("d, info, det", [(2.0 ** -100, 2, 0.0), (2.0 ** -101, 0, -0.5)])
 def test_review_exact_singularity_and_sign(d, info, det, replica):
     """Codex #2: ``[[2^100, 2^100], [2^-100, d]]`` in eye(65). On A (main's route) the multiplier 2^-200 flushed:
@@ -310,7 +321,9 @@ def test_review_exact_singularity_and_sign(d, info, det, replica):
     A = torch.eye(65)
     A[0, 0], A[0, 1], A[1, 0], A[1, 1] = 2.0 ** 100, 2.0 ** 100, 2.0 ** -100, d
     D, S = tpc.large_factors(A[None])
-    assert int(S[0, 1]) == info == int(torch.linalg.inv_ex(A).info)
+    assert int(S[0, 1]) == info
+    if INV_INFO_AS_BRIDGE_TORCH:
+        assert int(torch.linalg.inv_ex(A).info) == info
     assert float(S[0, 0] * D.double().prod(-1)) == det == float(torch.linalg.det(A.double()))
     _, _, _, D0, S0 = kr.gj_large(A.numpy())  # main's route, the kernel on A
     assert (S0[1], float(np.prod(D0.astype(np.float64)))) != (info, det)
@@ -323,7 +336,9 @@ def test_review_nonfinite_info_as_torch(block, info, replica):
     A = torch.eye(65)
     A[:2, :2] = torch.tensor(block)
     _, _, S = tpc.gj_inv(A[None])
-    assert int(S[0, 1]) == info == int(torch.linalg.inv_ex(A).info)
+    assert int(S[0, 1]) == info
+    if INV_INFO_AS_BRIDGE_TORCH:
+        assert int(torch.linalg.inv_ex(A).info) == info
     if not np.isnan(block).any():  # a NaN now gives info 0 on either orientation (the kernel's NaN rule)
         assert int(kr.gj_large(A.numpy())[4][1]) != info  # main's route, the kernel on A
 
@@ -599,6 +614,39 @@ def test_float64_opt_in_skips_out_overloads():
     k = object()
     assert linalg._float64_kernel("hpu", torch.ops.aten.linalg_solve_triangular.out, k) is k
     assert linalg._float64_kernel("cpu", torch.ops.aten.linalg_inv_ex.default, k) is not k  # wrapped, inert on cpu
+
+
+def test_float64_opt_in_skips_mixed_floats(monkeypatch):
+    """Mixed float64 / float32 arguments are never cast under ``HPU_OPS_FLOAT64=card`` so torch raises its dtype error."""
+    seen = []
+
+    def kernel(A, B, check_errors=False):
+        seen.append((A.dtype, B.dtype))
+        return torch.linalg.solve_ex(A, B)
+
+    wrapped = linalg._float64_kernel("hpu", torch.ops.aten.linalg_solve_ex.default, kernel)
+    monkeypatch.setenv(linalg.FLOAT64_ENV, "card")
+    A = torch.eye(4, dtype=torch.float64)
+    B = torch.ones(4, 2, dtype=torch.float32)
+    assert linalg._mixed_floats((A, B), {}) is True
+    with pytest.raises(RuntimeError, match="same dtype"):
+        wrapped(A, B)
+    assert seen == [(torch.float64, torch.float32)]
+
+
+def test_eigh_big_tiny_eigenvalue_ftz_safe(monkeypatch):
+    """Gershgorin-definite T with lambda_min / sigma <= 1e-19 must stay shifted so FTZ rsqrt(0) cannot yield NaN."""
+    monkeypatch.setattr(tpc, "_big_op", kr.jacobi_big_op)
+    A = torch.stack([
+        torch.diag(torch.tensor([1.0] + [1e-20] * 32, dtype=torch.float32)),
+        torch.zeros(33, 33, dtype=torch.float32),
+    ])
+    w, V = tpc.eigh_big(A)
+    assert torch.isfinite(w).all() and torch.isfinite(V).all()
+    assert (V.mT @ V - torch.eye(33)).abs().max() < 1e-5
+    torch.testing.assert_close(w[0, -1], torch.tensor(1.0), rtol=1e-5, atol=0)
+    torch.testing.assert_close(w[0, 0], torch.tensor(1e-20), rtol=1e-5, atol=0)
+    assert torch.equal(w[1], torch.zeros(33))
 
 
 def test_codex3_huge_identity_solve_is_exact(large_on_cpu):

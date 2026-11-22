@@ -136,7 +136,10 @@ def test_review3_another_threads_scan_does_not_skip_this_threads_check(monkeypat
 
 
 def test_review10_named_tensor_copies_need_the_checks_off(monkeypatch):
-    named = torch.tensor([7.0, 13.0], names=("N",))
+    try:
+        named = torch.tensor([7.0, 13.0], names=("N",))
+    except TypeError:  # torch 2.15 dropped named tensors
+        pytest.skip("named tensors are not in this torch")
     with cpu_as_hpu(wide.install_copy_checks), pytest.raises(RuntimeError, match="Named tensors"):
         torch.empty(2).copy_(named)  # a limit of Python kernels, documented
     monkeypatch.setenv("HPU_OPS_COPY_CHECKS", "0")

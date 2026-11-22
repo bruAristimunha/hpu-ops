@@ -388,7 +388,10 @@ def test_rereview1_float16_product_overflow_takes_the_float64_position():
                                          (torch.bfloat16, -3e38, 3e38)])
 def test_rereview2_width_past_the_dtype_range_counts_nothing(dtype, lo, hi):
     x = torch.tensor([0.0, 5.0, -100.0, -40000.0, 40000.0], dtype=dtype)
-    _check(x, 4, lo, hi)
+    with cpu_as_hpu(small.install_histc):
+        out = torch.histc(x, 4, lo, hi)
+    # torch 2.6, the bridge's, counts nothing when the width overflows the dtype; later CPU torch puts all in bin 0
+    same(out, torch.zeros(4, dtype=dtype), exact=True)
 
 
 def test_rereview_compiled_equal_bounds_on_an_empty_input():

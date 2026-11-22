@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from hpu_ops import indexing
-from test_cpu import assert_same, cpu_as_hpu, cpu_indices_off_device, train_step  # noqa: F401
+from test_cpu import SCALAR_MASK_PUT, assert_same, cpu_as_hpu, cpu_indices_off_device, train_step  # noqa: F401
 
 MASK = torch.tensor([True, False, True, False])
 
@@ -87,7 +87,8 @@ def test_mask_put_of_the_same_dtype_into_a_dense_tensor_is_still_rewritten():
         want[..., torch.arange(6) % 2 == 0] = 2 ** 0.5
         with cpu_as_hpu(indexing.install_mask_fill) as calls:
             got[..., torch.arange(6) % 2 == 0] = 2 ** 0.5
-        assert calls["mask_fill"] == 1 and torch.equal(got, want)
+        # a Python number reaches index_put_ through torch 2.14, masked_fill_ (left native) from 2.15
+        assert calls["mask_fill"] == SCALAR_MASK_PUT and torch.equal(got, want)
 
 
 def test_index_range_is_read_on_the_host_only_for_real_cpu_index_tensors():
@@ -169,7 +170,9 @@ def test_mask_put_gradient_of_the_value():
         got = train_step(f, x)
     assert calls["mask_fill"] == 1
     assert_same(got, want, tol=0)
-    assert torch.equal(v.grad, gv_want)
+    # the value's gradient is a sum of 576 elements: ATen's index_put_ backward sums the selected ones, where's the
+    # masked full tensor, in another order (bit-equal on macOS, 1 ulp apart on Linux)
+    torch.testing.assert_close(v.grad, gv_want, rtol=2e-6, atol=0)
 
 
 def test_duplicate_indices_accumulate_in_the_backward():
@@ -367,7 +370,7 @@ def test_review_8_leading_mask_put_is_still_rewritten():
     want[want[:, 0, 0] > 0] = 0.0
     with cpu_as_hpu(indexing.install_mask_fill) as calls:
         x[x[:, 0, 0] > 0] = 0.0
-    assert calls["mask_fill"] == 1 and torch.equal(x, want)
+    assert calls["mask_fill"] == SCALAR_MASK_PUT and torch.equal(x, want)  # torch 2.15+: masked_fill_, native
 
 
 @pytest.mark.parametrize("idx", [

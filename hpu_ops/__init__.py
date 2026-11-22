@@ -18,6 +18,11 @@ at the tensor's pickling:
   lazy mode a kernel of 256 over 1000 fails too while kernels 129..255 can get a wrong input gradient. Those are split
   into ``<= 256`` slices (``<= 128`` in lazy mode); the one class measured to run natively (one input channel, wide
   only in its last dim, e.g. TensorCSPNet's default ``(4, 4356)`` stride ``(1, 484)``) keeps the native op.
+- ``group_norm`` with a symbolic size under compile (``norm``, #42) as a reshape into groups, ``var_mean`` and the
+  affine terms: with the default dynamic shapes a second batch size traced ``native_group_norm`` with the batch as
+  a SymInt argument, and Habana's backend failed ("aten::IntImplicit isn't registered in KernelRegistry!":
+  FNIRSCNN1D, SAMBA, SignalJEPA_PostLocal now compile; NeuroRVQ, DIVER1, LaBraM and SignalJEPA_PreLocal then meet
+  other dynamic-shape failures). Static shapes and eager keep Gaudi's kernel.
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's
@@ -114,8 +119,8 @@ import warnings
 
 import torch
 
-from . import (composite, conv, eigh, extrema, im2col, indexing, lazy_compile, linalg, quantile,  # noqa: F401
-               serialization, small, tpc, upsample, wide)
+from . import (composite, conv, eigh, extrema, im2col, indexing, lazy_compile, linalg, norm,  # noqa: F401
+               quantile, serialization, small, tpc, upsample, wide)
 from ._dispatch import _STATE, chain
 from ._strict import CPUExecutionError, strict  # noqa: F401
 from ._strict import check as strict_check, format_report as strict_format_report  # noqa: F401
@@ -127,7 +132,8 @@ __all__ = ["enable", "strict", "CPUExecutionError", "strict_check", "strict_repo
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
-         composite.install_embedding, composite.install_roll, composite.install_unfold, indexing.install_index,
+         composite.install_embedding, composite.install_roll, composite.install_unfold,
+         composite.install_unfold_backward, norm.install_group_norm, indexing.install_index,
          indexing.install_mask_fill, im2col.install,
          linalg.install_solve_triangular, linalg.install_cholesky_solve,
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
@@ -184,7 +190,9 @@ def enable():
         import habana_frameworks.torch.core  # noqa: F401  (Habana's kernels first: they are never overridden)
     except ImportError:
         return
-    tpc.install_kernel_path()  # before the first HPU op: Habana reads the kernel path when the device initialises
+    with warnings.catch_warnings(record=True) as path_warnings:  # warned after the fixes are in (-W error)
+        warnings.simplefilter("always")
+        tpc.install_kernel_path()  # before the first HPU op: Habana reads the kernel path when the device initialises
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"
@@ -203,5 +211,7 @@ def enable():
 
     _STATE["undo"] = undo_once
     _strict_from_env()
-    if not _attention_fused():  # last: under -W error the fixes are already in
+    for caught in path_warnings:  # last, as the attention hint: under -W error the fixes are already in
+        warnings.warn(caught.message, stacklevel=2)
+    if not _attention_fused():
         warnings.warn(ATTENTION_HINT, stacklevel=2)

@@ -1932,3 +1932,340 @@ def test_unfold_elsewhere_and_eager_hpu_keep_the_native_kernel():
     with cpu_as_hpu(composite.install_unfold) as calls:
         torch.randn(3, 8).unfold(1, 2, 2)
     assert not calls.get("unfold")
+
+
+# ---- unfold_backward (Tensor.unfold's gradient): no Habana stack has a kernel; pads, reshapes and one sum (#43)
+
+
+@pytest.fixture
+def unfold_backward_key_free(monkeypatch):
+    """The CPU key of ``aten::unfold_backward`` counts as free, as the HPU key is on Gaudi (eager and lazy), so
+    ``register_kernels`` puts the rewrite there (over the CPU kernel, restored by the undo)."""
+    has = torch._C._dispatch_has_kernel_for_dispatch_key
+    monkeypatch.setattr(torch._C, "_dispatch_has_kernel_for_dispatch_key",
+                        lambda op, key: False if (op, key) == ("aten::unfold_backward", "CPU") else has(op, key))
+
+
+_UNFOLD_BACKWARD_CASES = [  # input shape, dim, size, step
+    ((16, 52, 64), 1, 8, 1),  # #43's four: MetaNeuromotorHand's, overlapping
+    ((16, 52, 64), 1, 4, 4),  # non-overlapping, step == size
+    ((16, 8, 64), -1, 4, 2),  # negative dim, overlapping
+    ((32, 128), 1, 16, 8),  # 2-D
+    ((5, 13), 1, 3, 5),  # step > size: gaps between windows
+    ((4, 12), -1, 3, 5),  # step > size: an uncovered tail
+    ((4, 11), 1, 4, 4),  # step == size, an uncovered tail
+    ((3, 17, 2), 1, 5, 2),  # step does not divide size
+    ((3, 18, 2), 1, 5, 3),  # ... and a last window short of the end
+    ((2, 9, 3), -2, 9, 1),  # size == length: one window
+    ((2, 40, 3), 1, 30, 1),  # few long windows: the skew over the windows
+    ((3, 41), 1, 30, 4),  # ... with step > 1 and an uncovered tail
+    ((16, 64), -1, 4, 4),  # step == size, no tail, inner 1: a copy, never a view of the gradient
+    ((2, 9, 3), 0, 1, 1),  # size 1
+    ((2, 9, 3), 1, 0, 2),  # size 0: no gradient
+    ((7,), 0, 3, 2),  # 1-d
+    ((1, 1), 1, 1, 3),
+    ((3, 0, 5), 2, 2, 1),  # empty
+    ((), 0, 1, 1),  # 0-d
+    ((), -1, 0, 4),
+]
+
+
+@pytest.mark.parametrize("shape,dim,size,step", _UNFOLD_BACKWARD_CASES, ids=[str(c) for c in _UNFOLD_BACKWARD_CASES])
+@pytest.mark.parametrize("dtype", [torch.float64, torch.int32, torch.bool])
+def test_unfold_backward_equals_aten(unfold_backward_key_free, shape, dim, size, step, dtype):
+    """Values, dtype, shape and strides equal ATen's CPU kernel (booleans add as ``or``), for a contiguous and a
+    non-contiguous gradient; the result is a new tensor, never a view of the gradient."""
+    windows = torch.empty(shape).unfold(dim, size, step).shape
+    grad = torch.randn(windows, dtype=torch.float64)
+    grad = grad > 0 if dtype == torch.bool else (grad * 5).to(dtype)
+    for g in (grad, grad.mT.contiguous().mT if grad.dim() > 1 else grad):
+        want = torch.ops.aten.unfold_backward(g, list(shape), dim, size, step)
+        with cpu_as_hpu(composite.install_unfold_backward) as calls:
+            got = torch.ops.aten.unfold_backward(g, list(shape), dim, size, step)
+        assert calls["unfold_backward"] == 1
+        assert got.dtype == want.dtype and got.shape == want.shape and got.stride() == want.stride()
+        assert not torch._C._is_alias_of(got, g)
+        if dtype == torch.float64:
+            assert_same([got], [want])
+        else:
+            assert torch.equal(got, want)
+
+
+def test_unfold_backward_float32_and_16_bit_within_rounding(unfold_backward_key_free):
+    """The overlapping sums of float32 and bfloat16 gradients, against float64."""
+    for dtype, tol in ((torch.float32, 1e-6), (torch.bfloat16, 1e-2)):
+        grad = torch.randn(16, 45, 64, 8, dtype=torch.float64)
+        want = torch.ops.aten.unfold_backward(grad, [16, 52, 64], 1, 8, 1)
+        with cpu_as_hpu(composite.install_unfold_backward):
+            got = torch.ops.aten.unfold_backward(grad.to(dtype), [16, 52, 64], 1, 8, 1)
+        assert got.dtype == dtype
+        assert ((got.double() - want).norm() / want.norm()).item() < tol
+
+
+@pytest.mark.parametrize("shape,dim,size,step", _UNFOLD_BACKWARD_CASES[:9], ids=[str(c) for c in
+                                                                                 _UNFOLD_BACKWARD_CASES[:9]])
+def test_unfold_backward_gradients_and_double_backward(unfold_backward_key_free, shape, dim, size, step):
+    """Input gradients and second order through Tensor.unfold equal the native ones; torch's autograd kernel stays
+    above the rewrite, so the derivative of unfold_backward is unfold."""
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.float64)
+    f = lambda t: t.unfold(dim, size, step).sin()  # noqa: E731
+
+    def second(t):
+        t = t.clone().requires_grad_()
+        (g,) = torch.autograd.grad(f(t).square().sum(), t, create_graph=True)
+        return torch.autograd.grad(g.square().sum(), t)[0]
+
+    want, want_gg = train_step(f, x), second(x)
+    with cpu_as_hpu(composite.install_unfold_backward) as calls:
+        got, got_gg = train_step(f, x), second(x)
+    assert calls["unfold_backward"] == 3  # one backward, then the double backward's first order and its second
+    assert_same(got, want)
+    assert_same([got_gg], [want_gg])
+
+
+def test_unfold_backward_gradcheck_and_inference_mode(unfold_backward_key_free):
+    with cpu_as_hpu(composite.install_unfold_backward) as calls:
+        for dim, size, step in ((1, 3, 2), (-1, 2, 3), (0, 2, 2)):
+            x = torch.randn(4, 7, dtype=torch.float64, requires_grad=True)
+            assert torch.autograd.gradcheck(lambda t: t.unfold(dim, size, step), (x,))
+            assert torch.autograd.gradgradcheck(lambda t: t.unfold(dim, size, step).square(), (x,))
+        with torch.inference_mode():
+            got = torch.ops.aten.unfold_backward(torch.ones(2, 4, 3), [2, 10], 1, 3, 2)
+    assert calls["unfold_backward"] > 0
+    assert torch.equal(got, torch.ops.aten.unfold_backward(torch.ones(2, 4, 3), [2, 10], 1, 3, 2))
+
+
+@pytest.mark.parametrize("shape,dim,size,step", [
+    ((4, 5, 13, 3), 2, 8, 4), ((2, 3, 9, 2, 3, 2), -4, 5, 2), ((2, 3, 9, 2, 3, 2), 0, 1, 3),
+    ((2, 3, 10, 2, 3, 2), 2, 3, 3),  # step == size with a cut tail
+    ((2, 3, 40, 2, 3, 2), 2, 30, 1),  # the skew over the windows
+])
+def test_unfold_backward_runs_ops_of_at_most_five_dims(shape, dim, size, step):
+    """Gaudi's lazy ``constant_pad_nd`` falls back to the CPU above 5 dims (measured: the second unfold of conv2d
+    patches, a 4-D input); the rewrite merges the dims around ``dim``, so no kernel it runs (views aside) sees more
+    than 5, for a contiguous gradient (a non-contiguous one is first copied at its own rank)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Ranks(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            if not func.is_view:  # kernels, not views
+                ranks.extend(t.dim() for t in [*args, out] if isinstance(t, torch.Tensor))
+            return out
+
+    ranks = []
+    grad = torch.randn(torch.empty(shape).unfold(dim, size, step).shape, dtype=torch.float64)
+    with Ranks():
+        got = composite.unfold_backward(grad, list(shape), dim, size, step)
+    assert ranks and max(ranks) <= 5, ranks
+    assert_same([got], [torch.ops.aten.unfold_backward(grad, list(shape), dim, size, step)])
+
+
+@pytest.mark.parametrize("shape,dim,size,step", [((16, 52, 64), 1, 8, 1), ((64, 3000), 1, 2500, 1),
+                                                 ((2, 1000, 4), 1, 1000, 1), ((32, 128), 1, 16, 8)])
+def test_unfold_backward_buffers_stay_near_the_gradient_size(shape, dim, size, step):
+    """The skew over the blocks alone needs ``k * (n + k)`` blocks: 1001x the gradient at size == length 1000; the
+    rewrite takes the smaller of its two skews, so no tensor it makes is above 1.25x the gradient here."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Peak(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            sizes.append(out.numel() if isinstance(out, torch.Tensor) else 0)
+            return out
+
+    sizes = []
+    grad = torch.randn(torch.empty(shape).unfold(dim, size, step).shape)
+    with Peak():
+        composite.unfold_backward(grad, list(shape), dim, size, step)
+    assert max(sizes) <= 1.25 * grad.numel(), (max(sizes), grad.numel())
+
+
+def test_unfold_backward_twice_leaves_the_upstream_gradient_alone(unfold_backward_key_free):
+    """Autograd accumulates the second backward into ``x.grad`` in place: a result that aliased the incoming
+    gradient (step == size, no tail) would change the caller's ``g``."""
+    x = torch.randn(16, 64, requires_grad=True)
+    g = torch.ones(16, 16, 4)
+    with cpu_as_hpu(composite.install_unfold_backward) as calls:
+        for _ in range(2):
+            x.unfold(-1, 4, 4).backward(g)
+    assert calls["unfold_backward"] == 2
+    assert torch.equal(g, torch.ones(16, 16, 4)) and torch.equal(x.grad, torch.full((16, 64), 2.0))
+
+
+@pytest.mark.parametrize("dim,step,error", [(-3, 2, IndexError), (2, 2, IndexError), (1, 0, RuntimeError)])
+def test_unfold_backward_rejects_bad_arguments(dim, step, error):
+    """An out-of-range dim raises ATen's IndexError; step 0 (which ``Tensor.unfold`` rejects) raises."""
+    with pytest.raises(error):
+        composite.unfold_backward(torch.ones(3, 5, 4), [3, 12], dim, 4, step)
+
+
+def _layouts(g):
+    """``g`` as contiguous, a slice with a storage offset, reversed-dims permuted, and expanded (stride 0)."""
+    big = torch.zeros([s + 1 for s in g.shape], dtype=g.dtype)
+    inner = tuple(slice(1, None) for _ in g.shape)
+    big[inner] = g
+    rev = list(range(g.dim()))[::-1]
+    out = {"contiguous": g, "offset": big[inner], "permuted": g.permute(rev).contiguous().permute(rev)}
+    if g.numel():
+        out["expanded"] = g.flatten()[:1].reshape([1] * g.dim()).expand(g.shape)
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.complex64, torch.int8, torch.uint8,
+                                   torch.int64])
+@pytest.mark.parametrize("shape,dim,size,step", [((3, 7), 1, 7, 1), ((1, 7), 1, 3, 1), ((2, 5), 1, 5, 9),
+                                                 ((4, 6, 3), 1, 6, 100), ((2, 3, 4, 5, 6, 7), 3, 3, 2),
+                                                 ((2, 8), 1, 4, 2), ((2, 40), 1, 30, 1)])
+def test_unfold_backward_dtypes_and_layouts_equal_aten(unfold_backward_key_free, dtype, shape, dim, size, step):
+    """Every dtype (integer-valued, so 16-bit sums are exact in any order; int8/uint8 wrap as ATen's) and every
+    gradient layout autograd can hand over: an offset slice, a permuted one, a stride-0 expand."""
+    torch.manual_seed(0)
+    scale = 2 if dtype in (torch.float16, torch.bfloat16) else 60  # 16-bit: sums of up to 30 stay exact
+    g = (torch.randn(torch.empty(shape).unfold(dim, size, step).shape, dtype=torch.float64) * scale).round()
+    g = torch.complex(g, -g).to(dtype) if dtype.is_complex else g.to(dtype)
+    for name, v in _layouts(g).items():
+        want = torch.ops.aten.unfold_backward(v, list(shape), dim, size, step)
+        with cpu_as_hpu(composite.install_unfold_backward) as calls:
+            got = torch.ops.aten.unfold_backward(v, list(shape), dim, size, step)
+        assert calls["unfold_backward"] == 1
+        assert got.dtype == want.dtype and got.stride() == want.stride(), name
+        assert not torch._C._is_alias_of(got, v), name
+        assert torch.equal(got, want), name
+
+
+@pytest.mark.parametrize("shape,dim,size,step", [((2, 8), 1, 4, 4), ((2, 8), 1, 3, 5), ((2, 8), 1, 4, 2),
+                                                 ((2, 40), 1, 30, 1)])
+def test_unfold_backward_keeps_aten_signs_infs_and_nans(unfold_backward_key_free, shape, dim, size, step):
+    """-0.0 stays -0.0 where ATen keeps it (no overlap) and turns +0.0 where ATen adds; inf + -inf is nan in the
+    same places."""
+    windows = torch.empty(shape).unfold(dim, size, step).shape
+    g = torch.full(windows, -0.0)
+    g.view(-1)[:: 3] = float("inf")
+    g.view(-1)[1:: 5] = float("-inf")
+    g.view(-1)[2:: 7] = float("nan")
+    for v in (torch.full(windows, -0.0), g):
+        want = torch.ops.aten.unfold_backward(v, list(shape), dim, size, step)
+        with cpu_as_hpu(composite.install_unfold_backward):
+            got = torch.ops.aten.unfold_backward(v, list(shape), dim, size, step)
+        assert torch.equal(got.isnan(), want.isnan())
+        assert torch.equal(got.nan_to_num(), want.nan_to_num())
+        assert torch.equal(got.signbit() & ~got.isnan(), want.signbit() & ~want.isnan())
+
+
+@pytest.mark.parametrize("shape,dim,size,step", [((4, 5), 1, 1, 10**7), ((4, 5), 1, 5, 10**7),
+                                                 ((3, 100, 2), 1, 99, 10**6)])
+def test_unfold_backward_a_step_past_the_end_pads_to_the_end_only(shape, dim, size, step):
+    """One window and a step beyond the input (``Tensor.unfold`` allows it): the window is padded to the input's
+    end, not to ``step`` (which made 2,000,000x the result: 160 MB for 20 floats at step 1e7)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Peak(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            sizes.append(out.numel() if isinstance(out, torch.Tensor) else 0)
+            return out
+
+    sizes = []
+    grad = torch.randn(torch.empty(shape).unfold(dim, size, step).shape, dtype=torch.float64)
+    with Peak():
+        got = composite.unfold_backward(grad, list(shape), dim, size, step)
+    assert max(sizes) <= torch.Size(shape).numel()
+    assert torch.equal(got, torch.ops.aten.unfold_backward(grad, list(shape), dim, size, step))
+
+
+def test_unfold_backward_under_torch_func(unfold_backward_key_free):
+    """vmap (torch's per-sample fallback calls the rewrite once per sample, batch dim anywhere), jacrev and hessian
+    of unfold equal the native ones."""
+    torch.manual_seed(0)
+    G = torch.randn(5, 3, 4, 4, dtype=torch.float64)
+    x = torch.randn(3, 10, dtype=torch.float64)
+    cases = [lambda: torch.vmap(lambda g: torch.ops.aten.unfold_backward(g, [3, 10], 1, 4, 2))(G),
+             lambda: torch.vmap(lambda g: torch.ops.aten.unfold_backward(g, [3, 10], -1, 4, 2), in_dims=3)(
+                 G.movedim(0, 3)),
+             lambda: torch.func.jacrev(lambda t: t.unfold(1, 4, 2).sin())(x),
+             lambda: torch.func.hessian(lambda t: t.unfold(1, 4, 2).sin().sum())(x)]
+    for case in cases:
+        want = case()
+        with cpu_as_hpu(composite.install_unfold_backward) as calls:
+            got = case()
+        assert calls["unfold_backward"] > 0
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+
+
+def test_unfold_backward_functionalized_write_through_unfold(unfold_backward_key_free):
+    """Functionalization replays a write through an unfold view as ``unfold_backward`` (also under compile): the
+    rewrite gives what torch's own kernel gives there. Both zero the input positions no window covers (torch 2.6
+    functionalization bug, not the rewrite's), so the reference is the functionalized native op, not eager."""
+    def write(t):
+        t.unfold(1, 3, 3).mul_(2)
+        t.unfold(1, 2, 4)[:, 1].add_(1)
+        return t * 1
+
+    x = torch.arange(30.0, dtype=torch.float64).reshape(3, 10)
+    want = torch.func.functionalize(write)(x.clone())
+    with cpu_as_hpu(composite.install_unfold_backward) as calls:
+        got = torch.func.functionalize(write)(x.clone())
+        torch._dynamo.reset()
+        got_c = torch.compile(write, backend="aot_eager", dynamic=True)(x.clone())
+    assert calls["unfold_backward"] >= 2
+    assert torch.equal(got, want) and torch.equal(got_c, want)
+
+
+def test_unfold_backward_compiled_dynamic_sees_concrete_shapes(unfold_backward_key_free):
+    """Under ``torch.compile(dynamic=True)`` the op stays one graph node run eagerly: the rewrite sees plain ints, one
+    graph serves every length, values equal eager."""
+    from torch._dynamo.utils import counters
+
+    torch._dynamo.reset()
+    counters.clear()
+    f = lambda t: t.unfold(1, 4, 2).sin().square().sum()  # noqa: E731
+    cf = torch.compile(f, backend="aot_eager", dynamic=True)
+    with cpu_as_hpu(composite.install_unfold_backward) as calls:
+        for length in (10, 11, 17, 64, 65):
+            x = torch.randn(2, length, 3, dtype=torch.float64, requires_grad=True)
+            f(x).backward()
+            want, x.grad = x.grad, None
+            cf(x).backward()
+            torch.testing.assert_close(x.grad, want, rtol=0, atol=1e-12)
+    assert calls["unfold_backward"] == 10
+    assert not counters["graph_break"]
+
+
+def test_unfold_backward_above_the_element_limit_runs_aten_on_a_cpu_copy(unfold_backward_key_free, monkeypatch):
+    """A gradient, result or buffer above ``UNFOLD_BACKWARD_MAX_ELEMENTS`` (2^31 - 1: a pad of 1.1e9 x 2 elements
+    stopped Gaudi2) takes ATen's kernel on a CPU copy, a named route strict mode reports; at the limit the rewrite runs.
+    The limit is lowered here (the stand-in's CPU key is the rewrite, which computes inside the route)."""
+    grad = torch.randn(3, 9, 4, dtype=torch.float64)  # (3, 12) unfolded at size 4, step 1: block-skew buffer 3 * 4 * 13
+    want = torch.ops.aten.unfold_backward(grad, [3, 12], 1, 4, 1)
+    elements = composite.unfold_backward_elements(grad, [3, 12], 1, 4, 1)
+    assert elements == 3 * 4 * (9 + 3 + 1)  # outer * k * (rows + 1) * step * inner
+    with cpu_as_hpu(composite.install_unfold_backward) as calls:
+        monkeypatch.setattr(composite, "UNFOLD_BACKWARD_MAX_ELEMENTS", elements)
+        at_limit = torch.ops.aten.unfold_backward(grad, [3, 12], 1, 4, 1)
+        assert calls["unfold_backward"] == 1 and not calls["unfold_backward_cpu"]
+        monkeypatch.setattr(composite, "UNFOLD_BACKWARD_MAX_ELEMENTS", elements - 1)
+        with hpu_ops.strict("report", watch_cpu_ops=False):
+            routed = torch.ops.aten.unfold_backward(grad, [3, 12], 1, 4, 1)
+            rows = hpu_ops.strict_report()
+    assert calls["unfold_backward_cpu"] == 1 and calls["unfold_backward"] == 2  # the route's inner call computes
+    assert [(r[0], r[1]) for r in rows] == [("hpu_ops route", "aten::unfold_backward")], rows
+    assert_same([at_limit, routed], [want, want])
+
+
+@pytest.mark.parametrize("length,routed", [(10**9, False), (11 * 10**8, True)])
+def test_unfold_backward_element_limit_at_the_crash_on_gaudi(length, routed):
+    """The review's measured case, ``(1, L - 1, 2)`` into ``[1, L]`` at size 2, step 1: its pad of ``2 * (L + 1)``
+    elements was right on Gaudi2 at L = 1.0e9 and stopped the card at 1.1e9 (3 of 3 runs). Shapes only, no tensor."""
+    plan = composite._unfold_backward_plan(length - 1, [1, length], 1, 2, 1)
+    assert plan[0] == "blocks" and plan[-1] == 2 * (length + 1)
+    assert (plan[-1] > composite.UNFOLD_BACKWARD_MAX_ELEMENTS) == routed
+
+
+def test_unfold_backward_elsewhere_keeps_the_native_kernel():
+    """Where the backend key has a kernel (the CPU here) nothing is registered."""
+    x = torch.randn(3, 8, requires_grad=True)
+    with cpu_as_hpu(composite.install_unfold_backward) as calls:
+        x.unfold(1, 2, 2).sum().backward()
+    assert not calls.get("unfold_backward")

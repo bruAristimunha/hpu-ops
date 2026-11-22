@@ -9,9 +9,20 @@ from torch.autograd import forward_ad
 from hpu_ops import linalg, tpc
 
 
+def _svd_stand_in(A, uv):
+    """``svd_reference`` on real tensors; under fake tensors torch's traceable SVD, as test_review_q_cpu's hook: on
+    the card the kernel is one opaque op, while the reference's data-dependent branches (``if bad_mask.any()``)
+    are rejected by torch 2.15's tracers."""
+    if not linalg._is_fake(A):
+        return tpc.svd_reference(A.detach(), compute_uv=uv)
+    if not uv:
+        return A.new_empty(0), torch.linalg.svdvals(A.detach()), A.new_empty(0)
+    return torch.linalg.svd(A.detach(), full_matrices=False)
+
+
 @pytest.fixture
 def svd_hook(monkeypatch):
-    monkeypatch.setattr(linalg, "_SVD", lambda A, uv: tpc.svd_reference(A.detach(), compute_uv=uv))
+    monkeypatch.setattr(linalg, "_SVD", _svd_stand_in)
 
 
 def _A():

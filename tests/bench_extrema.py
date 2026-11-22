@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from habana_frameworks.torch.hpu.metrics import metric_global
 
 from hpu_ops import extrema
+from hpu_ops._dispatch import _STATE
 
 LAZY = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
 HPU = torch.device("hpu")
@@ -92,15 +93,22 @@ def main():
     ap.add_argument("--inference", action="store_true", help="forward under torch.inference_mode() only")
     a = ap.parse_args()
     on = a.fix == "on"
-    if on:
-        extrema.install("hpu")
+    # keep the undo alive: its torch.library objects are referenced only by it, and they deregister the rewrite when
+    # it is freed (dropped, the "on" arm timed Gaudi's native kernels)
+    undo = extrema.install("hpu") if on else None
     inputs = {name: tuple(x.to(HPU) for x in xs) for name, (_, xs, _) in CASES.items()}
     for name, (f, _, diff) in CASES.items():
         for train in ((False,) if a.inference else (False, True) if diff else (False,)):
+            _STATE["calls"].clear()
             ms, fb = timed(f, inputs[name], train, a.reps, a.inference)
+            rewrites = sum(_STATE["calls"].values())
+            opt_in = name.startswith(("sort", "topk", "argsort")) and os.environ.get("HPU_OPS_EXACT_SORT") != "1"
+            if on and not rewrites and not opt_in:
+                raise RuntimeError(f"{name}: the rewrite did not run in the 'on' arm")
             print("BENCH " + json.dumps({"case": name + (" [inference]" if a.inference else ""), "train": train,
                                          "fix": on, "round": a.round, "ms": round(ms, 4),
-                                         "fallbacks_per_call": fb, "lazy": LAZY}), flush=True)
+                                         "fallbacks_per_call": fb, "lazy": LAZY, "rewrites": rewrites}), flush=True)
+    del undo
 
 
 if __name__ == "__main__":

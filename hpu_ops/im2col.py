@@ -106,7 +106,8 @@ def _is_4d_non_overlap(height, width, kernel_size, dilation, padding, stride):
 
 def _tracing(t):
     """True while ``torch.compile`` traces (dynamo, or AOT autograd's fake tensors): build index tensors on the device,
-    in the graph, instead of on the host."""
+    in the graph, instead of on the host. AOT's ``FunctionalTensor`` pass is left out as in ``indexing._tracing``
+    (measured for the index rewrite)."""
     from torch._subclasses.fake_tensor import is_fake
 
     return torch.compiler.is_compiling() or is_fake(t)
