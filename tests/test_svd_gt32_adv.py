@@ -205,6 +205,39 @@ def test_svd_gt32_extreme_scales_zero_rank_and_nan_inf_cpu():
         assert S.shape == (40,) and not torch.isfinite(S).all()
 
 
+@pytest.mark.parametrize("shape, full_matrices", [
+    ((40, 40), False),
+    ((72, 72), False),
+    ((160, 40), False),
+    ((40, 20), True),
+])
+def test_svd_gt32_batched_mixed_nan_inf_isolation_cpu(shape, full_matrices):
+    g = torch.Generator().manual_seed(29 + sum(shape))
+    m, n = shape
+    A_fin = torch.randn(m, n, generator=g, dtype=torch.float32)
+    A_nan = torch.randn(m, n, generator=g, dtype=torch.float32)
+    A_nan[3, 7] = float("nan")
+    A_inf = torch.randn(m, n, generator=g, dtype=torch.float32)
+    A_inf[0, 0] = float("inf")
+    A = torch.stack([A_fin, A_nan, A_inf])
+    S_ref = L.svdvals(A_fin.double())
+
+    with _cpu_as_hpu(linalg.install_svd) as calls:
+        U, S, Vh = L.svd(A, full_matrices=full_matrices)
+        assert calls["svd"] >= 1
+    assert torch.isfinite(U[0]).all() and torch.isfinite(S[0]).all() and torch.isfinite(Vh[0]).all()
+    assert _rel_err(S[0], S_ref) < 1e-5
+    _check_svd_factors(U[0], S[0], Vh[0], A_fin, full_matrices, tol=1e-4)
+    for idx in (1, 2):
+        assert U[idx].isnan().all() and S[idx].isnan().all() and Vh[idx].isnan().all()
+
+    with _cpu_as_hpu(linalg.install_svd) as calls:
+        Sv = L.svdvals(A)
+        assert calls["svd"] >= 1
+    assert torch.isfinite(Sv[0]).all() and _rel_err(Sv[0], S_ref) < 1e-5
+    assert Sv[1].isnan().all() and Sv[2].isnan().all()
+
+
 def test_svd_gt32_autograd_and_double_backward_cpu(svd_gt32_hook):
     g = torch.Generator().manual_seed(31)
     # 1. gradgradcheck at n = 34 x 33 in float64 (uses svd_gt32_hook for float64 finite diff)

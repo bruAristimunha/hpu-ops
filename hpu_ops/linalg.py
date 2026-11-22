@@ -1372,8 +1372,15 @@ def _complete_orthogonal(U, S):
     elif eigh._EIGH_BIG is not None and m <= tpc.BIG_EIGH_MAXN:
         unull = eigh.Eigh.compute(P_sym, "L", True)[1][..., k:]
     else:
+        bad = ~torch.isfinite(P_sym).all(dim=(-2, -1))
         with torch._C._AutoDispatchBelowAutograd():
-            unull = torch.linalg.eigh(P_sym)[1][..., k:]
+            if not bad.any():
+                unull = torch.linalg.eigh(P_sym)[1][..., k:]
+            else:
+                safe = torch.where(bad[..., None, None], 0.0, P_sym)
+                vecs = torch.linalg.eigh(safe)[1][..., k:]
+                nan = torch.tensor(float("nan"), dtype=U.dtype, device=U.device)
+                unull = torch.where(bad[..., None, None], nan, vecs)
     unull = unull - U @ (U.mT @ unull)
     unull = 1.5 * unull - 0.5 * unull @ (unull.mT @ unull)
     return torch.cat([U, unull], -1)

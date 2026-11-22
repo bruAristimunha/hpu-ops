@@ -157,13 +157,47 @@ def _sweep_svd(X, V, k, tsqr_r, svd_big, b):
 
 
 def _cpu_svd_big(X):
+    bad = ~torch.isfinite(X).all(dim=(-2, -1))
     with torch._C._AutoDispatchBelowAutograd():
-        return torch.ops.aten._linalg_svd.default(X, False, True)
+        if not bad.any():
+            return torch.ops.aten._linalg_svd.default(X, False, True)
+        safe = torch.where(bad[..., None, None], 0.0, X)
+        U, S, Vh = torch.ops.aten._linalg_svd.default(safe, False, True)
+    nan = torch.tensor(float("nan"), dtype=X.dtype, device=X.device)
+    return (torch.where(bad[..., None, None], nan, U),
+            torch.where(bad[..., None], nan, S),
+            torch.where(bad[..., None, None], nan, Vh))
 
 
 def _cpu_svdvals_big(X):
+    bad = ~torch.isfinite(X).all(dim=(-2, -1))
     with torch._C._AutoDispatchBelowAutograd():
-        return torch.ops.aten._linalg_svd.default(X, False, False)[1]
+        if not bad.any():
+            return torch.ops.aten._linalg_svd.default(X, False, False)[1]
+        safe = torch.where(bad[..., None, None], 0.0, X)
+        S = torch.ops.aten._linalg_svd.default(safe, False, False)[1]
+    nan = torch.tensor(float("nan"), dtype=X.dtype, device=X.device)
+    return torch.where(bad[..., None], nan, S)
+
+
+def _cpu_qr_r(X):
+    bad = ~torch.isfinite(X).all(dim=(-2, -1))
+    if not bad.any():
+        return torch.linalg.qr(X, mode="r").R
+    safe = torch.where(bad[..., None, None], 0.0, X)
+    R = torch.linalg.qr(safe, mode="r").R
+    nan = torch.tensor(float("nan"), dtype=X.dtype, device=X.device)
+    return torch.where(bad[..., None, None], nan, R)
+
+
+def _cpu_qr_reduced(X):
+    bad = ~torch.isfinite(X).all(dim=(-2, -1))
+    if not bad.any():
+        return torch.linalg.qr(X, mode="reduced")
+    safe = torch.where(bad[..., None, None], 0.0, X)
+    Q, R = torch.linalg.qr(safe, mode="reduced")
+    nan = torch.tensor(float("nan"), dtype=X.dtype, device=X.device)
+    return torch.where(bad[..., None, None], nan, Q), torch.where(bad[..., None, None], nan, R)
 
 
 def _svd_solvers(device, svd_big, svdvals_big, tsqr_r, tsqr_qr, block_qr):
@@ -178,9 +212,9 @@ def _svd_solvers(device, svd_big, svdvals_big, tsqr_r, tsqr_qr, block_qr):
                 tpc.BIG_SVD_MAXN, tpc.BIG_SVD_MAXM, tpc.BIG_SVDVALS_MAXN, tpc.BIG_SVDVALS_MAXM)
     return (_cpu_svd_big if svd_big is None else svd_big,
             _cpu_svdvals_big if svdvals_big is None else svdvals_big,
-            (lambda X: torch.linalg.qr(X, mode="r").R) if tsqr_r is None else tsqr_r,
-            (lambda X: torch.linalg.qr(X, mode="reduced")) if tsqr_qr is None else tsqr_qr,
-            (lambda X: torch.linalg.qr(X, mode="reduced")) if block_qr is None else block_qr,
+            _cpu_qr_r if tsqr_r is None else tsqr_r,
+            _cpu_qr_reduced if tsqr_qr is None else tsqr_qr,
+            _cpu_qr_reduced if block_qr is None else block_qr,
             64, 128, 128, 128)
 
 
@@ -278,7 +312,7 @@ def block_svd_gram_free(A, compute_uv=True, full_matrices=False, sweeps=None, po
         return A.new_empty(0), S, A.new_empty(0)
 
     tiny = torch.finfo(X.dtype).tiny
-    U_raw = torch.where(S_norm.unsqueeze(-2) > 0, X / S_norm.clamp_min(tiny).unsqueeze(-2), 0.0)
+    U_raw = torch.where(S_norm.unsqueeze(-2) == 0, 0.0, X / S_norm.clamp_min(tiny).unsqueeze(-2))
     U_r, Ru = _block_qr(U_raw.contiguous())
     d = torch.diagonal(Ru, dim1=-2, dim2=-1)
     U_r = (U_r * torch.where(d < 0, -1.0, 1.0).unsqueeze(-2)).reshape(*batch, n, n)
