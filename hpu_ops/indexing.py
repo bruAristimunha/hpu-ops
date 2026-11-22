@@ -370,7 +370,7 @@ class _ExpandedSelect(torch.autograd.Function):
 def _transformed():
     """Whether a ``torch.func`` transform or forward-mode AD is active (an autograd.Function applied from a
     dispatcher kernel has no kernel under the transforms, and ``_ExpandedSelect`` no jvp)."""
-    if getattr(torch.autograd.forward_ad, "_current_level", -1) >= 0:
+    if _dispatch.forward_ad_level() >= 0:
         return True
     return torch._C._functorch.peek_interpreter_stack() is not None
 

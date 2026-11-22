@@ -15,6 +15,35 @@ import torch
 from torch._C import DispatchKey
 
 _STATE = {"calls": collections.Counter()}
+_DUAL_PROBE = torch.empty(0)
+
+
+def forward_ad_level(*tensors):
+    """Active forward-mode AD dual level (>= 0), or -1 if none.
+
+    ``torch.compile`` lowers ``fwAD.dual_level()`` and ``torch.func.jvp`` to C++
+    ``torch._C._enter_dual_level()`` without updating Python's ``fwAD._current_level`` (which stays ``-1``).
+    When dispatch modes are active (e.g. AOTAutograd tracing), probe C++ level 0 with those modes temporarily
+    popped; otherwise check any passed tensors for a level-0 dual tangent (covers Dynamo ``eager`` backend).
+    """
+    if torch.is_inference_mode_enabled():
+        return -1
+    lvl = getattr(torch.autograd.forward_ad, "_current_level", -1)
+    if lvl >= 0:
+        return lvl
+    if torch._C._len_torch_dispatch_stack() > 0 or torch._ops._len_torch_dispatch_stack_pre_dispatch() > 0:
+        from torch.utils._python_dispatch import _disable_current_modes
+
+        with _disable_current_modes():
+            try:
+                torch._VF._make_dual(_DUAL_PROBE, _DUAL_PROBE, 0)
+                return 0
+            except RuntimeError:
+                return -1
+    if any(isinstance(t, torch.Tensor) and not t.is_inference() and torch._VF._unpack_dual(t, 0)[1] is not None
+           for t in tensors):
+        return 0
+    return -1
 
 
 def count(name):

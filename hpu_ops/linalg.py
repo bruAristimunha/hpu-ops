@@ -257,19 +257,17 @@ def _takes_tensors(device_type, name, tensors):
     return all(t.dtype in allowed and static(*t.shape) and t.numel() > 0 for t in tensors)
 
 
-def _transformed():
+def _transformed(*tensors):
     """Whether a functorch transform (vmap, grad, jvp, jacrev, ...) or forward-mode AD is active. The Functions here
     define no ``setup_context`` and no jvp, so those calls keep the op's own kernel."""
     if getattr(_BELOW, "on", False):  # a backend kernel: plain tensors (see _BELOW)
         return False
-    forward_ad = getattr(torch.autograd.forward_ad, "_current_level", -1) >= 0
-    return torch._C._functorch.peek_interpreter_stack() is not None or forward_ad
+    return torch._C._functorch.peek_interpreter_stack() is not None or _dispatch.forward_ad_level(*tensors) >= 0
 
 
-def _raw_transformed():
+def _raw_transformed(*tensors):
     """Whether a functorch transform or forward-mode AD is active directly (ignoring any ``_BELOW.on`` guard)."""
-    forward_ad = getattr(torch.autograd.forward_ad, "_current_level", -1) >= 0
-    return torch._C._functorch.peek_interpreter_stack() is not None or forward_ad
+    return torch._C._functorch.peek_interpreter_stack() is not None or _dispatch.forward_ad_level(*tensors) >= 0
 
 
 def _takes(device_type, name, matrix_at=0):
@@ -278,9 +276,9 @@ def _takes(device_type, name, matrix_at=0):
     warning per ``name``) tensor of static, non-empty shape."""
 
     def takes(*args, **kwargs):
-        if _transformed():
-            return False
         tensors = [x for x in (*args, *kwargs.values()) if isinstance(x, torch.Tensor)]
+        if _transformed(*tensors):
+            return False
         if not _takes_tensors(device_type, name, tensors):
             return False
         if len({t.device for t in tensors}) > 1:  # torch's own kernel raises its device error

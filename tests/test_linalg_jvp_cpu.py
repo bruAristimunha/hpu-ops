@@ -6,7 +6,7 @@ import torch
 import torch.autograd.forward_ad as fwAD
 from test_cpu import cpu_as_hpu
 
-from hpu_ops import linalg, linalg_jvp, tpc
+from hpu_ops import _dispatch, linalg, linalg_jvp, tpc
 
 
 def _general(*batch, n=4, dtype=torch.float32):
@@ -236,3 +236,152 @@ def test_declined_transforms_and_float64_hpu_warning(monkeypatch, gj_hook):
         f64 = fwAD.make_dual(A[0].double(), tA[0].double())
         with pytest.warns(UserWarning, match="hpu-ops#16"):
             assert takes_det(f64) is False
+
+
+def test_forward_ad_level_detects_cpp_dual_level():
+    assert _dispatch.forward_ad_level() == -1
+    with fwAD.dual_level():
+        assert _dispatch.forward_ad_level() == 0
+    lvl = torch._C._enter_dual_level()
+    try:
+        assert getattr(fwAD, "_current_level", -1) == -1
+        x = torch.eye(2)
+        d = torch._VF._make_dual(x, torch.ones_like(x), lvl)
+        assert _dispatch.forward_ad_level(d) == 0
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode():
+            assert _dispatch.forward_ad_level() == 0
+    finally:
+        torch._C._exit_dual_level(lvl)
+    assert _dispatch.forward_ad_level() == -1
+
+
+def _assert_tree_close(got, want):
+    if isinstance(want, tuple):
+        assert isinstance(got, tuple) and len(got) == len(want)
+        for g, w in zip(got, want):
+            _assert_tree_close(g, w)
+    elif want is None:
+        assert got is None
+    else:
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("op_name", ["solve", "solve_left_false", "solve_vec", "det", "slogdet"])
+def test_compile_jvp_and_fwad_match_torch(dynamic, op_name, gj_hook):
+    torch.manual_seed(4)
+    A = _general(2, n=4)
+    A[..., 0, :] = -A[..., 0, :]
+    tA = torch.randn_like(A)
+
+    if op_name == "solve":
+        B, tB = torch.randn(2, 4, 3), torch.randn(2, 4, 3)
+        fn = lambda a, b: torch.linalg.solve(a, b)
+        primals, tangents = (A, B), (tA, tB)
+    elif op_name == "solve_left_false":
+        B, tB = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
+        fn = lambda a, b: torch.linalg.solve(a, b, left=False)
+        primals, tangents = (A, B), (tA, tB)
+    elif op_name == "solve_vec":
+        B, tB = torch.randn(2, 4), torch.randn(2, 4)
+        fn = lambda a, b: torch.linalg.solve(a, b)
+        primals, tangents = (A, B), (tA, tB)
+    elif op_name == "det":
+        fn = torch.linalg.det
+        primals, tangents = (A,), (tA,)
+    else:
+        fn = lambda a: tuple(torch.linalg.slogdet(a))
+        primals, tangents = (A,), (tA,)
+
+    def run_jvp(*args):
+        n = len(primals)
+        return torch.func.jvp(fn, args[:n], args[n:])
+
+    def run_fwad(*args):
+        n = len(primals)
+        with fwAD.dual_level():
+            duals = [fwAD.make_dual(p, t) for p, t in zip(args[:n], args[n:])]
+            out = fn(*duals)
+            if isinstance(out, tuple):
+                return tuple(o.detach() for o in out), tuple(fwAD.unpack_dual(o).tangent for o in out)
+            return out.detach(), fwAD.unpack_dual(out).tangent
+
+    want_jvp = run_jvp(*primals, *tangents)
+    want_fwad = run_fwad(*primals, *tangents)
+
+    def install(d):
+        return _dispatch.chain([linalg.install_solve(d), linalg.install_inv_det(d)])
+
+    key = "solve" if op_name.startswith("solve") else op_name
+    with cpu_as_hpu(install) as calls:
+        for runner, want in ((run_jvp, want_jvp), (run_fwad, want_fwad)):
+            torch._dynamo.reset()
+            got = torch.compile(runner, backend="aot_eager", dynamic=dynamic)(*primals, *tangents)
+            _assert_tree_close(got, want)
+        if not dynamic:
+            assert calls[key] >= 2
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("tangent_mode", ["A_only", "B_only", "neither"])
+def test_compile_fwad_solve_partial_and_no_tangents(dynamic, tangent_mode, gj_hook):
+    torch.manual_seed(5)
+    A = _general(n=4)
+    B = torch.randn(4, 2)
+    tA = torch.randn_like(A) if tangent_mode == "A_only" else None
+    tB = torch.randn_like(B) if tangent_mode == "B_only" else None
+
+    def run_fwad(a, b):
+        with fwAD.dual_level():
+            da = fwAD.make_dual(a, tA) if tA is not None else a
+            db = fwAD.make_dual(b, tB) if tB is not None else b
+            out = torch.linalg.solve(da, db)
+            return out.detach(), fwAD.unpack_dual(out).tangent
+
+    want = run_fwad(A, B)
+    with cpu_as_hpu(linalg.install_solve):
+        torch._dynamo.reset()
+        got = torch.compile(run_fwad, backend="aot_eager", dynamic=dynamic)(A, B)
+    _assert_tree_close(got, want)
+
+
+@pytest.mark.parametrize("op_name", ["solve", "det", "slogdet"])
+def test_compile_jvp_with_requires_grad_and_traced_large_path(monkeypatch, op_name, gj_hook):
+    torch.manual_seed(6)
+    A = _general(2, n=4)
+    B = torch.randn(2, 4, 2)
+    tA = torch.randn_like(A)
+    tB = torch.randn_like(B)
+
+    def run(a, b, ta, tb):
+        if op_name == "solve":
+            return torch.func.jvp(torch.linalg.solve, (a, b), (ta, tb))
+        if op_name == "det":
+            return torch.func.jvp(torch.linalg.det, (a,), (ta,))
+        return torch.func.jvp(lambda x: tuple(torch.linalg.slogdet(x)), (a,), (ta,))
+
+    want = run(A, B, tA, tB)
+
+    def install(d):
+        return _dispatch.chain([linalg.install_solve(d), linalg.install_inv_det(d)])
+
+    # Declined via requires_grad=True under compile
+    with cpu_as_hpu(install):
+        torch._dynamo.reset()
+        got_rg = torch.compile(run, backend="aot_eager")(A.clone().requires_grad_(True), B, tA, tB)
+    _assert_tree_close(got_rg, want)
+
+    # Declined while tracing (e.g. HPU large route n > MAXN) -> _TracedJvp* at trace time, gj_hook at runtime
+    tpc_takes = linalg._tpc_takes
+
+    def gated(dt, takes, *a, **k):
+        inner = tpc_takes(dt, takes, *a, **k)
+        return lambda *args, **kw: inner(*args, **kw) and not linalg._tracing(args[0])
+
+    monkeypatch.setattr(linalg, "_tpc_takes", gated)
+    with cpu_as_hpu(install):
+        torch._dynamo.reset()
+        got_traced = torch.compile(run, backend="aot_eager")(A, B, tA, tB)
+    _assert_tree_close(got_traced, want)
