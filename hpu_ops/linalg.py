@@ -266,6 +266,12 @@ def _transformed():
     return torch._C._functorch.peek_interpreter_stack() is not None or forward_ad
 
 
+def _raw_transformed():
+    """Whether a functorch transform or forward-mode AD is active directly (ignoring any ``_BELOW.on`` guard)."""
+    forward_ad = getattr(torch.autograd.forward_ad, "_current_level", -1) >= 0
+    return torch._C._functorch.peek_interpreter_stack() is not None or forward_ad
+
+
 def _takes(device_type, name, matrix_at=0):
     """A predicate on a call's arguments: no functorch transform or forward-mode AD is active, the positional tensor
     at ``matrix_at`` is a square matrix and every tensor argument is a float32 (or float64, only off ``hpu``, with one
@@ -964,8 +970,16 @@ def install_solve(device_type):
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
     takes = _tpc_takes(device_type, shapes_ok, large=True)
-    return register_paired(device_type, [_kernels(device_type, op, "solve", SolveEx, takes, backend=False,
-                                                         traced=_TracedSolveEx)])
+
+    def backend_kernel(*args, **kwargs):
+        if not _raw_transformed() and takes(*args, **kwargs):
+            count("solve")
+            return SolveEx.compute(*_bind(op, args, kwargs))
+        return _on_cpu(op, args, kwargs)
+
+    group = _kernels(device_type, op, "solve", SolveEx, takes, backend=False, traced=_TracedSolveEx)
+    group.append((op, "{}", backend_kernel))
+    return register_paired(device_type, [group])
 
 
 def _inverse(LU, pivots):

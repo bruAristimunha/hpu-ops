@@ -2489,9 +2489,10 @@ def test_solve_det_slogdet_register_no_backend_kernel(monkeypatch):
     linalg.install_solve("hpu")
     linalg.install_inv_det("hpu")
     keys = {group[0][0].name(): [key for _, key, _ in group] for group in seen}
-    for name in ("aten::_linalg_solve_ex", "aten::_linalg_det", "aten::_linalg_slogdet"):
+    for name in ("aten::_linalg_det", "aten::_linalg_slogdet"):
         assert keys[name] == ["Autograd{}"], keys
-    assert keys["aten::linalg_inv_ex"] == ["Autograd{}", "{}"]
+    for name in ("aten::_linalg_solve_ex", "aten::linalg_inv_ex"):
+        assert keys[name] == ["Autograd{}", "{}"], keys
 
 
 def test_enable_installs_the_triangular_solves():

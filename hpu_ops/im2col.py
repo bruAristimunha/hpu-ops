@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch._C import DispatchKey
 
 from . import _strict
-from ._dispatch import count, register_kernels
+from ._dispatch import chain, count, override_kernels, register_kernels
 
 aten = torch.ops.aten
 MAX_INDEX = 1 << 24  # spatial index elements (kh * kw * oh * ow, int64: 128 MiB); larger calls keep the native op
@@ -105,12 +105,26 @@ def _is_4d_non_overlap(height, width, kernel_size, dilation, padding, stride):
 
 
 def _tracing(t):
-    """True while ``torch.compile`` traces (dynamo, or AOT autograd's fake tensors): build index tensors on the device,
-    in the graph, instead of on the host. AOT's ``FunctionalTensor`` pass is left out as in ``indexing._tracing``
-    (measured for the index rewrite)."""
-    from torch._subclasses.fake_tensor import is_fake
+    """True while ``torch.compile`` traces (dynamo, or AOT autograd's fake and functional tensors), in a fake mode,
+    under ``torch.func.functionalize``, or ``make_fx`` proxy mode: build index tensors on the device, in the graph,
+    instead of on the host."""
+    if (
+        torch._C._len_torch_dispatch_stack() == 0
+        and not torch.compiler.is_compiling()
+        and type(t) is torch.Tensor
+        and not torch._is_functional_tensor(t)
+    ):
+        return False
+    if torch.compiler.is_compiling() or torch._guards.detect_fake_mode() is not None:
+        return True
+    if torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY) is not None:
+        return True
+    if torch._is_functional_tensor(t):
+        return True
+    from torch._subclasses.fake_tensor import FakeTensor, is_fake
+    from torch._subclasses.functional_tensor import FunctionalTensor
 
-    return torch.compiler.is_compiling() or is_fake(t)
+    return isinstance(t, (FakeTensor, FunctionalTensor)) or is_fake(t)
 
 
 def _fresh(res, src):
@@ -305,11 +319,16 @@ def install(device_type):
     """Rewrite ``aten::im2col`` and ``aten::col2im`` (``.default`` and ``.out``) on ``device_type``. Returns an undo."""
     im_default, im_out = aten.im2col.default, aten.im2col.out
     col_default, col_out = aten.col2im.default, aten.col2im.out
-    return register_kernels(device_type, [
+    undo_autograd = register_kernels(device_type, [
         (im_default, "Autograd{}", _im2col_kernel(device_type, im_default, DispatchKey.Autograd)),
-        (im_default, "{}", _im2col_kernel(device_type, im_default)),
-        (im_out, "{}", _im2col_out_kernel(device_type, im_out)),
         (col_default, "Autograd{}", _col2im_kernel(device_type, col_default, DispatchKey.Autograd)),
-        (col_default, "{}", _col2im_kernel(device_type, col_default)),
-        (col_out, "{}", _col2im_out_kernel(device_type, col_out)),
     ])
+    if device_type == "cpu":
+        return undo_autograd
+    undo_backend = override_kernels(device_type, [
+        (im_default, _im2col_kernel(device_type, im_default)),
+        (im_out, _im2col_out_kernel(device_type, im_out)),
+        (col_default, _col2im_kernel(device_type, col_default)),
+        (col_out, _col2im_out_kernel(device_type, col_out)),
+    ])
+    return chain([undo_autograd, undo_backend])
