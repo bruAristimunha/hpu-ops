@@ -43,13 +43,16 @@ wrong (bridge 1.21.4).
 ``index_put_`` with integer indices keeps the native kernels, and so do lazy-mode calls below autograd (inference
 mode), where Habana's ``HPU`` kernel of ``index`` is registered.
 """
+import collections
 import contextlib
 import math
+import threading
+import weakref
 
 import torch
 from torch._C import DispatchKey
 
-from . import _strict
+from . import _dispatch, _strict
 from ._dispatch import count, register_kernels
 
 aten = torch.ops.aten
@@ -57,6 +60,14 @@ INTEGER = (torch.int64, torch.int32)
 MASKS = (torch.bool, torch.uint8)  # uint8: ATen's deprecated byte masks, which it still takes
 VALID = INTEGER + MASKS
 HOST_INDEX = "index: CPU index tensors checked and linearized on the host"
+
+INDEX_CACHE_SIZE = 128
+INDEX_CACHE_BYTES = 64 << 20
+INDEX_CACHE_ENTRY_MAX_BYTES = 16 << 20
+_INDEX_LOCK = threading.RLock()
+_INDEX_CACHE = collections.OrderedDict()
+_DEAD_KEYS = collections.deque()
+_INDEX_BYTES = 0
 
 
 def _positions(indices):
@@ -80,15 +91,120 @@ def _in_range(t, size):
         return None
 
 
-def _tracing(t):
-    """True while ``torch.compile`` traces (dynamo, or AOT autograd's fake tensors): index arithmetic then goes on the
-    device, in the graph, instead of on the host. Not AOT's ``FunctionalTensor`` pass, on purpose: there a CPU index
-    tensor's linear index is built from host ops and copied once per step, which measured faster on Gaudi2 than
-    building it in the graph on the device (bridge 1.21.4, compiled ``(x @ x.mT)[..., triu_indices]`` forward and
-    backward, batch 32, n = 22, one process, 4 alternating rounds: 1.94 against 2.22 ms per step)."""
-    from torch._subclasses.fake_tensor import is_fake
+def _tracing(*tensors):
+    """True while a tracer (``torch.compile`` Dynamo/AOT FakeTensor/FunctionalTensor, fake mode, or ``make_fx``
+    PROXY mode) sees ``tensors``: index arithmetic then goes on the device, in the graph, instead of on the host."""
+    return _dispatch.tracing(*tensors)
 
-    return torch.compiler.is_compiling() or is_fake(t)
+
+def _cacheable_cpu(t):
+    return (
+        type(t) is torch.Tensor
+        and t.device.type == "cpu"
+        and not t.is_inference()
+        and not torch._is_functional_tensor(t)
+        and not torch._C._functorch.is_functorch_wrapped_tensor(t)
+    )
+
+
+def _drain_dead_keys_locked():
+    global _INDEX_BYTES
+    while _DEAD_KEYS:
+        try:
+            dead_key = _DEAD_KEYS.popleft()
+        except IndexError:
+            break
+        entry = _INDEX_CACHE.get(dead_key)
+        if entry is not None and any(wr() is None for wr, _ in entry[3]):
+            _INDEX_CACHE.pop(dead_key)
+            _INDEX_BYTES -= entry[2]
+
+
+def _clear_cache():
+    global _INDEX_BYTES
+    with _INDEX_LOCK:
+        _INDEX_CACHE.clear()
+        _DEAD_KEYS.clear()
+        _INDEX_BYTES = 0
+
+
+def _cache_key_and_storages(self, indices, pos, start, end, flat_dims_rel, exact):
+    storages = []
+    seen_cdata = set()
+    idx_meta = []
+    for d in range(start, end + 1):
+        t = indices[d]
+        if t is None:
+            idx_meta.append(None)
+            continue
+        st = t.untyped_storage()
+        cd = st._cdata
+        if cd not in seen_cdata:
+            seen_cdata.add(cd)
+            storages.append(st)
+        idx_meta.append((t.data_ptr(), t._version, t.dtype, tuple(t.shape), tuple(t.stride()), cd))
+    key = (str(self.device), tuple(self.shape[start:end + 1]), flat_dims_rel, exact, tuple(idx_meta))
+    return key, storages
+
+
+def _cache_lookup(self, indices):
+    global _INDEX_BYTES
+    pos = _positions(indices)
+    if not pos or len(indices) > self.dim():
+        return None
+    if not all(indices[i].dtype in INTEGER and _cacheable_cpu(indices[i]) for i in pos):
+        return None
+    off = any(_off_device(self, indices[i]) for i in pos)
+    if not off and pos == list(range(len(pos))):
+        return None
+    if (_tracing(self, *(indices[i] for i in pos)) or _transformed()
+            or torch._C._functorch.get_dynamic_layer_stack_depth() != 0):
+        return None
+    try:
+        bshape = torch.broadcast_shapes(*(indices[i].shape for i in pos))
+    except RuntimeError:
+        return None
+    start, end = pos[0], pos[-1]
+    sizes = tuple(self.shape)
+    flat_dims_rel = tuple(d - start for d in range(start, end + 1) if sizes[d] > 1 and self.stride(d) == 0)
+    exact = bool(flat_dims_rel) and torch.is_grad_enabled() and self.requires_grad
+    key, storages = _cache_key_and_storages(self, indices, pos, start, end, flat_dims_rel, exact)
+    with _INDEX_LOCK:
+        _drain_dead_keys_locked()
+        entry = _INDEX_CACHE.get(key)
+        if entry is None:
+            return None
+        lin_flat, lin_true, nbytes, refs = entry
+        if not all(wr() is st for (wr, _), st in zip(refs, storages)):
+            _INDEX_CACHE.pop(key)
+            _INDEX_BYTES -= nbytes
+            return None
+        _INDEX_CACHE.move_to_end(key)
+    mids = [d for d in range(start, end + 1) if indices[d] is None]
+    flat_dims = [start + rel for rel in flat_dims_rel]
+    return lin_flat, lin_true, start, end, bshape, mids, flat_dims
+
+
+def _cache_store(key, storages, indices, pos, snap, lin_flat, lin_true):
+    global _INDEX_BYTES
+    if not all(indices[i].data_ptr() == ptr and indices[i]._version == ver for i, (ptr, ver) in zip(pos, snap)):
+        return
+    nbytes = lin_flat.numel() * lin_flat.element_size() + (
+        0 if lin_true is None else lin_true.numel() * lin_true.element_size()
+    )
+    if nbytes > INDEX_CACHE_ENTRY_MAX_BYTES:
+        return
+    with _INDEX_LOCK:
+        _drain_dead_keys_locked()
+        old = _INDEX_CACHE.pop(key, None)
+        if old is not None:
+            _INDEX_BYTES -= old[2]
+        refs = tuple((weakref.ref(st, lambda _r, k=key: _DEAD_KEYS.append(k)), st._cdata) for st in storages)
+        _INDEX_CACHE[key] = (lin_flat, lin_true, nbytes, refs)
+        _INDEX_BYTES += nbytes
+        while len(_INDEX_CACHE) > 1 and (len(_INDEX_CACHE) > INDEX_CACHE_SIZE or _INDEX_BYTES > INDEX_CACHE_BYTES):
+            _, evicted = _INDEX_CACHE.popitem(last=False)
+            _INDEX_BYTES -= evicted[2]
 
 
 def _off_device(self, t):
@@ -142,7 +258,27 @@ def _plan(self, indices):
     return "move" if off else None
 
 
-def index_select_flat(self, indices, checked=True):
+def _finish_index_select(self, lin_flat, lin_true, start, end, bshape, mids, flat_dims):
+    shape = tuple(bshape) + tuple(self.shape[d] for d in mids)
+    full = self
+    if flat_dims:
+        self = self[tuple(slice(0, 1) if d in flat_dims else slice(None) for d in range(self.dim()))]
+    flat = self.flatten(start, end) if end > start else self
+    if lin_true is not None:
+        out = _ExpandedSelect.apply(full, flat.detach(), lin_flat, lin_true, start, end)
+    else:
+        out = flat.index_select(start, lin_flat)
+    if len(shape) == 0:
+        return out.squeeze(start)  # 0-d indices (direct aten calls): the indexed dims go away
+    out = out.unflatten(start, shape) if len(shape) != 1 else out
+    if mids and start > 0 and len(bshape):  # separated indices: the broadcast dims go first, as in ATen
+        nb = len(bshape)
+        order = list(range(start, start + nb)) + list(range(start)) + list(range(start + nb, out.dim()))
+        out = out.permute(order).contiguous()
+    return out
+
+
+def index_select_flat(self, indices, checked=True, cache=True):
     """``self[indices]`` for integer indices as one ``index_select`` of the dims from the first to the last index
     flattened, with the linear index of the broadcast indices; a dim between two indices (a slice) joins the linear
     index as an ``arange``, so no permuted copy of ``self`` is made. ATen puts the broadcast index dims in place of
@@ -154,7 +290,7 @@ def index_select_flat(self, indices, checked=True):
     start, end = pos[0], pos[-1]
     bshape = torch.broadcast_shapes(*(indices[i].shape for i in pos))
     mids = [d for d in range(start, end + 1) if indices[d] is None]  # slices between two indices
-    on_host = not _tracing(self) and all(indices[i].device.type == "cpu" for i in pos)
+    on_host = not _tracing(self, *(indices[i] for i in pos)) and all(indices[i].device.type == "cpu" for i in pos)
     device = torch.device("cpu") if on_host else self.device
     host = _strict.route(HOST_INDEX, leaves=[indices[i] for i in pos],
                          detail="CPU index tensors: the linear index is computed on the CPU, then copied to the card") \
@@ -167,51 +303,49 @@ def index_select_flat(self, indices, checked=True):
     # ``torch.func`` transform or forward-mode AD (no Function there) ``self`` is materialized instead.
     sizes = tuple(self.shape)
     flat_dims = [d for d in range(start, end + 1) if sizes[d] > 1 and self.stride(d) == 0]
-    if flat_dims and _transformed():
+    transformed = _transformed() if (flat_dims or (cache and checked and on_host)) else False
+    if flat_dims and transformed:
         self, flat_dims = self.contiguous(), []
-    full = self
-    exact = bool(flat_dims) and torch.is_grad_enabled() and full.requires_grad
-    if flat_dims:
-        self = self[tuple(slice(0, 1) if d in flat_dims else slice(None) for d in range(self.dim()))]
+    exact = bool(flat_dims) and torch.is_grad_enabled() and self.requires_grad
+    can_cache = (cache and checked and on_host and not transformed
+                 and torch._C._functorch.get_dynamic_layer_stack_depth() == 0
+                 and all(_cacheable_cpu(indices[i]) for i in pos))
+    if can_cache:
+        flat_dims_rel = tuple(d - start for d in flat_dims)
+        key, storages = _cache_key_and_storages(self, indices, pos, start, end, flat_dims_rel, exact)
+        snap = tuple((indices[i].data_ptr(), indices[i]._version) for i in pos)
     with host:
-        lin = lin_true = ok = None
-        for d in range(start, end + 1):
-            size = sizes[d]
-            if d in mids:
-                j = mids.index(d)
-                true = torch.arange(size, device=device).reshape((size,) + (1,) * (len(mids) - 1 - j))
-                term = torch.zeros_like(true) if d in flat_dims else true
-            else:
-                t = indices[d].to(device=device, dtype=torch.int64)
-                if not checked:
-                    valid = (t >= -size) & (t < size)
-                    ok = valid if ok is None else ok & valid
-                true = torch.where(t < 0, t + size, t).reshape(tuple(t.shape) + (1,) * len(mids))
-                term = torch.zeros_like(true) if d in flat_dims else true
-            lin = term if lin is None else lin * self.shape[d] + term
+        with (torch.inference_mode(False) if can_cache else contextlib.nullcontext()), \
+                (torch.no_grad() if can_cache else contextlib.nullcontext()):
+            lin = lin_true = ok = None
+            for d in range(start, end + 1):
+                size = sizes[d]
+                sliced_size = 1 if d in flat_dims else size
+                if d in mids:
+                    j = mids.index(d)
+                    true = torch.arange(size, device=device).reshape((size,) + (1,) * (len(mids) - 1 - j))
+                    term = torch.zeros_like(true) if d in flat_dims else true
+                else:
+                    t = indices[d].to(device=device, dtype=torch.int64)
+                    if not checked:
+                        valid = (t >= -size) & (t < size)
+                        ok = valid if ok is None else ok & valid
+                    true = torch.where(t < 0, t + size, t).reshape(tuple(t.shape) + (1,) * len(mids))
+                    term = torch.zeros_like(true) if d in flat_dims else true
+                lin = term if lin is None else lin * sliced_size + term
+                if exact:
+                    lin_true = true if lin_true is None else lin_true * size + true
+            if ok is not None:
+                keep = ok.reshape(tuple(ok.shape) + (1,) * len(mids))
+                lin = torch.where(keep, lin, -1)
+                lin_true = None if lin_true is None else torch.where(keep, lin_true, -1)
+            lin = torch.broadcast_to(lin, shape)
+            lin_flat = lin.reshape(-1).to(self.device)
             if exact:
-                lin_true = true if lin_true is None else lin_true * size + true
-        if ok is not None:
-            keep = ok.reshape(tuple(ok.shape) + (1,) * len(mids))
-            lin = torch.where(keep, lin, -1)
-            lin_true = None if lin_true is None else torch.where(keep, lin_true, -1)
-        lin = torch.broadcast_to(lin, shape)
-        lin_flat = lin.reshape(-1).to(self.device)
-        if exact:
-            lin_true = torch.broadcast_to(lin_true, shape).reshape(-1).to(self.device)
-    flat = self.flatten(start, end) if end > start else self
-    if exact:
-        out = _ExpandedSelect.apply(full, flat.detach(), lin_flat, lin_true, start, end)
-    else:
-        out = flat.index_select(start, lin_flat)
-    if lin.dim() == 0:
-        return out.squeeze(start)  # 0-d indices (direct aten calls): the indexed dims go away
-    out = out.unflatten(start, shape) if lin.dim() != 1 else out
-    if mids and start > 0 and len(bshape):  # separated indices: the broadcast dims go first, as in ATen
-        nb = len(bshape)
-        order = list(range(start, start + nb)) + list(range(start)) + list(range(start + nb, out.dim()))
-        out = out.permute(order).contiguous()
-    return out
+                lin_true = torch.broadcast_to(lin_true, shape).reshape(-1).to(self.device)
+        if can_cache:
+            _cache_store(key, storages, indices, pos, snap, lin_flat, lin_true)
+    return _finish_index_select(self, lin_flat, lin_true, start, end, bshape, mids, flat_dims)
 
 
 class _ExpandedSelect(torch.autograd.Function):
@@ -255,10 +389,10 @@ def _expand_masks(indices):
 def _host_index_route(self, indices):
     """Strict mode's one route per call of a device tensor indexed by CPU index tensors: checked, linearized,
     masked or moved on the host (hpu_ops' choice: no device sync). A no-op when strict mode is off."""
-    if not _strict._ACTIVE["n"] or self.device.type == "cpu" or _tracing(self):
+    if not _strict._ACTIVE["n"] or self.device.type == "cpu":
         return contextlib.nullcontext()
     host = [t for t in indices if t is not None and t.device.type == "cpu"]
-    if not host:
+    if not host or _tracing(self, *host):
         return contextlib.nullcontext()
     return _strict.route(HOST_INDEX, *host,
                          detail="CPU index tensors: checked, linearized or masked on the host, then copied to the card")
@@ -268,15 +402,21 @@ def _index_kernel(device_type, fallback):
     op = aten.index.Tensor
 
     def kernel(self, indices):
+        if self.device.type != device_type:
+            return op._op_dk(fallback, self, indices)
+        hit = _cache_lookup(self, indices)
+        if hit is not None:
+            count("index")
+            return _finish_index_select(self, *hit)
         with _host_index_route(self, indices):
-            plan = _plan(self, indices) if self.device.type == device_type else None
+            plan = _plan(self, indices)
             if plan is None:
                 return op._op_dk(fallback, self, indices)
             count("index")
             if plan == "move":
                 return op._op_dk(fallback, self, [t if t is None else t.to(self.device) for t in indices])
             if plan == "mask":
-                return index_select_flat(self, _expand_masks(indices))
+                return index_select_flat(self, _expand_masks(indices), cache=False)
             return index_select_flat(self, indices, checked=plan == "int")
 
     return kernel
@@ -325,42 +465,55 @@ def _value(self, values):
     return (values.real if values.is_complex() else values).to(self.dtype)
 
 
+def _mask_value(self, indices, values, accumulate=False):
+    """Converted put value when ``self[..., mask] = value`` should run through ``where``, else None."""
+    pos = _positions(indices)
+    if accumulate or len(pos) != 1 or values.numel() != 1 or values.dim() > 1 or self.is_complex():
+        return None
+    mask, p = indices[pos[0]], pos[0]
+    if mask.dtype != torch.bool or p != len(indices) - 1 or len(indices) > self.dim():
+        return None  # byte masks: ATen's error; a mask with an explicit None after it: ATen's alignment
+    if mask.dim() == 0 or tuple(mask.shape) != tuple(self.shape[p:p + mask.dim()]):
+        return None
+    if mask.device not in (self.device, torch.device("cpu")) or values.device not in (self.device, torch.device("cpu")):
+        return None  # ATen's device error
+    if _shares_memory(self, mask) or _shares_memory(self, values) or not _dense(self):
+        return None  # ATen raises on aliasing; and writes into overlapping views its own way
+    return _value(self, values)  # ATen raises on the value's cast (overflow, complex to real)
+
+
 def _mask_takes(self, indices, values, accumulate=False):
     """The case Habana's lazy launch fails on (SPNN, DeepGeoCCA): ``self[..., mask] = value``, one boolean mask that
     is the last index (ATen aligns a mask followed by an explicit ``None`` differently), one value, a dense
     destination that shares no memory with the mask or the value. Leading masks too (``x[x < eps] = eps``): keeping
     those native brought the launch failure back in SPNN and DeepGeoCCA (measured), so ``where`` allocates one copy of
     the destination there instead of the in-place ``masked_fill_``."""
-    pos = _positions(indices)
-    if accumulate or len(pos) != 1 or values.numel() != 1 or values.dim() > 1 or self.is_complex():
-        return False
-    mask, p = indices[pos[0]], pos[0]
-    if mask.dtype != torch.bool or p != len(indices) - 1 or len(indices) > self.dim():
-        return False  # byte masks: ATen's error; a mask with an explicit None after it: ATen's alignment
-    if mask.dim() == 0 or tuple(mask.shape) != tuple(self.shape[p:p + mask.dim()]):
-        return False
-    if mask.device not in (self.device, torch.device("cpu")) or values.device not in (self.device, torch.device("cpu")):
-        return False  # ATen's device error
-    if _shares_memory(self, mask) or _shares_memory(self, values) or not _dense(self):
-        return False  # ATen raises on aliasing; and writes into overlapping views its own way
-    return _value(self, values) is not None  # ATen raises on the value's cast (overflow, complex to real)
+    return _mask_value(self, indices, values, accumulate) is not None
 
 
-def mask_fill(self, indices, values, accumulate=False):
+def mask_fill(self, indices, values, accumulate=False, value=None):
     """``self[..., mask] = value`` as ``self.copy_(where(mask, value, self))``; returns self."""
     p = _positions(indices)[0]
     mask = indices[p]
     mask = mask.to(self.device).reshape((1,) * p + tuple(mask.shape) + (1,) * (self.dim() - p - mask.dim()))
-    return self.copy_(torch.where(mask, _value(self, values).reshape(()).to(self.device), self))
+    if value is None:
+        value = _value(self, values)
+    return self.copy_(torch.where(mask, value.reshape(()).to(self.device), self))
 
 
 def install_index(device_type):
     """``index`` on ``device_type`` as above, at the autograd and backend keys. Returns an undo."""
     op = aten.index.Tensor
-    return register_kernels(device_type, [
+    undo_kernels = register_kernels(device_type, [
         (op, "Autograd{}", _index_kernel(device_type, DispatchKey.Autograd)),
         (op, "{}", _index_kernel(device_type, DispatchKey.CompositeExplicitAutogradNonFunctional)),
     ])
+
+    def undo():
+        undo_kernels()
+        _clear_cache()
+
+    return undo
 
 
 def install_mask_fill(device_type):
@@ -368,9 +521,10 @@ def install_mask_fill(device_type):
     op = aten.index_put_.default
 
     def kernel(self, indices, values, accumulate=False):
-        if _mask_takes(self, indices, values, accumulate):
+        val = _mask_value(self, indices, values, accumulate)
+        if val is not None:
             count("mask_fill")
-            return mask_fill(self, indices, values, accumulate)
+            return mask_fill(self, indices, values, accumulate, value=val)
         return op._op_dk(DispatchKey.Autograd, self, indices, values, accumulate)
 
     return register_kernels(device_type, [(op, "Autograd{}", kernel)])

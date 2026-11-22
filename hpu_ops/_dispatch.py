@@ -27,6 +27,23 @@ def static(*sizes):
     return all(isinstance(size, int) for size in sizes)
 
 
+def tracing(*tensors):
+    """True when ``torch.compile`` (Dynamo, or AOT autograd's fake and functional tensors, where
+    ``torch.compiler.is_compiling()`` is False), a fake mode, or ``make_fx`` (a proxy mode, also on real tensors)
+    is active on ``tensors``."""
+    if (torch._C._len_torch_dispatch_stack() == 0 and not torch.compiler.is_compiling()
+            and all(type(t) is torch.Tensor and not torch._is_functional_tensor(t) for t in tensors)):
+        return False
+    from torch._subclasses.fake_tensor import FakeTensor, is_fake
+    from torch._subclasses.functional_tensor import FunctionalTensor
+
+    if (torch.compiler.is_compiling() or torch._guards.detect_fake_mode() is not None
+            or torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY) is not None):
+        return True
+    return any(isinstance(t, FakeTensor) or is_fake(t) or torch._is_functional_tensor(t)
+               or isinstance(t, FunctionalTensor) for t in tensors)
+
+
 def below_autograd():
     """True where autograd's keys are excluded: below an autograd kernel (backend kernels, ``__torch_dispatch__``
     modes, hence the tracers' ``decompose()`` calls) and in inference mode."""
