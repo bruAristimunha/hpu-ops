@@ -3,13 +3,16 @@
  * the first RC rows stay there, the others are read and written in global memory (the output R) on every step.
  *
  * Tensors (TPC geometry, dim0 innermost; torch [batch, rows, cols] row-major):
- *   A [n, n, batch]   f32
- *   R [w, n, batch]   f32, w = 64 * ceil(n / 64): the in-place result, A^-1 = R[P, :][:, Q] (lanes >= n are 0);
- *                     each row is divided by its pivot at the end, the caller does the gathers
+ *   A [n, m, batch]   f32, m = n rows (square) or, built with -DTALL, n <= m <= 2048 rows (a tall panel)
+ *   R [w, m, batch]   f32, w = 64 * ceil(n / 64): the in-place result, A^-1 = R[P, :][:, Q] (lanes >= n are 0);
+ *                     each row taken as a pivot is divided by its pivot at the end, the caller does the gathers.
+ *                     Tall: R[P, :] = A[P, :]^-1 and the rows never taken hold -A[o, :] A[P, :]^-1
  *   P [n, batch]      f32: p_k, the row taken as the k-th pivot (exact integers)
- *   Q [n, batch]      f32: the inverse permutation, Q[p_k] = k
+ *   Q [m, batch]      f32: Q[p_k] = k (the inverse permutation when square), n + i for a row i never taken
  *   D [n, batch]      f32: the k-th pivot (U's diagonal of P A = L U)
  *   S [2, batch]      f32: lane 0 unused (0; the caller takes the sign from P), lane 1 = info (1 + first zero pivot)
+ * A NaN anywhere in A makes every entry of R and D NaN and the info 0 (LAPACK's results are NaN there and its NaN
+ * pivots are not zero; the elimination's need not be), so the caller needs no check of its own.
  * Pivoting is implicit (no row moves): step k takes the unused row p of largest |column k| (the first among ties; a
  * NaN counts as 0, so the order stays a permutation), stores 1 at (p, k) and leaves the rest of row p unnormalized;
  * every other row i gets q_i = -R[i][k] / pivot at (i, k) and q_i times the pivot row added elsewhere (LU-style, as
@@ -25,12 +28,19 @@
 #ifndef VA
 #define VA 4  // 64-lane vectors per row, ceil(n / 64): one build per VA in 2..8, so every loop over a row unrolls
 #endif
+#ifdef TALL
+#define VR 32  // tall panels (-DTALL): up to 64 * VR = 2048 rows, the per-row state in VR vectors
+#else
+#define VR VA  // square: one row per column
+#endif
 #if VA <= 6
 #define NR 2  // rows per group: two independent chains for the scheduler (VA 7, 8: one, as two spill registers)
 #else
 #define NR 1
 #endif
-#if VA < 8
+#if defined(TALL)
+#define CACHE (280 - 5 * VA - 2 * VR)  // the per-row state of 2048 rows takes 64 vectors of the cache's room
+#elif VA < 8
 #define CACHE 232  // vectors of local memory for the first rows (58 KB; VA = 8 spills past it)
 #else
 #define CACHE 216  // VA = 8: 27 rows (54 KB); with the normalized pivot row 224 and 232 spilled past 80 KB (measured)
@@ -40,12 +50,11 @@ __local__ float64 cache[CACHE];  // row i < RC, vector v at cache[i * VA + v]
 __local__ float64 nwl[VA];       // the next pivot row, spilled once per step for its lanes k, k + 1
 __local__ float64 pwl[VA];
 __local__ float64 pwsl[VA];
-__local__ float64 used[VA];      // lane i % 64 of used[i / 64]: 1 once row i was a pivot
 __local__ float64 dvv[VA];
 __local__ float64 pvv[VA];
-__local__ float64 qvv[VA];
-__local__ float64 drv[VA];  // lane i % 64 of drv[i / 64]: the pivot of the step that took row i, times the 2^-e
-                            // that normalized the row as stored
+__local__ float64 qvv[VR];  // lane i % 64 of qvv[i / 64]: the step k that took row i as its pivot, n + i while unused
+__local__ float64 drv[VR];  // lane i % 64 of drv[i / 64]: the pivot of the step that took row i, times the 2^-e
+                            // that normalized the row as stored (1 while unused: a row never taken is not divided)
 
 static inline float64 lane_bcast(float64 v, int k)
 {
@@ -115,9 +124,12 @@ static inline float64 small_quotient(float64 col, float64 q, float64 up, float64
 
 void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
 {
-    const int n = get_dim_size(A, 0);
-    const int RC = CACHE / VA < n ? CACHE / VA : n;  // rows kept in local memory
+    const int n = get_dim_size(A, 0);                 // columns, one elimination step each
+    const int m = get_dim_size(A, 1);                 // rows: n, or more for a tall panel
+    const int RC = CACHE / VA < m ? CACHE / VA : m;  // rows kept in local memory
     const int last = n - 64 * (VA - 1);              // lanes in the last vector
+    const int vm = (m + 63) / 64;                    // vectors of per-row state
+    const int lastm = m - 64 * (vm - 1);
     const uint64 lane = read_lane_id_4b_b();
     const float64 lanef = v_convert_i32_to_f32_b(as_int64(lane), 0);
     const int5 off = get_index_space_offset();
@@ -129,19 +141,22 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
 #pragma unroll
         for (int v = 0; v < VA; v++)
         {
-            used[v] = 0.0f;
             dvv[v] = 0.0f;
             pvv[v] = 0.0f;
-            qvv[v] = 0.0f;
-            drv[v] = 0.0f;
             nw[v] = 0.0f;
         }
+        for (int v = 0; v < vm; v++)
+        {
+            qvv[v] = v_f32_add_b(lanef, (float)(64 * v + n));  // n + i: row i not taken yet
+            drv[v] = 1.0f;
+        }
         float64 infov = 0.0f;
+        float64 nanv = 0.0f;  // lane-wise: 1 where a NaN was seen
 
         // pass 0: A into the cache and R (lanes >= n zeroed), find the pivot row of column 0
         float64 best = -1.0f;
         float64 bidx = 0.0f;
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < m; i++)
         {
             int5 c = {0, i, bt, 0, 0};
             float64 x[VA];
@@ -152,6 +167,11 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                 x[v] = v_f32_ld_tnsr_b(c, A);
             }
             x[VA - 1] = v_f32_sel_geq_u32_b(lane, (unsigned)last, 0.0f, x[VA - 1]);
+#pragma unroll
+            for (int v = 0; v < VA; v++)
+            {
+                nanv = v_f32_sel_eq_f32_b(x[v], x[v], nanv, 1.0f);
+            }
             float64 cand = v_f32_abs_b(lane_bcast(x[0], 0));
             cand = v_f32_sel_eq_f32_b(cand, cand, cand, 0.0f);  // NaN counts as 0: the order stays a permutation
             const float64 prev = best;
@@ -222,13 +242,16 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
             const float64 ns = as_float64(nsb);
             unsigned zl[VA];  // lane of vector v zeroed in every non-pivot row: lk in vector vk, none elsewhere
             float64 pws[VA];
+            const float64 pkns = v_f32_mul_b(pk, ns);
+            for (int v = 0; v < vm; v++)
+            {
+                float64 rowid = v_f32_add_b(lanef, (float)(64 * v));
+                qvv[v] = v_f32_sel_eq_f32_b(rowid, p, (float)k, qvv[v]);
+                drv[v] = v_f32_sel_eq_f32_b(rowid, p, pkns, drv[v]);
+            }
 #pragma unroll
             for (int v = 0; v < VA; v++)
             {
-                float64 rowid = v_f32_add_b(lanef, (float)(64 * v));
-                used[v] = v_f32_sel_eq_f32_b(rowid, p, 1.0f, used[v]);
-                qvv[v] = v_f32_sel_eq_f32_b(rowid, p, (float)k, qvv[v]);
-                drv[v] = v_f32_sel_eq_f32_b(rowid, p, v_f32_mul_b(pk, ns), drv[v]);
                 zl[v] = v == vk ? (unsigned)lk : 64u;
                 pw[v] = v_f32_sel_eq_u32_b(lane, zl[v], 1.0f, nw[v]);
                 pws[v] = v_f32_sel_less_u32_b(v_u32_and_b(as_uint64(pw[v]), 0x7FFFFFFFu), 0x7F800000u,
@@ -268,7 +291,7 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                     // candidate for step k + 1: the new value at column k + 1 of an unused row (same fused ops as below)
                     float64 cd = v_f32_abs_b(v_f32_mac_b(pksn, qs[r], v_f32_mac_b(pkn, q[r], lane_bcast(cache[base + vkn], lkn))));
                     cd = v_f32_sel_eq_f32_b(cd, cd, cd, 0.0f);  // NaN counts as 0
-                    cd = v_f32_sel_eq_f32_b(lane_bcast(used[ii[r] / 64], ii[r] % 64), 1.0f, -1.0f, cd);
+                    cd = v_f32_sel_less_f32_b(lane_bcast(qvv[ii[r] / 64], ii[r] % 64), (float)n, -1.0f, cd);  // taken
                     cand[r] = more ? cd : -1.0f;
                 }
 #pragma unroll
@@ -292,9 +315,9 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
             }
 
             // rows in global memory: all vectors of a pair loaded before any is stored
-            for (int i = RC; i < n; i += NR)
+            for (int i = RC; i < m; i += NR)
             {
-                const int ii[2] = {i, i + 1 < n ? i + 1 : i};  // ii[1] unused when NR = 1
+                const int ii[2] = {i, i + 1 < m ? i + 1 : i};  // ii[1] unused when NR = 1
                 float64 x[NR][VA], cand[NR], q[NR], qs[NR];
 #pragma unroll
                 for (int r = 0; r < NR; r++)
@@ -315,7 +338,7 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
                     qs[r] = small_quotient(col, q[r], up, ninv);
                     float64 cd = v_f32_abs_b(v_f32_mac_b(pksn, qs[r], v_f32_mac_b(pkn, q[r], lane_bcast(xkn, lkn))));
                     cd = v_f32_sel_eq_f32_b(cd, cd, cd, 0.0f);  // NaN counts as 0
-                    cd = v_f32_sel_eq_f32_b(lane_bcast(used[ii[r] / 64], ii[r] % 64), 1.0f, -1.0f, cd);
+                    cd = v_f32_sel_less_f32_b(lane_bcast(qvv[ii[r] / 64], ii[r] % 64), (float)n, -1.0f, cd);  // taken
                     cand[r] = more ? cd : -1.0f;
                 }
 #pragma unroll
@@ -342,45 +365,59 @@ void main(tensor A, tensor R, tensor P, tensor Q, tensor D, tensor S)
         }
 
         // Each row divided by its pivot (as gj_solve's B / diag(D)): |pivot| >= 2^64 scaled by 2^-64 first, so its
-        // reciprocal is never subnormal; a zero pivot gives a zero row. Cached rows from local memory, the others
-        // re-read (after the last step's ASO) and written back.
-#pragma unroll
-        for (int v = 0; v < VA; v++)
+        // reciprocal is never subnormal; a zero pivot gives a zero row, a row never taken (tall) is kept. Cached rows
+        // from local memory, the others re-read (after the last step's ASO) and written back.
+        // a NaN in any lane of any row: every output of this matrix NaN
+        float64 anynan = 0.0f;
+        for (int l = 0; l < 64; l++)
         {
-            float64 ds = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(drv[v]), 0x7FFFFFFFu), 0x5F800000u, 0x1p-64f, 1.0f);
-            pwl[v] = ds;
-            pwsl[v] = lut_free_recip(v_f32_mul_b(drv[v], ds));
+            anynan = v_f32_sel_eq_f32_b(lane_bcast(nanv, l), 1.0f, 1.0f, anynan);
         }
-        for (int i = 0; i < n; i++)
+        const float64 qnan = as_float64(v_u32_or_b(v_u32_and_b(as_uint64(anynan), 0u), 0x7FC00000u));
+        for (int i = 0; i < m; i++)
         {
-            const float64 ds = lane_bcast(pwl[i / 64], i % 64);
-            const float64 dinv = lane_bcast(pwsl[i / 64], i % 64);
+            const float64 dr = lane_bcast(drv[i / 64], i % 64);
+            const float64 ds = v_f32_sel_geq_u32_b(v_u32_and_b(as_uint64(dr), 0x7FFFFFFFu), 0x5F800000u, 0x1p-64f, 1.0f);
+            const float64 dinv = lut_free_recip(v_f32_mul_b(dr, ds));
 #pragma unroll
             for (int v = 0; v < VA; v++)
             {
                 int5 c = {64 * v, i, bt, 0, 0};
                 float64 y = i < RC ? cache[i * VA + v] : v_f32_ld_tnsr_b(c, R);
-                v_f32_st_tnsr(c, R, v_f32_mul_b(v_f32_mul_b(y, ds), dinv));
+                y = v_f32_mul_b(v_f32_mul_b(y, ds), dinv);
+                v_f32_st_tnsr(c, R, v_f32_sel_eq_f32_b(anynan, 1.0f, qnan, y));
             }
         }
 #pragma unroll
         for (int v = 0; v < VA; v++)
         {
             int5 cd = {64 * v, bt, 0, 0, 0};
+            const float64 dv = v_f32_sel_eq_f32_b(anynan, 1.0f, qnan, dvv[v]);
             if (v == VA - 1 && last < 64)
             {
-                v_f32_st_tnsr_partial(cd, D, dvv[v], (char)(last - 1), 0);
+                v_f32_st_tnsr_partial(cd, D, dv, (char)(last - 1), 0);
                 v_f32_st_tnsr_partial(cd, P, pvv[v], (char)(last - 1), 0);
-                v_f32_st_tnsr_partial(cd, Q, qvv[v], (char)(last - 1), 0);
             }
             else
             {
-                v_f32_st_tnsr(cd, D, dvv[v]);
+                v_f32_st_tnsr(cd, D, dv);
                 v_f32_st_tnsr(cd, P, pvv[v]);
-                v_f32_st_tnsr(cd, Q, qvv[v]);
+            }
+        }
+        for (int v = 0; v < vm; v++)
+        {
+            int5 cq = {64 * v, bt, 0, 0, 0};
+            if (v == vm - 1 && lastm < 64)
+            {
+                v_f32_st_tnsr_partial(cq, Q, qvv[v], (char)(lastm - 1), 0);
+            }
+            else
+            {
+                v_f32_st_tnsr(cq, Q, qvv[v]);
             }
         }
         int5 cs = {0, bt, 0, 0, 0};
+        infov = v_f32_sel_eq_f32_b(anynan, 1.0f, 0.0f, infov);  // a NaN: info 0, as LAPACK's (NaN pivots are not 0)
         v_f32_st_tnsr_partial(cs, S, v_f32_sel_eq_u32_b(lane, 1u, infov, 0.0f), 1, 0);
     }
 }

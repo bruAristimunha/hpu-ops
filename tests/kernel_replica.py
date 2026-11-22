@@ -84,14 +84,17 @@ def _scale(v):
     return np.where((_u32(v) & 0x7FFFFFFF) >= 0x5F800000, F32(2.0 ** -64), F32(1)).astype(F32)
 
 
-def gj_solve(A, B=None, legacy=False, legacy_tiny=False):
+def gj_solve(A, B=None, legacy=False, legacy_tiny=False, legacy_growth=False):
     """``(X, D, S)`` of ``gj_solve_f32_gaudi2.c`` (``gj_inv`` with ``B=None``) for one matrix ``A[n, n]`` and
     ``B[n, m]`` (numpy or torch, any float dtype; converted to float32). ``legacy_tiny=True``: the LU-style kernel
-    before multipliers below 2^-126 were carried scaled (commit 090da6b)."""
+    before multipliers below 2^-126 were carried scaled (commit 090da6b). ``legacy_growth=True``: before the stored
+    pivot row of |pivot| >= 2 was scaled down by a power of two (as gj_large's Codex #17). A NaN in ``A`` gives NaN ``X`` and ``D``
+    and info 0 (not with ``legacy``, the kernel before that)."""
     a = _ftz(np.array(A, dtype=F32))
     n = a.shape[0]
     b = np.eye(n, dtype=F32) if B is None else _ftz(np.array(B, dtype=F32))
     dv = np.zeros(n, F32)
+    dsv = np.zeros(n, F32)  # the k-th pivot times the 2^-e that normalized its row as stored
     sv, info = F32(1), 0
     for k in range(n):
         col = a[:, k].copy()
@@ -137,10 +140,19 @@ def gj_solve(A, B=None, legacy=False, legacy_tiny=False):
             if i != k:
                 a[i] = mac(aps, qs[i], mac(a[k], q[i], a[i]))
                 b[i] = mac(bps, qs[i], mac(b[k], q[i], b[i]))
+        if not (legacy or legacy_growth):  # the pivot row stored normalized by 2^-e (see gj_large)
+            pe = (int(_u32(pk)) >> 23) & 0xFF
+            ns = F32(1) if pe == 255 or pe < 128 else _f32((max(254 - pe, 1)) << 23)  # scaled down only
+            a[k], b[k] = mul(a[k], ns), mul(b[k], ns)
+            dsv[k] = mul(pk, ns)
+        else:
+            dsv[k] = pk
     if not legacy:
-        ds = _scale(dv)
-        dinv = recip(mul(dv, ds), zero_to_inf=False)
+        ds = _scale(dsv)
+        dinv = recip(mul(dsv, ds), zero_to_inf=False)
         b = mul(mul(b, ds[:, None]), dinv[:, None])
+        if np.isnan(np.array(A, dtype=F32)).any():  # a NaN in A: X and D NaN, info 0 (as LAPACK's)
+            b, dv, info = np.full_like(b, np.nan), np.full_like(dv, np.nan), 0
     return b, dv, np.array([sv, info], F32)
 
 
@@ -174,21 +186,24 @@ def gj_large(A, legacy=False, legacy_growth=False):
     first unused row of largest |new column k + 1|, a NaN candidate counting as 0). ``legacy=True`` replays the kernel
     before the review: the pivot row normalized by 1/pivot before the elimination (tiny quotients flushed) and NaN
     candidates never taken. ``legacy_growth=True``: the kernel before the stored pivot row was normalized by a power of
-    two (Codex review #17: the quotients of used rows overflowed)."""
+    two (Codex review #17: the quotients of used rows overflowed). ``A`` may be a tall panel ``[m, n]`` (m >= n, the
+    ``-DTALL`` build): n steps over m rows, ``Q[i] = n + i`` for a row never taken, which is not divided. A NaN in
+    ``A`` makes every entry of ``R`` and ``D`` NaN (not in ``legacy`` mode, the kernel before that)."""
     a = np.array(A, dtype=F32)  # tensor loads are not flushed; every op is
-    n = a.shape[0]
+    m, n = a.shape
     w = 64 * ((n + 63) // 64)
-    R = np.zeros((n, w), F32)
+    R = np.zeros((m, w), F32)
     R[:, :n] = a
-    used = np.zeros(n, bool)
-    P, Q, D = np.zeros(n, F32), np.zeros(n, F32), np.zeros(n, F32)
-    drv = np.zeros(n, F32)  # row i's pivot, times the 2^-e that normalized the row as stored
+    used = np.zeros(m, bool)
+    P, D = np.zeros(n, F32), np.zeros(n, F32)
+    Q = (n + np.arange(m)).astype(F32)
+    drv = np.ones(m, F32)  # row i's pivot, times the 2^-e that normalized the row as stored (1 while not taken)
     info = F32(0)
     lanes = np.arange(w)
 
     def pick(cand):
         best, idx = F32(-1), 0
-        for i in range(n):
+        for i in range(m):
             c = cand[i] if legacy or cand[i] == cand[i] else F32(0)
             if c > best:
                 best, idx = c, i
@@ -242,6 +257,8 @@ def gj_large(A, legacy=False, legacy_growth=False):
         dr = drv
         ds = _scale(dr)
         R = mul(mul(R, ds[:, None]), recip(mul(dr, ds), zero_to_inf=False)[:, None])
+        if np.isnan(a).any():
+            R, D, info = np.full_like(R, np.nan), np.full_like(D, np.nan), F32(0)
     return R, P, Q, D, np.array([0, info], F32)
 
 
@@ -660,6 +677,81 @@ def householder_product(A, tau, legacy=False):
             e = np.where(lanes == i, F32(1), F32(0)).astype(F32)
             q[i] = add(e, ntv) if legacy or tau_i != 0 else e
     return np.stack([x[:m] for x in q], 1)
+
+
+# ---- jacobi_big_f32_gaudi2.c: one-sided Jacobi, 32 < n <= 128, rows in local memory -------------------------------
+
+
+def _rsqrt_lut_free(x):
+    """``rsqrt_lut_free``: the bit-level guess 0x5f3759df - (bits >> 1) and three Newton steps."""
+    y = _f32(0x5F3759DF - (_u32(x) >> 1))
+    hx = mul(F32(-0.5), x)
+    for _ in range(3):
+        y = mul(y, mac(hx, mul(y, y), F32(1.5)))
+    return y
+
+
+def _inv_sqrt_unit(c2):
+    p = np.full_like(c2, F32(1.1498469))
+    for coef in (-4.40869479, 6.8050256, -5.47635557, 2.9302518):
+        p = mac(c2, p, F32(coef))
+    half_c2 = mul(F32(-0.5), c2)
+    nr = mac(half_c2, mul(p, p), F32(1.5))
+    return mul(p, nr)
+
+
+def jacobi_big(S0, sweeps=8):
+    """``U`` of ``jacobi_big_f32_gaudi2.c`` for one ``S0[n, w]`` (w = 64 * VA): the kernel's round-robin order, its
+    lane-wise accumulation over the VA vectors of a row, the 64-lane butterfly, the LUT-free reciprocal square root and
+    the polynomial 1/sqrt, each op rounded as the kernel's (FTZ, one rounding per FMA)."""
+    u = _ftz(np.array(S0, dtype=F32))
+    n, w = u.shape
+    va = w // 64
+    M = n if n % 2 else n - 1
+
+    def rotate(p, q):
+        a = b = g = np.zeros(64, F32)
+        up, uq = u[p].reshape(va, 64), u[q].reshape(va, 64)
+        for v in range(va):
+            a, b, g = mac(up[v], up[v], a), mac(uq[v], uq[v], b), mac(up[v], uq[v], g)
+        alpha, beta, gamma = _reduce_add_64(a), _reduce_add_64(b), _reduce_add_64(g)
+        d = sub(beta, alpha)
+        g2 = add(gamma, gamma)
+        r2 = mac(g2, g2, mul(d, d))
+        sr2 = np.where(r2 == 0, F32(1), r2).astype(F32)
+        inv_r = _rsqrt_lut_free(sr2)
+        c2 = mul(F32(0.5), mac(np.abs(d), inv_r, F32(1)))
+        inv_c = _inv_sqrt_unit(c2)
+        c = mul(c2, inv_c)
+        s = mul(gamma, mul(inv_r, inv_c))
+        s = np.where(d < 0, sub(F32(0), s), s).astype(F32)
+        conv = sub(mul(F32(1e-14), mul(alpha, beta)), mul(gamma, gamma))
+        c = np.where(conv >= 0, F32(1), c).astype(F32)
+        s = np.where(conv >= 0, F32(0), s).astype(F32)
+        c = np.where(r2 == 0, F32(1), c).astype(F32)
+        s = np.where(r2 == 0, F32(0), s).astype(F32)
+        ns = sub(F32(0), s)
+        cv, sv, nsv = np.tile(c, va), np.tile(s, va), np.tile(ns, va)
+        u[p], u[q] = mac(u[q], nsv, mul(u[p], cv)), mac(u[p], sv, mul(u[q], cv))
+
+    for _ in range(sweeps):
+        for r in range(M):
+            if M < n:
+                rotate(r, M)
+            for k in range(1, (M + 1) // 2):
+                x, y = (r + k) % M, (r - k) % M
+                rotate(min(x, y), max(x, y))
+    return u
+
+
+def jacobi_big_op(refine=False):
+    """A stand-in for ``torch.ops.linalg_tpc.jacobi_big`` (``_refine``: 3 sweeps): the replica per batch element."""
+    import torch
+
+    def op(S0):
+        return torch.from_numpy(np.stack([jacobi_big(s.detach().cpu().numpy(), 3 if refine else 8) for s in S0]))
+
+    return op
 
 
 # ---- complex64 kernels (planar re/im rows): cgj_solve / cgj_inv ----------------------------------------------------

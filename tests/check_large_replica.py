@@ -1,5 +1,7 @@
 """On a Gaudi card: the raw ``gj_large`` kernel against its float32 replica (``kernel_replica.gj_large``), and the
-inverse / det through ``tpc.gj_inv`` against float64, on random inputs and the review's matrices.
+inverse / det through ``tpc.gj_inv`` against float64, on random inputs and the review's matrices; tall panels (the
+``-DTALL`` builds the blocked route uses) and NaN inputs too, and ``gj_inv`` through both routes (one square kernel
+call, the blocked route) at n <= 512 and through the blocked route past it.
     PT_HPU_LAZY_MODE=0|1 python3 tests/check_large_replica.py
 A case is ok when the raw outputs are bit-equal to the replica's, ``P`` is a permutation and, for a finite input,
 the inverse and det are within ``max(FLOOR, 10x)`` CPU float32's error against float64 (Codex review #20: the
@@ -47,6 +49,14 @@ def cases():
     A = torch.randn(1, 70, 70, generator=g)
     A[0, 69, 69] = float("inf")
     yield "inf_69_69", A
+    for r, c in ((300, 70), (700, 130), (2048, 128), (1000, 512), (513, 512)):
+        yield f"tall_{r}x{c}", torch.randn(2, r, c, generator=g)
+    A = torch.randn(2, 400, 100, generator=g)
+    A[1, 17, 3] = float("nan")
+    yield "tall_nan_400x100", A
+    A = torch.randn(2, 130, 130, generator=g)
+    A[0, 5, 9] = float("nan")
+    yield "square_nan_130", A
 
 
 def rel_err(x, ref):
@@ -87,15 +97,34 @@ def main():
 
     assert tpc.ready()
     ok = True
+    import os
+    import habana_frameworks.torch.hpu as hthpu
+
     for name, A in cases():
+        if os.environ.get("ONLY_ROUTES"):
+            break
         n = A.shape[-1]
         got = [t.cpu() for t in torch.ops.linalg_tpc.gj_large(A.to("hpu").contiguous())]
         htcore.mark_step()
         want = kr.gj_large_op()(A)
         same = [bool(torch.equal(g.nan_to_num(), w.nan_to_num())) for g, w in zip(got, want)]
         diff = float((got[0] - want[0]).nan_to_num().abs().max())
-        perm = sorted(got[1][0].long().tolist()) == list(range(n))
-        row = {"case": name, "n": n, "bit_equal_R_P_Q_D_S": same, "R_maxdiff": diff, "P_is_permutation": perm}
+        rows = got[1][0].long().tolist()
+        perm = len(set(rows)) == n and all(0 <= i < A.shape[-2] for i in rows)  # distinct rows (a permutation if square)
+        row = {"case": name, "shape": list(A.shape[-2:]), "bit_equal_R_P_Q_D_S": same, "R_maxdiff": diff,
+               "P_is_permutation": perm}
+        if A.isnan().any():
+            nan = A.isnan().flatten(1).any(-1)
+            row["nan_filled"] = bool(got[0][nan].isnan().all() and got[3][nan].isnan().all())
+            row["ok"] = verdict(row) and row["nan_filled"]
+            ok &= row["ok"]
+            print("RESULT " + json.dumps(row), flush=True)
+            continue
+        if A.shape[-2] != n:
+            row["ok"] = verdict(row)
+            ok &= row["ok"]
+            print("RESULT " + json.dumps(row), flush=True)
+            continue
         if torch.isfinite(A).all():
             X, D, S = tpc.gj_inv(A.to("hpu"))
             htcore.mark_step()
@@ -103,6 +132,26 @@ def main():
         row["ok"] = verdict(row)
         ok &= row["ok"]
         print("RESULT " + json.dumps(row), flush=True)
+    original = tpc._square_pays
+    g = torch.Generator().manual_seed(1)
+    for n, b in ((130, 2), (300, 1), (512, 1), (600, 2), (1100, 1)):
+        A = torch.randn(b, n, n, generator=g)
+        for route, pays in (("square", True), ("blocked", False)):
+            if route == "square" and n > tpc.LARGE_MAXN:
+                continue
+            tpc._square_pays = lambda n_, b_, _p=pays: _p
+            X, D, S = tpc.gj_inv(A.to("hpu"))
+            hthpu.synchronize()
+            D2, S2 = tpc.large_factors(A.to("hpu"))
+            htcore.mark_step()
+            hthpu.synchronize()
+            row = {"case": f"gj_inv_{route}_n{n}_b{b}", "n": n, "bit_equal_R_P_Q_D_S": [True], "P_is_permutation": True}
+            row.update(accuracy(A, X.cpu(), D.cpu(), S.cpu()))
+            row["factors_equal"] = bool(torch.equal(D2.cpu(), D.cpu()) and torch.equal(S2.cpu()[..., 0], S.cpu()[..., 0]))
+            row["ok"] = verdict(row)
+            ok &= row["ok"]
+            print("RESULT " + json.dumps(row), flush=True)
+    tpc._square_pays = original
     print("SUMMARY", "ok" if ok else "MISMATCH", flush=True)
 
 
