@@ -314,7 +314,10 @@ def test_aot_functional_tensor_tracing_zero_cache_and_strict_clean(dynamic):
     - ``hpu_ops.strict("raise")`` does NOT fail compile."""
     ix = torch.triu_indices(5, 5)
     x = torch.randn(4, 5, 5)
-    f = lambda t: t[..., ix[0], ix[1]]
+
+    def f(t):
+        return t[..., ix[0], ix[1]]
+
     want = train_step(f, x)
     nodes = []
     with cpu_as_hpu(indexing.install_index):
@@ -454,3 +457,44 @@ def test_mask_fill_calls_value_once(monkeypatch):
         x[:, mask] = val
     assert calls["mask_fill"] == 1
     assert calls_to_value == 1
+
+
+@pytest.mark.usefixtures("cpu_indices_off_device")
+def test_compile_eager_backend_inside_fwad_dual_level_indexing():
+    """Bug 4: ``torch.compile(..., backend="eager")`` lowers ``fwAD.dual_level()`` to C++
+    ``_enter_dual_level()`` and executes with ``_len_torch_dispatch_stack() == 0`` and
+    ``fwAD._current_level == -1``; 0-arg ``forward_ad_level()`` must detect C++ dual level 0 so expanded
+    indexing materializes instead of hitting ``_ExpandedSelect``."""
+    import torch.autograd.forward_ad as fwAD
+
+    ix = torch.triu_indices(4, 4)
+    x = torch.randn(2, 1, 4)
+    t = torch.randn_like(x)
+
+    def run_expanded(a, ta):
+        with fwAD.dual_level():
+            d = fwAD.make_dual(a, ta)
+            out = d.expand(2, 4, 4)[..., ix[0], ix[1]]
+            return out.detach(), fwAD.unpack_dual(out).tangent
+
+    def run_plain(a):
+        return a.expand(2, 4, 4)[..., ix[0], ix[1]]
+
+    want_p, want_t = run_expanded(x, t)
+    with fwAD.dual_level():
+        want_plain = run_plain(x)
+
+    torch._dynamo.reset()
+    compiled_expanded = torch.compile(run_expanded, backend="eager", fullgraph=True)
+    compiled_plain = torch.compile(run_plain, backend="eager", fullgraph=True)
+
+    with cpu_as_hpu(indexing.install_index):
+        got_p, got_t = compiled_expanded(x, t)
+        assert len(indexing._INDEX_CACHE) == 0
+        with fwAD.dual_level():
+            got_plain = compiled_plain(x)
+        assert len(indexing._INDEX_CACHE) == 0
+
+    torch.testing.assert_close(got_p, want_p, rtol=0, atol=0)
+    torch.testing.assert_close(got_t, want_t, rtol=0, atol=0)
+    torch.testing.assert_close(got_plain, want_plain, rtol=0, atol=0)

@@ -23,15 +23,26 @@ def forward_ad_level(*tensors):
 
     ``torch.compile`` lowers ``fwAD.dual_level()`` and ``torch.func.jvp`` to C++
     ``torch._C._enter_dual_level()`` without updating Python's ``fwAD._current_level`` (which stays ``-1``).
-    When dispatch modes are active (e.g. AOTAutograd tracing), probe C++ level 0 with those modes temporarily
-    popped; otherwise check any passed tensors for a level-0 dual tangent (covers Dynamo ``eager`` backend).
+    Check passed tensors for a level-0 dual tangent first; otherwise probe C++ level 0 (popping active
+    dispatch modes when present so tracers do not record the probe). Skip probing only during Dynamo bytecode
+    tracing (where ``is_compiling()`` is True and no dispatch modes are active).
     """
+    has_modes = (
+        torch._C._len_torch_dispatch_stack() > 0
+        or torch._ops._len_torch_dispatch_stack_pre_dispatch() > 0
+    )
+    if torch.compiler.is_compiling() and not has_modes:
+        return getattr(torch.autograd.forward_ad, "_current_level", -1)
     if torch.is_inference_mode_enabled():
         return -1
     lvl = getattr(torch.autograd.forward_ad, "_current_level", -1)
     if lvl >= 0:
         return lvl
-    if torch._C._len_torch_dispatch_stack() > 0 or torch._ops._len_torch_dispatch_stack_pre_dispatch() > 0:
+    if (not below_autograd()
+            and any(isinstance(t, torch.Tensor) and not t.is_inference()
+                    and torch._VF._unpack_dual(t, 0)[1] is not None for t in tensors)):
+        return 0
+    if has_modes:
         from torch.utils._python_dispatch import _disable_current_modes
 
         with _disable_current_modes():
@@ -40,10 +51,11 @@ def forward_ad_level(*tensors):
                 return 0
             except RuntimeError:
                 return -1
-    if any(isinstance(t, torch.Tensor) and not t.is_inference() and torch._VF._unpack_dual(t, 0)[1] is not None
-           for t in tensors):
+    try:
+        torch._VF._make_dual(_DUAL_PROBE, _DUAL_PROBE, 0)
         return 0
-    return -1
+    except RuntimeError:
+        return -1
 
 
 def count(name):

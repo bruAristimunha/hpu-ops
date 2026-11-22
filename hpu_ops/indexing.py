@@ -157,7 +157,7 @@ def _cache_lookup(self, indices):
     off = any(_off_device(self, indices[i]) for i in pos)
     if not off and pos == list(range(len(pos))):
         return None
-    if (_tracing(self, *(indices[i] for i in pos)) or _transformed()
+    if (_tracing(self, *(indices[i] for i in pos)) or _transformed(self)
             or torch._C._functorch.get_dynamic_layer_stack_depth() != 0):
         return None
     try:
@@ -303,7 +303,7 @@ def index_select_flat(self, indices, checked=True, cache=True):
     # ``torch.func`` transform or forward-mode AD (no Function there) ``self`` is materialized instead.
     sizes = tuple(self.shape)
     flat_dims = [d for d in range(start, end + 1) if sizes[d] > 1 and self.stride(d) == 0]
-    transformed = _transformed() if (flat_dims or (cache and checked and on_host)) else False
+    transformed = _transformed(self) if (flat_dims or (cache and checked and on_host)) else False
     if flat_dims and transformed:
         self, flat_dims = self.contiguous(), []
     exact = bool(flat_dims) and torch.is_grad_enabled() and self.requires_grad
@@ -367,10 +367,10 @@ class _ExpandedSelect(torch.autograd.Function):
         flat = sizes[:start] + (math.prod(sizes[start:end + 1]),) + sizes[end + 1:]
         g = grad.new_zeros(flat).index_add(start, lin_true, grad)
         return (g.unflatten(start, sizes[start:end + 1]) if end > start else g), None, None, None, None, None
-def _transformed():
+def _transformed(*tensors):
     """Whether a ``torch.func`` transform or forward-mode AD is active (an autograd.Function applied from a
     dispatcher kernel has no kernel under the transforms, and ``_ExpandedSelect`` no jvp)."""
-    if _dispatch.forward_ad_level() >= 0:
+    if _dispatch.forward_ad_level(*tensors) >= 0:
         return True
     return torch._C._functorch.peek_interpreter_stack() is not None
 

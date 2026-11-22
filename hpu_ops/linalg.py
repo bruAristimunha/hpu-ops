@@ -139,6 +139,7 @@ def _float64_kernel(device_type, op, kernel):
 # Set while a backend-key kernel runs: below autograd the tensors are plain (functorch's layers and forward-mode AD's
 # duals are unwrapped above), so a transform active around the call does not concern the kernel (``_transformed``).
 _BELOW = threading.local()
+_BACKEND_SOLVE_UNSAFE = threading.local()
 
 
 def _backend(kernel):
@@ -177,40 +178,56 @@ def register_paired(device_type, groups):
                                                    for g in groups])
 
 
+def _own_outputs(out, inputs):
+    def own(t):
+        if not isinstance(t, torch.Tensor):
+            return t
+        if any(t is a or t._base is a or (t._base is not None and t._base is a._base) for a in inputs):
+            return t.clone()
+        return t.detach() if t._base is not None else t
+
+    outs = out if isinstance(out, tuple) else (out,)
+    return outs, tuple(own(t) for t in outs)
+
+
 def _function(cls):
-    """The ``torch.autograd.Function`` ``cls`` with (1) its backward run with autocast off on its device: autograd
-    runs a backward under the autocast state of the ``backward()`` call, which the kernels' own wrapper does not
-    cover; and (2) outputs that own their storage, as torch's ops return them: an output that is a forward input
-    (lstsq's solution and singular values) or a view of one is cloned, one that is a view of a tensor the forward made
-    (the kernels' reshapes, squeezes and transposes of their flat outputs) detached, which keeps the storage and drops
-    the view relation. A view returned by a forward makes autograd refuse in-place edits of the output ("is a view and
-    is being modified inplace"), and an input saved for backward and returned fails backward after one."""
+    """The ``torch.autograd.Function`` ``cls`` with (1) its backward (and jvp, if defined) run with autocast off on its
+    device: autograd runs a backward under the autocast state of the ``backward()`` call, which the kernels' own wrapper
+    does not cover; and (2) outputs that own their storage, as torch's ops return them: an output that is a forward
+    input (lstsq's solution and singular values) or a view of one is cloned, one that is a view of a tensor the
+    forward made (the kernels' reshapes, squeezes and transposes of their flat outputs) detached, which keeps the
+    storage and drops the view relation. A view returned by a forward makes autograd refuse in-place edits of the
+    output ("is a view and is being modified inplace"), and an input saved for backward and returned fails backward
+    after one."""
     forward, backward = cls.forward, cls.backward
 
-    @functools.wraps(forward)
-    def run_forward(ctx, *args):
-        out = forward(ctx, *args)
-        inputs = [a for a in args if isinstance(a, torch.Tensor)]
+    if "setup_context" in cls.__dict__:
 
-        def own(t):
-            if not isinstance(t, torch.Tensor):
-                return t
-            if any(t is a or t._base is a or (t._base is not None and t._base is a._base) for a in inputs):
-                return t.clone()
-            return t.detach() if t._base is not None else t
+        @functools.wraps(forward)
+        def run_forward(*args):
+            out = forward(*args)
+            inputs = [a for a in args if isinstance(a, torch.Tensor)]
+            _, owned = _own_outputs(out, inputs)
+            return owned if isinstance(out, tuple) else owned[0]
 
-        outs = out if isinstance(out, tuple) else (out,)
-        owned = tuple(own(t) for t in outs)
-        swapped = {id(t): o for t, o in zip(outs, owned) if o is not t}
-        input_ids = {id(a) for a in inputs}  # a set, not a generator over k: Dynamo 2.7-2.8 fails on the latter
-        made = {k: o for k, o in swapped.items() if k not in input_ids}
-        # mark_non_differentiable and save_for_backward match outputs by identity: an output saved for backward must
-        # be the returned tensor, or double backward loses its dependence on the inputs; a saved input stays the input
-        for attr, mapping in (("non_differentiable", swapped), ("to_save", made)):
-            marked = getattr(ctx, attr, None)
-            if mapping and marked:
-                setattr(ctx, attr, tuple(mapping.get(id(t), t) if t is not None else t for t in marked))
-        return owned if isinstance(out, tuple) else owned[0]
+    else:
+
+        @functools.wraps(forward)
+        def run_forward(ctx, *args):
+            out = forward(ctx, *args)
+            inputs = [a for a in args if isinstance(a, torch.Tensor)]
+            outs, owned = _own_outputs(out, inputs)
+            swapped = {id(t): o for t, o in zip(outs, owned) if o is not t}
+            input_ids = {id(a) for a in inputs}  # a set, not a generator over k: Dynamo 2.7-2.8 fails on the latter
+            made = {k: o for k, o in swapped.items() if k not in input_ids}
+            # mark_non_differentiable and save_for_backward match outputs by identity: an output saved for backward
+            # must be the returned tensor, or double backward loses its dependence on the inputs; a saved input stays
+            # the input
+            for attr, mapping in (("non_differentiable", swapped), ("to_save", made)):
+                marked = getattr(ctx, attr, None)
+                if mapping and marked:
+                    setattr(ctx, attr, tuple(mapping.get(id(t), t) if t is not None else t for t in marked))
+            return owned if isinstance(out, tuple) else owned[0]
 
     @functools.wraps(backward)
     def run_backward(ctx, *grads):
@@ -219,6 +236,19 @@ def _function(cls):
             return backward(ctx, *grads)
         with torch.autocast(device, enabled=False):
             return backward(ctx, *grads)
+
+    if "jvp" in cls.__dict__:
+        jvp = cls.jvp
+
+        @functools.wraps(jvp)
+        def run_jvp(ctx, *tangents):
+            device = next((t.device.type for t in tangents if isinstance(t, torch.Tensor)), None)
+            if device is None or not torch.is_autocast_enabled(device):
+                return jvp(ctx, *tangents)
+            with torch.autocast(device, enabled=False):
+                return jvp(ctx, *tangents)
+
+        cls.jvp = staticmethod(run_jvp)
 
     cls.forward, cls.backward = staticmethod(run_forward), staticmethod(run_backward)
     return cls
@@ -317,7 +347,10 @@ def _tpc_takes(device_type, takes, matrix_at=0, maxn=None, large=False):
 def _use_tpc(A):
     """Whether ``A`` goes through the Gauss-Jordan kernels (n <= ``tpc.MAXN``: rows in local memory; past it the
     in-place inverse kernels, ``tpc.gj_solve`` multiplying by the inverse): on HPU, float32 with the kernel ready; or,
-    with the ``_GJ`` hook set (CPU tests), any dtype."""
+    with the ``_GJ`` hook set (CPU tests), any dtype. Declines functorch ``GradTrackingTensor`` so reverse-mode
+    gradients inside ``jvp`` keep a differentiable composite path."""
+    if torch._C._functorch.is_gradtrackingtensor(A):
+        return False
     n = A.shape[-1]
     if _LARGE_ON_CPU and n > tpc.MAXN:
         return True
@@ -464,9 +497,14 @@ def _out_on_cpu_body(op, args, kwargs, outs):
 
 def _traced_with_grad(args, kwargs):
     """Whether a declined call is being traced (compile, AOT, make_fx) with its autograd recorded: grad mode on, a
-    real floating tensor argument that requires grad, all on one device, no functorch transform."""
+    real floating tensor argument that requires grad, all on one device, and at most ``vmap`` on the functorch stack
+    (``fwAD`` is supported via ``_Traced*.jvp``)."""
     tensors = [x for x in pytree.tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor)]
-    if not tensors or _transformed() or not torch.is_grad_enabled() or not any(t.requires_grad for t in tensors):
+    if not tensors or not torch.is_grad_enabled() or not any(t.requires_grad for t in tensors):
+        return False
+    stack = torch._C._functorch.get_interpreter_stack() or ()
+    vmap_type = torch._C._functorch.TransformType.Vmap
+    if not all(i.key() == vmap_type for i in stack):
         return False
     if len({t.device for t in tensors}) > 1 or not all(t.is_floating_point() for t in tensors):
         return False
@@ -954,6 +992,47 @@ class SolveEx(torch.autograd.Function):
         return gA, gB.sum_to_size(ctx.B_shape), None, None
 
 
+def _solve_declined_unsafe(args, kwargs):
+    tensors = [x for x in pytree.tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor)]
+    if not tensors:
+        return False
+    lvl = _dispatch.forward_ad_level(*tensors)
+    if lvl < 0:
+        return False
+    if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
+        return True
+    if _dispatch.below_autograd():
+        return False
+    return any(torch.autograd.forward_ad.unpack_dual(t, level=lvl).tangent is not None for t in tensors)
+
+
+def _backend_solve_safe(args):
+    """Whether ``install_solve``'s backend kernel can safely run ``SolveEx.compute`` (which emits placeholder
+    ``LU=0, pivots=[1..n]``): safe in ``inference_mode`` or eager/lazy no-tangent ``fwAD.dual_level()`` without
+    reverse grad, unsafe under functorch transforms (including ``torch.func.jvp`` / ``jacfwd``, which unwrap duals
+    above ``AutogradHPU`` with ``JVP_NESTING > 0`` and call ``linalg_lu_solve`` on the factors), dual tangents, or
+    reverse-mode ``requires_grad``."""
+    if getattr(_BACKEND_SOLVE_UNSAFE, "depth", 0) > 0:
+        return False
+    if torch._C._functorch.peek_interpreter_stack() is not None:
+        return False
+    lvl = _dispatch.forward_ad_level(*args)
+    if lvl < 0:
+        return True
+    # Eager/lazy fwAD.dual_level() with no tangents and no reverse grad needed does not read LU/pivots.
+    # torch.func.jvp / jacfwd set JVP_NESTING > 0 and read LU/pivots via linalg_lu_solve -> must keep _on_cpu.
+    import torch._functorch.eager_transforms as _et
+
+    if getattr(torch.autograd.forward_ad, "_current_level", -1) < 0 or getattr(_et, "JVP_NESTING", 0) > 0:
+        return False
+    if _dispatch.below_autograd():
+        return True
+    tensors = [x for x in args if isinstance(x, torch.Tensor)]
+    if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
+        return False
+    return all(torch.autograd.forward_ad.unpack_dual(t, level=lvl).tangent is None for t in tensors)
+
+
 def install_solve(device_type):
     """``linalg.solve`` (``_linalg_solve_ex``) on ``device_type`` as the masked LU and two triangular matmuls. Returns
     an undo."""
@@ -971,13 +1050,29 @@ def install_solve(device_type):
     from . import linalg_jvp
 
     def backend_kernel(*args, **kwargs):
-        if not _raw_transformed() and takes(*args, **kwargs):
+        bound = _bind(op, args, kwargs)
+        if _backend_solve_safe(bound) and takes(*args, **kwargs):
             count("solve")
-            return SolveEx.compute(*_bind(op, args, kwargs))
-        return _on_cpu(op, args, kwargs)
+            out = SolveEx.compute(*bound)
+        else:
+            out = _on_cpu(op, args, kwargs)
+        X = out[0]
+        X = X.mT.contiguous().mT if bound[2] and X.dim() >= 2 else X.contiguous()
+        return (X, *out[1:])
 
     entries = _kernels(device_type, op, "solve", SolveEx, takes, backend=False, traced=_TracedSolveEx)
-    entries.append((op, "{}", backend_kernel))
+    ag_op, ag_key, ag_orig = entries[0]
+
+    def solve_autograd_kernel(*args, **kwargs):
+        if _solve_declined_unsafe(args, kwargs):
+            _BACKEND_SOLVE_UNSAFE.depth = getattr(_BACKEND_SOLVE_UNSAFE, "depth", 0) + 1
+            try:
+                return ag_orig(*args, **kwargs)
+            finally:
+                _BACKEND_SOLVE_UNSAFE.depth -= 1
+        return ag_orig(*args, **kwargs)
+
+    entries = [(ag_op, ag_key, solve_autograd_kernel), (op, "{}", backend_kernel)]
     return register_paired(device_type, [linalg_jvp.with_solve_jvp(device_type, op, entries)])
 
 
@@ -1185,60 +1280,105 @@ def _plain_inverse(A):
 @_function
 class _TracedSolveEx(torch.autograd.Function):
     """A traced ``_linalg_solve_ex`` that ``takes`` declined (``_kernels``' ``traced``): the op's own forward, torch's
-    backward from ``A`` and ``X`` (``gB = solve(A^H, g)``, ``gA = -gB X^H``), never from ``LU`` and ``pivots``,
-    which the node may return as placeholders at run time."""
+    backward and jvp from ``A`` and ``X`` (``gB = solve(A^H, g)``, ``gA = -gB X^H``), never from ``LU`` and
+    ``pivots``, which the node may return as placeholders at run time."""
+
+    generate_vmap_rule = True
 
     @staticmethod
-    def forward(ctx, op, A, B, left, check_errors):
-        X, LU, pivots, info = _below_autograd(op, A, B, left=left, check_errors=check_errors)
+    def forward(op, A, B, left, check_errors):
+        return _below_autograd(op, A, B, left=left, check_errors=check_errors)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        _, A, B, left, _ = inputs
+        X, LU, pivots, info = output
         ctx.save_for_backward(A, X)
+        ctx.save_for_forward(A, X)
         ctx.left = left
         ctx.vector = _is_vector_rhs(A, B)
         ctx.B_shape = B.shape
         ctx.mark_non_differentiable(LU, pivots, info)
-        return X, LU, pivots, info
 
     @staticmethod
     def backward(ctx, grad, *_):
         A, X = ctx.saved_tensors
-        gB = torch.linalg.solve(A.mH, grad, left=ctx.left)
+        gB = torch.linalg.solve_ex(A.mH, grad, left=ctx.left, check_errors=False)[0]
         gA = None
         if ctx.needs_input_grad[1]:
             g, x = (gB.unsqueeze(-1), X.unsqueeze(-1)) if ctx.vector else (gB, X)
             gA = (-(g @ x.mH) if ctx.left else -(x.mH @ g)).sum_to_size(A.shape)
         return None, gA, gB.sum_to_size(ctx.B_shape), None, None
 
+    @staticmethod
+    def jvp(ctx, _op, gA, gB, _left, _check_errors):
+        if gA is None and gB is None:
+            return None, None, None, None
+        A, X = ctx.saved_for_forward
+        if gA is None:
+            rhs = gB
+        else:
+            x = X.unsqueeze(-1) if ctx.vector else X
+            d = gA @ x if ctx.left else x @ gA
+            if ctx.vector:
+                d = d.squeeze(-1)
+            rhs = -d if gB is None else gB - d
+        gX = torch.linalg.solve_ex(A, rhs, left=ctx.left, check_errors=False)[0]
+        return gX, None, None, None
+
 
 @_function
 class _TracedDet(torch.autograd.Function):
-    """A traced ``_linalg_det`` that ``takes`` declined: the op's forward, ``Det``'s backward through the public
-    inverse, never from ``LU`` and ``pivots`` (see ``_TracedSolveEx``)."""
+    """A traced ``_linalg_det`` that ``takes`` declined: the op's forward, ``Det``'s backward and jvp through the
+    public inverse, never from ``LU`` and ``pivots`` (see ``_TracedSolveEx``)."""
+
+    generate_vmap_rule = True
 
     @staticmethod
-    def forward(ctx, op, A):
-        det, LU, pivots = _below_autograd(op, A)
-        ctx.save_for_backward(A, det)
+    def forward(op, A):
+        return _below_autograd(op, A)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        det, LU, pivots = output
+        ctx.save_for_backward(inputs[1], det)
+        ctx.save_for_forward(inputs[1], det)
         ctx.mark_non_differentiable(LU, pivots)
-        return det, LU, pivots
 
     @staticmethod
     def backward(ctx, grad, *_):
         A, det = ctx.saved_tensors
         return None, _det_backward(A, det, grad, _plain_inverse)
 
+    @staticmethod
+    def jvp(ctx, _op, gA):
+        if gA is None:
+            return None, None, None
+        A, det = ctx.saved_for_forward
+        invA = _plain_inverse(A)
+        tan = det * (invA.mT * gA).sum((-2, -1))
+        tan = torch.where(det == 0, 0.0, tan)
+        return tan, None, None
+
 
 @_function
 class _TracedSlogdet(torch.autograd.Function):
-    """A traced ``_linalg_slogdet`` that ``takes`` declined: the op's forward, ``Slogdet``'s backward
+    """A traced ``_linalg_slogdet`` that ``takes`` declined: the op's forward, ``Slogdet``'s backward and jvp
     (``g A^-H``) through the public inverse, never from ``LU`` and ``pivots`` (see ``_TracedSolveEx``)."""
 
+    generate_vmap_rule = True
+
     @staticmethod
-    def forward(ctx, op, A):
-        sign, logabsdet, LU, pivots = _below_autograd(op, A)
-        ctx.save_for_backward(A)
+    def forward(op, A):
+        return _below_autograd(op, A)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        sign, _, LU, pivots = output
+        ctx.save_for_backward(inputs[1])
+        ctx.save_for_forward(inputs[1], sign)
         ctx.mark_non_differentiable(LU, pivots)
         ctx.set_materialize_grads(False)
-        return sign, logabsdet, LU, pivots
 
     @staticmethod
     def backward(ctx, _sign, grad, *_):
@@ -1246,6 +1386,15 @@ class _TracedSlogdet(torch.autograd.Function):
             return None, None
         (A,) = ctx.saved_tensors
         return None, grad[..., None, None] * _plain_inverse(A).mH
+
+    @staticmethod
+    def jvp(ctx, _op, gA):
+        if gA is None:
+            return None, None, None, None
+        A, sign = ctx.saved_for_forward
+        invA = _plain_inverse(A)
+        g_logabsdet = (invA.mT * gA).sum((-2, -1))
+        return torch.zeros_like(sign), g_logabsdet, None, None
 
 
 def install_inv_det(device_type):

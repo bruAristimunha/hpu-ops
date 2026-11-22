@@ -30,16 +30,18 @@ class _JvpCtx:
         pass
 
 
-def _only_forward_ad(*tensors):
-    """Whether only single-level forward-mode AD is active (``torch.func.jvp`` or ``forward_ad``), with no
-    ``vmap``/``grad``/nested ``jvp`` on the functorch stack, no active native decline re-entry, and no reverse-mode
-    ``requires_grad`` tensors when grad is enabled.
+def _only_forward_ad(*tensors, allow_vmap=False):
+    """Whether only single-level forward-mode AD is active (``torch.func.jvp`` or ``forward_ad``, plus ``vmap`` when
+    ``allow_vmap`` is True), with no ``grad`` or nested ``jvp`` on the functorch stack, no active native decline
+    re-entry, and no reverse-mode ``requires_grad`` tensors when grad is enabled.
     """
     if getattr(_DECLINING, "depth", 0) > 0:
         return False
     stack = torch._C._functorch.get_interpreter_stack() or ()
     jvp_type = torch._C._functorch.TransformType.Jvp
-    if len(stack) > 1 or not all(i.key() == jvp_type for i in stack):
+    vmap_type = torch._C._functorch.TransformType.Vmap
+    allowed = (jvp_type, vmap_type) if allow_vmap else (jvp_type,)
+    if sum(i.key() == jvp_type for i in stack) > 1 or not all(i.key() in allowed for i in stack):
         return False
     lvl = _dispatch.forward_ad_level(*tensors)
     if lvl < 0:
@@ -52,7 +54,11 @@ def _only_forward_ad(*tensors):
 
 
 def _own(t):
-    return t.detach() if t._base is not None else t
+    if t._base is None:
+        return t
+    if torch._C._functorch.is_gradtrackingtensor(t) or (torch.is_grad_enabled() and t.requires_grad):
+        return t.clone()
+    return t.detach()
 
 
 def _run_jvp_ctx(jvp_fn, *bound):
@@ -146,12 +152,12 @@ class _JvpSlogdet(torch.autograd.Function):
 
 class _TracedJvpSolveEx(torch.autograd.Function):
     """Traced fallback for single-level forward-AD ``solve`` when ``takes`` declines while tracing (symbolic shapes
-    or traced large ``n``): runs ``op`` below autograd and differentiates from ``A`` and ``X`` rather than ``LU`` and
-    ``pivots``, which may be placeholders at run time."""
+    or traced large ``n``): runs ``op`` via ``_TracedSolveEx`` and differentiates from ``A`` and ``X`` rather than
+    ``LU`` and ``pivots``, which may be placeholders at run time."""
 
     @staticmethod
     def forward(op, A, B, left, check_errors):
-        return tuple(_own(t) for t in linalg._below_autograd(op, A, B, left=left, check_errors=check_errors))
+        return linalg._TracedSolveEx.apply(op, A, B, left, check_errors)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
@@ -175,7 +181,7 @@ class _TracedJvpSolveEx(torch.autograd.Function):
             if ctx.vector:
                 d = d.squeeze(-1)
             rhs = -d if gB is None else gB - d
-        gX = torch.linalg.solve(A, rhs, left=ctx.left)
+        gX = torch.linalg.solve_ex(A, rhs, left=ctx.left, check_errors=False)[0]
         return _own(gX), None, None, None
 
 
@@ -184,7 +190,7 @@ class _TracedJvpDet(torch.autograd.Function):
 
     @staticmethod
     def forward(op, A):
-        return tuple(_own(t) for t in linalg._below_autograd(op, A))
+        return linalg._TracedDet.apply(op, A)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
@@ -208,7 +214,7 @@ class _TracedJvpSlogdet(torch.autograd.Function):
 
     @staticmethod
     def forward(op, A):
-        return tuple(_own(t) for t in linalg._below_autograd(op, A))
+        return linalg._TracedSlogdet.apply(op, A)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
@@ -248,7 +254,7 @@ def _traced_jvp_takes(device_type, shape_ok=None):
 
     def takes(*args, **kwargs):
         tensors = [x for x in (*args, *kwargs.values()) if isinstance(x, torch.Tensor)]
-        if not _only_forward_ad(*tensors) or not any(linalg._tracing(t) for t in tensors):
+        if not _only_forward_ad(*tensors, allow_vmap=True) or not any(linalg._tracing(t) for t in tensors):
             return False
         if not all(t.dtype in allowed and t.numel() > 0 for t in tensors):
             return False

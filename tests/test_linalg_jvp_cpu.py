@@ -82,19 +82,29 @@ def test_solve_jvp_and_fwad_match_torch(case, tangent_mode, gj_hook):
     torch.manual_seed(0)
     if case == "matrix":
         A, B = _general(2, 3, n=4), torch.randn(2, 3, 4, 2)
-        fn = lambda a, b: torch.linalg.solve(a, b)
+
+        def fn(a, b):
+            return torch.linalg.solve(a, b)
     elif case == "left_false":
         A, B = _general(3, n=4), torch.randn(3, 2, 4)
-        fn = lambda a, b: torch.linalg.solve(a, b, left=False)
+
+        def fn(a, b):
+            return torch.linalg.solve(a, b, left=False)
     elif case == "vector_1d":
         A, B = _general(3, n=4), torch.randn(4)
-        fn = lambda a, b: torch.linalg.solve(a, b)
+
+        def fn(a, b):
+            return torch.linalg.solve(a, b)
     elif case == "vector_batch":
         A, B = _general(3, n=4), torch.randn(3, 4)
-        fn = lambda a, b: torch.linalg.solve(a, b)
+
+        def fn(a, b):
+            return torch.linalg.solve(a, b)
     else:
         A, B = _general(1, 3, n=4), torch.randn(2, 1, 4, 3)
-        fn = lambda a, b: torch.linalg.solve(a, b)
+
+        def fn(a, b):
+            return torch.linalg.solve(a, b)
 
     tA = torch.randn_like(A) if tangent_mode in ("both", "A_only") else None
     tB = torch.randn_like(B) if tangent_mode in ("both", "B_only") else None
@@ -278,21 +288,33 @@ def test_compile_jvp_and_fwad_match_torch(dynamic, op_name, gj_hook):
 
     if op_name == "solve":
         B, tB = torch.randn(2, 4, 3), torch.randn(2, 4, 3)
-        fn = lambda a, b: torch.linalg.solve(a, b)
+
+        def fn(a, b):
+            return torch.linalg.solve(a, b)
+
         primals, tangents = (A, B), (tA, tB)
     elif op_name == "solve_left_false":
         B, tB = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
-        fn = lambda a, b: torch.linalg.solve(a, b, left=False)
+
+        def fn(a, b):
+            return torch.linalg.solve(a, b, left=False)
+
         primals, tangents = (A, B), (tA, tB)
     elif op_name == "solve_vec":
         B, tB = torch.randn(2, 4), torch.randn(2, 4)
-        fn = lambda a, b: torch.linalg.solve(a, b)
+
+        def fn(a, b):
+            return torch.linalg.solve(a, b)
+
         primals, tangents = (A, B), (tA, tB)
     elif op_name == "det":
         fn = torch.linalg.det
         primals, tangents = (A,), (tA,)
     else:
-        fn = lambda a: tuple(torch.linalg.slogdet(a))
+
+        def fn(a):
+            return tuple(torch.linalg.slogdet(a))
+
         primals, tangents = (A,), (tA,)
 
     def run_jvp(*args):
@@ -385,3 +407,219 @@ def test_compile_jvp_with_requires_grad_and_traced_large_path(monkeypatch, op_na
         torch._dynamo.reset()
         got_traced = torch.compile(run, backend="aot_eager")(A, B, tA, tB)
     _assert_tree_close(got_traced, want)
+
+
+def _fd_grad_a(scalar_fn, A, eps=1e-6):
+    A64 = A.detach().double()
+    grad = torch.zeros_like(A64)
+    flat = A64.reshape(-1)
+    gflat = grad.reshape(-1)
+    for i in range(flat.numel()):
+        e = torch.zeros_like(flat)
+        e[i] = eps
+        A_p = (flat + e).reshape(A64.shape)
+        A_m = (flat - e).reshape(A64.shape)
+        gflat[i] = (scalar_fn(A_p) - scalar_fn(A_m)) / (2 * eps)
+    return grad.to(A.dtype)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("op_name", ["solve", "det", "slogdet"])
+def test_compile_jvp_and_fwad_requires_grad_backward(dynamic, op_name, gj_hook):
+    """Bug 1: ``torch.compile(torch.func.jvp, dynamic=False/True)`` and ``torch.compile(fwAD)`` with
+    ``requires_grad=True`` + ``.backward()`` must match float64 finite differences without reading placeholder
+    ``LU=0``."""
+    torch.manual_seed(7)
+    A = _general(2, n=3)
+    B = torch.randn(2, 3, 2)
+    tA = torch.randn_like(A)
+    tB = torch.randn_like(B)
+
+    def make_jvp_scalar(a_in, b_in, ta_in, tb_in):
+        if op_name == "solve":
+            p, t = torch.func.jvp(torch.linalg.solve, (a_in, b_in), (ta_in, tb_in))
+            return p.sum() + t.sum()
+        if op_name == "det":
+            p, t = torch.func.jvp(torch.linalg.det, (a_in,), (ta_in,))
+            return p.sum() + t.sum()
+        p, t = torch.func.jvp(lambda x: tuple(torch.linalg.slogdet(x)), (a_in,), (ta_in,))
+        return p[1].sum() + t[1].sum()
+
+    def make_fwad_scalar(a_in, b_in, ta_in, tb_in):
+        with fwAD.dual_level():
+            da = fwAD.make_dual(a_in, ta_in)
+            db = fwAD.make_dual(b_in, tb_in)
+            if op_name == "solve":
+                out = torch.linalg.solve(da, db)
+            elif op_name == "det":
+                out = torch.linalg.det(da)
+            else:
+                out = torch.linalg.slogdet(da)[1]
+            return out + fwAD.unpack_dual(out).tangent
+
+    want_grad = _fd_grad_a(lambda a64: make_jvp_scalar(a64, B.double(), tA.double(), tB.double()), A)
+
+    def install(d):
+        return _dispatch.chain([linalg.install_solve(d), linalg.install_inv_det(d)])
+
+    with cpu_as_hpu(install):
+        for runner in (make_jvp_scalar, make_fwad_scalar):
+            torch._dynamo.reset()
+            Ag = A.clone().requires_grad_(True)
+            loss = torch.compile(runner, backend="aot_eager", dynamic=dynamic)(Ag, B, tA, tB)
+            loss.sum().backward()
+            assert torch.isfinite(Ag.grad).all()
+            torch.testing.assert_close(Ag.grad, want_grad, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("op_name", ["solve", "det", "slogdet"])
+def test_compile_jacfwd_match_torch(monkeypatch, dynamic, op_name, gj_hook):
+    """Bug 2: ``torch.compile(torch.func.jacfwd(...), dynamic=False/True)`` must match native ``jacfwd`` for both
+    normal and traced-declined paths."""
+    torch.manual_seed(8)
+    A = _general(2, n=3)
+    B = torch.randn(2, 3, 2)
+
+    if op_name == "solve":
+        def jac_fn(a, b):
+            return torch.func.jacfwd(torch.linalg.solve)(a, b)
+        args = (A, B)
+    elif op_name == "det":
+        def jac_fn(a):
+            return torch.func.jacfwd(torch.linalg.det)(a)
+        args = (A,)
+    else:
+        def jac_fn(a):
+            return torch.func.jacfwd(lambda x: torch.linalg.slogdet(x)[1])(a)
+        args = (A,)
+
+    want = jac_fn(*args)
+
+    def install(d):
+        return _dispatch.chain([linalg.install_solve(d), linalg.install_inv_det(d)])
+
+    with cpu_as_hpu(install):
+        torch._dynamo.reset()
+        got = torch.compile(jac_fn, backend="aot_eager", dynamic=dynamic)(*args)
+        assert torch.isfinite(got).all()
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+        # Also exercise _TracedJvp* + _Traced*.apply when _tpc_takes declines while tracing.
+        tpc_takes = linalg._tpc_takes
+        monkeypatch.setattr(
+            linalg,
+            "_tpc_takes",
+            lambda dt, takes, *a, **k: (lambda *ar, **kw: tpc_takes(dt, takes, *a, **k)(*ar, **kw) and not linalg._tracing(ar[0])),
+        )
+        torch._dynamo.reset()
+        got_traced = torch.compile(jac_fn, backend="aot_eager", dynamic=dynamic)(*args)
+        assert torch.isfinite(got_traced).all()
+        torch.testing.assert_close(got_traced, want, rtol=1e-4, atol=1e-4)
+
+
+def test_backend_solve_safe():
+    """Bug 3: ``_backend_solve_safe`` allows inference_mode and eager/lazy no-tangent ``fwAD.dual_level()`` without
+    reverse grad, while declining ``torch.func.*`` (including ``JVP_NESTING > 0``), tangents, and ``requires_grad``."""
+    A = _general(n=3)
+    B = torch.randn(3, 2)
+    tA = torch.randn_like(A)
+
+    assert linalg._backend_solve_safe((A, B, True, False)) is True
+    with torch.inference_mode():
+        assert linalg._backend_solve_safe((A, B, True, False)) is True
+
+    with fwAD.dual_level():
+        assert linalg._backend_solve_safe((A, B, True, False)) is True
+        assert linalg._backend_solve_safe((fwAD.make_dual(A, tA), B, True, False)) is False
+        Ar = A.clone().requires_grad_(True)
+        assert linalg._backend_solve_safe((Ar, B, True, False)) is False
+        with torch.no_grad():
+            assert linalg._backend_solve_safe((Ar, B, True, False)) is True
+
+    seen = {}
+    torch.func.jvp(lambda a, b: (seen.setdefault("jvp", linalg._backend_solve_safe((a, b, True, False))), a)[1], (A, B), (tA, B))
+    torch.func.vmap(lambda a, b: (seen.setdefault("vmap", linalg._backend_solve_safe((a, b, True, False))), a)[1])(
+        A.unsqueeze(0), B.unsqueeze(0)
+    )
+    torch.func.grad(lambda a: (seen.setdefault("grad", linalg._backend_solve_safe((a, B, True, False))), a.sum())[1])(A)
+    assert seen == {"jvp": False, "vmap": False, "grad": False}
+
+    # Simulate Habana fork where torch.func.jvp strips DualTensor & stack above AutogradHPU, leaving JVP_NESTING > 0.
+    import torch._functorch.eager_transforms as _et
+
+    with fwAD.dual_level(), _et.jvp_increment_nesting():
+        assert linalg._backend_solve_safe((A, B, True, False)) is False
+
+    # C++ _enter_dual_level() without Python fwAD._current_level >= 0 must decline.
+    lvl = torch._C._enter_dual_level()
+    try:
+        assert linalg._backend_solve_safe((A, B, True, False)) is False
+    finally:
+        torch._C._exit_dual_level(lvl)
+
+    # Below autograd (where VariableType strips requires_grad & tangents), _solve_declined_unsafe propagates
+    # via _BACKEND_SOLVE_UNSAFE, and _backend_solve_safe does not call _unpack_dual on below-autograd tensors.
+    with fwAD.dual_level():
+        assert linalg._solve_declined_unsafe((A, B), {}) is False
+        assert linalg._solve_declined_unsafe((Ar, B), {}) is True
+        assert linalg._solve_declined_unsafe((fwAD.make_dual(A, tA), B), {}) is True
+        with torch._C._AutoDispatchBelowAutograd():
+            assert linalg._backend_solve_safe((A, B, True, False)) is True
+            linalg._BACKEND_SOLVE_UNSAFE.depth = 1
+            try:
+                assert linalg._backend_solve_safe((A, B, True, False)) is False
+            finally:
+                linalg._BACKEND_SOLVE_UNSAFE.depth = 0
+
+
+def test_compile_eager_backend_inside_fwad_dual_level_linalg():
+    """Bug 4: ``torch.compile(..., backend="eager")`` lowers ``fwAD.dual_level()`` to C++
+    ``_enter_dual_level()`` with ``fwAD._current_level == -1`` and ``_len_torch_dispatch_stack() == 0``;
+    ``linalg.svd`` must detect C++ dual level 0 and decline to native instead of calling ``_Svd`` on DualTensors."""
+    A = _general(n=3)
+    tA = torch.randn_like(A)
+
+    def run(a, ta):
+        with fwAD.dual_level():
+            s = torch.linalg.svd(fwAD.make_dual(a, ta))[1]
+            return s.detach(), fwAD.unpack_dual(s).tangent
+
+    want_p, want_t = run(A, tA)
+    torch._dynamo.reset()
+    compiled_run = torch.compile(run, backend="eager", fullgraph=True)
+
+    with cpu_as_hpu(linalg.install_svd) as calls:
+        got_p, got_t = compiled_run(A, tA)
+        assert calls["svd"] == 0
+
+    torch.testing.assert_close(got_p, want_p, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(got_t, want_t, rtol=1e-4, atol=1e-4)
+
+
+def test_solve_backend_kernel_output_strides(monkeypatch):
+    """Bug 5: ``install_solve``'s ``backend_kernel`` must match ``aten._linalg_solve_ex``'s ``mT.contiguous().mT``
+    stride convention when ``left=True`` and ``X.dim() >= 2``, and row-major contiguous when ``left=False``."""
+    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
+    monkeypatch.setattr(linalg, "_tpc_takes", lambda dt, fn, **kw: fn)
+    groups = []
+    orig_register = linalg.register_paired
+    monkeypatch.setattr(linalg, "register_paired", lambda dt, gs: (groups.extend(gs), orig_register(dt, []))[1])
+    linalg.install_solve("hpu")
+    backend_fn = {key: fn for _, key, fn in groups[0]}["{}"]
+
+    torch.manual_seed(9)
+    cases = [
+        (_general(n=6), torch.randn(6, 2), True),
+        (_general(2, n=6), torch.randn(2, 6, 3), True),
+        (_general(2, 3, n=6), torch.randn(2, 3, 6, 4), True),
+        (_general(n=6), torch.randn(6), True),
+        (_general(2, n=6), torch.randn(2, 6), True),
+        (_general(2, n=6), torch.randn(2, 3, 6), False),
+    ]
+    with torch.inference_mode():
+        for A, B, left in cases:
+            want_X = torch.ops.aten._linalg_solve_ex.default(A, B, left=left)[0]
+            got_X = backend_fn(A, B, left=left)[0]
+            assert got_X.stride() == want_X.stride(), (A.shape, B.shape, left, got_X.stride(), want_X.stride())
+            torch.testing.assert_close(got_X, want_X, rtol=1e-4, atol=1e-4)
