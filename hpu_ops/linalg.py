@@ -970,6 +970,7 @@ def install_solve(device_type):
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
     takes = _tpc_takes(device_type, shapes_ok, large=True)
+    from . import linalg_jvp
 
     def backend_kernel(*args, **kwargs):
         if not _raw_transformed() and takes(*args, **kwargs):
@@ -977,9 +978,9 @@ def install_solve(device_type):
             return SolveEx.compute(*_bind(op, args, kwargs))
         return _on_cpu(op, args, kwargs)
 
-    group = _kernels(device_type, op, "solve", SolveEx, takes, backend=False, traced=_TracedSolveEx)
-    group.append((op, "{}", backend_kernel))
-    return register_paired(device_type, [group])
+    entries = _kernels(device_type, op, "solve", SolveEx, takes, backend=False, traced=_TracedSolveEx)
+    entries.append((op, "{}", backend_kernel))
+    return register_paired(device_type, [linalg_jvp.with_solve_jvp(device_type, op, entries)])
 
 
 def _inverse(LU, pivots):
@@ -1252,12 +1253,15 @@ class _TracedSlogdet(torch.autograd.Function):
 def install_inv_det(device_type):
     """``linalg.inv``/``inv_ex``, ``det`` and ``slogdet`` on ``device_type`` from the masked LU and two triangular
     matmuls. Returns an undo."""
+    from . import linalg_jvp
+
     groups = []
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
         takes = _tpc_takes(device_type, _takes(device_type, name), large=True)
         traced = {"det": _TracedDet, "slogdet": _TracedSlogdet}.get(name)
-        groups.append(_kernels(device_type, op, name, function, takes, backend=name == "inv", traced=traced))
+        entries = _kernels(device_type, op, name, function, takes, backend=name == "inv", traced=traced)
+        groups.append(linalg_jvp.with_inv_det_jvp(device_type, op, name, entries))
     return register_paired(device_type, groups)
 
 

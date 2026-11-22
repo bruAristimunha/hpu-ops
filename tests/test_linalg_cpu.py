@@ -2393,9 +2393,15 @@ def test_forward_ad_takes_the_native_path(gj_hook):
         with fwAD.dual_level():
             got = fwAD.unpack_dual(torch.linalg.det(fwAD.make_dual(A, t))).tangent
         jv = torch.func.jvp(torch.linalg.det, (A,), (t,))[1]
+        assert gj_hook != []
+        before = len(gj_hook)
+        Ar = A.clone().requires_grad_()
+        with fwAD.dual_level():
+            mixed = fwAD.unpack_dual(torch.linalg.det(fwAD.make_dual(Ar, t))).tangent
     torch.testing.assert_close(got, want)
     torch.testing.assert_close(jv, want)
-    assert gj_hook == []
+    torch.testing.assert_close(mixed, want)
+    assert gj_hook[before:] == []
 
 
 def test_singular_triangle_gives_nan_like_torch(monkeypatch):
