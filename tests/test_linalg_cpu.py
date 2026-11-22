@@ -1022,12 +1022,15 @@ def test_tpc_flushes_the_lazy_graph_before_the_op(monkeypatch, lazy, flushes):
 
 @pytest.fixture
 def svd_hook(monkeypatch):
-    """``linalg._SVD`` set to ``svd_reference``; collects ``(shape, compute_uv)`` per call."""
+    """``linalg._SVD`` set to ``svd_reference`` for n <= 32 (and torch.linalg.svd past it); collects ``(shape, compute_uv)``."""
     calls = []
 
     def hook(A, compute_uv):
         calls.append((tuple(A.shape), compute_uv))
-        return tpc.svd_reference(A.detach(), compute_uv=compute_uv)
+        if max(A.shape[-2:]) <= tpc.SMALL_MAXN:
+            return tpc.svd_reference(A.detach(), compute_uv=compute_uv)
+        with torch._C._AutoDispatchBelowAutograd():
+            return torch.ops.aten._linalg_svd.default(A.detach(), False, compute_uv)
 
     monkeypatch.setattr(linalg, "_SVD", hook)
     return calls
@@ -1120,21 +1123,39 @@ def test_tpc_expm_and_householder_flush_before_the_op(monkeypatch, lazy, flushes
         assert len(marks) == flushes
 
 
-def test_svd_declined_past_maxn_and_without_kernel(monkeypatch, svd_hook):
+def test_svd_accepts_past_maxn_and_declines_without_kernel(monkeypatch, svd_hook):
     A = torch.randn(2, 4, 4)
     takes = linalg._svd_takes("hpu")
+    pinv_takes = linalg._pinv_takes("hpu")
+    lstsq_takes = linalg._lstsq_takes("hpu")
     monkeypatch.setattr(tpc, "ready", lambda: False)
     assert takes(A) is False
+    assert pinv_takes(A) is False
+    assert lstsq_takes(A, torch.randn(2, 4, 2)) is False
     monkeypatch.setattr(tpc, "ready", lambda: True)
     assert takes(A) is True
-    assert takes(torch.randn(tpc.SMALL_MAXN + 1, 4)) is False  # past the kernel: main's route (SVD_GRAM_NOTE)
-    assert takes(torch.randn(4, tpc.SMALL_MAXN + 1)) is False
+    for shape in ((tpc.SMALL_MAXN + 1, 4), (4, tpc.SMALL_MAXN + 1), (40, 40), (64, 64), (65, 65)):
+        M = torch.randn(*shape)
+        assert takes(M) is True
+        assert pinv_takes(M) is True
+        assert lstsq_takes(M, torch.randn(shape[0], 3)) is True
     assert takes(torch.randn(tpc.SMALL_MAXN, tpc.SMALL_MAXN)) is True
     assert takes(A, driver="gesvd") is False
+    assert pinv_takes(torch.randn(40, 40), hermitian=True) is False
 
-    with cpu_as_hpu(linalg.install_svd):
+    with cpu_as_hpu(linalg.install_svd) as calls:
         torch.linalg.svd(torch.randn(2, tpc.SMALL_MAXN + 1, 4))
-    assert svd_hook == []
+        torch.linalg.matrix_norm(torch.randn(2, 40, 35), ord=2)
+        torch.linalg.matrix_norm(torch.randn(2, 40, 35), ord="nuc")
+        assert calls["svd"] >= 3
+    assert svd_hook
+
+    with cpu_as_hpu(linalg.install_matrix_rank) as calls:
+        torch.linalg.matrix_rank(torch.randn(2, 40, 35))
+        assert calls["svd"] >= 1
+        calls.clear()
+        torch.linalg.matrix_rank(spd(2, n=40, dtype=torch.float32), hermitian=True)
+        assert calls["svd"] == 0
 
 
 def test_svd_family_float64_warns_once_on_hpu():
@@ -1256,10 +1277,18 @@ def test_svd_and_svdvals_compiled(svd_hook):
 
     nodes_big = []
     big = torch.randn(tpc.SMALL_MAXN + 1, 4, dtype=torch.float64)
-    with cpu_as_hpu(linalg.install_svd):
+    with cpu_as_hpu(linalg.install_svd) as calls:
         got_big = compiled(lambda x: torch.linalg.svdvals(x), nodes_big)(big)
+        assert calls["svd"] >= 1
     torch.testing.assert_close(got_big, torch.linalg.svdvals(big))
-    assert "aten._linalg_svd.default" in ops(nodes_big), ops(nodes_big)
+
+    nodes_declined = []
+    big_c = torch.randn(tpc.SMALL_MAXN + 1, 4, dtype=torch.complex64)
+    with cpu_as_hpu(linalg.install_svd) as calls:
+        got_dec = compiled(lambda x: torch.linalg.svdvals(x), nodes_declined)(big_c)
+        assert calls["svd"] == 0
+    torch.testing.assert_close(got_dec, torch.linalg.svdvals(big_c))
+    assert "aten._linalg_svd.default" in ops(nodes_declined), ops(nodes_declined)
 
 
 @pytest.mark.parametrize("shape", [(4, 4), (7, 4), (4, 7), (2, 3, 5, 4)])
@@ -1580,11 +1609,21 @@ def test_svd_u_backend_takes_and_decline_copy_back(monkeypatch, svd_hook):
     torch.testing.assert_close(S, want_S, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close((U * S.unsqueeze(-2)) @ Vh, A, rtol=1e-4, atol=1e-4)
 
-    # Decline path: float64 and past SMALL_MAXN (driver != None is also declined by takes)
+    # Accept path past SMALL_MAXN
+    A_big = torch.randn(2, 4, tpc.SMALL_MAXN + 2, dtype=torch.float32)
+    assert linalg._svd_takes("hpu")(A_big)
+    U_b, S_b, Vh_b = torch.zeros(2, 4, 4), torch.zeros(2, 4), torch.zeros(2, 4, tpc.SMALL_MAXN + 2)
+    rUb, rSb, rVhb = svd_u(A_big, False, True, U=U_b, S=S_b, Vh=Vh_b)
+    assert rUb is U_b and rSb is S_b and rVhb is Vh_b
+    want_Ub, want_Sb, want_Vhb = torch.linalg.svd(A_big, full_matrices=False)
+    torch.testing.assert_close(S_b, want_Sb, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close((U_b * S_b.unsqueeze(-2)) @ Vh_b, A_big, rtol=1e-4, atol=1e-4)
+
+    # Decline path: float64 and driver != None (genuine declines)
     assert not linalg._svd_takes("hpu")(A, driver="gesvd")
-    assert not linalg._svd_takes("hpu")(torch.randn(2, 4, tpc.SMALL_MAXN + 1))
     for mat, cuv in (
         (torch.randn(2, 4, 3, dtype=torch.float64), True),
+        (torch.randn(2, 4, 34, dtype=torch.float64), False),
     ):
         m, n = mat.shape[-2], mat.shape[-1]
         k = min(m, n)

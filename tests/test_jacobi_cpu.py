@@ -133,3 +133,151 @@ def test_jacobi_big_replica_matches_the_contract():
     want = tpc.jacobi_big_reference(S0)
     norm = lambda U: U[..., :40] / U[..., :40].norm(dim=-1, keepdim=True)  # noqa: E731
     assert (norm(got).abs() - norm(want).abs()).abs().max() < 1e-4  # rows to sign (the rotation conventions differ)
+
+
+def test_jacobi_svd_big_and_hh_qr_replicas():
+    """Float32 FTZ-faithful replicas of ``jacobi_svd_big``, ``jacobi_svdvals_big``, ``hh_qr``, ``tsqr_*``, and
+    ``block_qr`` preserve singular values, orthogonality, and reconstruction across extreme scales and zero/rank-def."""
+    import numpy as np
+    import kernel_replica as kr
+
+    g = torch.Generator().manual_seed(7)
+    graded = torch.diag(torch.tensor([10.0 ** (-30 * i / 39) for i in range(40)], dtype=torch.float32))
+    cases = [
+        ("graded_1e-30_40", graded, False),
+        ("tiny_1e-25_40", torch.randn(40, 40, generator=g) * 1e-25, False),
+        ("huge_1e25_40", torch.randn(40, 40, generator=g) * 1e25, False),
+        ("zeros_40x40", torch.zeros(40, 40), True),
+        ("rank5_64x40", torch.randn(64, 5, generator=g) @ torch.randn(5, 40, generator=g), True),
+        ("wide_33x64", torch.randn(33, 64, generator=g), True),
+    ]
+    for name, a, full in cases:
+        U, S, Vh = kr.jacobi_svd_big(a.numpy(), compute_uv=True, full_matrices=full)
+        ref_s = torch.linalg.svdvals(a.double()).numpy()
+        scale = float(a.abs().max()) or 1.0
+        k = S.shape[0]
+        assert np.abs((U[:, :k] * S) @ Vh[:k] - a.numpy()).max() / scale < 1e-5, name
+        assert np.abs(U.T @ U - np.eye(U.shape[1])).max() < 1e-5, name
+        assert np.abs(Vh @ Vh.T - np.eye(Vh.shape[0])).max() < 1e-5, name
+        assert np.abs(S - ref_s).max() / scale < 1e-5, name
+        _, S_only, _ = kr.jacobi_svd_big(a.numpy(), compute_uv=False)
+        assert np.allclose(S_only, S, rtol=1e-6, atol=0.0), name
+
+    for name, a, fn in (
+        ("hh_qr_128x40", torch.randn(128, 40, generator=g), lambda x: kr.hh_qr_kernel(x, "qr")),
+        ("hh_qr_zeros", torch.zeros(40, 40), lambda x: kr.hh_qr_kernel(x, "qr")),
+        ("tsqr_300x40", torch.randn(300, 40, generator=g), kr.tsqr_qr_replica),
+        ("block_qr_96x96", torch.randn(96, 96, generator=g), kr.block_qr_replica),
+    ):
+        Q, R = fn(a.numpy())
+        scale = float(a.abs().max()) or 1.0
+        assert np.abs(Q @ R - a.numpy()).max() / scale < 1e-5, name
+        assert np.abs(Q.T @ Q - np.eye(Q.shape[1])).max() < 1e-5, name
+        assert np.abs(np.tril(R, -1)).max() / scale < 1e-5, name
+    r_tsqr = kr.tsqr_r_replica(torch.randn(300, 40, generator=g).numpy())
+    assert np.abs(np.tril(r_tsqr, -1)).max() < 1e-5
+
+
+def _svd_metrics(U, S, Vh, A):
+    k = S.shape[-1]
+    A64 = A.double()
+    S_ref = torch.linalg.svdvals(A64)
+    scale = float(A64.abs().max()) or 1.0
+    Uk, Vhk = U.double()[..., :k], Vh.double()[..., :k, :]
+    rec = float(((Uk * S.double().unsqueeze(-2)) @ Vhk - A64).abs().max() / scale)
+    eye_u = torch.eye(U.shape[-1], dtype=torch.float64).expand(*U.shape[:-2], U.shape[-1], U.shape[-1])
+    eye_v = torch.eye(Vh.shape[-2], dtype=torch.float64).expand(*Vh.shape[:-2], Vh.shape[-2], Vh.shape[-2])
+    orth_u = float((U.double().mT @ U.double() - eye_u).abs().max())
+    orth_v = float((Vh.double() @ Vh.double().mT - eye_v).abs().max())
+    s_err = float((S.double() - S_ref).abs().max() / (float(S_ref.max()) or 1.0))
+    return s_err, rec, orth_u, orth_v
+
+
+@pytest.mark.parametrize("full_matrices", [False, True])
+@pytest.mark.parametrize("shape", [
+    (2, 33, 33), (2, 40, 20), (2, 20, 40), (2, 64, 64),
+    (2, 72, 64), (2, 40, 96), (2, 128, 128), (2, 3, 64, 48),
+])
+def test_block_svd_gram_free_shapes_and_full_matrices(shape, full_matrices):
+    g = torch.Generator().manual_seed(shape[-2] * 100 + shape[-1])
+    A = torch.randn(*shape, generator=g, dtype=torch.float32)
+    U, S, Vh = jacobi.block_svd_gram_free(A, compute_uv=True, full_matrices=full_matrices)
+    m, n = shape[-2], shape[-1]
+    k = min(m, n)
+    assert U.shape == (*shape[:-2], m, m if full_matrices else k)
+    assert S.shape == (*shape[:-2], k)
+    assert Vh.shape == (*shape[:-2], n if full_matrices else k, n)
+    s_err, rec, orth_u, orth_v = _svd_metrics(U, S, Vh, A)
+    assert s_err < 1e-5 and rec < 1e-5 and orth_u < 1e-5 and orth_v < 1e-5
+    _, S_only, _ = jacobi.block_svd_gram_free(A, compute_uv=False)
+    torch.testing.assert_close(S_only, S, rtol=1e-5, atol=1e-6)
+
+
+def test_block_svd_gram_free_ill_conditioned_and_extreme_scales():
+    g = torch.Generator().manual_seed(42)
+    # Ill-conditioned 40x20 (cond=1e4), 128x128 (cond=1e5, 1e6), 256x256 (cond=1e5)
+    for m, n, lo in ((40, 20, -4), (128, 128, -5), (128, 128, -6), (256, 256, -5)):
+        Q1 = torch.linalg.qr(torch.randn(1, m, m, generator=g, dtype=torch.float64))[0]
+        Q2 = torch.linalg.qr(torch.randn(1, n, n, generator=g, dtype=torch.float64))[0]
+        k = min(m, n)
+        spec = torch.logspace(0, lo, k, dtype=torch.float64)
+        A = ((Q1[..., :k] * spec) @ Q2[..., :k, :]).float()
+        U, S, Vh = jacobi.block_svd_gram_free(A, compute_uv=True, full_matrices=False)
+        S_ref = torch.linalg.svdvals(A.double())
+        S_cpu32 = torch.linalg.svdvals(A)
+        rel_s = float((S.double() - S_ref).abs().max() / S_ref.max())
+        rel_cpu32 = float((S_cpu32.double() - S_ref).abs().max() / S_ref.max())
+        rel_smin = float((S[0, -1].double() - S_ref[0, -1]).abs() / S_ref[0, -1])
+        _, rec, orth_u, orth_v = _svd_metrics(U, S, Vh, A)
+        assert rel_s <= max(1e-6, 10 * rel_cpu32), (m, n, lo, rel_s, rel_cpu32)
+        assert rel_smin < 1e-2, (m, n, lo, rel_smin)  # Gram-free preserves sigma_min without squaring kappa
+        assert rec < 1e-5 and orth_u < 1e-5 and orth_v < 1e-5
+
+    # Extreme scales, zeros, rank-deficient
+    for name, A in (
+        ("tiny_1e-25", torch.randn(2, 65, 65, generator=g) * 1e-25),
+        ("huge_1e25", torch.randn(2, 65, 65, generator=g) * 1e25),
+        ("zeros_64", torch.zeros(2, 64, 64)),
+        ("rank10_128", torch.randn(2, 128, 10, generator=g) @ torch.randn(2, 10, 128, generator=g)),
+    ):
+        U, S, Vh = jacobi.block_svd_gram_free(A, compute_uv=True, full_matrices=True)
+        s_err, rec, orth_u, orth_v = _svd_metrics(U, S, Vh, A)
+        assert s_err < 1e-5 and rec < 1e-5 and orth_u < 1e-5 and orth_v < 1e-5, name
+
+
+def test_block_svd_gram_free_uses_subsolver_hooks():
+    """Verify sub-solver kwargs (``svd_big``, ``svdvals_big``, ``tsqr_r``, ``tsqr_qr``, ``block_qr``) are invoked."""
+    seen = []
+    g = torch.Generator().manual_seed(9)
+
+    def h_svd_big(X, full_matrices=False, sort=True):
+        seen.append(("svd_big", tuple(X.shape)))
+        return torch.linalg.svd(X, full_matrices=full_matrices)
+
+    def h_svdvals_big(X, sort=True):
+        seen.append(("svdvals_big", tuple(X.shape)))
+        return torch.linalg.svdvals(X)
+
+    def h_tsqr_r(X):
+        seen.append(("tsqr_r", tuple(X.shape)))
+        return torch.linalg.qr(X, mode="r").R
+
+    def h_tsqr_qr(X):
+        seen.append(("tsqr_qr", tuple(X.shape)))
+        return torch.linalg.qr(X, mode="reduced")
+
+    def h_block_qr(X):
+        seen.append(("block_qr", tuple(X.shape)))
+        return torch.linalg.qr(X, mode="reduced")
+
+    kw = dict(svd_big=h_svd_big, svdvals_big=h_svdvals_big, tsqr_r=h_tsqr_r, tsqr_qr=h_tsqr_qr, block_qr=h_block_qr)
+    # Tier 1: <= 64 cols
+    jacobi.block_svd_gram_free(torch.randn(1, 160, 40, generator=g), compute_uv=True, **kw)
+    assert any(k == "tsqr_qr" for k, _ in seen) and any(k == "svd_big" for k, _ in seen)
+    seen.clear()
+    jacobi.block_svd_gram_free(torch.randn(1, 60, 60, generator=g), compute_uv=False, **kw)
+    assert any(k == "svdvals_big" for k, _ in seen)
+    seen.clear()
+    # Tier 2: > 64 cols (block Jacobi using panel tsqr_r + svd_big + block_qr cleanup)
+    jacobi.block_svd_gram_free(torch.randn(1, 96, 96, generator=g), compute_uv=True, **kw)
+    assert any(k == "tsqr_r" for k, _ in seen) and any(k == "svd_big" for k, _ in seen)
