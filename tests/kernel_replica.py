@@ -1215,3 +1215,387 @@ def csvd_op():
 def csvdvals_op():
     """Stand-in for ``torch.ops.linalg_tpc.jacobi_csvdvals``: S alone."""
     return _torch_op(lambda a: (csvd_kernel(a, compute_uv=False)[1],), 1)
+
+
+# ---- M3B-A LUT-free 80 KB VLM kernels: jacobi_svd_big / jacobi_svdvals_big / hh_qr -------------------------------
+
+_LANES64 = np.arange(64)
+_XOR16 = _LANES64 ^ 16
+_XOR32 = _LANES64 ^ 32
+_XOR8 = _LANES64 ^ 8
+_XOR4 = _LANES64 ^ 4
+_XOR2 = _LANES64 ^ 2
+_XOR1 = _LANES64 ^ 1
+
+
+def _bfly_add_64_batch(p):
+    """64-lane butterfly sum along axis=-1 for shape ``(..., 64)`` -> ``(..., 1)``."""
+    p = add(p, p[..., _XOR16])
+    p = add(p, p[..., _XOR32])
+    p = add(p, p[..., _XOR8])
+    p = add(p, p[..., _XOR4])
+    p = add(p, p[..., _XOR2])
+    p = add(p, p[..., _XOR1])
+    return p[..., :1]
+
+
+def _bfly_add_64(p):
+    return _bfly_add_64_batch(p)[0]
+
+
+def _bfly_max_64(p):
+    p = np.maximum(p, p[_XOR16]).astype(F32)
+    p = np.maximum(p, p[_XOR32]).astype(F32)
+    p = np.maximum(p, p[_XOR8]).astype(F32)
+    p = np.maximum(p, p[_XOR4]).astype(F32)
+    p = np.maximum(p, p[_XOR2]).astype(F32)
+    p = np.maximum(p, p[_XOR1]).astype(F32)
+    return p[0]
+
+
+def _red_add_va(vecs):
+    """Sum across VA 64-lane vectors then 64-lane butterfly."""
+    acc = vecs[0] if len(vecs) == 1 else add(vecs[0], vecs[1])
+    for vi in range(2, len(vecs)):
+        acc = add(acc, vecs[vi])
+    return _bfly_add_64(acc)
+
+
+def _red_max_va(vecs):
+    """Max across VA 64-lane vectors then 64-lane butterfly."""
+    acc = vecs[0]
+    for vi in range(1, len(vecs)):
+        acc = np.maximum(acc, vecs[vi]).astype(F32)
+    return _bfly_max_64(acc)
+
+
+def _row_norm_va(vecs):
+    """LUT-free ``ROW_NORM`` across VA vectors: ``(mx, cw, nrm, rn)``."""
+    mx = _red_max_va(np.abs(vecs))
+    smx = F32(1) if mx == 0 else mx
+    rmx = recip(smx, zero_to_inf=False)[0]
+    cw = mul(vecs, rmx)
+    sq = _red_add_va(mul(cw, cw))
+    rn = rsqrt_fine(F32(1) if sq < F32(1e-36) else sq)
+    return mx, cw, mul(mul(sq, rn), smx), rn
+
+
+def jacobi_svd_big_kernel(A_t, compute_uv=True, full_u=False, sweeps=None):
+    """Float32 FTZ-faithful replica of ``jacobi_svd_big_f32_gaudi2.c`` (LUT-free 80 KB VLM: ``rsqrt_fine``,
+    ``lut_free_recip``, 64-lane butterfly across ``VA = ceil(m / 64)`` vectors, ``ROW_NORM``, relative
+    ``gamma^2 <= 1e-14 * alpha * beta`` skip rule, equal-norm 45-deg exact cancellation, 2-pass MGS completion).
+    Supports ``k <= 64, m <= 128`` (with UV) or ``k <= 128, m <= 128`` (NO_UV)."""
+    with np.errstate(all="ignore"):
+        w0 = _ftz(np.array(A_t, dtype=F32))
+        n, m = w0.shape
+        if np.isnan(w0).any():
+            nan = np.full
+            ut_rows = m if (compute_uv and full_u) else n
+            return (nan((ut_rows, m), np.nan, F32) if compute_uv else None, nan(n, np.nan, F32),
+                    nan((n, n), np.nan, F32) if compute_uv else None)
+        va = max(1, (m + 63) // 64)
+        width = 64 * va
+        w = np.zeros((n, va, 64), F32)
+        w.reshape(n, width)[:, :m] = w0
+        v = np.eye(n, 64, dtype=F32) if compute_uv else None
+        sigma = F32(np.max(np.abs(w))) if w.size else F32(0)
+        pre = F32(1e-4) if F32(1e35) < sigma else F32(1)
+        safe_sigma = F32(1) if sigma == 0 else sigma
+        inv = recip(mul(safe_sigma, pre), zero_to_inf=False)[0]
+        w = mul(mul(w, pre), inv)
+
+        if sweeps is None:
+            sweeps = 6 if n <= 4 else 10 if n <= 16 else 12 if n <= 32 else 18 if n <= 64 else 20
+
+        rounds = []
+        for r in range(((n + 1) & ~1) - 1):
+            pairs_ = _rr_pairs(r, n)
+            if pairs_:
+                rounds.append((np.array([p for p, _ in pairs_]), np.array([q for _, q in pairs_])))
+        for _ in range(sweeps):
+            for ps, qs in rounds:
+                up, uq = w[ps], w[qs]
+                if va == 1:
+                    up0, uq0 = up[:, 0], uq[:, 0]
+                    alpha = _bfly_add_64_batch(mul(up0, up0))[:, 0]
+                    beta = _bfly_add_64_batch(mul(uq0, uq0))[:, 0]
+                    gamma = _bfly_add_64_batch(mul(up0, uq0))[:, 0]
+                else:
+                    alpha = _bfly_add_64_batch(add(mul(up[:, 0], up[:, 0]), mul(up[:, 1], up[:, 1])))[:, 0]
+                    beta = _bfly_add_64_batch(add(mul(uq[:, 0], uq[:, 0]), mul(uq[:, 1], uq[:, 1])))[:, 0]
+                    gamma = _bfly_add_64_batch(add(mul(up[:, 0], uq[:, 0]), mul(up[:, 1], uq[:, 1])))[:, 0]
+                ab = add(alpha, beta)
+                k_ = rsqrt_fine(np.where(ab == 0, F32(1), ab).astype(F32))
+                k_ = mul(k_, k_)
+                a_, b_, g_ = mul(alpha, k_), mul(beta, k_), mul(gamma, k_)
+                d, g2 = sub(b_, a_), add(g_, g_)
+                r2 = mac(g2, g2, mul(d, d))
+                inv_r = rsqrt_fine(np.where(r2 < F32(1e-34), F32(1), r2).astype(F32))
+                c2 = mul(F32(0.5), mac(np.abs(d), inv_r, F32(1)))
+                inv_c = rsqrt_fine(c2)
+                c = mul(c2, inv_c)
+                s = mul(mul(F32(0.5), g2), mul(inv_r, inv_c))
+                s = np.where(d < 0, sub(F32(0), s), s).astype(F32)
+                eq = d == 0
+                c = np.where(eq, F32(0.70710677), c).astype(F32)
+                s = np.where(eq, np.where(g2 < 0, F32(-0.70710677), F32(0.70710677)), s).astype(F32)
+                skip = (~(mul(F32(1e-14), mul(a_, b_)) < mul(g_, g_))) | (r2 < F32(1e-34)) | (gamma == 0)
+                c = np.where(skip, F32(1), c).astype(F32)
+                s = np.where(skip, F32(0), s).astype(F32)
+                c3, s3 = c[:, None, None], s[:, None, None]
+                w[ps] = sub(mul(up, c3), mul(uq, s3))
+                w[qs] = mac(up, s3, mul(uq, c3))
+                if compute_uv:
+                    vp, vq = v[ps], v[qs]
+                    c2d, s2d = c[:, None], s[:, None]
+                    v[ps] = sub(mul(vp, c2d), mul(vq, s2d))
+                    v[qs] = mac(vp, s2d, mul(vq, c2d))
+
+        S = np.zeros(n, F32)
+        nrm_all = np.zeros(n, F32)
+        for j in range(n):
+            mx, cw, nrm, rn = _row_norm_va(w[j])
+            zero = mx == 0
+            nrm = F32(0) if zero else nrm
+            nrm_all[j] = nrm
+            S[j] = mul(nrm, safe_sigma)
+            if compute_uv:
+                w[j] = mul(cw, F32(0) if zero else rn)
+        if not compute_uv:
+            return None, S, None
+
+        w_flat = w.reshape(n, width)
+        done = (~(nrm_all < max(F32(1e-37), mul(F32(1e-5), np.max(nrm_all))))).astype(F32)
+        diag = np.where(np.arange(width) < m, F32(1), F32(-1)).astype(F32)
+        for k in range(n):
+            uk = mul(w_flat[k], done[k])
+            diag = sub(diag, mul(uk, uk))
+        order = [[j for j in range(n) if nrm_all[j] != 0], [j for j in range(n) if nrm_all[j] == 0]]
+        for phase in order:
+            for j in phase:
+                if done[j] != 0:
+                    continue
+                cand1 = w_flat[j].copy()
+                cand2 = np.zeros(width, F32)
+                cand2[_first_max(diag)] = F32(1)
+                for _ in range(2):
+                    for k in range(n):
+                        uk = mul(w_flat[k], done[k])
+                        d1 = _red_add_va(mul(cand1.reshape(va, 64), uk.reshape(va, 64)))
+                        d2 = _red_add_va(mul(cand2.reshape(va, 64), uk.reshape(va, 64)))
+                        cand1 = sub(cand1, mul(d1, uk))
+                        cand2 = sub(cand2, mul(d2, uk))
+                cn1 = _red_add_va(mul(cand1.reshape(va, 64), cand1.reshape(va, 64)))
+                cn2 = _red_add_va(mul(cand2.reshape(va, 64), cand2.reshape(va, 64)))
+                cand, cn = (cand1, cn1) if F32(0.25) < cn1 else (cand2, cn2)
+                cand = mul(cand, rsqrt_fine(F32(1) if cn < F32(1e-36) else cn))
+                w_flat[j] = cand
+                diag = sub(diag, mul(cand, cand))
+                done[j] = 1
+        Ut = w_flat[:, :m].copy()
+        if full_u and m > n:
+            rows = [np.where(np.arange(width) < m, w_flat[j], F32(0)).astype(F32) for j in range(n)]
+            for j in range(n, m):
+                cand = np.zeros(width, F32)
+                cand[_first_max(diag)] = F32(1)
+                for _ in range(2):
+                    for uk in rows:
+                        d_ = _red_add_va(mul(cand.reshape(va, 64), uk.reshape(va, 64)))
+                        cand = sub(cand, mul(d_, uk))
+                cn = _red_add_va(mul(cand.reshape(va, 64), cand.reshape(va, 64)))
+                cand = mul(cand, rsqrt_fine(F32(1) if cn < F32(1e-36) else cn))
+                cand[m:] = 0
+                rows.append(cand)
+                diag = sub(diag, mul(cand, cand))
+            Ut = np.stack(rows)[:, :m]
+        return Ut, S, v[:, :n].copy()
+
+
+def jacobi_svd_big(A, compute_uv=True, full_matrices=False, contiguous=True):
+    """High-level replica of ``tpc.jacobi_svd_big`` / ``tpc.jacobi_svdvals_big`` for ``A[m, n]``."""
+    a = np.array(A, dtype=F32)
+    m, n = a.shape
+    k, big = min(m, n), max(m, n)
+    full = full_matrices and m != n
+    swap = m < n or (m == n and contiguous)
+    Ut, S, Vt = jacobi_svd_big_kernel(a if swap else a.T, compute_uv, full)
+    order = np.argsort(-S, kind="stable")
+    if not compute_uv:
+        return None, S[order], None
+    U, Vh = (Vt.T, Ut) if swap else (Ut.T, Vt)
+    full_order = np.concatenate([order, np.arange(k, big)]) if full else order
+    u_ord, v_ord = ((order, full_order) if swap else (full_order, order)) if full else (order, order)
+    return U[:, u_ord], S[order], Vh[v_ord, :]
+
+
+def jacobi_svd_big_op(full_u=False):
+    """Stand-in for ``jacobi_svd_big`` kernel op: ``A_t[b, k, big] -> (Ut, S, Vt)``."""
+    return _torch_op(lambda a: jacobi_svd_big_kernel(a, compute_uv=True, full_u=full_u), 3)
+
+
+def jacobi_svdvals_big_op():
+    """Stand-in for ``jacobi_svdvals_big`` kernel op: ``A_t[b, k, big] -> S``."""
+    return _torch_op(lambda a: (jacobi_svd_big_kernel(a, compute_uv=False)[1],), 1)
+
+
+def hh_qr_kernel(A, mode="qr"):
+    """Float32 FTZ-faithful replica of ``hh_qr_f32_gaudi2.c`` (LUT-free 80 KB VLM, ``MAXN=64, MAXM=256``):
+    column-max prescaling (``xs = x / mx``), zero-col/zero-tail guard (``tau = 0``), and per-column power-of-2
+    scaling (``1e30 -> 2^-40``, ``1e-25 -> 2^+40``) during trailing updates.
+    ``mode``: ``"r"`` -> ``R[k, n]``; ``"qr"`` -> ``(Q[m, k], R[k, n])``; ``"ytau"`` -> ``(YR[m, n], tau[k])``."""
+    with np.errstate(all="ignore"):
+        a = _ftz(np.array(A, dtype=F32))
+        m, n = a.shape
+        k = min(m, n)
+        if np.isnan(a).any():
+            nan = np.full
+            if mode == "r":
+                return (nan((k, n), np.nan, F32),)
+            if mode == "ytau":
+                return nan((m, n), np.nan, F32), nan((k,), np.nan, F32)
+            return nan((m, k), np.nan, F32), nan((k, n), np.nan, F32)
+        va = max(1, (m + 63) // 64)
+        width = 64 * va
+        q = np.zeros((n, va, 64), F32)
+        q.reshape(n, width)[:, :m] = a.T
+        q_flat = q.reshape(n, width)
+        tau = np.zeros(k, F32)
+        row_idx = np.arange(width)
+
+        for i in range(k):
+            x = np.where((row_idx >= i) & (row_idx < m), q_flat[i], F32(0)).astype(F32)
+            mx = _red_max_va(np.abs(x.reshape(va, 64)))
+            zero_col = mx == 0
+            smx = F32(1) if zero_col else mx
+            inv_mx = recip(smx, zero_to_inf=False)[0]
+            xs = mul(x, inv_mx)
+            tail = np.where(row_idx > i, xs, F32(0)).astype(F32)
+            sigma_rest = _red_add_va(mul(tail.reshape(va, 64), tail.reshape(va, 64)))
+            xs0, orig_ii = xs[i], q_flat[i, i]
+            sq = mac(xs0, xs0, sigma_rest)
+            inv_nrm = rsqrt_fine(F32(1) if sq == 0 else sq)
+            nrm_xs = mul(sq, inv_nrm)
+            beta_xs = nrm_xs if xs0 < 0 else sub(F32(0), nrm_xs)
+            v0 = sub(xs0, beta_xs)
+            inv_v0 = recip(F32(1) if v0 == 0 else v0, zero_to_inf=False)[0]
+            tau_i = F32(0) if (sigma_rest == 0 or zero_col) else mul(np.abs(v0), inv_nrm)
+            r_ii = orig_ii if sigma_rest == 0 else mul(beta_xs, smx)
+            tau[i] = tau_i
+
+            v = mul(xs, inv_v0)
+            v[row_idx < i] = F32(0)
+            v[i] = F32(1)
+            if tau_i == 0:
+                v[:] = F32(0)
+            q_flat[i] = np.where(row_idx > i, F32(0) if mode == "r" else v, q_flat[i]).astype(F32)
+            q_flat[i, i] = r_ii
+
+            v_va = v.reshape(va, 64)
+            for j in range(i + 1, n):
+                qjv = q_flat[j].copy()
+                qj_act = np.where(row_idx < i, F32(0), qjv).astype(F32)
+                mx_j = _red_max_va(np.abs(qj_act.reshape(va, 64)))
+                if mx_j > F32(1e30):
+                    sc, sc_inv = F32(2.0 ** -40), F32(2.0 ** 40)
+                elif mx_j != 0 and mx_j < F32(1e-25):
+                    sc, sc_inv = F32(2.0 ** 40), F32(2.0 ** -40)
+                else:
+                    sc, sc_inv = F32(1), F32(1)
+                qj_sc = mul(qj_act, sc)
+                dot = _red_add_va(mul(v_va, qj_sc.reshape(va, 64)))
+                neg_tau_dot = mul(sub(F32(0), tau_i), dot)
+                if tau_i != 0:
+                    qj_upd = mul(mac(neg_tau_dot, v, qj_sc), sc_inv)
+                    q_flat[j] = np.where(row_idx < i, qjv, qj_upd).astype(F32)
+
+        if mode == "ytau":
+            return q_flat[:, :m].T.copy(), tau
+        R = np.triu(q_flat[:, :k].T).astype(F32)
+        if mode == "r":
+            return (R,)
+        # Form thin Q [m, k] in-place via backward Householder accumulation
+        for i in range(k - 1, -1, -1):
+            tau_i = tau[i]
+            vi = np.where((row_idx >= i) & (row_idx < m), q_flat[i], F32(0)).astype(F32)
+            vi[i] = F32(1)
+            neg_tau_vi = mul(sub(F32(0), tau_i), vi)
+            vi_va = vi.reshape(va, 64)
+            if tau_i != 0:
+                for j in range(i + 1, k):
+                    d = _red_add_va(mul(vi_va, q[j]))
+                    q_flat[j] = mac(neg_tau_vi, d, q_flat[j])
+            ei = np.where(row_idx == i, F32(1), F32(0)).astype(F32)
+            q_flat[i] = ei if tau_i == 0 else add(ei, neg_tau_vi)
+        return q_flat[:k, :m].T.copy(), R
+
+
+def tsqr_r_replica(A, chunk=256):
+    """Replica of tree-reduction TSQR R-only via ``hh_qr_kernel(..., mode='r')``."""
+    a = _ftz(np.array(A, dtype=F32))
+    m, n = a.shape
+    if m <= chunk:
+        return hh_qr_kernel(a, mode="r")[0]
+    blocks = [hh_qr_kernel(a[i:i + chunk], mode="r")[0] for i in range(0, m, chunk)]
+    while len(blocks) > 1:
+        next_blocks = []
+        for i in range(0, len(blocks), 4):
+            grp = np.concatenate(blocks[i:i + 4], axis=0)
+            next_blocks.append(hh_qr_kernel(grp, mode="r")[0])
+        blocks = next_blocks
+    return blocks[0]
+
+
+def tsqr_qr_replica(A, chunk=256):
+    """Replica of tree-reduction TSQR ``(Q, R)`` via ``hh_qr_kernel(..., mode='qr')``."""
+    a = _ftz(np.array(A, dtype=F32))
+    m, n = a.shape
+    if m <= chunk:
+        return hh_qr_kernel(a, mode="qr")
+    q_levels = []
+    cur = a
+    while cur.shape[0] > chunk:
+        qs, rs = [], []
+        for i in range(0, cur.shape[0], chunk):
+            q_i, r_i = hh_qr_kernel(cur[i:i + chunk], mode="qr")
+            qs.append(q_i)
+            rs.append(r_i)
+        q_levels.append(qs)
+        cur = np.concatenate(rs, axis=0)
+    Q_top, R = hh_qr_kernel(cur, mode="qr")
+    Q = Q_top
+    for qs in reversed(q_levels):
+        out = []
+        off = 0
+        for q_i in qs:
+            k_i = q_i.shape[1]
+            out.append(matmul(q_i, Q[off:off + k_i]))
+            off += k_i
+        Q = np.concatenate(out, axis=0)
+    return Q, R
+
+
+def block_qr_replica(A, b=64):
+    """Replica of ``tpc.block_qr`` for arbitrary ``A[m, n]`` using ``tsqr_qr_replica`` panel factorization and
+    float32 ``matmul`` trailing updates."""
+    a = _ftz(np.array(A, dtype=F32))
+    m, n = a.shape
+    if n <= b:
+        return tsqr_qr_replica(a)
+    k = min(m, n)
+    Q_list = []
+    cur = a.copy()
+    r_rows = []
+    for j in range(0, k, b):
+        jb = min(b, k - j)
+        Qp, Rp = tsqr_qr_replica(cur[:, j:j + jb])
+        Q_list.append(Qp)
+        r_row = np.zeros((jb, n), F32)
+        r_row[:, j:j + jb] = Rp
+        if j + jb < n:
+            proj = matmul(Qp.T, cur[:, j + jb:])
+            cur[:, j + jb:] = sub(cur[:, j + jb:], matmul(Qp, proj))
+            proj2 = matmul(Qp.T, cur[:, j + jb:])
+            cur[:, j + jb:] = sub(cur[:, j + jb:], matmul(Qp, proj2))
+            r_row[:, j + jb:] = add(proj, proj2)
+        r_rows.append(r_row)
+    return np.concatenate(Q_list, axis=1), np.concatenate(r_rows, axis=0)

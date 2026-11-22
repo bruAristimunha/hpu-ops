@@ -87,6 +87,38 @@ extern const char _binary___jacobi_csvd_f32_gaudi2_o_start[];
 extern const char _binary___jacobi_csvd_f32_gaudi2_o_end[];
 extern const char _binary___jacobi_csvdvals_f32_gaudi2_o_start[];
 extern const char _binary___jacobi_csvdvals_f32_gaudi2_o_end[];
+extern const char _binary___jacobi_svd_big1_f32_gaudi2_o_start[];
+extern const char _binary___jacobi_svd_big1_f32_gaudi2_o_end[];
+extern const char _binary___jacobi_svd_big2_f32_gaudi2_o_start[];
+extern const char _binary___jacobi_svd_big2_f32_gaudi2_o_end[];
+extern const char _binary___jacobi_svdvals_big1_f32_gaudi2_o_start[];
+extern const char _binary___jacobi_svdvals_big1_f32_gaudi2_o_end[];
+extern const char _binary___jacobi_svdvals_big2_f32_gaudi2_o_start[];
+extern const char _binary___jacobi_svdvals_big2_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr1_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr1_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr2_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr2_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr3_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr3_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr4_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr4_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr_r1_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr_r1_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr_r2_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr_r2_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr_r3_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr_r3_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr_r4_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr_r4_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr_ytau1_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr_ytau1_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr_ytau2_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr_ytau2_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr_ytau3_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr_ytau3_f32_gaudi2_o_end[];
+extern const char _binary___hh_qr_ytau4_f32_gaudi2_o_start[];
+extern const char _binary___hh_qr_ytau4_f32_gaudi2_o_end[];
 }
 
 namespace {
@@ -125,6 +157,16 @@ constexpr uint64_t kMaxHH = 64;     // MAXHH of householder_product
 constexpr uint64_t kMaxEighN = 32;  // MAXN of jacobi_eigh
 constexpr uint64_t kMaxLargeN = 512;  // NMAX of gj_large
 constexpr uint64_t kMaxTallM = 2048;  // rows of a tall gj_large panel (-DTALL: VR = 32)
+const char* kSvdBig = "jacobi_svd_big_f32_gaudi2";
+const char* kSvdvalsBig = "jacobi_svdvals_big_f32_gaudi2";
+const char* kHhQr = "hh_qr_f32_gaudi2";
+const char* kHhQrR = "hh_qr_r_f32_gaudi2";
+const char* kHhQrYtau = "hh_qr_ytau_f32_gaudi2";
+constexpr uint64_t kMaxBigSvdN = 64;
+constexpr uint64_t kMaxBigSvdM = 128;
+constexpr uint64_t kMaxBigSvdvalsN = 128;
+constexpr uint64_t kMaxHhQrN = 64;
+constexpr uint64_t kMaxHhQrM = 256;
 
 void base_pattern(tpc_lib_api::TensorAccessPattern& p)
 {
@@ -995,6 +1037,99 @@ tpc_lib_api::GlueCodeReturn large_defs(tpc_lib_api::HabanaKernelParams* in, tpc_
     }
 }
 
+tpc_lib_api::GlueCodeReturn svd_big_defs(tpc_lib_api::HabanaKernelParams* in,
+                                          tpc_lib_api::HabanaKernelInstantiation* out, bool no_uv)
+{
+    auto status = check_io(in, 1, no_uv ? 1 : 3);
+    if (status != tpc_lib_api::GLUE_SUCCESS)
+    {
+        return status;
+    }
+    const uint64_t m = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[1];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    const uint64_t max_n = no_uv ? kMaxBigSvdvalsN : kMaxBigSvdN;
+    if (m < 1 || n < 1 || m > kMaxBigSvdM || n > max_n || m < n || batch < 1)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+    full3(out->inputTensorAccessPattern[0], m, n);
+    if (no_uv)
+    {
+        full2(out->outputTensorAccessPattern[0], n);
+        return (m <= 64) ? copy_elf(out, _binary___jacobi_svdvals_big1_f32_gaudi2_o_start,
+                                    _binary___jacobi_svdvals_big1_f32_gaudi2_o_end)
+                         : copy_elf(out, _binary___jacobi_svdvals_big2_f32_gaudi2_o_start,
+                                    _binary___jacobi_svdvals_big2_f32_gaudi2_o_end);
+    }
+    full3(out->outputTensorAccessPattern[0], m, n);
+    full2(out->outputTensorAccessPattern[1], n);
+    full3(out->outputTensorAccessPattern[2], n, n);
+    return (m <= 64) ? copy_elf(out, _binary___jacobi_svd_big1_f32_gaudi2_o_start,
+                                _binary___jacobi_svd_big1_f32_gaudi2_o_end)
+                     : copy_elf(out, _binary___jacobi_svd_big2_f32_gaudi2_o_start,
+                                _binary___jacobi_svd_big2_f32_gaudi2_o_end);
+}
+
+// mode: 0 = (Q_t, R_t), 1 = R_t only, 2 = (YR_t, tau)
+tpc_lib_api::GlueCodeReturn hh_qr_defs(tpc_lib_api::HabanaKernelParams* in,
+                                        tpc_lib_api::HabanaKernelInstantiation* out, int mode)
+{
+    auto status = check_io(in, 1, mode == 1 ? 1 : 2);
+    if (status != tpc_lib_api::GLUE_SUCCESS)
+    {
+        return status;
+    }
+    const uint64_t m = in->inputTensors[0].geometry.maxSizes[0];
+    const uint64_t n = in->inputTensors[0].geometry.maxSizes[1];
+    const uint64_t batch = in->inputTensors[0].geometry.maxSizes[2];
+    if (m < 1 || n < 1 || m > kMaxHhQrM || n > kMaxHhQrN || batch < 1)
+    {
+        return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
+    }
+    const uint64_t k = m < n ? m : n;
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = batch;
+    out->preferredSplitDim = 1;
+    full3(out->inputTensorAccessPattern[0], m, n);
+    const uint64_t va = (m + 63) / 64;
+    if (mode == 1)
+    {
+        full3(out->outputTensorAccessPattern[0], k, n);
+        switch (va)
+        {
+            case 1: return copy_elf(out, _binary___hh_qr_r1_f32_gaudi2_o_start, _binary___hh_qr_r1_f32_gaudi2_o_end);
+            case 2: return copy_elf(out, _binary___hh_qr_r2_f32_gaudi2_o_start, _binary___hh_qr_r2_f32_gaudi2_o_end);
+            case 3: return copy_elf(out, _binary___hh_qr_r3_f32_gaudi2_o_start, _binary___hh_qr_r3_f32_gaudi2_o_end);
+            default: return copy_elf(out, _binary___hh_qr_r4_f32_gaudi2_o_start, _binary___hh_qr_r4_f32_gaudi2_o_end);
+        }
+    }
+    if (mode == 2)
+    {
+        full3(out->outputTensorAccessPattern[0], m, n);
+        full2(out->outputTensorAccessPattern[1], k);
+        switch (va)
+        {
+            case 1: return copy_elf(out, _binary___hh_qr_ytau1_f32_gaudi2_o_start, _binary___hh_qr_ytau1_f32_gaudi2_o_end);
+            case 2: return copy_elf(out, _binary___hh_qr_ytau2_f32_gaudi2_o_start, _binary___hh_qr_ytau2_f32_gaudi2_o_end);
+            case 3: return copy_elf(out, _binary___hh_qr_ytau3_f32_gaudi2_o_start, _binary___hh_qr_ytau3_f32_gaudi2_o_end);
+            default: return copy_elf(out, _binary___hh_qr_ytau4_f32_gaudi2_o_start, _binary___hh_qr_ytau4_f32_gaudi2_o_end);
+        }
+    }
+    full3(out->outputTensorAccessPattern[0], m, k);
+    full3(out->outputTensorAccessPattern[1], k, n);
+    switch (va)
+    {
+        case 1: return copy_elf(out, _binary___hh_qr1_f32_gaudi2_o_start, _binary___hh_qr1_f32_gaudi2_o_end);
+        case 2: return copy_elf(out, _binary___hh_qr2_f32_gaudi2_o_start, _binary___hh_qr2_f32_gaudi2_o_end);
+        case 3: return copy_elf(out, _binary___hh_qr3_f32_gaudi2_o_start, _binary___hh_qr3_f32_gaudi2_o_end);
+        default: return copy_elf(out, _binary___hh_qr4_f32_gaudi2_o_start, _binary___hh_qr4_f32_gaudi2_o_end);
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -1002,7 +1137,7 @@ extern "C" {
 tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint32_t* kernelCount,
                                            tpc_lib_api::GuidInfo* guids)
 {
-    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 26 : 0;
+    const uint32_t count = deviceId == tpc_lib_api::DEVICE_ID_GAUDI2 ? 31 : 0;
     if (guids != nullptr && count)
     {
         strcpy(guids[0].name, kSolve);
@@ -1031,6 +1166,11 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId, uint3
         strcpy(guids[23].name, kCEighRefine);
         strcpy(guids[24].name, kCSvd);
         strcpy(guids[25].name, kCSvdvals);
+        strcpy(guids[26].name, kSvdBig);
+        strcpy(guids[27].name, kSvdvalsBig);
+        strcpy(guids[28].name, kHhQr);
+        strcpy(guids[29].name, kHhQrR);
+        strcpy(guids[30].name, kHhQrYtau);
     }
     if (kernelCount != nullptr)
     {
@@ -1145,6 +1285,26 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (strcmp(params->guid.name, kCSvdvals) == 0)
     {
         return csvd_defs(params, instance, true);
+    }
+    if (strcmp(params->guid.name, kSvdBig) == 0)
+    {
+        return svd_big_defs(params, instance, false);
+    }
+    if (strcmp(params->guid.name, kSvdvalsBig) == 0)
+    {
+        return svd_big_defs(params, instance, true);
+    }
+    if (strcmp(params->guid.name, kHhQr) == 0)
+    {
+        return hh_qr_defs(params, instance, 0);
+    }
+    if (strcmp(params->guid.name, kHhQrR) == 0)
+    {
+        return hh_qr_defs(params, instance, 1);
+    }
+    if (strcmp(params->guid.name, kHhQrYtau) == 0)
+    {
+        return hh_qr_defs(params, instance, 2);
     }
     return tpc_lib_api::GLUE_NODE_NOT_FOUND;
 }
