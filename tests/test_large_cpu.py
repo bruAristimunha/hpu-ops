@@ -25,6 +25,17 @@ def eager_tpc(monkeypatch):
     monkeypatch.setenv("PT_HPU_LAZY_MODE", "0")
 
 
+@pytest.fixture(autouse=True)
+def single_thread_blas():
+    """Avoid an Intel oneMKL multi-thread race in batched CPU ``torch.linalg.{inv,slogdet}`` at n >= 256."""
+    n = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(n)
+
+
 @pytest.fixture
 def replica(monkeypatch):
     """``tpc._large_op`` -> the current kernel's replica; the list collects the shapes it was called with."""

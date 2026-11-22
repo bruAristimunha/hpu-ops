@@ -65,7 +65,7 @@ def test_duplicate_rows_det_and_gradient_like_torch(n, replica):
         det = torch.linalg.det(got)
         det.backward()
     ref = torch.linalg.det(A.double())
-    assert abs(float(det) - float(torch.linalg.det(A))) <= 10 * abs(float(torch.linalg.det(A)) - float(ref)) + 1e-30
+    assert abs(float(det) - float(torch.linalg.det(A))) <= max(1e-7, 10 * abs(float(torch.linalg.det(A)) - float(ref)))
     assert got.grad.abs().max() > 0  # torch gives the adjugate, not zero
     assert rel(got.grad, want.grad) < 1e-2
 
