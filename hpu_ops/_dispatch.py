@@ -15,6 +15,47 @@ import torch
 from torch._C import DispatchKey
 
 _STATE = {"calls": collections.Counter()}
+_DUAL_PROBE = torch.empty(0)
+
+
+def forward_ad_level(*tensors):
+    """Active forward-mode AD dual level (>= 0), or -1 if none.
+
+    ``torch.compile`` lowers ``fwAD.dual_level()`` and ``torch.func.jvp`` to C++
+    ``torch._C._enter_dual_level()`` without updating Python's ``fwAD._current_level`` (which stays ``-1``).
+    Check passed tensors for a level-0 dual tangent first; otherwise probe C++ level 0 (popping active
+    dispatch modes when present so tracers do not record the probe). Skip probing only during Dynamo bytecode
+    tracing (where ``is_compiling()`` is True and no dispatch modes are active).
+    """
+    has_modes = (
+        torch._C._len_torch_dispatch_stack() > 0
+        or torch._ops._len_torch_dispatch_stack_pre_dispatch() > 0
+    )
+    if torch.compiler.is_compiling() and not has_modes:
+        return getattr(torch.autograd.forward_ad, "_current_level", -1)
+    if torch.is_inference_mode_enabled():
+        return -1
+    lvl = getattr(torch.autograd.forward_ad, "_current_level", -1)
+    if lvl >= 0:
+        return lvl
+    if (not below_autograd()
+            and any(isinstance(t, torch.Tensor) and not t.is_inference()
+                    and torch._VF._unpack_dual(t, 0)[1] is not None for t in tensors)):
+        return 0
+    if has_modes:
+        from torch.utils._python_dispatch import _disable_current_modes
+
+        with _disable_current_modes():
+            try:
+                torch._VF._make_dual(_DUAL_PROBE, _DUAL_PROBE, 0)
+                return 0
+            except RuntimeError:
+                return -1
+    try:
+        torch._VF._make_dual(_DUAL_PROBE, _DUAL_PROBE, 0)
+        return 0
+    except RuntimeError:
+        return -1
 
 
 def count(name):
@@ -25,6 +66,23 @@ def count(name):
 def static(*sizes):
     """True when every size is a plain int, i.e. none is symbolic under ``torch.compile``."""
     return all(isinstance(size, int) for size in sizes)
+
+
+def tracing(*tensors):
+    """True when ``torch.compile`` (Dynamo, or AOT autograd's fake and functional tensors, where
+    ``torch.compiler.is_compiling()`` is False), a fake mode, or ``make_fx`` (a proxy mode, also on real tensors)
+    is active on ``tensors``."""
+    if (torch._C._len_torch_dispatch_stack() == 0 and not torch.compiler.is_compiling()
+            and all(type(t) is torch.Tensor and not torch._is_functional_tensor(t) for t in tensors)):
+        return False
+    from torch._subclasses.fake_tensor import FakeTensor, is_fake
+    from torch._subclasses.functional_tensor import FunctionalTensor
+
+    if (torch.compiler.is_compiling() or torch._guards.detect_fake_mode() is not None
+            or torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY) is not None):
+        return True
+    return any(isinstance(t, FakeTensor) or is_fake(t) or torch._is_functional_tensor(t)
+               or isinstance(t, FunctionalTensor) for t in tensors)
 
 
 def below_autograd():
