@@ -68,7 +68,11 @@ def build_spd(names):
 
 
 def build_bd(names):
-    from braindecode.models.util import _get_signal_params, models_dict, models_mandatory_parameters
+    try:
+        from braindecode.models.util import _get_signal_params
+    except ImportError:  # moved to the test package (braindecode master, Nov 2026)
+        from test.unit_tests.models._fixtures import _get_signal_params
+    from braindecode.models.util import models_dict, models_mandatory_parameters
 
     specs = {name: (required, params) for name, required, params in models_mandatory_parameters}
 
