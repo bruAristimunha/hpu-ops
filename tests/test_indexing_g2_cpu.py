@@ -104,6 +104,25 @@ def test_g2_cache_hit_skips_host_check_ops_and_route(monkeypatch):
         assert len(indexing._INDEX_CACHE) == 1
 
 
+def test_g2_value_cache_hit_for_fresh_equal_indices():
+    """Fresh equal index tensors every call (spd_learn's triu_indices pattern): the ptr key always misses, the
+    value key hits, so the 2nd+ calls do no host linearization or copy; different values never hit."""
+    x = torch.randn(4, 6, 6)
+    want = x[..., *torch.triu_indices(6, 6)]
+    with cpu_as_hpu(indexing.install_index):
+        got1 = x[..., *torch.triu_indices(6, 6)]
+        with _RecordOps() as rec:
+            got2 = x[..., *torch.triu_indices(6, 6)]
+        other = torch.triu_indices(6, 6)
+        other[0, 0] = 1  # different values: a miss, computed fresh
+        got3 = x[..., other[0], other[1]]
+        assert any(isinstance(k, tuple) and k and k[0] == "val" for k in indexing._INDEX_VALUE_CACHE)
+    assert torch.equal(got1, want) and torch.equal(got2, want)
+    assert torch.equal(got3, x[..., other[0], other[1]])
+    host_ops = {"aten.add.Tensor", "aten.mul.Tensor", "aten.where.self", "aten._to_copy.default"}
+    assert not (set(rec.ops) & host_ops), rec.ops
+
+
 def test_g2_cache_batch_vs_dim_size_and_oob_not_cached(monkeypatch):
     ix = torch.triu_indices(5, 5)
     x32 = torch.randn(32, 5, 5)

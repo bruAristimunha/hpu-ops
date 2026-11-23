@@ -64,8 +64,11 @@ HOST_INDEX = "index: CPU index tensors checked and linearized on the host"
 INDEX_CACHE_SIZE = 128
 INDEX_CACHE_BYTES = 64 << 20
 INDEX_CACHE_ENTRY_MAX_BYTES = 16 << 20
+INDEX_VALUE_MAX_NUMEL = 8192  # value-keyed cache: hashing a CPU index tensor's bytes pays below this size
 _INDEX_LOCK = threading.RLock()
 _INDEX_CACHE = collections.OrderedDict()
+_INDEX_VALUE_CACHE = collections.OrderedDict()
+_INDEX_VALUE_BYTES = 0
 _DEAD_KEYS = collections.deque()
 _INDEX_BYTES = 0
 
@@ -121,11 +124,13 @@ def _drain_dead_keys_locked():
 
 
 def _clear_cache():
-    global _INDEX_BYTES
+    global _INDEX_BYTES, _INDEX_VALUE_BYTES
     with _INDEX_LOCK:
         _INDEX_CACHE.clear()
+        _INDEX_VALUE_CACHE.clear()
         _DEAD_KEYS.clear()
         _INDEX_BYTES = 0
+        _INDEX_VALUE_BYTES = 0
 
 
 def _cache_key_and_storages(self, indices, pos, start, end, flat_dims_rel, exact):
@@ -145,6 +150,22 @@ def _cache_key_and_storages(self, indices, pos, start, end, flat_dims_rel, exact
         idx_meta.append((t.data_ptr(), t._version, t.dtype, tuple(t.shape), tuple(t.stride()), cd))
     key = (str(self.device), tuple(self.shape[start:end + 1]), flat_dims_rel, exact, tuple(idx_meta))
     return key, storages
+
+
+def _value_key(self, indices, pos, start, end, flat_dims_rel, exact):
+    """The ptr-key with each index tensor's bytes hashed in place of (data_ptr, version): a caller that builds
+    fresh equal indices every step (spd_learn's triu_indices) hits where the ptr key cannot. Small tensors only:
+    the hash reads every value (already on the host, no sync)."""
+    if sum(indices[i].numel() for i in pos) > INDEX_VALUE_MAX_NUMEL:
+        return None
+    idx_meta = []
+    for d in range(start, end + 1):
+        t = indices[d]
+        if t is None:
+            idx_meta.append(None)
+            continue
+        idx_meta.append((t.dtype, tuple(t.shape), tuple(t.stride()), hash(t.contiguous().numpy().tobytes())))
+    return ("val", str(self.device), tuple(self.shape[start:end + 1]), flat_dims_rel, exact, tuple(idx_meta))
 
 
 def _cache_lookup(self, indices):
@@ -172,14 +193,21 @@ def _cache_lookup(self, indices):
     with _INDEX_LOCK:
         _drain_dead_keys_locked()
         entry = _INDEX_CACHE.get(key)
+        if entry is not None:
+            lin_flat, lin_true, nbytes, refs = entry
+            if not all(wr() is st for (wr, _), st in zip(refs, storages)):
+                _INDEX_CACHE.pop(key)
+                _INDEX_BYTES -= nbytes
+                entry = None
+            else:
+                _INDEX_CACHE.move_to_end(key)
         if entry is None:
-            return None
-        lin_flat, lin_true, nbytes, refs = entry
-        if not all(wr() is st for (wr, _), st in zip(refs, storages)):
-            _INDEX_CACHE.pop(key)
-            _INDEX_BYTES -= nbytes
-            return None
-        _INDEX_CACHE.move_to_end(key)
+            vkey = _value_key(self, indices, pos, start, end, flat_dims_rel, exact)
+            entry = _INDEX_VALUE_CACHE.get(vkey) if vkey is not None else None
+            if entry is None:
+                return None
+            lin_flat, lin_true = entry[0], entry[1]
+            _INDEX_VALUE_CACHE.move_to_end(vkey)
     mids = [d for d in range(start, end + 1) if indices[d] is None]
     flat_dims = [start + rel for rel in flat_dims_rel]
     return lin_flat, lin_true, start, end, bshape, mids, flat_dims
@@ -205,6 +233,27 @@ def _cache_store(key, storages, indices, pos, snap, lin_flat, lin_true):
         while len(_INDEX_CACHE) > 1 and (len(_INDEX_CACHE) > INDEX_CACHE_SIZE or _INDEX_BYTES > INDEX_CACHE_BYTES):
             _, evicted = _INDEX_CACHE.popitem(last=False)
             _INDEX_BYTES -= evicted[2]
+
+
+def _cache_store_value(vkey, lin_flat, lin_true):
+    global _INDEX_VALUE_BYTES
+    if vkey is None:
+        return
+    nbytes = lin_flat.numel() * lin_flat.element_size() + (
+        0 if lin_true is None else lin_true.numel() * lin_true.element_size()
+    )
+    if nbytes > INDEX_CACHE_ENTRY_MAX_BYTES:
+        return
+    with _INDEX_LOCK:
+        old = _INDEX_VALUE_CACHE.pop(vkey, None)
+        if old is not None:
+            _INDEX_VALUE_BYTES -= old[2]
+        _INDEX_VALUE_CACHE[vkey] = (lin_flat, lin_true, nbytes, ())
+        _INDEX_VALUE_BYTES += nbytes
+        while len(_INDEX_VALUE_CACHE) > 1 and (
+                len(_INDEX_VALUE_CACHE) > INDEX_CACHE_SIZE or _INDEX_VALUE_BYTES > INDEX_CACHE_BYTES):
+            _, evicted = _INDEX_VALUE_CACHE.popitem(last=False)
+            _INDEX_VALUE_BYTES -= evicted[2]
 
 
 def _off_device(self, t):
@@ -345,6 +394,7 @@ def index_select_flat(self, indices, checked=True, cache=True):
                 lin_true = torch.broadcast_to(lin_true, shape).reshape(-1).to(self.device)
         if can_cache:
             _cache_store(key, storages, indices, pos, snap, lin_flat, lin_true)
+            _cache_store_value(_value_key(self, indices, pos, start, end, flat_dims_rel, exact), lin_flat, lin_true)
     return _finish_index_select(self, lin_flat, lin_true, start, end, bshape, mids, flat_dims)
 
 
