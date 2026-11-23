@@ -11,6 +11,8 @@ does (FTZ/DAZ), and the reciprocal is the kernels' bit-level Newton ``lut_free_r
 ``legacy=True`` replays the arithmetic of the kernels before the Codex review (Gauss-Jordan normalizing the pivot row
 by 1/pivot; substitution summing the products before one subtraction), so a test can show that it reproduces the
 reported failures and that the current arithmetic does not."""
+import struct
+
 import numpy as np
 
 F32 = np.float32
@@ -454,12 +456,24 @@ def lu_solve(LU, pivots, B, legacy_recip=False):
     return b
 
 
+_IDX32 = np.arange(32)
+_XOR32_SHIFTS = tuple(_IDX32 ^ sh for sh in (16, 8, 4, 2, 1))
+
+
 def _red_add(v):
     """``reduce_add_half32`` of a 32-lane vector (the butterfly; every lane ends with the same sum)."""
     v = np.asarray(v, F32).copy()
+    for perm in _XOR32_SHIFTS:
+        v = add(v, v[perm])
+    return v[0]
+
+
+def _red_max_32(v):
+    """``reduce_max_half32`` of a 32-lane vector (every lane ends with the same max)."""
+    v = np.asarray(v, F32).copy()
     idx = np.arange(32)
     for sh in (16, 8, 4, 2, 1):
-        v = add(v, v[idx ^ sh])
+        v = np.maximum(v, v[idx ^ sh]).astype(F32)
     return v[0]
 
 
@@ -1742,11 +1756,225 @@ def _clartg(fr, fi, gr, gi):
     return cs, snr, sni, mul(pfr, r_abs), mul(pfi, r_abs)
 
 
-def ceig_kernel(A, compute_vectors=True):
-    """``(W, V, info)`` of ``ceig_f32_gaudi2.c`` (``ceigvals_f32_gaudi2`` with ``compute_vectors=False``, where
-    ``V`` is ``None``) for one planar ``A[2n, n]`` (rows 0..n-1 real, n..2n-1 imag): ``W[2, n]`` eigenvalues
-    (row 0 real, row 1 imag), ``V[2n, n]`` unit-2-norm eigenvectors as columns (None if ``not compute_vectors``),
-    ``info[1]`` (0 if converged; >0 if QR iteration limit reached). Non-finite input: NaN W and V."""
+_XOR64_SHIFTS = (_XOR16, _XOR32, _XOR8, _XOR4, _XOR2, _XOR1)
+
+
+def _ceig_sftz(x):
+    fx = float(x)
+    if -TINY < fx < TINY:
+        return F32(-0.0) if fx < 0.0 else F32(0.0)
+    return F32(fx)
+
+
+def _ceig_aftz(x):
+    if np.any(np.abs(x) < TINY):
+        return np.where(np.abs(x) < TINY, F32(0) * np.sign(x), x).astype(F32)
+    return x
+
+
+def _ceig_smul(a, b):
+    return _ceig_sftz(a * b)
+
+
+def _ceig_sadd(a, b):
+    return _ceig_sftz(a + b)
+
+
+def _ceig_ssub(a, b):
+    return _ceig_sftz(a - b)
+
+
+def _ceig_smac(a, b, acc):
+    return _ceig_sftz(float(acc) + float(a) * float(b))
+
+
+def _ceig_amul(a, b):
+    return _ceig_aftz(a * b)
+
+
+def _ceig_aadd(a, b):
+    return _ceig_aftz(a + b)
+
+
+def _ceig_amac(a, b, acc):
+    return _ceig_aftz((acc.astype(np.float64) + float(a) * b.astype(np.float64)).astype(F32))
+
+
+def _ceig_amac_vv(a, b, acc):
+    return _ceig_aftz((acc.astype(np.float64) + a.astype(np.float64) * b.astype(np.float64)).astype(F32))
+
+
+def _ceig_su32(x):
+    return struct.unpack("<I", struct.pack("<f", float(x)))[0]
+
+
+def _ceig_sf32(bits):
+    return F32(struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0])
+
+
+def _ceig_red32(v):
+    v = v.copy()
+    for perm in _XOR32_SHIFTS:
+        v = _ceig_aadd(v, v[perm])
+    return v[0]
+
+
+def _ceig_red64(v):
+    for perm in _XOR64_SHIFTS:
+        v = _ceig_aadd(v, v[perm])
+    return v[0]
+
+
+def _ceig_spow2_scale(m):
+    e = (_ceig_su32(m) >> 23) & 0xFF
+    if e == 0:
+        return F32(1)
+    return _ceig_sf32(((254 - min(e, 253)) & 0xFFFFFFFF) << 23)
+
+
+def _ceig_spow2_unscale(m):
+    e = (_ceig_su32(m) >> 23) & 0xFF
+    if e == 0:
+        return F32(1)
+    return _ceig_sf32((min(e, 253) & 0xFFFFFFFF) << 23)
+
+
+def _ceig_srsqrt_fine(x):
+    if x == 0:
+        x = F32(1)
+    if x < F32(2.0 ** -125):
+        sc, out_m = F32(4.0), F32(2.0)
+    elif x >= F32(2.0 ** 120):
+        sc, out_m = F32(2.0 ** -8), F32(2.0 ** -4)
+    else:
+        sc, out_m = F32(1.0), F32(1.0)
+    xs = _ceig_smul(x, sc)
+    y = _ceig_sf32((0x5F375A86 - (_ceig_su32(xs) >> 1)) & 0xFFFFFFFF)
+    hx = _ceig_smul(xs, F32(-0.5))
+    y = _ceig_smul(y, _ceig_smac(hx, _ceig_smul(y, y), F32(1.5)))
+    y = _ceig_smul(y, _ceig_smac(hx, _ceig_smul(y, y), F32(1.5)))
+    e = _ceig_smac(_ceig_ssub(F32(0), _ceig_smul(xs, y)), y, F32(1))
+    return _ceig_smul(_ceig_smac(_ceig_smul(y, F32(0.5)), e, y), out_m)
+
+
+def _ceig_srecip(x):
+    bits = _ceig_su32(x)
+    sign = bits & 0x80000000
+    abits = bits & 0x7FFFFFFF
+    if abits == 0x7F800000:
+        return _ceig_sf32(sign)
+    if abits == 0:
+        return F32(0.0)
+    if abits > 0x7F800000:
+        return x
+    if abits < 0x00800000:
+        nbits = _ceig_su32(_ceig_ssub(_ceig_sf32(abits | 0x3F800000), F32(1)))
+        e_adj = 126
+    else:
+        nbits = abits
+        e_adj = 0
+    m = _ceig_sf32((nbits & 0x007FFFFF) | 0x3F000000)
+    y = _ceig_smac(m, F32(2.58586), F32(-5.81818))
+    y = _ceig_smac(m, y, F32(4.24242))
+    nm = _ceig_ssub(F32(0), m)
+    for _ in range(3):
+        err = _ceig_smac(nm, y, F32(1))
+        y = _ceig_smac(y, err, y)
+    yb = _ceig_su32(y)
+    ey = yb >> 23
+    ymant = yb & 0x007FFFFF
+    e_in = nbits >> 23
+    e_biased = (ey + 382 + e_adj - e_in) & 0xFFFFFFFF
+    if e_biased >= 511:
+        res = sign | 0x7F800000
+    elif e_biased < 257:
+        res = sign | ((0x00800000 | ymant) >> min(257 - e_biased, 63))
+    else:
+        res = sign | (((e_biased - 256) & 0xFFFFFFFF) << 23) | ymant
+    return _ceig_sftz(_ceig_sf32(res))
+
+
+def _ceig_scdiv(ar, ai, br, bi):
+    bm = F32(max(abs(float(br)), abs(float(bi))))
+    am = F32(max(abs(float(ar)), abs(float(ai))))
+    if bm == 0 or am == 0:
+        return F32(0), F32(0)
+    tb = _ceig_spow2_scale(bm)
+    btr, bti = _ceig_smul(br, tb), _ceig_smul(bi, tb)
+    den = _ceig_smac(bti, bti, _ceig_smul(btr, btr))
+    inv_den = _ceig_srecip(den)
+    ta = _ceig_spow2_scale(am)
+    atr, ati = _ceig_smul(ar, ta), _ceig_smul(ai, ta)
+    nr = _ceig_smac(ati, bti, _ceig_smul(atr, btr))
+    ni = _ceig_smac(_ceig_ssub(F32(0), atr), bti, _ceig_smul(ati, btr))
+    qr, qi = _ceig_smul(nr, inv_den), _ceig_smul(ni, inv_den)
+    ea = min(253, (_ceig_su32(am) >> 23) & 0xFF)
+    eb = min(253, (_ceig_su32(bm) >> 23) & 0xFF)
+    ediff = ea - eb
+    exp_biased = 127 + ediff
+    if exp_biased >= 255:
+        e1 = ediff >> 1
+        e2 = ediff - e1
+        s1 = _ceig_sf32(min(254, max(1, 127 + e1)) << 23)
+        s2 = _ceig_sf32(min(254, max(1, 127 + e2)) << 23)
+        return _ceig_smul(_ceig_smul(qr, s1), s2), _ceig_smul(_ceig_smul(qi, s1), s2)
+    if exp_biased <= 0:
+        return F32(0), F32(0)
+    scale_q = _ceig_sf32(exp_biased << 23)
+    return _ceig_smul(qr, scale_q), _ceig_smul(qi, scale_q)
+
+
+def _ceig_scsqrt(zr, zi):
+    m = F32(max(abs(float(zr)), abs(float(zi))))
+    if m == 0:
+        return F32(0), F32(0)
+    e = (_ceig_su32(m) >> 23) & 0xFF
+    unb = (e - 127) & ~1
+    sc = _ceig_sf32((127 - unb) << 23)
+    un_sqrt = _ceig_sf32((127 + (unb >> 1)) << 23)
+    u, v = _ceig_smul(zr, sc), _ceig_smul(zi, sc)
+    n2 = _ceig_smac(v, v, _ceig_smul(u, u))
+    r = _ceig_smul(n2, _ceig_srsqrt_fine(n2))
+    if u >= 0:
+        s2 = _ceig_smul(_ceig_sadd(r, u), F32(0.5))
+        wr = _ceig_smul(s2, _ceig_srsqrt_fine(s2))
+        wi = _ceig_smul(v, _ceig_srecip(_ceig_smul(F32(2), wr)))
+    else:
+        s2 = _ceig_smul(_ceig_ssub(r, u), F32(0.5))
+        wi = _ceig_smul(s2, _ceig_srsqrt_fine(s2))
+        if v < 0:
+            wi = _ceig_ssub(F32(0), wi)
+        wr = _ceig_smul(v, _ceig_srecip(_ceig_smul(F32(2), wi)))
+    return _ceig_smul(wr, un_sqrt), _ceig_smul(wi, un_sqrt)
+
+
+def _ceig_sclartg(fr, fi, gr, gi):
+    mx = F32(max(abs(float(fr)), abs(float(fi)), abs(float(gr)), abs(float(gi))))
+    t = _ceig_spow2_scale(mx)
+    un_t = _ceig_spow2_unscale(mx)
+    fsr, fsi = _ceig_smul(fr, t), _ceig_smul(fi, t)
+    gsr, gsi = _ceig_smul(gr, t), _ceig_smul(gi, t)
+    f2 = _ceig_smac(fsi, fsi, _ceig_smul(fsr, fsr))
+    g2 = _ceig_smac(gsi, gsi, _ceig_smul(gsr, gsr))
+    if g2 == 0:
+        return F32(1), F32(0), F32(0), fr, fi
+    fg2 = _ceig_sadd(f2, g2)
+    inv_fg = _ceig_srsqrt_fine(fg2)
+    if f2 == 0:
+        g_abs = _ceig_smul(_ceig_smul(g2, inv_fg), un_t)
+        return F32(0), _ceig_smul(gsr, inv_fg), _ceig_smul(_ceig_ssub(F32(0), gsi), inv_fg), g_abs, F32(0)
+    inv_f = _ceig_srsqrt_fine(f2)
+    f_abs_s = _ceig_smul(f2, inv_f)
+    cs = _ceig_smul(f_abs_s, inv_fg)
+    pfr, pfi = _ceig_smul(fsr, inv_f), _ceig_smul(fsi, inv_f)
+    snr = _ceig_smul(_ceig_smac(pfi, gsi, _ceig_smul(pfr, gsr)), inv_fg)
+    sni = _ceig_smul(_ceig_smac(_ceig_ssub(F32(0), pfr), gsi, _ceig_smul(pfi, gsr)), inv_fg)
+    r_abs = _ceig_smul(_ceig_smul(fg2, inv_fg), un_t)
+    return cs, snr, sni, _ceig_smul(pfr, r_abs), _ceig_smul(pfi, r_abs)
+
+
+def _ceig_core(A, compute_vectors=True, maxn=32, v_transposed=False):
+    red_add = _ceig_red64 if maxn == 64 else _ceig_red32
     with np.errstate(all="ignore"):
         A = np.array(A, dtype=F32)
         n = A.shape[1]
@@ -1767,9 +1995,9 @@ def ceig_kernel(A, compute_vectors=True):
             return W1, V1, np.array([0.0], F32)
 
         # Entry prescaling by exact power of 2 so max(|ar|, |ai|) in [1, 2) (or [2, 4) for e == 254)
-        sc_entry = _ceig_pow2_scale(max_abs)
-        unsc_entry = _ceig_pow2_unscale(max_abs)
-        ar, ai = mul(ar, sc_entry), mul(ai, sc_entry)
+        sc_entry = _ceig_spow2_scale(max_abs)
+        unsc_entry = _ceig_spow2_unscale(max_abs)
+        ar, ai = _ceig_amul(ar, sc_entry), _ceig_amul(ai, sc_entry)
 
         # Stage 1: Parlett-Reinsch radix-2 diagonal balancing (16 sweeps, branchless binary-power steps)
         d_scale = np.ones(n, dtype=F32)
@@ -1777,31 +2005,31 @@ def ceig_kernel(A, compute_vectors=True):
         SFMAX2 = F32(2.0 ** 101)
         P2S = [F32(2.0 ** p) for p in (64, 32, 16, 8, 4, 2, 1, 1)]
         IP2S = [F32(2.0 ** -p) for p in (64, 32, 16, 8, 4, 2, 1, 1)]
+        row_a = np.zeros(maxn, dtype=F32)
+        col_a = np.zeros(maxn, dtype=F32)
         for _ in range(16):
             converged = True
             for i in range(n):
-                row_a = np.zeros(32, dtype=F32)
-                col_a = np.zeros(32, dtype=F32)
-                for j in range(n):
-                    if j != i:
-                        row_a[j] = _cabs1(ar[i, j], ai[i, j])
-                        col_a[j] = _cabs1(ar[j, i], ai[j, i])
-                r = _red_add(row_a)
+                row_a[:n] = _ceig_aftz(np.abs(ar[i, :n]) + np.abs(ai[i, :n]))
+                col_a[:n] = _ceig_aftz(np.abs(ar[:n, i]) + np.abs(ai[:n, i]))
+                row_a[i] = F32(0)
+                col_a[i] = F32(0)
+                r = red_add(row_a)
                 ra = F32(np.max(row_a))
-                c = _red_add(col_a)
+                c = red_add(col_a)
                 ca = F32(np.max(col_a))
                 if c == 0 or r == 0:
                     continue
-                g = mul(r, F32(0.5))
+                g = _ceig_smul(r, F32(0.5))
                 f, inv_f = F32(1), F32(1)
-                s0 = add(c, r)
+                s0 = _ceig_sadd(c, r)
                 for st in range(8):
                     p, ip = P2S[st], IP2S[st]
-                    c_test = mul(c, p) if st < 7 else c
-                    g_test = mul(g, ip) if st < 7 else g
-                    f_n, inv_n = mul(f, p), mul(inv_f, ip)
-                    c_n, ca_n = mul(c, p), mul(ca, p)
-                    r_n, g_n, ra_n = mul(r, ip), mul(g, ip), mul(ra, ip)
+                    c_test = _ceig_smul(c, p) if st < 7 else c
+                    g_test = _ceig_smul(g, ip) if st < 7 else g
+                    f_n, inv_n = _ceig_smul(f, p), _ceig_smul(inv_f, ip)
+                    c_n, ca_n = _ceig_smul(c, p), _ceig_smul(ca, p)
+                    r_n, g_n, ra_n = _ceig_smul(r, ip), _ceig_smul(g, ip), _ceig_smul(ra, ip)
                     ok = (c_test < g_test and max(f, c, ca) < SFMAX2 and min(r, g, ra) > SFMIN2)
                     if st < 7:
                         ok = ok and max(f_n, c_n, ca_n) < SFMAX2 and min(r_n, g_n, ra_n) > SFMIN2
@@ -1809,14 +2037,14 @@ def ceig_kernel(A, compute_vectors=True):
                         f, inv_f = f_n, inv_n
                         c, ca = c_n, ca_n
                         r, g, ra = r_n, g_n, ra_n
-                g = mul(c, F32(0.5))
+                g = _ceig_smul(c, F32(0.5))
                 for st in range(8):
                     p, ip = P2S[st], IP2S[st]
-                    g_test = mul(g, ip) if st < 7 else g
-                    r_test = mul(r, p) if st < 7 else r
-                    f_n, inv_n = mul(f, ip), mul(inv_f, p)
-                    r_n, ra_n = mul(r, p), mul(ra, p)
-                    c_n, g_n, ca_n = mul(c, ip), mul(g, ip), mul(ca, ip)
+                    g_test = _ceig_smul(g, ip) if st < 7 else g
+                    r_test = _ceig_smul(r, p) if st < 7 else r
+                    f_n, inv_n = _ceig_smul(f, ip), _ceig_smul(inv_f, p)
+                    r_n, ra_n = _ceig_smul(r, p), _ceig_smul(ra, p)
+                    c_n, g_n, ca_n = _ceig_smul(c, ip), _ceig_smul(g, ip), _ceig_smul(ca, ip)
                     ok = (g_test >= r_test and max(f, r, ra) < SFMAX2 and min(inv_f, c, g, ca) > SFMIN2)
                     if st < 7:
                         ok = ok and max(f_n, r_n, ra_n) < SFMAX2 and min(inv_n, c_n, g_n, ca_n) > SFMIN2
@@ -1824,11 +2052,11 @@ def ceig_kernel(A, compute_vectors=True):
                         f, inv_f = f_n, inv_n
                         r, ra = r_n, ra_n
                         c, g, ca = c_n, g_n, ca_n
-                if add(c, r) < mul(F32(0.95), s0):
+                if _ceig_sadd(c, r) < _ceig_smul(F32(0.95), s0):
                     converged = False
-                    d_scale[i] = mul(d_scale[i], f)
-                    ar[i, :], ai[i, :] = mul(ar[i, :], inv_f), mul(ai[i, :], inv_f)
-                    ar[:, i], ai[:, i] = mul(ar[:, i], f), mul(ai[:, i], f)
+                    d_scale[i] = _ceig_smul(d_scale[i], f)
+                    ar[i, :], ai[i, :] = _ceig_amul(ar[i, :], inv_f), _ceig_amul(ai[i, :], inv_f)
+                    ar[:, i], ai[:, i] = _ceig_amul(ar[:, i], f), _ceig_amul(ai[:, i], f)
             if converged:
                 break
 
@@ -1838,106 +2066,112 @@ def ceig_kernel(A, compute_vectors=True):
             qi = np.zeros((n, n), dtype=F32)
 
         for k in range(n - 2):
-            mx = F32(0)
-            for i in range(k + 1, n):
-                mx = max(mx, abs(ar[i, k]), abs(ai[i, k]))
+            mx = F32(max(float(np.max(np.abs(ar[k + 1:n, k]))), float(np.max(np.abs(ai[k + 1:n, k])))))
             if mx == 0:
                 continue
-            if not any(ar[i, k] != 0 or ai[i, k] != 0 for i in range(k + 2, n)):
+            if not (np.any(ar[k + 2:n, k] != 0) or np.any(ai[k + 2:n, k] != 0)):
                 continue
-            t = _ceig_pow2_scale(mx)
-            un_t = _ceig_pow2_unscale(mx)
-            sxr = np.zeros(32, dtype=F32)
-            sxi = np.zeros(32, dtype=F32)
-            sxr[k + 1:n] = mul(ar[k + 1:n, k], t)
-            sxi[k + 1:n] = mul(ai[k + 1:n, k], t)
-            sq = _red_add(mac(sxi, sxi, mul(sxr, sxr)))
-            xnorm = mul(mul(sq, F32(_ceig_rsqrt_fine(sq))), un_t)
+            t = _ceig_spow2_scale(mx)
+            un_t = _ceig_spow2_unscale(mx)
+            sxr = np.zeros(maxn, dtype=F32)
+            sxi = np.zeros(maxn, dtype=F32)
+            sxr[k + 1:n] = _ceig_amul(ar[k + 1:n, k], t)
+            sxi[k + 1:n] = _ceig_amul(ai[k + 1:n, k], t)
+            sq = red_add(_ceig_amac_vv(sxi, sxi, _ceig_amul(sxr, sxr)))
+            xnorm = _ceig_smul(_ceig_smul(sq, _ceig_srsqrt_fine(sq)), un_t)
             if xnorm == 0:
                 continue
             alr, ali = ar[k + 1, k], ai[k + 1, k]
-            beta = sub(F32(0), xnorm) if alr >= 0 else xnorm
-            inv_beta = recip(beta, zero_to_inf=False)[0]
-            taur = sub(F32(1), mul(alr, inv_beta))
-            taui = sub(F32(0), mul(ali, inv_beta))
-            dr, di = sub(alr, beta), ali
+            beta = _ceig_ssub(F32(0), xnorm) if alr >= 0 else xnorm
+            inv_beta = _ceig_srecip(beta)
+            taur = _ceig_ssub(F32(1), _ceig_smul(alr, inv_beta))
+            taui = _ceig_ssub(F32(0), _ceig_smul(ali, inv_beta))
+            dr, di = _ceig_ssub(alr, beta), ali
             vr = np.zeros(n, dtype=F32)
             vi = np.zeros(n, dtype=F32)
             vr[k + 1] = F32(1)
             for i in range(k + 2, n):
-                vr[i], vi[i] = _cdiv(ar[i, k], ai[i, k], dr, di)
+                vr[i], vi[i] = _ceig_scdiv(ar[i, k], ai[i, k], dr, di)
             drr, dri = np.zeros(n, dtype=F32), np.zeros(n, dtype=F32)
             for i in range(k + 1, n):
-                cvr, cvi = vr[i], sub(F32(0), vi[i])
-                drr[k + 1:] = add(drr[k + 1:], mac(sub(F32(0), cvi), ai[i, k + 1:], mul(cvr, ar[i, k + 1:])))
-                dri[k + 1:] = add(dri[k + 1:], mac(cvi, ar[i, k + 1:], mul(cvr, ai[i, k + 1:])))
-            ctaur, ctaui = taur, sub(F32(0), taui)
+                cvr, cvi = vr[i], _ceig_ssub(F32(0), vi[i])
+                drr[k + 1:] = _ceig_aadd(drr[k + 1:], _ceig_amac(_ceig_ssub(F32(0), cvi), ai[i, k + 1:], _ceig_amul(ar[i, k + 1:], cvr)))
+                dri[k + 1:] = _ceig_aadd(dri[k + 1:], _ceig_amac(cvi, ar[i, k + 1:], _ceig_amul(ai[i, k + 1:], cvr)))
+            ctaur, ctaui = taur, _ceig_ssub(F32(0), taui)
             for i in range(k + 1, n):
-                mr, mi = _cmul(ctaur, ctaui, vr[i], vi[i])
-                ar[i, k + 1:] = mac(mi, dri[k + 1:], mac(sub(F32(0), mr), drr[k + 1:], ar[i, k + 1:]))
-                ai[i, k + 1:] = mac(sub(F32(0), mi), drr[k + 1:], mac(sub(F32(0), mr), dri[k + 1:], ai[i, k + 1:]))
+                mr = _ceig_smac(_ceig_ssub(F32(0), ctaui), vi[i], _ceig_smul(ctaur, vr[i]))
+                mi = _ceig_smac(ctaui, vr[i], _ceig_smul(ctaur, vi[i]))
+                nmr = _ceig_ssub(F32(0), mr)
+                ar[i, k + 1:] = _ceig_amac(mi, dri[k + 1:], _ceig_amac(nmr, drr[k + 1:], ar[i, k + 1:]))
+                ai[i, k + 1:] = _ceig_amac(_ceig_ssub(F32(0), mi), drr[k + 1:], _ceig_amac(nmr, dri[k + 1:], ai[i, k + 1:]))
             ar[k + 1, k], ai[k + 1, k] = beta, F32(0)
             ar[k + 2:, k], ai[k + 2:, k] = F32(0), F32(0)
-            vr_32 = np.pad(vr, (0, 32 - n))
-            vi_32 = np.pad(vi, (0, 32 - n))
+            vr_pad = np.pad(vr, (0, maxn - n))
+            vi_pad = np.pad(vi, (0, maxn - n))
+            ar_i = np.zeros(maxn, dtype=F32)
+            ai_i = np.zeros(maxn, dtype=F32)
             for i in range(n):
-                ar_i = np.pad(ar[i], (0, 32 - n))
-                ai_i = np.pad(ai[i], (0, 32 - n))
-                sr = _red_add(mac(sub(F32(0), ai_i), vi_32, mul(ar_i, vr_32)))
-                si = _red_add(mac(ar_i, vi_32, mul(ai_i, vr_32)))
-                tsr, tsi = _cmul(taur, taui, sr, si)
-                ar[i, k + 1:] = mac(sub(F32(0), tsi), vi[k + 1:], mac(sub(F32(0), tsr), vr[k + 1:], ar[i, k + 1:]))
-                ai[i, k + 1:] = mac(tsr, vi[k + 1:], mac(sub(F32(0), tsi), vr[k + 1:], ai[i, k + 1:]))
+                ar_i[:n] = ar[i]
+                ai_i[:n] = ai[i]
+                sr = red_add(_ceig_amac_vv(-ai_i, vi_pad, _ceig_amul(ar_i, vr_pad)))
+                si = red_add(_ceig_amac_vv(ar_i, vi_pad, _ceig_amul(ai_i, vr_pad)))
+                tsr = _ceig_smac(_ceig_ssub(F32(0), taui), si, _ceig_smul(taur, sr))
+                tsi = _ceig_smac(taui, sr, _ceig_smul(taur, si))
+                ntsr, ntsi = _ceig_ssub(F32(0), tsr), _ceig_ssub(F32(0), tsi)
+                ar[i, k + 1:] = _ceig_amac(ntsi, vi[k + 1:], _ceig_amac(ntsr, vr[k + 1:], ar[i, k + 1:]))
+                ai[i, k + 1:] = _ceig_amac(tsr, vi[k + 1:], _ceig_amac(ntsi, vr[k + 1:], ai[i, k + 1:]))
             if compute_vectors:
                 sr_v, si_v = np.zeros(n, dtype=F32), np.zeros(n, dtype=F32)
                 for j in range(k + 1, n):
-                    sr_v = mac(sub(F32(0), vi[j]), qi[j], mac(vr[j], qr[j], sr_v))
-                    si_v = mac(vi[j], qr[j], mac(vr[j], qi[j], si_v))
-                tsr_v = mac(sub(F32(0), taui), si_v, mul(taur, sr_v))
-                tsi_v = mac(taui, sr_v, mul(taur, si_v))
+                    sr_v = _ceig_amac(_ceig_ssub(F32(0), vi[j]), qi[j], _ceig_amac(vr[j], qr[j], sr_v))
+                    si_v = _ceig_amac(vi[j], qr[j], _ceig_amac(vr[j], qi[j], si_v))
+                tsr_v = _ceig_amac_vv(np.full(n, _ceig_ssub(F32(0), taui), F32), si_v, _ceig_amul(sr_v, taur))
+                tsi_v = _ceig_amac_vv(np.full(n, taui, F32), sr_v, _ceig_amul(si_v, taur))
+                ntsr_v, ntsi_v = _ceig_aftz(-tsr_v), _ceig_aftz(-tsi_v)
                 for j in range(k + 1, n):
-                    cvr, cvi = vr[j], sub(F32(0), vi[j])
-                    qr[j] = mac(tsi_v, cvi, mac(sub(F32(0), tsr_v), cvr, qr[j]))
-                    qi[j] = mac(sub(F32(0), tsi_v), cvr, mac(sub(F32(0), tsr_v), cvi, qi[j]))
+                    cvr, cvi = vr[j], _ceig_ssub(F32(0), vi[j])
+                    qr[j] = _ceig_amac(cvi, tsi_v, _ceig_amac(cvr, ntsr_v, qr[j]))
+                    qi[j] = _ceig_amac(cvr, ntsi_v, _ceig_amac(cvi, ntsr_v, qi[j]))
 
-        # Stage 3: Explicit complex single-shift QR iteration (matches ceig_f32_gaudi2.c vector-predicated loop)
+        # Stage 3: Explicit complex single-shift QR iteration (matches ceig*_f32_gaudi2.c vector-predicated loop)
         m = n - 1
         prev_m = m
         max_itn = 30 * max(10, n) if n > 1 else 0
         exc_cnt = 0
-        sml = max(_EIG_SMLNUM, mul(F32(n), _EIG_SMLNUM))
+        sml = max(_EIG_SMLNUM, _ceig_smul(F32(n), _EIG_SMLNUM))
         for _step in range(max_itn):
-            defl = [False] * n
-            new_m = 0
-            for i in range(1, m + 1):
-                s_diag = add(_cabs1(ar[i - 1, i - 1], ai[i - 1, i - 1]), _cabs1(ar[i, i], ai[i, i]))
-                if _cabs1(ar[i, i - 1], ai[i, i - 1]) <= max(sml, mul(_EIG_EPS32, s_diag)):
-                    ar[i, i - 1] = F32(0)
-                    ai[i, i - 1] = F32(0)
-                    defl[i] = True
-                else:
-                    new_m = i
-            m = new_m
+            diag_abs = _ceig_aftz(np.abs(ar.diagonal()[:m + 1]) + np.abs(ai.diagonal()[:m + 1]))
+            sub_abs = _ceig_aftz(np.abs(ar.diagonal(-1)[:m]) + np.abs(ai.diagonal(-1)[:m]))
+            s_diags = _ceig_aftz(diag_abs[:-1] + diag_abs[1:])
+            tols = np.maximum(sml, _ceig_aftz(_EIG_EPS32 * s_diags))
+            defl_arr = sub_abs <= tols
+            lo = 0
+            if np.any(defl_arr):
+                idx_def = np.nonzero(defl_arr)[0] + 1
+                ar[idx_def, idx_def - 1] = F32(0)
+                ai[idx_def, idx_def - 1] = F32(0)
+                non_def = np.nonzero(~defl_arr)[0]
+                m = int(non_def[-1]) + 1 if non_def.size else 0
+                if m > 0:
+                    idx_lt = idx_def[idx_def < m]
+                    if idx_lt.size:
+                        lo = int(idx_lt[-1])
             if m < 1:
                 break
             if m != prev_m:
                 exc_cnt = 0
                 prev_m = m
             exc_cnt += 1
-            lo = 0
-            for i in range(1, m):
-                if defl[i]:
-                    lo = i
             if exc_cnt == 10:
                 exc_cnt = 0
-                s = _cabs1(ar[m, m - 1], ai[m, m - 1])
+                s = _ceig_sadd(F32(abs(float(ar[m, m - 1]))), F32(abs(float(ai[m, m - 1]))))
                 if m - 1 > lo:
-                    s = add(s, _cabs1(ar[m - 1, m - 2], ai[m - 1, m - 2]))
-                sigr = mac(F32(0.75), s, ar[m, m])
-                sigi = mac(F32(-0.4375), s, ai[m, m])
+                    s = _ceig_sadd(s, _ceig_sadd(F32(abs(float(ar[m - 1, m - 2]))), F32(abs(float(ai[m - 1, m - 2])))))
+                sigr = _ceig_smac(F32(0.75), s, ar[m, m])
+                sigi = _ceig_smac(F32(-0.4375), s, ai[m, m])
             else:
                 tr, ti = ar[m, m], ai[m, m]
-                ur, ui = sub(ar[m - 1, m - 1], tr), sub(ai[m - 1, m - 1], ti)
+                ur, ui = _ceig_ssub(ar[m - 1, m - 1], tr), _ceig_ssub(ai[m - 1, m - 1], ti)
                 br, bi = ar[m - 1, m], ai[m - 1, m]
                 cr, ci = ar[m, m - 1], ai[m, m - 1]
                 sm = max(abs(float(ur)), abs(float(ui)), abs(float(br)),
@@ -1946,130 +2180,158 @@ def ceig_kernel(A, compute_vectors=True):
                     sigr, sigi = tr, ti
                 else:
                     sm = F32(sm)
-                    sc, unsc = _ceig_pow2_scale(sm), _ceig_pow2_unscale(sm)
-                    xr, xi = mul(mul(ur, sc), F32(0.5)), mul(mul(ui, sc), F32(0.5))
-                    bsr, bsi = mul(br, sc), mul(bi, sc)
-                    csr, csi = mul(cr, sc), mul(ci, sc)
-                    vr_, vi_ = _cmul(bsr, bsi, csr, csi)
-                    x2r, x2i = _cmul(xr, xi, xr, xi)
-                    sr, si = _csqrt(add(x2r, vr_), add(x2i, vi_))
-                    if add(mul(xr, sr), mul(xi, si)) < 0:
-                        sr, si = sub(F32(0), sr), sub(F32(0), si)
-                    denr, deni = add(xr, sr), add(xi, si)
+                    sc, unsc = _ceig_spow2_scale(sm), _ceig_spow2_unscale(sm)
+                    xr, xi = _ceig_smul(_ceig_smul(ur, sc), F32(0.5)), _ceig_smul(_ceig_smul(ui, sc), F32(0.5))
+                    bsr, bsi = _ceig_smul(br, sc), _ceig_smul(bi, sc)
+                    csr, csi = _ceig_smul(cr, sc), _ceig_smul(ci, sc)
+                    vr_ = _ceig_smac(_ceig_ssub(F32(0), bsi), csi, _ceig_smul(bsr, csr))
+                    vi_ = _ceig_smac(bsi, csr, _ceig_smul(bsr, csi))
+                    x2r = _ceig_smac(_ceig_ssub(F32(0), xi), xi, _ceig_smul(xr, xr))
+                    x2i = _ceig_smac(xi, xr, _ceig_smul(xr, xi))
+                    sr, si = _ceig_scsqrt(_ceig_sadd(x2r, vr_), _ceig_sadd(x2i, vi_))
+                    if _ceig_sadd(_ceig_smul(xr, sr), _ceig_smul(xi, si)) < 0:
+                        sr, si = _ceig_ssub(F32(0), sr), _ceig_ssub(F32(0), si)
+                    denr, deni = _ceig_sadd(xr, sr), _ceig_sadd(xi, si)
                     if denr == 0 and deni == 0:
                         sigr, sigi = tr, ti
                     else:
-                        dr, di = _cdiv(vr_, vi_, denr, deni)
-                        sigr, sigi = sub(tr, mul(dr, unsc)), sub(ti, mul(di, unsc))
+                        dr, di = _ceig_scdiv(vr_, vi_, denr, deni)
+                        sigr, sigi = _ceig_ssub(tr, _ceig_smul(dr, unsc)), _ceig_ssub(ti, _ceig_smul(di, unsc))
 
+            c_end = n if compute_vectors else (m + 1)
+            r_start = 0 if compute_vectors else lo
             for k in range(lo, m):
                 if k == lo:
-                    fr, fi = sub(ar[lo, lo], sigr), sub(ai[lo, lo], sigi)
+                    fr, fi = _ceig_ssub(ar[lo, lo], sigr), _ceig_ssub(ai[lo, lo], sigi)
                     gr, gi = ar[lo + 1, lo], ai[lo + 1, lo]
                 else:
                     fr, fi = ar[k, k - 1], ai[k, k - 1]
                     gr, gi = ar[k + 1, k - 1], ai[k + 1, k - 1]
-                cs, snr, sni, rr, ri = _clartg(fr, fi, gr, gi)
+                cs, snr, sni, rr, ri = _ceig_sclartg(fr, fi, gr, gi)
                 if k > lo:
                     ar[k, k - 1], ai[k, k - 1] = rr, ri
                     ar[k + 1, k - 1], ai[k + 1, k - 1] = F32(0), F32(0)
-                c_start, c_end = k, (n if compute_vectors else (m + 1))
-                r0r, r0i = ar[k, c_start:c_end].copy(), ai[k, c_start:c_end].copy()
-                r1r, r1i = ar[k + 1, c_start:c_end].copy(), ai[k + 1, c_start:c_end].copy()
-                ar[k, c_start:c_end] = mac(sub(F32(0), sni), r1i, mac(snr, r1r, mul(cs, r0r)))
-                ai[k, c_start:c_end] = mac(sni, r1r, mac(snr, r1i, mul(cs, r0i)))
-                nsnr, nsni = sub(F32(0), snr), sni
-                ar[k + 1, c_start:c_end] = mac(sub(F32(0), nsni), r0i, mac(nsnr, r0r, mul(cs, r1r)))
-                ai[k + 1, c_start:c_end] = mac(nsni, r0r, mac(nsnr, r0i, mul(cs, r1i)))
-                r_start, r_end = (0 if compute_vectors else lo), min(k + 3, m + 1)
-                csnr, csni = snr, sub(F32(0), sni)
-                nsr, nsi = sub(F32(0), snr), sub(F32(0), sni)
-                for i in range(r_start, r_end):
-                    ckr, cki = ar[i, k], ai[i, k]
-                    ck1r, ck1i = ar[i, k + 1], ai[i, k + 1]
-                    ar[i, k] = mac(sub(F32(0), csni), ck1i, mac(csnr, ck1r, mul(cs, ckr)))
-                    ai[i, k] = mac(csni, ck1r, mac(csnr, ck1i, mul(cs, cki)))
-                    ar[i, k + 1] = mac(sub(F32(0), nsi), cki, mac(nsr, ckr, mul(cs, ck1r)))
-                    ai[i, k + 1] = mac(nsi, ckr, mac(nsr, cki, mul(cs, ck1i)))
+                r0r, r0i = ar[k, k:c_end].copy(), ai[k, k:c_end].copy()
+                r1r, r1i = ar[k + 1, k:c_end].copy(), ai[k + 1, k:c_end].copy()
+                nsni = _ceig_ssub(F32(0), sni)
+                ar[k, k:c_end] = _ceig_amac(nsni, r1i, _ceig_amac(snr, r1r, _ceig_amul(r0r, cs)))
+                ai[k, k:c_end] = _ceig_amac(sni, r1r, _ceig_amac(snr, r1i, _ceig_amul(r0i, cs)))
+                nsnr, nsni_l = _ceig_ssub(F32(0), snr), sni
+                ar[k + 1, k:c_end] = _ceig_amac(_ceig_ssub(F32(0), nsni_l), r0i, _ceig_amac(nsnr, r0r, _ceig_amul(r1r, cs)))
+                ai[k + 1, k:c_end] = _ceig_amac(nsni_l, r0r, _ceig_amac(nsnr, r0i, _ceig_amul(r1i, cs)))
+                r_end = min(k + 3, m + 1)
+                csnr, csni = snr, nsni
+                nsr, nsi = nsnr, nsni
+                sl = slice(r_start, r_end)
+                ckr, cki = ar[sl, k].copy(), ai[sl, k].copy()
+                ck1r, ck1i = ar[sl, k + 1].copy(), ai[sl, k + 1].copy()
+                ar[sl, k] = _ceig_amac(_ceig_ssub(F32(0), csni), ck1i, _ceig_amac(csnr, ck1r, _ceig_amul(ckr, cs)))
+                ai[sl, k] = _ceig_amac(csni, ck1r, _ceig_amac(csnr, ck1i, _ceig_amul(cki, cs)))
+                ar[sl, k + 1] = _ceig_amac(_ceig_ssub(F32(0), nsi), cki, _ceig_amac(nsr, ckr, _ceig_amul(ck1r, cs)))
+                ai[sl, k + 1] = _ceig_amac(nsi, ckr, _ceig_amac(nsr, cki, _ceig_amul(ck1i, cs)))
                 if compute_vectors:
                     qk0r, qk0i = qr[k].copy(), qi[k].copy()
                     qk1r, qk1i = qr[k + 1].copy(), qi[k + 1].copy()
-                    qr[k] = mac(sub(F32(0), csni), qk1i, mac(csnr, qk1r, mul(cs, qk0r)))
-                    qi[k] = mac(csni, qk1r, mac(csnr, qk1i, mul(cs, qk0i)))
-                    qr[k + 1] = mac(sub(F32(0), nsi), qk0i, mac(nsr, qk0r, mul(cs, qk1r)))
-                    qi[k + 1] = mac(nsi, qk0r, mac(nsr, qk0i, mul(cs, qk1i)))
+                    qr[k] = _ceig_amac(_ceig_ssub(F32(0), csni), qk1i, _ceig_amac(csnr, qk1r, _ceig_amul(qk0r, cs)))
+                    qi[k] = _ceig_amac(csni, qk1r, _ceig_amac(csnr, qk1i, _ceig_amul(qk0i, cs)))
+                    qr[k + 1] = _ceig_amac(_ceig_ssub(F32(0), nsi), qk0i, _ceig_amac(nsr, qk0r, _ceig_amul(qk1r, cs)))
+                    qi[k + 1] = _ceig_amac(nsi, qk0r, _ceig_amac(nsr, qk0i, _ceig_amul(qk1i, cs)))
 
         final_m = 0
         for i in range(1, m + 1):
-            s_diag = add(_cabs1(ar[i - 1, i - 1], ai[i - 1, i - 1]), _cabs1(ar[i, i], ai[i, i]))
-            if _cabs1(ar[i, i - 1], ai[i, i - 1]) <= max(sml, mul(_EIG_EPS32, s_diag)):
+            d0 = _ceig_sadd(F32(abs(float(ar[i - 1, i - 1]))), F32(abs(float(ai[i - 1, i - 1]))))
+            d1 = _ceig_sadd(F32(abs(float(ar[i, i]))), F32(abs(float(ai[i, i]))))
+            s_diag = _ceig_sadd(d0, d1)
+            sub_d = _ceig_sadd(F32(abs(float(ar[i, i - 1]))), F32(abs(float(ai[i, i - 1]))))
+            if sub_d <= max(sml, _ceig_smul(_EIG_EPS32, s_diag)):
                 ar[i, i - 1] = F32(0)
                 ai[i, i - 1] = F32(0)
             else:
                 final_m = i
         info = (final_m + 1) if final_m >= 1 else 0
 
-        w_out = np.stack([mul(np.diag(ar), unsc_entry), mul(np.diag(ai), unsc_entry)]).astype(F32)
+        w_out = np.stack([_ceig_amul(np.diag(ar), unsc_entry), _ceig_amul(np.diag(ai), unsc_entry)]).astype(F32)
         if not compute_vectors:
             return w_out, None, np.array([float(info)], F32)
 
         # Stage 4: Back-substitution on upper triangular T, Q @ Y, unbalance, unit 2-norm
         norm_T = F32(0)
         for i in range(n):
-            for j in range(i, n):
-                norm_T = max(norm_T, _cabs1(ar[i, j], ai[i, j]))
+            c_i = _ceig_aftz(np.abs(ar[i, i:n]) + np.abs(ai[i, i:n]))
+            norm_T = max(norm_T, F32(np.max(c_i)))
         Vr_out = np.zeros((n, n), dtype=F32)
         Vi_out = np.zeros((n, n), dtype=F32)
+        tr_p = np.zeros(maxn, dtype=F32)
+        ti_p = np.zeros(maxn, dtype=F32)
+        yr_p = np.zeros(maxn, dtype=F32)
+        yi_p = np.zeros(maxn, dtype=F32)
         for k in range(n):
             lam_r, lam_i = ar[k, k], ai[k, k]
-            smin = max(sml, mul(_EIG_EPS32, max(_cabs1(lam_r, lam_i), norm_T)))
+            smin = max(sml, _ceig_smul(_EIG_EPS32, max(_ceig_sadd(F32(abs(float(lam_r))), F32(abs(float(lam_i)))), norm_T)))
             yr, yi = np.zeros(n, dtype=F32), np.zeros(n, dtype=F32)
             yr[k] = F32(1)
             for i in range(k - 1, -1, -1):
-                tr_32 = np.zeros(32, dtype=F32)
-                ti_32 = np.zeros(32, dtype=F32)
-                yr_32 = np.zeros(32, dtype=F32)
-                yi_32 = np.zeros(32, dtype=F32)
-                tr_32[i + 1:k + 1] = ar[i, i + 1:k + 1]
-                ti_32[i + 1:k + 1] = ai[i, i + 1:k + 1]
-                yr_32[:k + 1] = yr[:k + 1]
-                yi_32[:k + 1] = yi[:k + 1]
-                sr = _red_add(mac(sub(F32(0), ti_32), yi_32, mul(tr_32, yr_32)))
-                si = _red_add(mac(ti_32, yr_32, mul(tr_32, yi_32)))
-                rhsr, rhsi = sub(F32(0), sr), sub(F32(0), si)
-                dr, di = sub(ar[i, i], lam_r), sub(ai[i, i], lam_i)
-                if _cabs1(dr, di) < smin:
+                tr_p.fill(F32(0))
+                ti_p.fill(F32(0))
+                yr_p.fill(F32(0))
+                yi_p.fill(F32(0))
+                tr_p[i + 1:k + 1] = ar[i, i + 1:k + 1]
+                ti_p[i + 1:k + 1] = ai[i, i + 1:k + 1]
+                yr_p[:k + 1] = yr[:k + 1]
+                yi_p[:k + 1] = yi[:k + 1]
+                sr = red_add(_ceig_amac_vv(-ti_p, yi_p, _ceig_amul(tr_p, yr_p)))
+                si = red_add(_ceig_amac_vv(ti_p, yr_p, _ceig_amul(tr_p, yi_p)))
+                rhsr, rhsi = _ceig_ssub(F32(0), sr), _ceig_ssub(F32(0), si)
+                dr, di = _ceig_ssub(ar[i, i], lam_r), _ceig_ssub(ai[i, i], lam_i)
+                if _ceig_sadd(F32(abs(float(dr))), F32(abs(float(di)))) < smin:
                     dr, di = smin, F32(0)
                 rm = max(abs(float(rhsr)), abs(float(rhsi)))
                 dm = max(abs(float(dr)), abs(float(di)))
                 if rm > (2.0 ** 28) * dm:
-                    sc = _ceig_pow2_scale(F32(rm))
-                    yr[i + 1:k + 1], yi[i + 1:k + 1] = mul(yr[i + 1:k + 1], sc), mul(yi[i + 1:k + 1], sc)
-                    rhsr, rhsi = mul(rhsr, sc), mul(rhsi, sc)
-                yr[i], yi[i] = _cdiv(rhsr, rhsi, dr, di)
+                    sc = _ceig_spow2_scale(F32(rm))
+                    yr[i + 1:k + 1], yi[i + 1:k + 1] = _ceig_amul(yr[i + 1:k + 1], sc), _ceig_amul(yi[i + 1:k + 1], sc)
+                    rhsr, rhsi = _ceig_smul(rhsr, sc), _ceig_smul(rhsi, sc)
+                yr[i], yi[i] = _ceig_scdiv(rhsr, rhsi, dr, di)
                 ym = max(float(np.max(np.abs(yr[:k + 1]))), float(np.max(np.abs(yi[:k + 1]))))
                 if ym > 2.0 ** 28:
-                    sc = _ceig_pow2_scale(F32(ym))
-                    yr[:k + 1], yi[:k + 1] = mul(yr[:k + 1], sc), mul(yi[:k + 1], sc)
+                    sc = _ceig_spow2_scale(F32(ym))
+                    yr[:k + 1], yi[:k + 1] = _ceig_amul(yr[:k + 1], sc), _ceig_amul(yi[:k + 1], sc)
             ym = max(float(np.max(np.abs(yr[:k + 1]))), float(np.max(np.abs(yi[:k + 1]))))
             if ym > 0:
-                sc = _ceig_pow2_scale(F32(ym))
-                yr[:k + 1], yi[:k + 1] = mul(yr[:k + 1], sc), mul(yi[:k + 1], sc)
+                sc = _ceig_spow2_scale(F32(ym))
+                yr[:k + 1], yi[:k + 1] = _ceig_amul(yr[:k + 1], sc), _ceig_amul(yi[:k + 1], sc)
             vr, vi = np.zeros(n, dtype=F32), np.zeros(n, dtype=F32)
             for j in range(k + 1):
-                vr = mac(sub(F32(0), yi[j]), qi[j], mac(yr[j], qr[j], vr))
-                vi = mac(yi[j], qr[j], mac(yr[j], qi[j], vi))
-            vr, vi = mul(vr, d_scale), mul(vi, d_scale)
+                vr = _ceig_amac(_ceig_ssub(F32(0), yi[j]), qi[j], _ceig_amac(yr[j], qr[j], vr))
+                vi = _ceig_amac(yi[j], qr[j], _ceig_amac(yr[j], qi[j], vi))
+            vr, vi = _ceig_amul(vr, d_scale), _ceig_amul(vi, d_scale)
             vm = max(float(np.max(np.abs(vr))), float(np.max(np.abs(vi))))
             if vm > 0:
-                sc = _ceig_pow2_scale(F32(vm))
-                vsr = np.pad(mul(vr, sc), (0, 32 - n))
-                vsi = np.pad(mul(vi, sc), (0, 32 - n))
-                sq = _red_add(mac(vsi, vsi, mul(vsr, vsr)))
-                rn = F32(_ceig_rsqrt_fine(sq))
-                vr, vi = mul(vsr[:n], rn), mul(vsi[:n], rn)
+                sc = _ceig_spow2_scale(F32(vm))
+                vsr = np.pad(_ceig_amul(vr, sc), (0, maxn - n))
+                vsi = np.pad(_ceig_amul(vi, sc), (0, maxn - n))
+                sq = red_add(_ceig_amac_vv(vsi, vsi, _ceig_amul(vsr, vsr)))
+                rn = _ceig_srsqrt_fine(sq)
+                vr, vi = _ceig_amul(vsr[:n], rn), _ceig_amul(vsi[:n], rn)
             Vr_out[:, k], Vi_out[:, k] = vr, vi
+        if v_transposed:
+            return w_out, np.vstack([Vr_out.T, Vi_out.T]).astype(F32), np.array([float(info)], F32)
         return w_out, np.vstack([Vr_out, Vi_out]).astype(F32), np.array([float(info)], F32)
+
+
+def ceig_kernel(A, compute_vectors=True):
+    """``(W, V, info)`` of ``ceig_f32_gaudi2.c`` (``ceigvals_f32_gaudi2`` with ``compute_vectors=False``, where
+    ``V`` is ``None``) for one planar ``A[2n, n]`` (rows 0..n-1 real, n..2n-1 imag): ``W[2, n]`` eigenvalues
+    (row 0 real, row 1 imag), ``V[2n, n]`` unit-2-norm eigenvectors as columns (None if ``not compute_vectors``),
+    ``info[1]`` (0 if converged; >0 if QR iteration limit reached). Non-finite input: NaN W and V."""
+    return _ceig_core(A, compute_vectors=compute_vectors, maxn=32, v_transposed=False)
+
+
+def ceig_big_kernel(A, compute_vectors=True):
+    """``(W, V_t, info)`` of ``ceig_big_f32_gaudi2.c`` (``ceigvals_big_f32_gaudi2`` with ``compute_vectors=False``,
+    where ``V_t`` is ``None``) for one planar ``A[2n, n]`` (``32 < n <= 64``): ``W[2, n]`` eigenvalues,
+    ``V_t[2n, n]`` transposed eigenvectors (row ``k`` = eigenvector ``k``), ``info[1]``."""
+    return _ceig_core(A, compute_vectors=compute_vectors, maxn=64, v_transposed=True)
 
 
 def ceig_op(with_info=False):
@@ -2091,3 +2353,199 @@ def ceigvals_op(with_info=False):
     if with_info:
         return _torch_op(_ceigvals_with_info, 2)
     return _torch_op(lambda a: (ceig_kernel(a, compute_vectors=False)[0],), 1)
+
+
+def cqr_kernel(A_t, mode="reduced"):
+    """Exact float32 FTZ replica of ``cqr_f32_gaudi2.c`` for ``A_t [2*n, m]`` (``1 <= n <= m <= 32``).
+
+    ``mode`` is ``"reduced"``, ``"complete"``, or ``"r"``.
+    """
+    A_t = _ftz(np.asarray(A_t, F32))
+    n = A_t.shape[0] // 2
+    m = A_t.shape[1]
+    k_q = m if mode == "complete" else n
+    k_r = m if mode == "complete" else n
+    if _nonfinite(A_t):
+        R_nan = np.full((2 * n, k_r), F32("nan"), F32)
+        if mode == "r":
+            return (R_nan,)
+        return np.full((2 * k_q, m), F32("nan"), F32), R_nan
+
+    lane = np.arange(32)
+    qr = np.zeros((32, 32), F32)
+    qi = np.zeros((32, 32), F32)
+    for j in range(n):
+        qr[j, :m] = A_t[j, :m]
+        qi[j, :m] = A_t[n + j, :m]
+    tau_r = np.zeros(32, F32)
+    tau_i = np.zeros(32, F32)
+
+    for i in range(n):
+        qir = qr[i].copy()
+        qii = qi[i].copy()
+        active_i = (lane >= i) & (lane < m)
+        xr = np.where(active_i, qir, F32(0))
+        xi = np.where(active_i, qii, F32(0))
+        mx = _red_max_32(np.maximum(np.abs(xr), np.abs(xi)))
+        sc = _ceig_pow2_scale(mx)
+        unsc = _ceig_pow2_unscale(mx)
+        xsr = mul(xr, sc)
+        xsi = mul(xi, sc)
+
+        tail_r = np.where(lane > i, xsr, F32(0))
+        tail_i = np.where(lane > i, xsi, F32(0))
+        sigma_rest = _red_add(mac(tail_i, tail_i, mul(tail_r, tail_r)))
+
+        xsr0, xsi0, orig_r = xsr[i], xsi[i], qir[i]
+        no_reflect = (mx == F32(0)) or (sigma_rest == F32(0) and xsi0 == F32(0))
+
+        if no_reflect:
+            tau_r_i = F32(0)
+            tau_i_i = F32(0)
+            r_ii_r = orig_r
+            vr = np.zeros(32, F32)
+            vi = np.zeros(32, F32)
+        else:
+            sq = mac(xsi0, xsi0, mac(xsr0, xsr0, sigma_rest))
+            inv_nrm = F32(_ceig_rsqrt_fine(sq))
+            nrm_xs = mul(sq, inv_nrm)
+            beta = sub(F32(0), nrm_xs) if xsr0 >= F32(0) else nrm_xs
+            inv_beta = recip(beta, zero_to_inf=False)[0]
+            tau_r_i = sub(F32(1), mul(xsr0, inv_beta))
+            tau_i_i = sub(F32(0), mul(xsi0, inv_beta))
+            r_ii_r = mul(beta, unsc)
+
+            u0r = sub(xsr0, beta)
+            u0i = xsi0
+            u0sq = mac(u0i, u0i, mul(u0r, u0r))
+            inv_u0sq = recip(u0sq, zero_to_inf=False)[0]
+            inv_u0_r = mul(u0r, inv_u0sq)
+            inv_u0_i = mul(sub(F32(0), u0i), inv_u0sq)
+
+            vr = mac(sub(F32(0), xsi), inv_u0_i, mul(xsr, inv_u0_r))
+            vi = mac(xsi, inv_u0_r, mul(xsr, inv_u0_i))
+            vr = np.where(lane < i, F32(0), vr)
+            vi = np.where(lane < i, F32(0), vi)
+            vr[i] = F32(1)
+            vi[i] = F32(0)
+
+        if mode == "r":
+            qr[i, i] = r_ii_r
+            qi[i, i] = F32(0)
+        else:
+            qr[i, i + 1:] = vr[i + 1:]
+            qi[i, i + 1:] = vi[i + 1:]
+            qr[i, i] = r_ii_r
+            qi[i, i] = F32(0)
+            tau_r[i] = tau_r_i
+            tau_i[i] = tau_i_i
+
+        if not no_reflect:
+            for j in range(i + 1, n):
+                qjr = qr[j].copy()
+                qji = qi[j].copy()
+                act_r = np.where(active_i, qjr, F32(0))
+                act_i = np.where(active_i, qji, F32(0))
+                mx_j = _red_max_32(np.maximum(np.abs(act_r), np.abs(act_i)))
+                sc_j = _ceig_pow2_scale(mx_j)
+                unsc_j = _ceig_pow2_unscale(mx_j)
+                qjr_sc = mul(act_r, sc_j)
+                qji_sc = mul(act_i, sc_j)
+
+                dr = _red_add(mac(vi, qji_sc, mul(vr, qjr_sc)))
+                di = _red_add(mac(sub(F32(0), vi), qjr_sc, mul(vr, qji_sc)))
+
+                cr_c = mac(tau_i_i, di, mul(tau_r_i, dr))
+                ci_c = mac(sub(F32(0), tau_i_i), dr, mul(tau_r_i, di))
+
+                upd_r = mul(mac(ci_c, vi, mac(sub(F32(0), cr_c), vr, qjr_sc)), unsc_j)
+                upd_i = mul(mac(sub(F32(0), ci_c), vr, mac(sub(F32(0), cr_c), vi, qji_sc)), unsc_j)
+
+                qr[j] = np.where(active_i, upd_r, qjr)
+                qi[j] = np.where(active_i, upd_i, qji)
+
+    R_t = np.zeros((2 * n, k_r), F32)
+    for j in range(n):
+        R_t[j, :j + 1] = qr[j, :j + 1]
+        R_t[n + j, :j + 1] = qi[j, :j + 1]
+    if mode == "r":
+        return (R_t,)
+
+    if mode == "complete":
+        for j in range(n, m):
+            qr[j] = F32(0)
+            qr[j, j] = F32(1)
+            qi[j] = F32(0)
+
+    for i in range(n - 1, -1, -1):
+        tau_r_i = tau_r[i]
+        tau_i_i = tau_i[i]
+        zero_tau = (tau_r_i == F32(0))
+        vr = np.where((lane > i) & (lane < m), qr[i], F32(0))
+        vi = np.where((lane > i) & (lane < m), qi[i], F32(0))
+        vr[i] = F32(1)
+        vi[i] = F32(0)
+
+        ntr = sub(F32(0), tau_r_i)
+        nti = sub(F32(0), tau_i_i)
+        ntv_r = mac(sub(F32(0), nti), vi, mul(ntr, vr))
+        ntv_i = mac(nti, vr, mul(ntr, vi))
+
+        if not zero_tau:
+            for j in range(i + 1, k_q):
+                qjr = qr[j].copy()
+                qji = qi[j].copy()
+                dr = _red_add(mac(vi, qji, mul(vr, qjr)))
+                di = _red_add(mac(sub(F32(0), vi), qjr, mul(vr, qji)))
+                qr[j] = mac(sub(F32(0), ntv_i), di, mac(ntv_r, dr, qjr))
+                qi[j] = mac(ntv_i, dr, mac(ntv_r, di, qji))
+
+        eir = np.zeros(32, F32)
+        eir[i] = F32(1)
+        if zero_tau:
+            qr[i] = eir
+            qi[i] = np.zeros(32, F32)
+        else:
+            qr[i] = add(eir, ntv_r)
+            qi[i] = ntv_i
+
+    Q_t = np.zeros((2 * k_q, m), F32)
+    Q_t[:k_q, :] = qr[:k_q, :m]
+    Q_t[k_q:, :] = qi[:k_q, :m]
+    return Q_t, R_t
+
+
+def cqr_op():
+    """Stand-in for ``torch.ops.linalg_tpc.cqr``: planar A_t [b, 2n, m] -> (Q_t [b, 2n, m], R_t [b, 2n, n])."""
+    return _torch_op(lambda a: cqr_kernel(a, mode="reduced"), 2)
+
+
+def cqr_complete_op():
+    """Stand-in for ``torch.ops.linalg_tpc.cqr_complete``: planar A_t [b, 2n, m] -> (Q_t [b, 2m, m], R_t [b, 2n, m])."""
+    return _torch_op(lambda a: cqr_kernel(a, mode="complete"), 2)
+
+
+def cqr_r_op():
+    """Stand-in for ``torch.ops.linalg_tpc.cqr_r``: planar A_t [b, 2n, m] -> R_t [b, 2n, n]."""
+    return _torch_op(lambda a: cqr_kernel(a, mode="r"), 1)
+
+
+def ceig_big_op(with_info=False):
+    """Stand-in for ``torch.ops.linalg_tpc.ceig_big``: planar A [b, 2n, n] -> (W [b, 2, n], V_t [b, 2n, n])
+    (or ``(W, V_t, info)`` when ``with_info=True``)."""
+    if with_info:
+        return _torch_op(lambda a: ceig_big_kernel(a, compute_vectors=True), 3)
+    return _torch_op(lambda a: ceig_big_kernel(a, compute_vectors=True)[:2], 2)
+
+
+def _ceigvals_big_with_info(a):
+    w, _, info = ceig_big_kernel(a, compute_vectors=False)
+    return w, info
+
+
+def ceigvals_big_op(with_info=False):
+    """Stand-in for ``torch.ops.linalg_tpc.ceigvals_big``: planar A [b, 2n, n] -> W [b, 2, n]
+    (or ``(W, info)`` when ``with_info=True``)."""
+    if with_info:
+        return _torch_op(_ceigvals_big_with_info, 2)
+    return _torch_op(lambda a: (ceig_big_kernel(a, compute_vectors=False)[0],), 1)

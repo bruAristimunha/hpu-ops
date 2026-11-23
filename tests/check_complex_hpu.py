@@ -435,6 +435,35 @@ def _eig_res(A, w, V):
     return res if nrm == 0.0 else res / nrm
 
 
+def _eig_backward(A, w, V):
+    """Largest backward errors relative to ||A||_2: sigma_min(A - w_k I) and ||A v_k - w_k v_k|| / ||v_k||."""
+    A128 = np.asarray(A, dtype=np.complex128)
+    w128 = np.asarray(w, dtype=np.complex128)
+    V128 = np.asarray(V, dtype=np.complex128)
+    eye = np.eye(A128.shape[-1])
+    pseudo = max(np.linalg.svd(A128 - wk * eye, compute_uv=False)[-1] for wk in w128)
+    pair = np.max(np.linalg.norm(A128 @ V128 - V128 * w128[None, :], axis=0) / np.linalg.norm(V128, axis=0))
+    nrm = np.linalg.norm(A128, 2)
+    return float(pseudo / nrm), float(pair / nrm)
+
+
+def _eig_first_order(A, w, eps32):
+    """The largest err_i / (kappa_i * n * eps32 * ||A||_2) over the eigenvalues where first-order theory applies (the
+    bound under a quarter of the gap to the nearest other eigenvalue, cond(X) <= 1e12); 0.0 if there are none."""
+    A128 = np.asarray(A, dtype=np.complex128)
+    n = A128.shape[-1]
+    lam, X = np.linalg.eig(A128)
+    kappa = np.linalg.norm(X, axis=0) * np.linalg.norm(np.linalg.inv(X), axis=1)
+    bound = kappa * n * eps32 * np.linalg.norm(A128, 2)
+    dist = np.abs(lam[:, None] - lam[None, :]) + np.diag(np.full(n, np.inf))
+    valid = (bound < 0.25 * dist.min(axis=1)) & (np.linalg.cond(X) <= 1e12)
+    cost = np.abs(np.asarray(w, dtype=np.complex128)[:, None] - lam[None, :])
+    r, c = _linear_sum_assignment_np(cost)
+    err = np.empty(n)
+    err[c] = cost[r, c]
+    return float(np.max(err[valid] / bound[valid])) if valid.any() else 0.0
+
+
 def eig_cases():
     yield "zero_16", torch.zeros(2, 16, 16, dtype=C64), None
     yield "eye_32", torch.eye(32, dtype=C64)[None], None
@@ -502,12 +531,47 @@ def eig_cases():
         ),
         None,
     )
-    for n in (1, 2, 4, 8, 16, 22, 32):
-        yield f"randn_{n}", crandn(3, n, n, seed=100 + n), None
+    for n in (1, 2, 4, 8, 16, 22, 32, 33, 48, 64):
+        yield f"randn_{n}", crandn(2 if n > 32 else 3, n, n, seed=100 + n), None
+    for n in (33, 48, 64):
+        R_n = torch.randn(1, n, n, generator=torch.Generator().manual_seed(140 + n), dtype=torch.float32)
+        yield f"rand_real_{n}", R_n.to(C64), None
+    yield "zero_64", torch.zeros(1, 64, 64, dtype=C64), None
+    yield "eye_64", torch.eye(64, dtype=C64)[None], None
+    yield "subnormal_64", (torch.randn(1, 64, 64, generator=torch.Generator().manual_seed(31), dtype=torch.float32) * 1e-40).to(C64), None
+    rep64 = torch.cat([
+        torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0 + 1e-6, -3j, 5.0 + 2j], dtype=C128),
+        torch.arange(10, 10 + 57, dtype=torch.float64).to(C128),
+    ])
+    Q64 = unitary(64, 34)
+    yield "repeated_64", (Q64 @ torch.diag(rep64) @ Q64.mH).to(C64)[None], None
+    J48 = torch.diag(torch.cat([torch.full((4,), 2.0 + 1j, dtype=C128), torch.arange(5, 49, dtype=torch.float64).to(C128)]))
+    for i in range(3):
+        J48[i, i + 1] = 1.0
+    Q48 = unitary(48, 32)
+    yield "jordan_4_sim_48", (Q48 @ J48 @ Q48.mH).to(C64)[None], 4
+    D_bad64 = torch.diag(2.0 ** torch.linspace(-30, 30, 64, dtype=torch.float64)).to(C128)
+    M64 = crandn(64, 64, seed=35).to(C128)
+    yield "bad_scale_64", (D_bad64 @ M64 @ torch.linalg.inv(D_bad64)).to(C64)[None], None
+    Q64b = unitary(64, 36)
+    T64 = torch.diag(torch.tensor(np.geomspace(1.0, 1e-5, 64), dtype=C128))
+    iu64 = torch.triu_indices(64, 64, offset=1)
+    T64[iu64[0], iu64[1]] = 0.05 * crandn(iu64.shape[1], seed=37).to(C128)
+    yield "illcond_1e5_64", (Q64b @ T64 @ Q64b.mH).to(C64)[None], None
+    Qn64 = unitary(64, 38)
+    Dn64 = torch.diag(torch.tensor(np.geomspace(1.0, 1e-5, 64), dtype=C128))
+    yield "illcond_norm_1e5_64", (Qn64 @ Dn64 @ Qn64.mH).to(C64)[None], None
+    Fo64 = torch.diag(torch.ones(63, dtype=C64), 1)
+    Fo64[63, 0] = 0.1
+    yield "forsythe_n64_eps0.1", Fo64[None], None
     NF = crandn(3, 5, 5, seed=29)
     NF[0, 2, 3] = complex(math.nan, 0.0)
     NF[2, 1, 4] = complex(0.0, math.inf)
     yield "nonfinite", NF, None
+    NF48 = crandn(3, 48, 48, seed=39)
+    NF48[0, 35, 10] = complex(math.nan, 0.0)
+    NF48[2, 12, 41] = complex(0.0, math.inf)
+    yield "nonfinite_48", NF48, None
 
 
 def run_eig(emit, time_it):
@@ -519,8 +583,10 @@ def run_eig(emit, time_it):
         with warnings.catch_warnings(record=True) as wrec:
             warnings.simplefilter("always", UserWarning)
             f0 = fallbacks()
-            raw_eig = cl._call(cl._ceig_op(), a.to("hpu"))
-            raw_ev = cl._call(cl._ceigvals_op(), a.to("hpu"))
+            eig_op = cl._ceig_op() if n <= cl.COMPLEX_MAXN else cl._ceig_big_op()
+            ev_op = cl._ceigvals_op() if n <= cl.COMPLEX_MAXN else cl._ceigvals_big_op()
+            raw_eig = cl._call(eig_op, a.to("hpu"))
+            raw_ev = cl._call(ev_op, a.to("hpu"))
             w, Vp = cl.eig(pairs(A).to("hpu"))
             wv = cl.eigvals(pairs(A).to("hpu"))
             W_raw = raw_eig[0].cpu()
@@ -530,8 +596,9 @@ def run_eig(emit, time_it):
             fb = fallbacks() - f0
         cpu_warns = sum(1 for m in wrec if "runs on the CPU" in str(m.message))
 
-        rep = [kr.ceig_kernel(x, compute_vectors=True) for x in a.numpy()]
-        repv = [kr.ceig_kernel(x, compute_vectors=False) for x in a.numpy()]
+        kfn = kr.ceig_kernel if n <= cl.COMPLEX_MAXN else kr.ceig_big_kernel
+        rep = [kfn(x, compute_vectors=True) for x in a.numpy()]
+        repv = [kfn(x, compute_vectors=False) for x in a.numpy()]
         rW = torch.from_numpy(np.stack([r[0] for r in rep]))
         rV = torch.from_numpy(np.stack([r[1] for r in rep]))
         rWv = torch.from_numpy(np.stack([r[0] for r in repv]))
@@ -543,7 +610,13 @@ def run_eig(emit, time_it):
                "eigvals_parity": ev_parity, "fallbacks": fb, "cpu_route_warns": cpu_warns,
                "ok": ndiff == 0 and ev_parity and fb == 0 and cpu_warns == 0}
 
-        if torch.isfinite(A).all():
+        if name.startswith("subnormal_"):
+            w_c = cplx(w).numpy()
+            V_c = cplx(Vp).numpy()
+            ftz_ok = bool(np.all(w_c == 0) and np.array_equal(V_c[0], np.eye(n, dtype=np.complex64)))
+            row.update(ftz_ok=ftz_ok)
+            row["ok"] = row["ok"] and ftz_ok
+        elif torch.isfinite(A).all():
             w_c = cplx(w).numpy()
             V_c = cplx(Vp).numpy()
             w32_t, _ = torch.linalg.eig(A)
@@ -563,10 +636,20 @@ def run_eig(emit, time_it):
                 ew_tol = max(1e-5, 100.0 * n * eps32, 20.0 * max_ew32)
             elif name.startswith("frank"):
                 ew_tol = 0.02
+            elif name.startswith("illcond_1e5_"):
+                ew_tol = math.inf  # non-normal: only the first-order test below bounds it
             else:
                 ew_tol = max(1e-5, 20.0 * max_ew32)
             row.update(res=max_res, vnorm_err=max_vnorm_err, err_w=max_ew, err_w_cpu32=max_ew32, ew_tol=ew_tol)
             row["ok"] = row["ok"] and (max_res < 50 * n * eps32) and (max_vnorm_err < 1e-5) and (max_ew <= ew_tol)
+            if n > cl.COMPLEX_MAXN and A.abs().max() > 0:
+                # ceig_big: backward errors at most n * eps32 * ||A||_2 (eigenvalues and pairs), and each eigenvalue
+                # where first-order theory applies within kappa_i times that of the exact one.
+                bw = [_eig_backward(A[b].numpy(), w_c[b], V_c[b]) for b in range(A.shape[0])]
+                pseudo, pair = max(x[0] for x in bw), max(x[1] for x in bw)
+                fo = max(_eig_first_order(A[b].numpy(), w_c[b], eps32) for b in range(A.shape[0]))
+                row.update(pseudo_n_eps=pseudo / (n * eps32), pair_n_eps=pair / (n * eps32), first_order=fo)
+                row["ok"] = row["ok"] and pseudo <= n * eps32 and pair <= n * eps32 and fo <= 1.0
         else:
             nan_ok = bool(w[0].isnan().all() and Vp[0].isnan().all() and wv[0].isnan().all()
                           and w[2].isnan().all() and Vp[2].isnan().all() and wv[2].isnan().all()
@@ -622,16 +705,38 @@ def run_eig(emit, time_it):
                 _raises_value_error(cl.eig, torch.zeros(4, dtype=C64))
                 and _raises_value_error(cl.eigvals, torch.zeros(4, dtype=C64))
             ),
+            "invalid_n65": (
+                _raises_value_error(cl.eig, torch.zeros(1, 65, 65, 2))
+                and _raises_value_error(cl.eigvals, torch.zeros(1, 65, 65, 2))
+            ),
         }
         fb_adv = fallbacks() - f0
     cpu_warns_adv = sum(1 for m in wrec if "runs on the CPU" in str(m.message))
+
+    A48 = crandn(4, 48, 48, seed=61)
+    P48 = pairs(A48).to("hpu")
+    with warnings.catch_warnings(record=True) as wrec48:
+        warnings.simplefilter("always", UserWarning)
+        f0_48 = fallbacks()
+        w48, V48 = cl.eig(P48)
+        u48 = cl.eig(P48[1])
+        view_checks["eig_big_twice"] = _pairs_eq((w48, V48), (cl.eig(P48), cl.eig(P48))[1])
+        view_checks["strided_batch_48"] = _pairs_eq(cl.eig(P48[::2]), cl.eig(P48[::2].contiguous()))
+        view_checks["unbatched_48"] = torch.equal(u48[0].cpu(), w48[1].cpu()) and torch.equal(u48[1].cpu(), V48[1].cpu())
+        view_checks["empty_batch_48"] = (
+            tuple(cl.eig(P48[:0])[0].shape) == (0, 48, 2)
+            and tuple(cl.eig(P48[:0])[1].shape) == (0, 48, 48, 2)
+            and tuple(cl.eigvals(P48[:0]).shape) == (0, 48, 2)
+        )
+        fb_adv += fallbacks() - f0_48
+    cpu_warns_adv += sum(1 for m in wrec48 if "runs on the CPU" in str(m.message))
     for cname, cok in view_checks.items():
         emit({"op": "ceig_adv", "case": cname, "fallbacks": fb_adv, "cpu_route_warns": cpu_warns_adv,
               "ok": bool(cok) and fb_adv == 0 and cpu_warns_adv == 0})
 
     if not time_it:
         return
-    for n in (16, 22, 32):
+    for n in (16, 22, 32, 48, 64):
         Ah = pairs(crandn(32, n, n, seed=30 + n)).to("hpu")
 
         def cpu_route_eig(t=Ah):

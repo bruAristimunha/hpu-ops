@@ -199,7 +199,8 @@ foreach(KERNEL
     target_link_libraries(linalg_tpc ${KERNEL})
 endforeach()
 
-# complex64 general eig / eigvals (MPS recipe): ceig and ceigvals (-DNO_VECTORS) share ceig_f32_gaudi2.c.
+# complex64 general eig / eigvals (MPS recipe): ceig and ceigvals (-DNO_VECTORS) share ceig_f32_gaudi2.c;
+# ceig_big and ceigvals_big (-DNO_VECTORS) share ceig_big_f32_gaudi2.c (32 < n <= 64).
 set(CEIG_SOURCE ceig_f32_gaudi2)
 foreach(KERNEL ceig_f32_gaudi2 ceigvals_f32_gaudi2)
     set(DEFINES "")
@@ -210,6 +211,43 @@ foreach(KERNEL ceig_f32_gaudi2 ceigvals_f32_gaudi2)
         OUTPUT ${KERNEL}_x86.o
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${CEIG_SOURCE}.c
         COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${CEIG_SOURCE}.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
+        COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 ${DEFINES} -I${TPC_INCLUDE_DIR}/ ./${KERNEL}.c -c
+        COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
+    add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
+    set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
+    target_link_libraries(linalg_tpc ${KERNEL})
+endforeach()
+
+set(CEIG_BIG_SOURCE ceig_big_f32_gaudi2)
+foreach(KERNEL ceig_big_f32_gaudi2 ceigvals_big_f32_gaudi2)
+    set(DEFINES "")
+    if(KERNEL STREQUAL "ceigvals_big_f32_gaudi2")
+        set(DEFINES -DNO_VECTORS)
+    endif()
+    add_custom_command(
+        OUTPUT ${KERNEL}_x86.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${CEIG_BIG_SOURCE}.c
+        COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${CEIG_BIG_SOURCE}.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
+        COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 ${DEFINES} -I${TPC_INCLUDE_DIR}/ ./${KERNEL}.c -c
+        COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
+    add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
+    set_target_properties(${KERNEL} PROPERTIES LINKER_LANGUAGE C)
+    target_link_libraries(linalg_tpc ${KERNEL})
+endforeach()
+
+# LUT-free 16 KB VLM complex64 Householder QR: cqr (reduced), cqr_complete (-DFULL_Q), cqr_r (-DR_ONLY).
+set(CQR_SOURCE cqr_f32_gaudi2)
+foreach(KERNEL cqr_f32_gaudi2 cqr_complete_f32_gaudi2 cqr_r_f32_gaudi2)
+    set(DEFINES "")
+    if(KERNEL STREQUAL "cqr_complete_f32_gaudi2")
+        set(DEFINES -DFULL_Q)
+    elseif(KERNEL STREQUAL "cqr_r_f32_gaudi2")
+        set(DEFINES -DR_ONLY)
+    endif()
+    add_custom_command(
+        OUTPUT ${KERNEL}_x86.o
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${CQR_SOURCE}.c
+        COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/${CQR_SOURCE}.c ${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.c
         COMMAND ${TPC_COMPILER_PATH} -Wall -Werror -march=gaudi2 -O2 ${DEFINES} -I${TPC_INCLUDE_DIR}/ ./${KERNEL}.c -c
         COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ./${KERNEL}.o ${KERNEL}_x86.o)
     add_library(${KERNEL} STATIC ${KERNEL}_x86.o)
