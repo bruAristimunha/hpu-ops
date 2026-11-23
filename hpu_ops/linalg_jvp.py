@@ -354,9 +354,15 @@ def _solve_tangent(Ap, Bp, X, gA, gB, left):
     return torch.linalg.solve_ex(Ap, rhs, left=left, check_errors=False)[0]
 
 
-def _inv_via_solve(A):
-    eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device).expand_as(A)
-    return torch.linalg.solve(A, eye)
+def _inv_via_solve(A, singular):
+    """``A^-1`` from one solve against the identity, never raising; where ``singular`` (det 0) the identity is
+    inverted instead, as in ``linalg._det_backward``. A singular matrix's inverse is non-finite on the CPU and finite
+    garbage from Gaudi2's kernel (measured); the tangent is fixed there (det 0, logabsdet nan), and through
+    ``torch.where``'s derivative that inverse made the gradient NaN, or raised in the checked solve with which
+    ``torch.func.grad`` differentiates ``solve_ex``."""
+    eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)
+    safe = torch.where(singular[..., None, None], eye, A)
+    return torch.linalg.solve_ex(safe, eye.expand_as(A), check_errors=False)[0]
 
 
 def _cia_solve_ex(A, B, *, left=True, check_errors=False):
@@ -396,7 +402,7 @@ def _cia_det(A):
             det = aten._linalg_det.default(Ap)[0]
             if gA is None:
                 return det
-            invA = _inv_via_solve(Ap)
+            invA = _inv_via_solve(Ap, det == 0)
             dt = torch.where(det == 0, 0.0, det * (invA.mT * gA).sum((-2, -1)))
             return fwAD.make_dual(det, dt, level=fw_lvl)
     return aten._linalg_det.default(A)[0]
@@ -410,7 +416,7 @@ def _other_det(A):
             det, LU, pivots = aten._linalg_det.default(Ap)
             if gA is None:
                 return det, LU, pivots
-            invA = _inv_via_solve(Ap)
+            invA = _inv_via_solve(Ap, det == 0)
             dt = torch.where(det == 0, 0.0, det * (invA.mT * gA).sum((-2, -1)))
             return fwAD.make_dual(det, dt, level=fw_lvl), LU, pivots
     return aten._linalg_det.default._op_dk(DispatchKey.Autograd, A)
@@ -424,8 +430,8 @@ def _cia_slogdet(A):
             sign, logabsdet, _, _ = aten._linalg_slogdet.default(Ap)
             if gA is None:
                 return sign, logabsdet
-            invA = _inv_via_solve(Ap)
-            dlog = (invA.mT * gA).sum((-2, -1))
+            invA = _inv_via_solve(Ap, sign == 0)
+            dlog = torch.where(sign == 0, float("nan"), (invA.mT * gA).sum((-2, -1)))
             return fwAD.make_dual(sign, torch.zeros_like(sign), level=fw_lvl), fwAD.make_dual(
                 logabsdet, dlog, level=fw_lvl
             )
@@ -441,8 +447,8 @@ def _other_slogdet(A):
             sign, logabsdet, LU, pivots = aten._linalg_slogdet.default(Ap)
             if gA is None:
                 return sign, logabsdet, LU, pivots
-            invA = _inv_via_solve(Ap)
-            dlog = (invA.mT * gA).sum((-2, -1))
+            invA = _inv_via_solve(Ap, sign == 0)
+            dlog = torch.where(sign == 0, float("nan"), (invA.mT * gA).sum((-2, -1)))
             return (
                 fwAD.make_dual(sign, torch.zeros_like(sign), level=fw_lvl),
                 fwAD.make_dual(logabsdet, dlog, level=fw_lvl),

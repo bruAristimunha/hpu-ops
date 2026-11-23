@@ -1,6 +1,9 @@
 """CPU stand-in tests for forward-mode AD (``torch.func.jvp`` and ``torch.autograd.forward_ad``) of
 ``solve``, ``det`` and ``slogdet`` (``hpu_ops.linalg_jvp``).
 """
+import collections
+import contextlib
+
 import pytest
 import torch
 import torch.autograd.forward_ad as fwAD
@@ -708,3 +711,139 @@ def test_hpu_jvp_composites_helpers_and_undo(monkeypatch, gj_hook):
         assert calls["solve"] == 1
     torch.testing.assert_close(got_p, want_p, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(got_t, want_t, rtol=1e-4, atol=1e-4)
+
+
+def _cpu_jvp_eligible(*tensors):
+    """``linalg_jvp._hpu_jvp_eligible`` with CPU float32 tensors in the role of HPU ones."""
+    return (all(isinstance(t, torch.Tensor) and t.dtype == torch.float32 and t.numel() > 0 for t in tensors)
+            and tensors[0].dim() >= 2 and tensors[0].shape[-1] == tensors[0].shape[-2])
+
+
+@contextlib.contextmanager
+def _cpu_inv_det_composites(monkeypatch):
+    """``install_inv_det_composites``, installed on ``hpu`` only, with CPU float32 tensors in the role of HPU ones;
+    yields the calls of ``_cia_det`` and ``_cia_slogdet``, the only ones CPU tensors reach: functorch's wrappers keep
+    the CPU key but not HPU's (``kKeysToPropagateToWrapper``), so on Gaudi2 ``torch.func.jvp`` also reaches the
+    ``AutogradOther`` composites (measured), tested directly in ``test_hpu_other_composites_singular_match_torch``."""
+    ran = collections.Counter()
+    for name in ("_cia_det", "_cia_slogdet"):
+        fn = getattr(linalg_jvp, name)
+        monkeypatch.setattr(linalg_jvp, name, lambda *a, _f=fn, _n=name: (ran.update([_n]), _f(*a))[1])
+    monkeypatch.setattr(linalg_jvp, "_hpu_jvp_eligible", _cpu_jvp_eligible)
+    undo = linalg_jvp.install_inv_det_composites("hpu")
+    try:
+        yield ran
+    finally:
+        undo()
+
+
+def _singular(case):
+    S = torch.diag(torch.tensor([1.0, 2.0, 0.0, 3.0]))
+    return {"zeros": torch.zeros(4, 4), "rank3": S, "batch": torch.stack([torch.eye(4), S])}[case]
+
+
+def _slogdet(a):
+    return tuple(torch.linalg.slogdet(a))
+
+
+def _assert_singular_close(op, got, want):
+    """``got`` (value, tangent) as torch's CPU ``want``: det 0 with tangent 0; slogdet (0, -inf) with tangent (0, nan)."""
+    if op == "det":
+        torch.testing.assert_close(got[0], want[0], rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(got[1], want[1], rtol=1e-4, atol=1e-4, equal_nan=True)
+        return
+    torch.testing.assert_close(got[0], want[0], rtol=1e-4, atol=1e-4)
+    assert torch.equal(got[1][0], torch.zeros_like(want[0][0]))
+    torch.testing.assert_close(got[1][1], want[1][1], rtol=1e-4, atol=1e-4, equal_nan=True)
+
+
+@pytest.mark.parametrize("case", ["zeros", "rank3", "batch"])
+@pytest.mark.parametrize(("op", "mode"), [("det", "fwad"), ("det", "jvp"), ("det", "compile_jvp"),
+                                          ("slogdet", "fwad"), ("slogdet", "jvp"), ("slogdet", "jvp_vmap"),
+                                          ("slogdet", "compile_jvp")])
+def test_hpu_composites_singular_match_torch(case, op, mode, monkeypatch):
+    """Bug C: the HPU det/slogdet composites inverted A with ``torch.linalg.solve``, which raised on a singular matrix
+    before ``torch.where(det == 0, ...)`` was reached. A zero, a rank-3 and a batch of the identity and a singular
+    matrix give torch's CPU values through ``fwAD.dual_level``, ``torch.func.jvp``, ``jvp(vmap)`` and
+    ``torch.compile(jvp, backend="aot_eager")``. (``vmap`` of det takes functorch's C++ decomposition on CPU; on
+    Gaudi2 it reaches the ``AutogradOther`` composite, tested below.)"""
+    torch.manual_seed(10)
+    A = _singular(case)
+    if mode == "jvp_vmap" and A.dim() == 2:
+        A = A[None]
+    t = torch.randn_like(A)
+    fn = torch.linalg.det if op == "det" else _slogdet
+    want = _fwad(fn, (A,), (t,))
+
+    def run(a, ta):
+        return torch.func.jvp(torch.func.vmap(fn) if mode == "jvp_vmap" else fn, (a,), (ta,))
+
+    with _cpu_inv_det_composites(monkeypatch) as ran:
+        if mode == "fwad":
+            got = _fwad(fn, (A,), (t,))
+        elif mode == "compile_jvp":
+            torch._dynamo.reset()
+            got = torch.compile(run, backend="aot_eager")(A, t)
+        else:
+            got = run(A, t)
+        assert ran[f"_cia_{op}"] >= 1
+    _assert_singular_close(op, got, want)
+
+
+@pytest.mark.parametrize("case", ["zeros", "rank3", "batch"])
+def test_hpu_other_composites_singular_match_torch(case, monkeypatch):
+    """Bug C through the ``AutogradOther`` composites ``_other_det`` and ``_other_slogdet``, which ``torch.func.jvp``
+    and ``jvp(vmap(det))`` of HPU tensors reach on Gaudi2 (measured) and CPU tensors never do: called directly."""
+    torch.manual_seed(11)
+    A = _singular(case)
+    t = torch.randn_like(A)
+    want_det = _fwad(torch.linalg.det, (A,), (t,))
+    want_slog = _fwad(_slogdet, (A,), (t,))
+    monkeypatch.setattr(linalg_jvp, "_hpu_jvp_eligible", _cpu_jvp_eligible)
+    with fwAD.dual_level():
+        d = fwAD.make_dual(A, t)
+        det = linalg_jvp._other_det(d)[0]
+        slog = linalg_jvp._other_slogdet(d)[:2]
+        got_det = det.detach(), fwAD.unpack_dual(det).tangent
+        got_slog = tuple(o.detach() for o in slog), tuple(fwAD.unpack_dual(o).tangent for o in slog)
+    _assert_singular_close("det", got_det, want_det)
+    _assert_singular_close("slogdet", got_slog, want_slog)
+
+
+@pytest.mark.parametrize("case", ["zeros", "rank3", "batch"])
+@pytest.mark.parametrize("op", ["det", "logabsdet"])
+@pytest.mark.parametrize("mode", ["grad_jvp", "fwad_backward", "compile_backward"])
+def test_hpu_composites_singular_jvp_backward(case, op, mode, monkeypatch):
+    """Reverse mode through the composites' tangent at singular matrices, where torch's CPU gradient is finite: no
+    exception (``torch.func.grad`` differentiates the solve with a checked ``linalg.solve``) and no NaN (``backward``
+    with the inverse of a singular matrix). A singular matrix's tangent is fixed (0 for det, nan for logabsdet), so
+    its gradient is 0; the identity in the batch keeps the exact one, tr(T) I - T^T for det and -T^T for logabsdet."""
+    torch.manual_seed(12)
+    A = _singular(case)
+    t = torch.randn_like(A)
+    want = torch.zeros_like(A)
+    if case == "batch":
+        want[0] = t[0].trace() * torch.eye(4) - t[0].mT if op == "det" else -t[0].mT
+
+    def fn(a):
+        return torch.linalg.det(a) if op == "det" else torch.linalg.slogdet(a)[1]
+
+    def tangent_sum(a, ta):
+        return torch.func.jvp(fn, (a,), (ta,))[1].sum()
+
+    with _cpu_inv_det_composites(monkeypatch) as ran:
+        if mode == "grad_jvp":
+            got = torch.func.grad(tangent_sum)(A, t)
+        else:
+            Ag = A.clone().requires_grad_(True)
+            if mode == "fwad_backward":
+                with fwAD.dual_level():
+                    tangent = fwAD.unpack_dual(fn(fwAD.make_dual(Ag, t))).tangent
+                tangent.sum().backward()
+            else:
+                torch._dynamo.reset()
+                torch.compile(tangent_sum, backend="aot_eager")(Ag, t).backward()
+            got = Ag.grad
+        assert ran["_cia_det" if op == "det" else "_cia_slogdet"] >= 1
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
