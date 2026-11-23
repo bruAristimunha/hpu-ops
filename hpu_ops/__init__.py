@@ -21,8 +21,12 @@ at the tensor's pickling:
 - ``group_norm`` with a symbolic size under compile (``norm``, #42) as a reshape into groups, ``var_mean`` and the
   affine terms: with the default dynamic shapes a second batch size traced ``native_group_norm`` with the batch as
   a SymInt argument, and Habana's backend failed ("aten::IntImplicit isn't registered in KernelRegistry!":
-  FNIRSCNN1D, SAMBA, SignalJEPA_PostLocal now compile; NeuroRVQ, DIVER1, LaBraM and SignalJEPA_PreLocal then meet
-  other dynamic-shape failures). Static shapes and eager keep Gaudi's kernel.
+  FNIRSCNN1D, SAMBA, SignalJEPA_PostLocal now compile). Static shapes and eager keep Gaudi's kernel.
+- Symbolic ``expand`` and ``int64`` ``constant_pad_nd`` under compile (``dynshape``, #42): resolving ``-1`` dims in
+  symbolic ``aten.expand.default`` fixes Habana's ``BroadcastOperator`` crash, and rewriting ``int64``
+  ``aten.constant_pad_nd.default`` avoids ``hpu.constant_pad_nd_ds`` ``synStatus 26`` (inference of ``NeuroRVQ``,
+  ``NeuroRVQTokenizer``, ``DIVER1`` and ``LaBraM`` now compiles at ``16 <-> 128``; Habana's own dynamic-shape bugs
+  remain, see the README). Static ``expand``, non-``int64`` dtypes, and eager calls keep Gaudi's path.
 - ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's
@@ -119,7 +123,7 @@ import warnings
 
 import torch
 
-from . import (composite, conv, eigh, extrema, im2col, indexing, lazy_compile, linalg, norm,  # noqa: F401
+from . import (composite, conv, dynshape, eigh, extrema, im2col, indexing, lazy_compile, linalg, norm,  # noqa: F401
                quantile, serialization, small, tpc, upsample, wide)
 from ._dispatch import _STATE, chain
 from ._strict import CPUExecutionError, strict  # noqa: F401
@@ -133,7 +137,8 @@ BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_grou
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
          composite.install_embedding, composite.install_roll, composite.install_unfold,
-         composite.install_unfold_backward, norm.install_group_norm, indexing.install_index,
+         composite.install_unfold_backward, norm.install_group_norm, dynshape.install_expand,
+         dynshape.install_pad_int64, indexing.install_index,
          indexing.install_mask_fill, im2col.install,
          linalg.install_solve_triangular, linalg.install_cholesky_solve,
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
