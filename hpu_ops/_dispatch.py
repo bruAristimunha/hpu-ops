@@ -13,7 +13,9 @@ import functools
 
 import torch
 from torch._C import DispatchKey
+from torch._subclasses.fake_tensor import is_fake
 
+REDUCED = (torch.float16, torch.bfloat16)
 _STATE = {"calls": collections.Counter()}
 _DUAL_PROBE = torch.empty(0)
 
@@ -83,6 +85,11 @@ def tracing(*tensors):
         return True
     return any(isinstance(t, FakeTensor) or is_fake(t) or torch._is_functional_tensor(t)
                or isinstance(t, FunctionalTensor) for t in tensors)
+
+
+def concrete(t):
+    """True for a real tensor outside any tracer."""
+    return not is_fake(t) and torch._guards.detect_fake_mode() is None and not torch._is_functional_tensor(t)
 
 
 def below_autograd():

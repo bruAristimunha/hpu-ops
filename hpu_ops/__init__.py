@@ -179,15 +179,7 @@ def _strict_from_env():
                       stacklevel=3)
 
 
-def _lazy():
-    """Whether Habana's bridge runs in lazy mode (read after ``habana_frameworks.torch.core`` loads): its own
-    ``is_lazy``; on a bridge without it, ``PT_HPU_LAZY_MODE == "1"`` (unset counts as eager, 1.21.4's default:
-    its bridge configuration prints ``PT_HPU_LAZY_MODE = 0`` when the variable is unset)."""
-    try:
-        from habana_frameworks.torch.utils.internal import is_lazy
-    except ImportError:
-        return os.environ.get("PT_HPU_LAZY_MODE", "0") == "1"
-    return is_lazy()
+_lazy = tpc.lazy_mode
 
 
 def enable():

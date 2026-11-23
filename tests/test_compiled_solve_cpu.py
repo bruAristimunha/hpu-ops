@@ -9,13 +9,7 @@ import pytest
 import torch
 from test_cpu import cpu_as_hpu
 
-from hpu_ops import linalg, tpc
-
-
-@pytest.fixture
-def gj(monkeypatch):
-    """The Gauss-Jordan stand-in: the route returns placeholder ``LU`` / ``pivots``, as the TPC kernels do."""
-    monkeypatch.setattr(linalg, "_GJ", tpc.gj_solve_reference)
+from hpu_ops import linalg
 
 
 @pytest.fixture
@@ -70,19 +64,19 @@ def aot(f):
 
 @pytest.mark.parametrize("name", list(CASES))
 @pytest.mark.parametrize("tracer", ["compile", "aot_function"])
-def test_traced_decline_runtime_route_grad(name, tracer, gj, trace_declines):
+def test_traced_decline_runtime_route_grad(name, tracer, gj_ref, trace_declines):
     run = (lambda f: torch.compile(f, backend="aot_eager", fullgraph=True)) if tracer == "compile" else aot
     got, want = grads(name, run)
     torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.parametrize("name", list(CASES))
-def test_symbolic_shape_decline_grad(name, gj):
+def test_symbolic_shape_decline_grad(name, gj_ref):
     got, want = grads(name, lambda f: torch.compile(f, backend="aot_eager", dynamic=True, fullgraph=True))
     torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
-def test_traced_decline_double_backward(gj, trace_declines):
+def test_traced_decline_double_backward(gj_ref, trace_declines):
     """The traced Function's backward is made of differentiable ops: a second derivative is torch's."""
     torch.manual_seed(0)
     A = (torch.eye(5) + 0.1 * torch.randn(5, 5)).requires_grad_()
@@ -101,7 +95,7 @@ def test_traced_decline_double_backward(gj, trace_declines):
     torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
-def test_eager_and_untraced_routes_unchanged(gj):
+def test_eager_and_untraced_routes_unchanged(gj_ref):
     """No tracer: the call is taken (one count), as before."""
     A = (torch.eye(6) + 0.1 * torch.randn(6, 6)).requires_grad_()
     with cpu_as_hpu(linalg.install_solve) as calls:
@@ -110,7 +104,7 @@ def test_eager_and_untraced_routes_unchanged(gj):
 
 
 @pytest.mark.parametrize("singular", [False, True])
-def test_traced_det_double_backward(singular, gj, trace_declines):
+def test_traced_det_double_backward(singular, gj_ref, trace_declines):
     """A det backward with ``create_graph`` under a tracer selects torch's SVD formula per matrix without a host read
     (review; it raised on ``bool(singular.any())``). Singular: the first derivative (the second is NaN in the untraced
     route too, a known limit); else the second."""

@@ -64,13 +64,12 @@ import threading
 
 import torch
 from torch._C import DispatchKey
-from torch._subclasses.fake_tensor import is_fake
 
-from ._dispatch import chain, count, override_kernels, register_kernels, replace_py_kernels
+from ._dispatch import REDUCED  # noqa: F401
+from ._dispatch import chain, concrete as _concrete, count, override_kernels, register_kernels, replace_py_kernels
 
 aten = torch.ops.aten
 NAN = float("nan")
-REDUCED = (torch.float16, torch.bfloat16)
 POOL_PLANE_MAX = 1 << 24  # float32 holds every code of a pooled plane exactly up to here
 
 
@@ -129,11 +128,6 @@ def _restore(t, x, dims, keepdim):
     """``t`` with the reduced ``dims`` of ``x`` back as size 1 (torch's restore_reduced_dims), by a reshape: in lazy
     mode the backward of ``amax()`` over all dims with unsqueezes fails ("incorrect input sizes for Copy")."""
     return t if keepdim or x.dim() == 0 else t.reshape(_kept(x, dims))
-
-
-def _concrete(t):
-    """True for a real tensor outside any tracer."""
-    return not is_fake(t) and torch._guards.detect_fake_mode() is None and not torch._is_functional_tensor(t)
 
 
 def _traced(args, kwargs):
