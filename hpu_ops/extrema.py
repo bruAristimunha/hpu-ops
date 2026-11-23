@@ -153,7 +153,8 @@ def _eager_native(op, composite):
     """At ``Autograd{}``: outside a tracer, torch's autograd kernel of ``op`` (over the backend kernel's fixed result:
     torch's gradient); traced, ``composite``."""
     def kernel(*args, **kwargs):
-        if _traced(args, kwargs):  # a CPU 0-d operand stays a graph scalar (moved, it adds a copy to every step)
+        if _traced(args, kwargs) and not getattr(_TRACING, "active", False):
+            # a CPU 0-d operand stays a graph scalar (moved, it adds a copy to every step)
             return composite(*args, **kwargs)
         args = _onto_device(args, keep_self=op._schema.is_mutable)
         if _BACKEND.get(_device(args)):
@@ -1299,7 +1300,8 @@ def _inference_traced(device_type, composite, original):
     has_original = not isinstance(original, functools.partial)
 
     def kernel(*args, **kwargs):
-        if (getattr(_TRACING, "active", False) or not torch.is_inference_mode_enabled()
+        if (getattr(_TRACING, "active", False)
+                or not (torch.is_inference_mode_enabled() or _traced(args, kwargs))
                 or _device(args) != device_type):
             return original(*args, **kwargs) if has_original else NotImplemented
         _TRACING.active = True
