@@ -87,9 +87,12 @@ at the tensor's pickling:
   as ints and aborts the process on a float one, and does not compile from about 350 bins. The CPU kernel's bin
   edges are found on the host, the card only compares (bucketize) and counts; bit for bit ATen's one-thread result,
   eager, lazy, compiled and in inference mode.
-- ``bincount`` of 1-D integer inputs of 65536 to 2**24 elements with at most 4096 bins and no weights through one
-  ``aminmax`` read and ``histc`` in chunks of 256 bins (``small``, #21): Gaudi's kernel took 4.7-427 ms at 409600
-  elements (64 to 4096 bins), 2-43x longer.
+- ``bincount`` of 1-D integer inputs (65536 to 2**24 - 1 elements, or 4096..65535 when ``minlength >= 256`` eager /
+  ``>= 128`` lazy) with at most 4096 bins and no weights through ``aminmax`` + chunked ``histc``, and ``uint8``
+  with ``minlength >= 256`` under ``torch.compile`` via ``one_hot`` (``small``, #21); scoped lazy-mode rewrites for
+  ``logsumexp`` (``numel <= 2**19``) and ``index_add`` (no-grad ``dim == 0`` float32 into at most 256 rows, with
+  ``>= 40960`` source rows and (``>= 1280`` per row or rows of ``>= 128`` elements)). ``trace`` stays
+  native (Python dispatcher overhead exceeds the kernel gain).
 - Warnings for the 8-byte dtypes in eager mode (``wide``), at the copy to the card: float64 views with a storage
   offset read and write at twice the offset, int64 values past int32 are computed on their low 32 bits. Neither is
   fixable at the dispatcher at a cost a model would accept (see the README, "float64").
@@ -145,6 +148,7 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
          linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, quantile.install,
          extrema.install, small.install_bincount, small.install_histc,
+         small.install_logsumexp, small.install_index_add,
          wide.install_copy_checks, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "

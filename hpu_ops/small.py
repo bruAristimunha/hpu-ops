@@ -1,34 +1,35 @@
-"""``bincount`` of large 1-D integer tensors through ``histc`` (hpu-ops #21), and ``histc`` itself where Gaudi's
-kernel fails (see "histc" below).
+"""``bincount``, ``histc``, and scoped lazy-mode rewrites for ``logsumexp`` and ``index_add`` (hpu-ops #21).
 
 Gaudi's ``bincount`` (bridge 1.21.4) grows with the input and steeply with the bins: 409600 elements take 7.4 ms
 eager / 4.7 ms lazy with 64 bins, 230 / 225 ms with 1000 bins and 427 ms eager with 4096 bins, where one CPU core
-takes 0.8 ms. Here, for 1-D integer inputs of 65536 to 2**24 elements without weights and with at most 4096 bins:
-one ``aminmax`` read (the output length and the sign; Habana's kernel syncs the host too) and ``histc`` over
-``[a, a + 255]`` with 256 bins per chunk of 256 bins (values outside a chunk's range are not counted). That counts
-exactly: integers below 2**24 are exact in float32, the counts too (fewer than 2**24 elements), and on Gaudi2 every
-bin count to 300 put ``arange(n)`` one per bin (``histc`` does not compile from 400 bins, and non-integer bounds abort
-Habana's eager kernel: ``repro/histc_float_bounds.py``). The last chunk overlaps the one before, so no chunk has one
-bin (``histc`` widens ``min == max`` by 1 on each side). Results are int64. A negative value raises ATen's error
-(Habana's kernel counts it instead: ``repro/bincount_negative.py``).
+takes 0.8 ms; even at 4096..40960 elements with >= 256 bins (eager) / >= 128 bins (lazy) it takes 2.4-24 ms.
+Here, for 1-D integer inputs of 65536 to 2**24 - 1 elements (or 4096..65535 when ``minlength >= 256`` eager /
+``>= 128`` lazy) without weights and with at most 4096 bins: one ``aminmax`` read (skipped for ``uint8`` with
+``minlength >= 256``, since values are in ``0..255``) and ``histc`` over ``[a, a + 255]`` with 256 bins per chunk,
+zero-padded when ``minlength > hi + 1``. Under ``torch.compile``, ``uint8`` inputs with ``minlength >= 256`` take
+``F.one_hot(x.long(), 256).float().sum(0).long()`` (zero-padded when ``minlength > 256``), with zero host syncs
+and zero graph breaks.
 
-Measured through the dispatcher (``tests/bench_small_dispatch.py``), isolated synced calls and a batch of calls:
-65536 elements and up are faster in both modes (eager 1.04-43x, lazy 1.9-35x). Smaller inputs keep Habana's kernel:
-below 65536 elements the host read costs as much as Habana's whole kernel with few bins (4096 elements, 64 bins: no
-exact variant faster in both modes), and the bin count is only known after it.
+Scoped lazy-mode winners (eager and ``torch.compile`` stay native where Habana is already faster or parity):
+- ``logsumexp`` (lazy mode, ``numel <= 2**19``): ``lse_safe`` (``amax(keepdim=True)`` + ``where(m.isinf(), 0, m)``
+  + ``exp().sum().log() + m`` reshaped without ``squeeze``, avoiding Habana's ``all_dims`` squeeze and 1-D
+  ``expand`` bugs) and an ``autograd.Function`` (``_LseFn``) with exact analytical backward ``g * exp(x - out)``.
+- ``index_add`` (lazy mode, ``not torch.is_grad_enabled()``, ``dim == 0``, float32, ``self`` of at most 256 rows,
+  ``source.shape[0] >= 40960`` and (at least 1280 source rows per row of ``self`` or rows of >= 128 elements)):
+  ``index_put_((slot,), source * alpha, accumulate=True)`` into a copy of ``self`` with one scratch row, at
+  ``Autograd{}`` and ``{}`` (inference mode). ``slot`` wraps ``[-rows, -1]`` and sends any other index out of range
+  to the scratch row, as Habana's ``index_add`` does (ATen raises, which needs a host read); Habana's ``index_put``
+  stops the device on an index of -1. Past 512 rows Habana's lazy accumulating ``index_put`` returns wrong sums
+  for an index made by an ``add`` in the same graph (``repro/index_put_lazy_add_index.py``), hence the row cap.
 
-Measured and not rewritten (see the README): ``logsumexp`` (faster forward in lazy mode only; forward + backward
-0.80-1.21x; eager not faster), ``cumsum`` (a triangular-ones matmul is faster but turns ``[1, inf]`` into
-``[nan, inf]``; exact variants 0.02-0.45x), ``index_add`` / ``scatter_add`` as one-hot matmuls (slower in at least
-one mode, and ``inf * 0`` again).
-
-Registered at ``AutogradHPU``; calls it does not take (weights, other dtypes and dims, ``minlength`` or values past
-4096, traced graphs) and inference mode go to Habana's kernel.
+Ops where native Habana wins or no exact rewrite beats it through the dispatcher (``trace``, ``scatter_add``,
+``where``, ``lerp``, ``cumsum``, ``cumprod``, ``allclose``) stay native.
 """
 import math
 import threading
 
 import torch
+import torch.nn.functional as F
 from torch._C import DispatchKey
 
 from . import _strict
@@ -36,22 +37,46 @@ from ._dispatch import chain, count, override_kernels, register_kernels, static
 from .linalg import _is_fake, _transformed
 
 aten = torch.ops.aten
-BINCOUNT_MIN_NUMEL = 1 << 16  # below, one host read plus histc is not faster than Habana's kernel (measured)
-BINCOUNT_MAX_NUMEL = 1 << 24  # histc counts in float32: exact below 2**24
+BINCOUNT_MIN_NUMEL = 1 << 16  # below, only high-minlength calls beat Habana's kernel (measured)
+BINCOUNT_SMALL_MIN_NUMEL = 4096
+BINCOUNT_SMALL_MIN_BINS_EAGER = 256
+BINCOUNT_SMALL_MIN_BINS_LAZY = 128
+BINCOUNT_MAX_NUMEL = 1 << 24  # histc / one_hot float32 counts are exact below 2**24
 BINCOUNT_MAX_BINS = 4096  # 16 histc launches
 BINCOUNT_CHUNK = 256  # histc compiles up to ~300 bins on Gaudi2
 INTEGRAL = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+LOGSUMEXP_MAX_NUMEL = 1 << 19  # 524288: past ~1M elements (e.g. 6400x22x22) Habana's native fwdbwd wins
+INDEX_ADD_MIN_ROWS = 40960  # source rows; below, Habana's native lazy kernel wins in isolated calls
+INDEX_ADD_MAX_SELF_ROWS = 256  # Habana's lazy accumulating index_put into more than 512 rows misreads an index made
+#                                by an add in the same graph (repro/index_put_lazy_add_index.py): 2x margin
+INDEX_ADD_MIN_PER_ROW = 1280  # source rows per row of self below a wide row (measured: 640 is parity, 320 loses)
+INDEX_ADD_WIDE_ROW = 128  # elements per row of self from which the rewrite wins at every contention measured
+_MODE = {}
+
+
+def _lazy():
+    """Whether Habana's bridge runs in lazy mode (read once; fixed when the bridge loads). Off a Gaudi stack, False
+    (the CPU tests patch this)."""
+    if "lazy" not in _MODE:
+        try:
+            from habana_frameworks.torch.utils.internal import is_lazy
+
+            _MODE["lazy"] = bool(is_lazy())
+        except ImportError:
+            _MODE["lazy"] = False
+    return _MODE["lazy"]
 
 
 def _concrete(x):
     """True for a plain eager call: the host read needs real values, outside any transform or tracer. Declined, so
-    Habana's kernel runs: functorch transforms and forward-mode AD (``linalg._transformed``; the layer depth too,
-    since below ``torch.func.grad``'s layer the interpreter stack reads empty), fake or functional tensors and
-    ``torch.compile`` (``linalg._is_fake``), and any ``__torch_dispatch__`` mode such as ``make_fx``'s proxy mode
-    (``is_compiling()`` is false inside AOT dispatch)."""
-    if _transformed() or torch._C._functorch.get_dynamic_layer_stack_depth() > 0 or _is_fake(x):
+    Habana's kernel runs: ``torch.compile`` / fake mode (checked first so Dynamo does not graph-break on C++
+    functorch queries, and since ``is_compiling()`` is false in Dynamo ``get_fake_value`` and AOT dispatch on
+    2.6/2.8), functorch transforms and forward-mode AD (``linalg._transformed``; the layer depth too, since below
+    ``torch.func.grad``'s layer the interpreter stack reads empty), functional tensors, and any ``__torch_dispatch__``
+    mode such as ``make_fx``'s proxy mode."""
+    if torch.compiler.is_compiling() or _is_fake(x) or torch._guards.detect_fake_mode() is not None:
         return False
-    if _strict.foreign_modes() or torch._guards.detect_fake_mode() is not None:  # strict mode's watch is not one
+    if _transformed() or torch._C._functorch.get_dynamic_layer_stack_depth() > 0 or _strict.foreign_modes():
         return False
     return not torch._is_functional_tensor(x) and not torch._C._functorch.is_functorch_wrapped_tensor(x)
 
@@ -77,27 +102,53 @@ def bincount_histc(x, bins):
     return count_bins(xf, bins).long()
 
 
+def _bincount_min_bins():
+    return BINCOUNT_SMALL_MIN_BINS_LAZY if _lazy() else BINCOUNT_SMALL_MIN_BINS_EAGER
+
+
 def _takes(x, weights=None, minlength=0):
-    return (BINCOUNT_MIN_NUMEL <= x.numel() < BINCOUNT_MAX_NUMEL and weights is None and x.dim() == 1
-            and x.dtype in INTEGRAL and isinstance(minlength, int) and 0 <= minlength <= BINCOUNT_MAX_BINS
-            and static(*x.shape) and _concrete(x))
+    n = x.numel()
+    if not (weights is None and x.dim() == 1 and x.dtype in INTEGRAL
+            and isinstance(minlength, int) and 0 <= minlength <= BINCOUNT_MAX_BINS
+            and static(*x.shape) and _concrete(x)):
+        return False
+    if BINCOUNT_MIN_NUMEL <= n < BINCOUNT_MAX_NUMEL:
+        return True
+    return BINCOUNT_SMALL_MIN_NUMEL <= n < BINCOUNT_MIN_NUMEL and minlength >= _bincount_min_bins()
+
+
+def _compile_uint8_takes(x, weights=None, minlength=0):
+    tracing = torch.compiler.is_compiling() or _is_fake(x) or torch._guards.detect_fake_mode() is not None
+    return (tracing and weights is None and x.dim() == 1 and x.dtype == torch.uint8
+            and isinstance(minlength, int) and minlength >= 256
+            and x.numel() < BINCOUNT_MAX_NUMEL and static(*x.shape))
 
 
 def install_bincount(device_type):
-    """``bincount`` of large 1-D integer tensors with at most 4096 bins on ``device_type`` through ``histc``.
-    Returns an undo."""
+    """``bincount`` of 1-D integer tensors on ``device_type`` through ``histc`` (eager/lazy) and ``one_hot``
+    (``uint8`` with ``minlength >= 256`` under ``torch.compile``). Returns an undo."""
     op = aten.bincount.default
 
     def kernel(x, weights=None, minlength=0):
+        if _compile_uint8_takes(x, weights, minlength):
+            count("bincount")
+            counts = F.one_hot(x.long(), 256).float().sum(0).long()
+            return counts if minlength == 256 else F.pad(counts, (0, minlength - 256))
         if _takes(x, weights, minlength):
+            if x.dtype == torch.uint8 and minlength >= 256:  # unsigned [0..255]: no host sync needed
+                count("bincount")
+                counts = bincount_histc(x, 256)
+                return counts if minlength == 256 else F.pad(counts, (0, minlength - 256))
             with _strict.host_read("bincount: value range", x):
                 lo, hi = (int(v) for v in torch.stack(torch.aminmax(x)).tolist())
             if lo < 0:  # ATen's error; Habana's kernel counts negative values instead
                 raise RuntimeError("bincount only supports 1-d non-negative integral inputs.")
-            bins = max(hi + 1, minlength)
+            active_bins = hi + 1
+            bins = max(active_bins, minlength)
             if bins <= BINCOUNT_MAX_BINS:
                 count("bincount")
-                return bincount_histc(x, bins)
+                counts = bincount_histc(x, active_bins)
+                return counts if active_bins >= minlength else F.pad(counts, (0, minlength - active_bins))
         return op._op_dk(DispatchKey.Autograd, x, weights, minlength)
 
     return register_kernels(device_type, [(op, "Autograd{}", kernel)])
@@ -387,3 +438,149 @@ def install_histc(device_type):
             _EDGE_CACHE.clear()
 
     return undo
+
+
+# ---- logsumexp (lazy mode only) -----------------------------------------------------------------------------------
+
+def _lse_dims(x, dim):
+    """Normalised sorted reduced dims for ``logsumexp``, or None for calls that should fall through to ATen
+    (0-D tensors, empty ``dim`` on >= 1-D, out-of-range or duplicate dims)."""
+    nd = x.dim()
+    if nd == 0:
+        return None
+    if isinstance(dim, int):
+        dims = [dim]
+    elif isinstance(dim, (list, tuple)) and len(dim) > 0:
+        dims = list(dim)
+    else:
+        return None
+    norm = []
+    for d in dims:
+        if not isinstance(d, int) or not -nd <= d < nd:
+            return None
+        norm.append(d % nd)
+    if len(set(norm)) != len(norm):
+        return None
+    return sorted(norm)
+
+
+def _lse_takes(x, dim):
+    if not (_lazy() and x.numel() <= LOGSUMEXP_MAX_NUMEL and static(*x.shape)
+            and not x.is_complex() and _concrete(x)):
+        return None
+    return _lse_dims(x, dim)
+
+
+def lse_safe(x, dims, keepdim=False):
+    """Exact ``logsumexp(x, dims, keepdim)`` via ``amax(keepdim=True)`` + ``where(m.isinf(), 0, m)``.
+    Uses ``reshape`` instead of ``squeeze`` to avoid Habana lazy's ``all_dims`` squeeze and 1-D ``expand`` bugs."""
+    if not x.is_floating_point():
+        x = x.float()
+    out_shape = [1 if d in dims else s for d, s in enumerate(x.shape)] if keepdim else [
+        s for d, s in enumerate(x.shape) if d not in dims]
+    if any(x.shape[d] == 0 for d in dims):
+        return torch.full(out_shape, -math.inf, dtype=x.dtype, device=x.device)
+    m = x.amax(dims, keepdim=True)
+    m_safe = torch.where(m.isinf(), 0.0, m)
+    y = (x - m_safe).exp().sum(dims, keepdim=True).log() + m
+    return y if keepdim else y.reshape(out_shape)
+
+
+class _LseFn(torch.autograd.Function):
+    """Lazy-mode ``logsumexp`` with ``lse_safe`` forward and exact ATen-matching analytical backward."""
+
+    @staticmethod
+    def forward(ctx, x, dims, keepdim):
+        out = lse_safe(x, dims, keepdim)
+        ctx.save_for_backward(x, out)
+        ctx.kept_shape = [1 if d in dims else s for d, s in enumerate(x.shape)]
+        ctx.keepdim = keepdim
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, out = ctx.saved_tensors
+        if not ctx.keepdim:
+            out = out.reshape(ctx.kept_shape)
+            grad_out = grad_out.reshape(ctx.kept_shape)
+        return grad_out * torch.exp(x - out), None, None
+
+
+def install_logsumexp(device_type):
+    """Scoped lazy-mode ``logsumexp`` on ``device_type`` (``numel <= LOGSUMEXP_MAX_NUMEL``). Returns an undo."""
+    if not _lazy():
+        return lambda: None
+    op = aten.logsumexp.default
+
+    def autograd_kernel(self, dim, keepdim=False):
+        if torch.is_grad_enabled() and self.requires_grad:
+            dims = _lse_takes(self, dim)
+            if dims is not None:
+                count("logsumexp")
+                return _LseFn.apply(self, dims, keepdim)
+        return op._op_dk(DispatchKey.Autograd, self, dim, keepdim)
+
+    def backend_kernel(self, dim, keepdim=False):
+        dims = _lse_takes(self, dim)
+        if dims is not None:
+            count("logsumexp")
+            return lse_safe(self, dims, keepdim)
+        return op._op_dk(DispatchKey.CompositeExplicitAutograd, self, dim, keepdim)
+
+    return register_kernels(device_type, [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)])
+
+
+# ---- index_add (lazy mode, no_grad / inference_mode, dim == 0) ----------------------------------------------------
+
+def _index_add_wins(shape, src_rows):
+    """Where the rewrite beats Habana's lazy kernel in isolated and batched calls, inside the rows where Habana's
+    accumulating put is right: many source rows per row of ``self``, or wide rows."""
+    rows, width = shape[0], math.prod(shape[1:])
+    return (0 < rows <= INDEX_ADD_MAX_SELF_ROWS and width > 0 and src_rows >= INDEX_ADD_MIN_ROWS
+            and (src_rows >= INDEX_ADD_MIN_PER_ROW * rows or width >= INDEX_ADD_WIDE_ROW))
+
+
+def _index_add_takes(self, dim, index, source):
+    return (_lazy() and not torch.is_grad_enabled()
+            and self.dim() >= 1 and source.dim() == self.dim() and index.dim() == 1
+            and index.shape[0] == source.shape[0]
+            and -self.dim() <= dim < self.dim() and (dim % self.dim()) == 0
+            and self.shape[1:] == source.shape[1:] and self.dtype == source.dtype == torch.float32
+            and index.dtype in (torch.int32, torch.int64)
+            and static(*self.shape, *index.shape, *source.shape)
+            and _index_add_wins(self.shape, source.shape[0])
+            and _concrete(self) and not _is_fake(index) and not _is_fake(source))
+
+
+def install_index_add(device_type):
+    """Scoped lazy-mode ``index_add`` on ``device_type`` (``not grad_enabled``, ``dim == 0``, float32, the shapes of
+    ``_index_add_wins``) via ``index_put_(..., accumulate=True)`` into a copy of ``self`` with a scratch row.
+    Returns an undo."""
+    if not _lazy():
+        return lambda: None
+    op, out_op = aten.index_add.default, aten.index_add.out
+
+    def _run(self, index, source, alpha):
+        count("index_add")
+        src = source if alpha == 1 else source * alpha
+        rows = self.shape[0]
+        # As Habana's index_add: [-rows, -1] wraps, any other index out of range is dropped (into the scratch row):
+        # Habana's index_put stops the device on an index of -1, and ATen's error would need a host read.
+        slot = torch.where((index >= -rows) & (index < rows), torch.remainder(index, rows), rows)
+        padded = torch.cat([self, self.new_zeros((1,) + self.shape[1:])])  # a fresh copy: accumulate in place
+        return padded.index_put_((slot,), src, accumulate=True)[:rows]
+
+    def autograd_kernel(self, dim, index, source, *, alpha=1):
+        if _index_add_takes(self, dim, index, source):
+            return _run(self, index, source, alpha)
+        return op._op_dk(DispatchKey.Autograd, self, dim, index, source, alpha=alpha)
+
+    def backend_kernel(self, dim, index, source, *, alpha=1):
+        if _index_add_takes(self, dim, index, source):
+            return _run(self, index, source, alpha)
+        out = torch.empty_like(self)
+        with torch._C._AutoDispatchBelowADInplaceOrView():
+            return out_op(self, dim, index, source, alpha=alpha, out=out)
+
+    return chain([register_kernels(device_type, [(op, "Autograd{}", autograd_kernel)]),
+                  override_kernels(device_type, [(op, backend_kernel)])])
