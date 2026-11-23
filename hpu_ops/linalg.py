@@ -30,6 +30,11 @@ accuracy is lost on ill-conditioned triangles, and ``cholesky_solve`` is two sub
 kernel the call on ``hpu`` is declined and runs through hpu-ops' own CPU route (``_on_cpu``), which is not Habana's
 fallback. The composites stay the path of the CPU stand-in. ``HPU_OPS_FLOAT64=card`` runs float64 HPU tensors on the
 card too, in float32 precision (``_float64_kernel``).
+
+Under ``torch.compile`` the TPC-backed calls (solve, inv, the triangular solves, and eigh and svd in their modules)
+are declined while a tracer sees them (``_decline_traced``): Habana's recipe compiler rejects the TPC custom-op
+nodes (compiled SPDNet, bridge 1.21.4), so the graph keeps the aten op and the node dispatches to the TPC kernel
+with real tensors at run time, outside the graph.
 """
 import functools
 import math
@@ -344,6 +349,21 @@ def _tpc_takes(device_type, takes, matrix_at=0, maxn=None, large=False):
     return tpc_takes
 
 
+def _decline_traced(device_type, takes, matrix_at=0):
+    """``takes``, declined while a tracer sees the call on ``hpu``: the ``torch.compile`` graph then holds the aten
+    op, not the TPC custom-op node, which Habana's recipe compiler rejects (Gaudi2, bridge 1.21.4: compiled SPDNet
+    fails recipe compilation with the kernels traced in and compiles with ``HPU_OPS_TPC=0``). At run time the aten
+    node dispatches to the same install's kernels with real tensors, so the TPC kernel still runs, outside the
+    graph: no CPU execution and eager speed, at the price of a graph boundary at the op. Ops whose torch derivative
+    reads factor outputs pair this with their ``traced`` Function (``_kernels``), whose backward reads ``A`` and the
+    solution only, never the run-time placeholder factors."""
+
+    def decline_traced(*args, **kwargs):
+        return takes(*args, **kwargs) and not (device_type == "hpu" and _tracing(args[matrix_at]))
+
+    return decline_traced
+
+
 def _use_tpc(A):
     """Whether ``A`` goes through the Gauss-Jordan kernels (n <= ``tpc.MAXN``: rows in local memory; past it the
     in-place inverse kernels, ``tpc.gj_solve`` multiplying by the inverse): on HPU, float32 with the kernel ready; or,
@@ -617,7 +637,7 @@ def install_solve_triangular(device_type):
     def shapes_ok(A, B, upper=False, left=True, unitriangular=False):
         return base(A, B) and B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
-    takes = _tpc_takes(device_type, shapes_ok, maxn=math.inf)  # past tpc.MAXN the blocked substitution
+    takes = _decline_traced(device_type, _tpc_takes(device_type, shapes_ok, maxn=math.inf))  # past tpc.MAXN: blocked
     groups = [_kernels(device_type, op, "solve_triangular", SolveTriangular, takes),
               _solve_triangular_out_kernels(device_type, takes), _triangular_solve_kernels(device_type, takes)]
     return register_paired(device_type, groups)
@@ -796,7 +816,7 @@ def install_cholesky_solve(device_type):
     def shapes_ok(B, L, upper=False):
         return base(B, L) and B.dim() >= 2 and B.shape[-2] == L.shape[-1]
 
-    takes = _tpc_takes(device_type, shapes_ok, matrix_at=1, maxn=math.inf)  # past tpc.MAXN blocked substitutions
+    takes = _decline_traced(device_type, _tpc_takes(device_type, shapes_ok, matrix_at=1, maxn=math.inf), matrix_at=1)
     autograd = _kernels(device_type, aten.cholesky_solve.default, "cholesky_solve", CholeskySolve, takes)[0]
     # The other two entries are dropped: the helper is the backend key of the same op, so each key gets one kernel.
     backend = _kernels(device_type, aten._cholesky_solve_helper.default, "cholesky_solve", CholeskySolve, takes)[1]
@@ -1050,7 +1070,7 @@ def install_solve(device_type):
             return left and B.shape[-1] == A.shape[-1]
         return B.dim() >= 2 and B.shape[-2 if left else -1] == A.shape[-1]
 
-    takes = _tpc_takes(device_type, shapes_ok, large=True)
+    takes = _decline_traced(device_type, _tpc_takes(device_type, shapes_ok, large=True))
     from . import linalg_jvp
 
     def backend_kernel(*args, **kwargs):
@@ -1413,6 +1433,8 @@ def install_inv_det(device_type):
     for op, name, function in ((aten.linalg_inv_ex.default, "inv", InvEx), (aten._linalg_det.default, "det", Det),
                                (aten._linalg_slogdet.default, "slogdet", Slogdet)):
         takes = _tpc_takes(device_type, _takes(device_type, name), large=True)
+        if name == "inv":  # det and slogdet keep their traced path (their compiled route is measured clean)
+            takes = _decline_traced(device_type, takes)
         traced = {"det": _TracedDet, "slogdet": _TracedSlogdet}.get(name)
         entries = _kernels(device_type, op, name, function, takes, backend=name == "inv", traced=traced)
         groups.append(linalg_jvp.with_inv_det_jvp(device_type, op, name, entries))
@@ -1445,6 +1467,8 @@ def _svd_takes(device_type, name="svd"):
             return False
         if A.dim() < 2:
             return False
+        if device_type == "hpu" and _tracing(A):
+            return False  # traced: the graph keeps the aten op, the kernel runs at run time (_decline_traced)
         return device_type != "hpu" or tpc.ready()
 
     return takes

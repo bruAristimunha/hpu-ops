@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from . import tpc
 from .extrema import internal_sort
-from .linalg import _function, _kernels, _takes, register_paired
+from .linalg import _function, _kernels, _takes, _tracing, register_paired
 
 aten = torch.ops.aten
 JACOBI_SWEEPS = 10
@@ -46,6 +46,8 @@ def _tpc_takes(device_type):
     def tpc_takes(*args, **kwargs):
         if not takes(*args, **kwargs):
             return False
+        if device_type == "hpu" and _tracing(args[0]):
+            return False  # traced: the graph keeps aten._linalg_eigh, the kernel runs at run time (linalg's note)
         if device_type == "hpu" and args[0].shape[-1] > tpc.EIGH_MAXN and os.environ.get(LARGE_EIGH) == "cpu":
             return False  # the opt-out: hpu-ops' CPU route past the kernel (see LARGE_EIGH)
         return device_type != "hpu" or tpc.ready()
