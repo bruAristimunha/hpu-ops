@@ -14,8 +14,13 @@ Scoped lazy-mode winners (eager and ``torch.compile`` stay native where Habana i
 - ``logsumexp`` (lazy mode, ``numel <= 2**19``): ``lse_safe`` (``amax(keepdim=True)`` + ``where(m.isinf(), 0, m)``
   + ``exp().sum().log() + m`` reshaped without ``squeeze``, avoiding Habana's ``all_dims`` squeeze and 1-D
   ``expand`` bugs) and an ``autograd.Function`` (``_LseFn``) with exact analytical backward ``g * exp(x - out)``.
-- ``index_add`` (lazy mode, ``not torch.is_grad_enabled()``, ``dim == 0``, ``source.shape[0] >= 40960``):
-  ``self.index_put((index,), source * alpha, accumulate=True)`` at ``Autograd{}`` and ``{}`` (inference mode).
+- ``index_add`` (lazy mode, ``not torch.is_grad_enabled()``, ``dim == 0``, float32, ``self`` of at most 256 rows,
+  ``source.shape[0] >= 40960`` and (at least 1280 source rows per row of ``self`` or rows of >= 128 elements)):
+  ``index_put_((slot,), source * alpha, accumulate=True)`` into a copy of ``self`` with one scratch row, at
+  ``Autograd{}`` and ``{}`` (inference mode). ``slot`` wraps ``[-rows, -1]`` and sends any other index out of range
+  to the scratch row, as Habana's ``index_add`` does (ATen raises, which needs a host read); Habana's ``index_put``
+  stops the device on an index of -1. Past 512 rows Habana's lazy accumulating ``index_put`` returns wrong sums
+  for an index made by an ``add`` in the same graph (``repro/index_put_lazy_add_index.py``), hence the row cap.
 
 Ops where native Habana wins or no exact rewrite beats it through the dispatcher (``trace``, ``scatter_add``,
 ``where``, ``lerp``, ``cumsum``, ``cumprod``, ``allclose``) stay native.
@@ -41,7 +46,11 @@ BINCOUNT_MAX_BINS = 4096  # 16 histc launches
 BINCOUNT_CHUNK = 256  # histc compiles up to ~300 bins on Gaudi2
 INTEGRAL = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
 LOGSUMEXP_MAX_NUMEL = 1 << 19  # 524288: past ~1M elements (e.g. 6400x22x22) Habana's native fwdbwd wins
-INDEX_ADD_MIN_ROWS = 40960  # below 40960 source rows, Habana's native lazy kernel wins in isolated calls
+INDEX_ADD_MIN_ROWS = 40960  # source rows; below, Habana's native lazy kernel wins in isolated calls
+INDEX_ADD_MAX_SELF_ROWS = 256  # Habana's lazy accumulating index_put into more than 512 rows misreads an index made
+#                                by an add in the same graph (repro/index_put_lazy_add_index.py): 2x margin
+INDEX_ADD_MIN_PER_ROW = 1280  # source rows per row of self below a wide row (measured: 640 is parity, 320 loses)
+INDEX_ADD_WIDE_ROW = 128  # elements per row of self from which the rewrite wins at every contention measured
 _MODE = {}
 
 
@@ -523,20 +532,30 @@ def install_logsumexp(device_type):
 
 # ---- index_add (lazy mode, no_grad / inference_mode, dim == 0) ----------------------------------------------------
 
+def _index_add_wins(shape, src_rows):
+    """Where the rewrite beats Habana's lazy kernel in isolated and batched calls, inside the rows where Habana's
+    accumulating put is right: many source rows per row of ``self``, or wide rows."""
+    rows, width = shape[0], math.prod(shape[1:])
+    return (0 < rows <= INDEX_ADD_MAX_SELF_ROWS and width > 0 and src_rows >= INDEX_ADD_MIN_ROWS
+            and (src_rows >= INDEX_ADD_MIN_PER_ROW * rows or width >= INDEX_ADD_WIDE_ROW))
+
+
 def _index_add_takes(self, dim, index, source):
     return (_lazy() and not torch.is_grad_enabled()
             and self.dim() >= 1 and source.dim() == self.dim() and index.dim() == 1
-            and source.shape[0] >= INDEX_ADD_MIN_ROWS and index.shape[0] == source.shape[0]
+            and index.shape[0] == source.shape[0]
             and -self.dim() <= dim < self.dim() and (dim % self.dim()) == 0
-            and self.shape[1:] == source.shape[1:] and self.dtype == source.dtype
+            and self.shape[1:] == source.shape[1:] and self.dtype == source.dtype == torch.float32
             and index.dtype in (torch.int32, torch.int64)
             and static(*self.shape, *index.shape, *source.shape)
+            and _index_add_wins(self.shape, source.shape[0])
             and _concrete(self) and not _is_fake(index) and not _is_fake(source))
 
 
 def install_index_add(device_type):
-    """Scoped lazy-mode ``index_add`` on ``device_type`` (``not grad_enabled``, ``dim == 0``,
-    ``source.shape[0] >= INDEX_ADD_MIN_ROWS``) via ``index_put(..., accumulate=True)``. Returns an undo."""
+    """Scoped lazy-mode ``index_add`` on ``device_type`` (``not grad_enabled``, ``dim == 0``, float32, the shapes of
+    ``_index_add_wins``) via ``index_put_(..., accumulate=True)`` into a copy of ``self`` with a scratch row.
+    Returns an undo."""
     if not _lazy():
         return lambda: None
     op, out_op = aten.index_add.default, aten.index_add.out
@@ -544,7 +563,12 @@ def install_index_add(device_type):
     def _run(self, index, source, alpha):
         count("index_add")
         src = source if alpha == 1 else source * alpha
-        return self.index_put((index,), src, accumulate=True)
+        rows = self.shape[0]
+        # As Habana's index_add: [-rows, -1] wraps, any other index out of range is dropped (into the scratch row):
+        # Habana's index_put stops the device on an index of -1, and ATen's error would need a host read.
+        slot = torch.where((index >= -rows) & (index < rows), torch.remainder(index, rows), rows)
+        padded = torch.cat([self, self.new_zeros((1,) + self.shape[1:])])  # a fresh copy: accumulate in place
+        return padded.index_put_((slot,), src, accumulate=True)[:rows]
 
     def autograd_kernel(self, dim, index, source, *, alpha=1):
         if _index_add_takes(self, dim, index, source):

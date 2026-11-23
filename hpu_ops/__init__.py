@@ -86,7 +86,8 @@ at the tensor's pickling:
 - ``bincount`` of 1-D integer inputs (65536 to 2**24 - 1 elements, or 4096..65535 when ``minlength >= 256`` eager /
   ``>= 128`` lazy) with at most 4096 bins and no weights through ``aminmax`` + chunked ``histc``, and ``uint8``
   with ``minlength >= 256`` under ``torch.compile`` via ``one_hot`` (``small``, #21); scoped lazy-mode rewrites for
-  ``logsumexp`` (``numel <= 2**19``) and ``index_add`` (no-grad ``dim == 0``, ``rows >= 40960``). ``trace`` stays
+  ``logsumexp`` (``numel <= 2**19``) and ``index_add`` (no-grad ``dim == 0`` float32 into at most 256 rows, with
+  ``>= 40960`` source rows and (``>= 1280`` per row or rows of ``>= 128`` elements)). ``trace`` stays
   native (Python dispatcher overhead exceeds the kernel gain).
 - Warnings for the 8-byte dtypes in eager mode (``wide``), at the copy to the card: float64 views with a storage
   offset read and write at twice the offset, int64 values past int32 are computed on their low 32 bits. Neither is

@@ -2,6 +2,7 @@
 
 Run in Eager (`PT_HPU_LAZY_MODE=0`), Lazy (`PT_HPU_LAZY_MODE=1`), or Compile (`BENCH_COMPILE=1 PT_HPU_LAZY_MODE=0`):
     python3 tests/bench_m6a_21.py
+BENCH_OPS=index_add (comma separated) keeps those ops' rows.
 """
 import os
 import time
@@ -140,12 +141,17 @@ def run_ab():
                     ab_cases.append(("logsumexp", f"fwdbwd {shape}",
                                      lambda x, d=dim: torch.autograd.grad(torch.logsumexp(x, d).sum(), x)[0],
                                      (torch.randn(*shape, requires_grad=True),), st))
-            for rows, n in [(64, 40960), (64, 409600), (1024, 40960), (1024, 409600)]:
+            # taken (_index_add_wins), then declined: 640 source rows per narrow row, and past the 256-row cap
+            for rows, n, cols in [(16, 40960, 22), (64, 81920, 22), (128, 163840, 22), (64, 409600, 22),
+                                  (256, 409600, 22), (256, 40960, 128), (64, 40960, 22), (1024, 40960, 22),
+                                  (1024, 40960, 128)]:
                 for st in ("iso", "batch"):
-                    ab_cases.append(("index_add", f"({rows},22)<-({n},22)",
+                    ab_cases.append(("index_add", f"({rows},{cols})<-({n},{cols})",
                                      lambda d, i, s: d.index_add(0, i, s),
-                                     (torch.randn(rows, 22), torch.randint(0, rows, (n,)), torch.randn(n, 22)), st))
+                                     (torch.randn(rows, cols), torch.randint(0, rows, (n,)), torch.randn(n, cols)), st))
 
+    if os.environ.get("BENCH_OPS"):
+        ab_cases = [c for c in ab_cases if c[0] in os.environ["BENCH_OPS"].split(",")]
     for op, label, fn, args, style in ab_cases:
         if "fwdbwd" in label:
             cpu_ms, ref = cpu_time(fn, [a.detach().clone().requires_grad_() for a in args])

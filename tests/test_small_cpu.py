@@ -476,8 +476,8 @@ def test_logsumexp_lazy_transforms_and_compile_decline(monkeypatch):
 
 def test_index_add_scope_declines_eager_grad_dim_and_small(monkeypatch):
     rows = small.INDEX_ADD_MIN_ROWS
-    dst = torch.randn(64, 8)
-    idx = torch.randint(0, 64, (rows,))
+    dst = torch.randn(16, 8)  # taken in lazy no_grad (2560 source rows per row): every decline below is the scope's
+    idx = torch.randint(0, 16, (rows,))
     src = torch.randn(rows, 8)
 
     monkeypatch.setattr(small, "_lazy", lambda: False)
@@ -508,10 +508,11 @@ def test_index_add_scope_declines_eager_grad_dim_and_small(monkeypatch):
 
 
 @pytest.mark.parametrize("shape_dst,dim,alpha,idx_dtype", [
-    ((64,), 0, 1.0, torch.int64),
-    ((64, 22), 0, 1.0, torch.int64),
-    ((64, 22), -2, 2.5, torch.int32),
+    ((16,), 0, 1.0, torch.int64),
+    ((16, 22), 0, 1.0, torch.int64),
+    ((16, 22), -2, 2.5, torch.int32),
     ((16, 4, 3), 0, 1.0, torch.int64),
+    ((256, 128), 0, 1.0, torch.int64),  # wide rows: taken at 160 source rows per row
 ])
 def test_index_add_lazy_nograd_and_inference_match_aten(monkeypatch, shape_dst, dim, alpha, idx_dtype):
     monkeypatch.setattr(small, "_lazy", lambda: True)
@@ -548,6 +549,104 @@ def test_index_add_errors_and_undo(monkeypatch):
     assert torch._C._dispatch_has_kernel_for_dispatch_key("aten::index_add", "AutogradCPU")
     undo()
     assert not torch._C._dispatch_has_kernel_for_dispatch_key("aten::index_add", "AutogradCPU")
+
+
+@pytest.mark.parametrize("shape,src_rows,wins", [
+    ((16, 22), 40960, True),  # 2560 source rows per row
+    ((16, 22), 40959, False),  # below INDEX_ADD_MIN_ROWS
+    ((32, 22), 1280 * 32, True),  # at INDEX_ADD_MIN_PER_ROW
+    ((32, 22), 1280 * 32 - 1, False),
+    ((64, 22), 40960, False),  # 640 per row in narrow rows: Habana's kernel is as fast
+    ((64,), 1280 * 64, True),
+    ((256, 128), 40960, True),  # wide rows win at 160 per row
+    ((256, 127), 40960, False),
+    ((16, 4, 32), 40960, True),  # 128 elements per row
+    ((257, 128), 1 << 22, False),  # past INDEX_ADD_MAX_SELF_ROWS, whatever the contention or width
+    ((1024, 22), 1280 * 1024, False),
+    ((0, 22), 1 << 20, False),  # empty: remainder by 0 rows
+    ((16, 0), 1 << 20, False),
+])
+def test_index_add_scope_rows_contention_and_width(shape, src_rows, wins):
+    """Taken only where it was measured to win on Gaudi2 lazy, and never into more than 256 rows: Habana's lazy
+    accumulating index_put into more than 512 rows misreads an index made by an add in the same graph."""
+    assert small._index_add_wins(shape, src_rows) is wins
+
+
+def test_index_add_past_the_row_cap_stays_native(monkeypatch):
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    rows = small.INDEX_ADD_MIN_ROWS
+    dst = torch.randn(small.INDEX_ADD_MAX_SELF_ROWS + 1, 128)
+    idx = torch.randint(0, dst.shape[0], (rows,))
+    src = torch.randn(rows, 128)
+    ref = dst.index_add(0, idx, src)
+    with cpu_as_hpu(small.install_index_add) as calls, torch.no_grad():
+        out = dst.index_add(0, idx, src)
+    assert calls["index_add"] == 0
+    same(out, ref, exact=True)
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("bad", [[-1], [-16], [-17], [16], [1 << 20], [-(1 << 20)], [-1, -17, 16, 1 << 20]])
+def test_index_add_out_of_range_indices_as_habanas_kernel(monkeypatch, bad, idx_dtype):
+    """ATen raises for an index out of range, which needs a host read. Habana's own index_add (measured on Gaudi2,
+    eager and lazy) wraps [-n, -1] and drops the others; its index_put(accumulate=True) stops the device on an index
+    of -1 ("Compute or dma timeout"). The rewrite does what Habana's index_add does, and no index out of range
+    reaches index_put (the CPU's index_put raises for one)."""
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    rows, n = small.INDEX_ADD_MIN_ROWS, 16
+    dst = torch.full((n, 8), 0.5)
+    idx = torch.zeros(rows, dtype=idx_dtype)
+    idx[:len(bad)] = torch.tensor(bad)
+    src = torch.ones(rows, 8)
+    src[:4] = torch.tensor([2.0, 3.0, 5.0, 7.0]).unsqueeze(1)  # sums stay exact in float32, in any order
+    wrapped = torch.where(idx < 0, idx + n, idx)
+    keep = (wrapped >= 0) & (wrapped < n)
+    ref = dst.index_add(0, wrapped[keep], src[keep])
+    with cpu_as_hpu(small.install_index_add) as calls, torch.no_grad():
+        out = dst.index_add(0, idx, src)
+    assert calls["index_add"] == 1
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype,alpha", [(torch.int64, 0.5), (torch.int64, 1.5), (torch.int32, 1.5), (torch.int32, 2),
+                                         (torch.int16, 1), (torch.uint8, 1), (torch.bool, 1), (torch.float16, 1.0),
+                                         (torch.bfloat16, 0.5), (torch.float64, 0.5)])
+def test_index_add_keeps_atens_kernel_off_float32(monkeypatch, dtype, alpha):
+    """Only float32 is taken. ATen casts ``alpha`` to ``self``'s dtype (int: 1.5 adds 1, 0.5 adds 0) where
+    ``source * alpha`` promotes to float, a bool ``self`` accumulates as a logical or, and ATen sums the half dtypes
+    in float32 (40960 ones give 40960, not bfloat16's 256)."""
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    rows = small.INDEX_ADD_MIN_ROWS
+    dst = torch.zeros(10, 4, dtype=dtype)
+    idx = torch.zeros(rows, dtype=torch.int64)
+    src = torch.ones(rows, 4, dtype=dtype)
+    with torch.no_grad():
+        ref = dst.index_add(0, idx, src, alpha=alpha)
+    with cpu_as_hpu(small.install_index_add) as calls, torch.no_grad():
+        out = dst.index_add(0, idx, src, alpha=alpha)
+    assert calls["index_add"] == 0
+    same(out, ref, exact=True)
+
+
+def test_index_add_noncontiguous_taken_and_out_variants_native(monkeypatch):
+    """The taken path accepts any strides (transposed self, sliced source); ``out=`` and ``index_add_`` are never
+    registered, so they keep the native kernel."""
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    rows = small.INDEX_ADD_MIN_ROWS
+    dst = torch.randn(32, 16).t()  # (16, 32), non-contiguous
+    src = torch.ones(2 * rows, 32)[::2]  # non-contiguous; ones keep every sum exact in float32
+    idx = torch.randint(0, 16, (rows,), generator=torch.Generator().manual_seed(0))
+    with torch.no_grad():
+        ref = dst.index_add(0, idx, src)
+    with cpu_as_hpu(small.install_index_add) as calls, torch.no_grad():
+        out = dst.index_add(0, idx, src)
+    assert calls["index_add"] == 1
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    with cpu_as_hpu(small.install_index_add) as calls, torch.no_grad():
+        buf = dst.clone()
+        torch.index_add(dst, 0, idx, src, out=buf)
+        dst.clone().index_add_(0, idx, src)
+    assert calls["index_add"] == 0
 
 
 # ---- trace stays native ----------------------------------------------------------------------------------------------

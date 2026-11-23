@@ -210,7 +210,8 @@ def check_index_add():
     want_taken = 1 if LAZY else 0
     rows = small.INDEX_ADD_MIN_ROWS
     torch.manual_seed(0)
-    for shape_dst, dim, alpha in [((64,), 0, 1.0), ((64, 22), 0, 1.0), ((64, 22), -2, 2.5), ((16, 4, 3), 0, 1.0)]:
+    for shape_dst, dim, alpha in [((16,), 0, 1.0), ((16, 22), 0, 1.0), ((16, 22), -2, 2.5), ((16, 4, 3), 0, 1.0),
+                                  ((256, 128), 0, 1.0)]:
         dst = torch.randn(shape_dst)
         idx = torch.randint(0, shape_dst[0], (rows,))
         src = torch.randn((rows,) + shape_dst[1:])
@@ -245,6 +246,64 @@ def check_index_add():
         return gd.shape == dst.shape and gs.shape == src.shape, ""
 
     run_checked("index_add grad/small/dim!=0 stay native", _declined, {"index_add": 0})
+
+    # an index made by an add in the same lazy graph: Habana's accumulating put returns wrong sums for it past 512
+    # rows (repro/index_put_lazy_add_index.py), so the rewrite stays at <= 256 rows; Habana's index_add is right
+    for shape_dst, taken in [((16, 22), want_taken), ((256, 128), want_taken), ((1024, 128), 0)]:
+        dst = torch.randn(shape_dst)
+        idx = torch.randint(0, shape_dst[0], (rows,))
+        src = torch.randn((rows,) + shape_dst[1:])
+        ref = dst.index_add(0, idx, src)
+
+        def _added(dst=dst, idx=idx, src=src, ref=ref):
+            with torch.no_grad():
+                o = dst.to(HPU).index_add(0, idx.to(HPU) + 0, src.to(HPU))
+            htcore.mark_step()
+            return same(o.cpu(), ref, rtol=1e-4, atol=1e-3)
+
+        run_checked(f"index_add {shape_dst} index made by an add", _added, {"index_add": taken})
+
+    # an index out of range: ATen raises (a host read); Habana's own kernel, and so the rewrite, wraps [-n, -1] and
+    # drops the others. Habana's index_put stops the device on an index of -1 (exit 137), so none may reach it.
+    n = 16
+    for bad in ([-1], [-n], [-n - 1], [n], [1 << 20], [-(1 << 20)], [-1, -n - 1, n, 1 << 20]):
+        for idx_dtype in (torch.int64, torch.int32):
+            d = torch.full((n, 8), 0.5)
+            i = torch.zeros(rows, dtype=idx_dtype)
+            i[:len(bad)] = torch.tensor(bad, dtype=idx_dtype)
+            s = torch.ones(rows, 8)
+            s[:4] = torch.tensor([2.0, 3.0, 5.0, 7.0]).unsqueeze(1)  # sums stay exact in float32, in any order
+            w = torch.where(i < 0, i + n, i)
+            keep = (w >= 0) & (w < n)
+            ref = d.index_add(0, w[keep], s[keep])
+
+            def _oob(d=d, i=i, s=s, ref=ref):
+                with torch.no_grad():
+                    o = d.to(HPU).index_add(0, i.to(HPU), s.to(HPU))
+                htcore.mark_step()
+                return same(o.cpu(), ref, exact=True)
+
+            run_checked(f"index_add idx={bad} {idx_dtype}", _oob, {"index_add": want_taken})
+
+    # off float32 the rewrite declines; the integral results are ATen's (alpha cast to self's dtype), bool and the
+    # half dtypes are Habana's own kernel (printed, not checked: its bugs, not hpu_ops')
+    for dt, alpha in [(torch.int32, 1.5), (torch.int64, 0.5), (torch.bool, 1), (torch.float16, 1.0),
+                      (torch.bfloat16, 1.0)]:
+        d = torch.zeros(10, 4, dtype=dt)
+        i = torch.zeros(rows, dtype=torch.long)
+        s = torch.ones(rows, 4, dtype=dt)
+        ref = d.index_add(0, i, s, alpha=alpha)
+
+        def _dtype(d=d, i=i, s=s, alpha=alpha, ref=ref, dt=dt):
+            with torch.no_grad():
+                o = d.to(HPU).index_add(0, i.to(HPU), s.to(HPU), alpha=alpha)
+            htcore.mark_step()
+            ok, detail = same(o.cpu(), ref, exact=True)
+            if dt in (torch.int32, torch.int64):
+                return ok, detail
+            return o.dtype == dt, f"Habana's kernel row0={o.cpu()[0, 0].item()} ATen {ref[0, 0].item()}"
+
+        run_checked(f"index_add {dt} a={alpha} declines", _dtype, {"index_add": 0})
 
 
 def check_trace_native():
