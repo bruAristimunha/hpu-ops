@@ -27,7 +27,8 @@ at the tensor's pickling:
   ``aten.constant_pad_nd.default`` avoids ``hpu.constant_pad_nd_ds`` ``synStatus 26`` (inference of ``NeuroRVQ``,
   ``NeuroRVQTokenizer``, ``DIVER1`` and ``LaBraM`` now compiles at ``16 <-> 128``; Habana's own dynamic-shape bugs
   remain, see the README). Static ``expand``, non-``int64`` dtypes, and eager calls keep Gaudi's path.
-- ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails (BrainModule).
+- ``glu`` as ``a * sigmoid(b)`` (``composite``): Gaudi's compiled glu fails, and its lazy backend graph for a
+  permuted intermediate fails in inference mode (BrainModule).
 - ``renorm`` as norm, scale and multiply (``composite``): it has no HPU kernel and ran on the CPU (SSTDPN).
 - The ``embedding`` gradient of a 0-d index through the one-element index (``composite``): Gaudi's
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).

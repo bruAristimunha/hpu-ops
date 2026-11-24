@@ -3,7 +3,8 @@
 a strided input by a multiple of the size) or rejects an inferred argument (``one_hot`` with ``num_classes=-1``).
 
 Each is registered at ``AutogradHPU``, so eager calls and traced graphs both use it and autograd differentiates the
-composite; ``renorm`` and ``one_hot`` are also registered at ``HPU`` for calls below autograd (inference mode). ``unfold`` and
+composite; ``renorm`` and ``one_hot`` are also registered at ``HPU`` for calls below autograd (inference mode),
+and ``glu`` is as well in lazy mode. ``unfold`` and
 ``unfold_backward`` are registered at ``HPU`` only, below torch's own autograd kernels, which keep their formulas. Cases a composite does
 not take (odd ``glu`` halves, invalid ``renorm`` arguments) go to the op's own kernel, which raises its usual error;
 so do embedding gradients of indices with dimensions, which Gaudi gets right. The composites run with autocast off and
@@ -210,10 +211,22 @@ def _kernel(op, name, composite, takes, fallback):
 
 
 def install_glu(device_type):
-    """``glu`` on ``device_type`` as ``a * sigmoid(b)``. Returns an undo."""
+    """``glu`` on ``device_type`` as ``a * sigmoid(b)``, at the autograd and backend keys. Returns an undo.
+
+    The backend registration replaces Habana's lazy kernel, whose graph for a permuted intermediate is
+    rejected in inference mode (BrainModule's (32, 640, 1000) GLU along dim 1); cases the composite
+    declines go to the structured kernel below it. It is registered only in lazy mode: the eager kernel
+    computes the same call, so eager inference keeps Habana's path."""
+    from . import tpc
+
     op = aten.glu.default
-    kernel = _kernel(op, "glu", glu, _glu_takes, DispatchKey.Autograd)
-    return register_kernels(device_type, [(op, "Autograd{}", kernel)])
+    below = DispatchKey.CompositeExplicitAutogradNonFunctional
+    undos = [register_kernels(device_type, [
+        (op, "Autograd{}", _kernel(op, "glu", glu, _glu_takes, DispatchKey.Autograd))])]
+    if tpc.lazy_mode():
+        undos.append(override_kernels(device_type, [
+            (op, _kernel(op, "glu", glu, _glu_takes, below))]))
+    return chain(undos)
 
 
 def install_renorm(device_type):
