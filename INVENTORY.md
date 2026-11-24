@@ -3,7 +3,8 @@
 Every CPU execution that hpu-ops' strict mode (`HPU_OPS_STRICT=report`, `hpu_ops.strict("report")`) saw in one
 training step and one inference forward of each model, on one Gaudi2 card (gaudi-docker 1.21.4, bridge 1.21.4,
 torch 2.6.0), hpu-ops at 97065c2, hpu-complex at 754ff53, braindecode at dafe8339 (the G12/G13 branch),
-spd_learn at 16b39ce, November 24, 2026.
+spd_learn at 16b39ce, November 24, 2026. BrainModule's and FNIRS4D's lazy rows were re-measured at
+hpu-ops 5bc0116 (the #70 GLU backend fix): both pass strict with zero rows.
 
 - Models: the 21 `spd_diag.models.MODELS` (BNCI2014_001, 22 channels, real batch of 32, cross-entropy) and the
   braindecode models of `braindecode.models.util.models_mandatory_parameters` (104 census rows, braindecode-kernels'
@@ -36,8 +37,8 @@ native input gradient was measured wrong, #66) and MEGGPT's argmax (a same-shape
 
 ## Not CPU executions, but blockers seen on the way (each a separate issue)
 
-- Lazy braindecode: 90 ok / 13 error / 1 crashed of 104, in four measured classes. Habana's lazy fuser rejects
-  the full-step graph (BBL, BrainTokenizer, FNIRS4D; BrainModule and VEMG2Pose at inference, after failing
+- Lazy braindecode: 92 ok / 11 error / 1 crashed of 104, in four measured classes. Habana's lazy fuser rejects
+  the full-step graph (BBL, BrainTokenizer; VEMG2Pose at inference, after failing
   stock training too): syncing after each top-level module passes forward and backward, so segmentation with
   `mark_step` is the workaround and eager/compiled pass. `HabanaParameterWrapper` breaks
   `UninitializedParameter` materialization (#68, with a bare `nn.LazyLinear` repro): CBraMod, CSBrain and
@@ -84,7 +85,7 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | BIOT | 45.31 | 30.28 | 49.71 |
 | bd | BaRISTA | 146.94 | 82.7 | 2555.1 |
 | bd | BrainBERT | 21.66 | 19.09 | 41.27 |
-| bd | BrainModule | 57.92 | 33.54, error: inference RuntimeError('Graph compile failed. synStatus=synStatus 26 [Generic fa | 56.57 |
+| bd | BrainModule | 57.92 | 29.17 | 56.57 |
 | bd | BrainOmni | 183.55 | 119.33 | 278.49 |
 | bd | BrainTokenizer | 157.38 | error: warm-up RuntimeError('[Rank:0] FATAL ERROR :: MODULE:PT_BRIDGE Exception in La | 211.52 |
 | bd | Brant | 55.03 | error: warm-up RuntimeError('[Rank:0] FATAL ERROR :: MODULE:PT_BRIDGE Exception in La | 92.18 |
@@ -120,7 +121,7 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | FBCNet | 6.16 | 8.76 | 10.34 |
 | bd | FBLightConvNet | 5.82 | 6.97 | 8.49 |
 | bd | FBMSNet | 13.83 | 11.35 | 14.9 |
-| bd | FNIRS4D | 58.16 | 42.67, error: inference RuntimeError('Graph compile failed. synStatus=synStatus 26 [Generic fa | 85.31 |
+| bd | FNIRS4D | 58.16 | 40.83 | 85.31 |
 | bd | FNIRSCNN1D | 212.78 | 7.3 | 280.6 |
 | bd | FNIRSNet | 6.3 | 5.2 | 6.35 |
 | bd | FNIRSPreT | 76.21 | 76.36 | 122.83 |
