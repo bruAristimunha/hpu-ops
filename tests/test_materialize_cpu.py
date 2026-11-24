@@ -27,6 +27,14 @@ def test_plain_model_no_forward():
     assert model.weight is weight
 
 
+def test_compile_materializes_and_wraps():
+    model = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.LazyLinear(4))
+    with pytest.raises(Exception, match="hpu_backend"):
+        hpu_ops.compile(model, torch.randn(2, 3, 5), device="cpu")
+    assert _uninit(model) == []
+    assert model[1].weight.shape == (4, 15)
+
+
 def test_segmented_is_noop_off_gaudi():
     model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.ReLU())
     out, undo = hpu_ops.segmented(model)

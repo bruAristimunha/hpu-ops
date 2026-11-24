@@ -137,8 +137,8 @@ from ._strict import CPUExecutionError, strict  # noqa: F401
 from ._strict import check as strict_check, format_report as strict_format_report  # noqa: F401
 from ._strict import report as strict_report, reset as strict_reset  # noqa: F401
 
-__all__ = ["enable", "materialize", "segmented", "strict", "CPUExecutionError", "strict_check", "strict_report",
-           "strict_reset", "strict_format_report"]
+__all__ = ["enable", "materialize", "segmented", "compile", "strict", "CPUExecutionError", "strict_check",
+           "strict_report", "strict_reset", "strict_format_report"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
@@ -271,3 +271,17 @@ def segmented(model):
             handle.remove()
 
     return model, undo
+
+
+def compile(model, example_input, device="hpu", dynamic=False):
+    """The fast compiled path, measured on Gaudi2 (bridge 1.21.4, batch 32, synced steps):
+    ``enable()``, ``materialize`` on the CPU, move to ``device``, a dynamo reset, then
+    ``torch.compile(backend="hpu_backend", dynamic=False)``. Static compile is the fastest
+    measured mode for EEGNet (6.28 vs eager 10.94 ms/step), Deep4Net (8.52 vs 15.83), ATCNet
+    (53.95 vs 114.02) and EpiNT (37.42 vs 61.81); it is not universal — GCNsNet and VEMG2Pose
+    run fastest lazy, and BrainTokenizer/BBL only segmented lazy (COMPATIBILITY.md)."""
+    enable()
+    materialize(model, example_input)
+    model = model.to(device)
+    torch._dynamo.reset()
+    return torch.compile(model, backend="hpu_backend", dynamic=dynamic)
