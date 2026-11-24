@@ -7,8 +7,11 @@ spd_learn at 16b39ce, November 24, 2026. BrainModule's and FNIRS4D's lazy rows w
 hpu-ops 5bc0116 (the #70 GLU backend fix): both pass strict with zero rows. Targeted rows below were
 re-measured at 7d9f8b7 (#72): CBraMod and CSBrain pass lazy after `hpu_ops.materialize`, BBL,
 BrainTokenizer and VEMG2Pose pass lazy with `--segment-topchild`, and NeuroRVQTokenizer passes eager
-and compiled after the sweep's grad-carrying target fix. These targeted passes imply eager 102/104,
-compiled 102/104 and lazy 97/104; a full census recount is still pending.
+and compiled after the sweep's grad-carrying target fix. At 88bf934 (#74) GCNsNet passes eager,
+lazy and compiled (the wide-kernel `max_pool1d` composite), EpiNT passes eager and lazy (the
+`instance_norm` composite; compiled inference still fails), and CareSleepNet passes segmented lazy.
+These targeted passes imply eager 104/104, compiled 103/104 and lazy 99/104; a full census recount
+is still pending. Causes and fixes: `COMPATIBILITY.md`.
 
 - Models: the 21 `spd_diag.models.MODELS` (BNCI2014_001, 22 channels, real batch of 32, cross-entropy) and the
   braindecode models of `braindecode.models.util.models_mandatory_parameters` (104 census rows, braindecode-kernels'
@@ -42,16 +45,16 @@ graph-compile failure in every mode.
 
 ## Not CPU executions, but blockers seen on the way (each a separate issue)
 
-- Lazy braindecode: 92 ok / 11 error / 1 crashed in the census; targeted #72 passes raise the proven
-  total to 97/104, pending a full recount. Habana's lazy fuser rejects the full-step graph (BBL,
-  BrainTokenizer; VEMG2Pose at inference): the sweep's `--segment-topchild` mode (one `mark_step` after
-  each top-level child) passes all three. `HabanaParameterWrapper` breaks `UninitializedParameter`
-  materialization (#68, with a bare `nn.LazyLinear` repro): the sweep now calls
-  `hpu_ops.materialize(model, X)` on the CPU first, and CBraMod and CSBrain pass; GCNsNet materializes
-  but then hits the separate graph-compile failure above. CareSleepNet's lazy inference hangs both
-  after training steps and in a fresh inference-only process (training alone passes), so process
-  isolation is not a workaround. SyncNet's census crash was the knock-on from that fatality in the
-  same census process (it passes isolated), as do Brant, NeuroPose and FNIRST, whose census errors do
+- Lazy braindecode: 92 ok / 11 error / 1 crashed in the census; targeted #72/#74 passes raise the
+  proven total to 99/104, pending a full recount. Habana's lazy fuser rejects the full-step graph
+  (BBL, BrainTokenizer; VEMG2Pose at inference): the sweep's `--segment-topchild` mode (one
+  `mark_step` after each top-level child) passes all three, and CareSleepNet segmented too (its
+  unsegmented lazy inference hangs, even in a fresh process; training alone passes).
+  `HabanaParameterWrapper` breaks `UninitializedParameter` materialization (#68, with a bare
+  `nn.LazyLinear` repro): the sweep now calls `hpu_ops.materialize(model, X)` on the CPU first, and
+  CBraMod and CSBrain pass. GCNsNet then reached its last pooling (kernel 2 over length 1), now a
+  composite (#74). SyncNet's census crash was the knock-on from CareSleepNet's fatality in the same
+  census process (it passes isolated), as do Brant, NeuroPose and FNIRST, whose census errors do
   not reproduce alone.
 - EpiNT eager/compiled inference: synapse graph compile failure (also in the old inventory).
 - Default-dynamic compiled inference: Habana's recipe compiler raises `KeyError('output_strides')` (#63,
@@ -100,7 +103,7 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | CORTEG | 24.93 | 21.12 | 38.61 |
 | bd | CSBrain | 491.68 | 155.17 (materialized, #72) | 651.73 |
 | bd | CTNet | 57.23 | 52.49 | 100.12 |
-| bd | CareSleepNet | 155.88 | 140.25, error: inference RuntimeError('[Rank:0] FATAL ERROR :: MODULE:PT_SYNHELPER synStatus 31 | 344.16 |
+| bd | CareSleepNet | 155.88 | 122.52 (segmented, #74) | 344.16 |
 | bd | CodeBrain | 549.34 | 174.37 | 684.99 |
 | bd | ContraWR | 30.38 | 24.2 | 54.04 |
 | bd | DANCE | 26.94 | 21.93 | 36.15 |
@@ -124,7 +127,7 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | EEGSym | 85.45 | 50.0 | 132.89 |
 | bd | EEGTCNet | 22.21 | 19.83 | 36.82 |
 | bd | EMG2QwertyNet | 191.76 | 118.25 | 191.85 |
-| bd | EpiNT | 74.16, error: inference RuntimeError('Graph compile failed. synStatus=synStatus 26 [Generic fa | 45.96 | 118.6, error: inference RuntimeError('Graph compile failed. synStatus=synStatus 26 [Generic fa |
+| bd | EpiNT | 110.31 (#74) | 45.93 (#74) | 118.6, error: inference RuntimeError('Graph compile failed. synStatus=synStatus 26 [Generic fa |
 | bd | FBCNet | 6.16 | 8.76 | 10.34 |
 | bd | FBLightConvNet | 5.82 | 6.97 | 8.49 |
 | bd | FBMSNet | 13.83 | 11.35 | 14.9 |
@@ -133,7 +136,7 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | FNIRSNet | 6.3 | 5.2 | 6.35 |
 | bd | FNIRSPreT | 76.21 | 76.36 | 122.83 |
 | bd | FNIRST | 76.57 | error: warm-up RuntimeError('[Rank:0] FATAL ERROR :: MODULE:PT_BRIDGE Exception in La | 101.23 |
-| bd | GCNsNet | error: warm-up RuntimeError('Graph compile failed. synStatus=synStatus 26 [Generic fa | error: warm-up RuntimeError('max_pool1d: Expected 2D or 3D (batch mode) tensor with o | error: warm-up RuntimeError('Graph compile failed. synStatus=synStatus 26 [Generic fa |
+| bd | GCNsNet | 132.42 (#74) | 71.75 (#74) | 1088.84 (#74) |
 | bd | GeoNIRS | 138.01 | 85.02 | 209.93 |
 | bd | Guetschel2026 | 25.0 | 29.91 | 32.96 |
 | bd | IFNet | 10.43 | 9.41 | 14.89 |
