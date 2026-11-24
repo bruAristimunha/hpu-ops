@@ -24,6 +24,7 @@ LAZY = os.environ.get("PT_HPU_LAZY_MODE", "1") != "0"
 HPU = torch.device("hpu")
 BATCH, STEPS, TIMED = 32, 3, 5
 PER_OP = True  # --step-check: no dispatch mode, the counters read per block (the program as it runs unwatched)
+SEGMENT = False  # --segment-topchild: mark_step after each top-level child (lazy graph segmentation)
 BRIDGE = "1.21.4"
 
 
@@ -90,25 +91,40 @@ def build_bd(names):
     return (names or [n for n, _, _ in models_mandatory_parameters]), make
 
 
-def first_tensor(out):
+def _floating(out):
     if isinstance(out, torch.Tensor):
-        return out
+        return [out] if out.is_floating_point() else []
     if isinstance(out, dict):
         out = list(out.values())
+    found = []
     for o in out:
-        t = first_tensor(o) if not isinstance(o, torch.Tensor) else o
-        if t is not None and t.is_floating_point():
+        found += _floating(o)
+    return found
+
+
+def first_tensor(out):
+    """The tensor the loss trains on: the first floating tensor that requires grad, else the
+    first floating tensor (a target computed from the input alone, e.g. NeuroRVQTokenizer's
+    element 0, cannot take a backward)."""
+    tensors = _floating(out)
+    for t in tensors:
+        if t.requires_grad:
             return t
-    return None
+    return tensors[0] if tensors else None
 
 
 def run(name, make, hpu_ops, compiled):
     mode = "compile" if compiled else ("lazy" if LAZY else "eager")
     row = dict(model=name, mode=mode, batch=BATCH, bridge=BRIDGE)
     stage = "build"
+    seg_handles = []
     try:
         model, X, y, loss_kind = make(name)
+        hpu_ops.materialize(model, X)  # lazy parameters allocated on the CPU (#68)
         model = model.to(HPU).train()
+        if SEGMENT and LAZY:  # one lazy graph per top-level child (BBL, BrainTokenizer, VEMG2Pose)
+            seg_handles = [child.register_forward_hook(lambda *a: htcore.mark_step())
+                           for child in model.children()]
         xb = X.to(HPU)
         yb = y.to(HPU) if y is not None else None
         fwd = torch.compile(model, backend="hpu_backend") if compiled else model
@@ -178,6 +194,8 @@ def run(name, make, hpu_ops, compiled):
         row.update(status="error", stage=stage, error=repr(e)[:500],
                    where=[f"{_short(f.filename)}:{f.lineno}" for f in traceback.extract_tb(e.__traceback__)][-5:])
     finally:
+        for handle in seg_handles:
+            handle.remove()
         gc.collect()
     return row
 
@@ -192,9 +210,12 @@ def main():
                         help="strict(per_op=False): no dispatch mode at all, bridge and hpu_complex counters per block")
     parser.add_argument("--resume", action="store_true",
                         help="skip the models --out has; a model started and never finished is recorded as crashed")
+    parser.add_argument("--segment-topchild", action="store_true",
+                        help="lazy: mark_step after each top-level child module (one graph per child)")
     args = parser.parse_args()
-    global PER_OP
+    global PER_OP, SEGMENT
     PER_OP = not args.step_check
+    SEGMENT = args.segment_topchild
     import hpu_complex
 
     hpu_complex.enable()
