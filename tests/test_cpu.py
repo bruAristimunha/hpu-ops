@@ -710,6 +710,18 @@ def test_glu_dtypes_layouts_and_errors():
     torch.testing.assert_close(strided, want[1], atol=1e-6, rtol=1e-6)
 
 
+def test_glu_inference_mode_uses_the_backend_composite(monkeypatch):
+    """Inference mode skips autograd: BrainModule's GLU along dim 1 must not fall back to Habana's kernel."""
+    x = torch.randn(4, 6, 8)
+    want = F.glu(x, 1)
+    monkeypatch.setenv("PT_HPU_LAZY_MODE", "1")
+    with cpu_as_hpu(composite.install_glu) as calls:
+        with torch.inference_mode():
+            got = F.glu(x, 1)
+    assert calls["glu"] == 1
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
 def test_glu_elsewhere_stays_glu():
     nodes = []
     with cpu_as_hpu(lambda device: composite.install_glu("hpu")) as calls:
