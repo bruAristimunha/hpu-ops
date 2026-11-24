@@ -129,7 +129,7 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | EEGSym | 85.45 | 50.0 | 132.89 |
 | bd | EEGTCNet | 22.21 | 19.83 | 36.82 |
 | bd | EMG2QwertyNet | 191.76 | 118.25 | 191.85 |
-| bd | EpiNT | 110.31 (#74) | 45.93 (#74) | 118.6, error: inference RuntimeError('Graph compile failed. synStatus=synStatus 26 [Generic fa |
+| bd | EpiNT | 110.31 (#74) | 45.93 (#74) | inference passes under no_grad (inference_mode recipe fails) |
 | bd | FBCNet | 6.16 | 8.76 | 10.34 |
 | bd | FBLightConvNet | 5.82 | 6.97 | 8.49 |
 | bd | FBMSNet | 13.83 | 11.35 | 14.9 |
