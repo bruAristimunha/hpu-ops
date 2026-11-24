@@ -15,17 +15,21 @@ full list: a 2-D convolution gets a garbage second padding and the graph fails t
 EEGITNet). On HPU, ``"valid"`` goes through ``conv{n}d.default`` with ``n`` zeros instead, which passes full lists.
 Eager calls do not trace through this kernel and keep working as before.
 
-Large kernels (``> 256``; ``> 128`` in lazy mode):
+Large kernels (``> 256``; in lazy mode also 256 and the measured 129..255 conv1d band):
 
 Gaudi2's MME AGU rejects convolutions whose spatial kernel dimension exceeds 256
 (``gaudi2_agu_config.cpp::338 setAssociatedDimAndSize: size - 1 <= uint8 max`` in ``STaRNet(64)`` ``conv_spatial_fusion``
 ``(351, 1)`` and ``TensorCSPNet(22, dims=(22, 11, 11, 11))`` ``temporal_block`` ``(4, 1089)``). In lazy mode the bound is
 lower (measured on bridge 1.21.4, forward and backward, native op): conv1d (4, 8, 1000) x (16, 8, 256) fails graph
 compile the same way, and for 129 <= k <= 255 the input gradient is wrong (relative error 1.3 to 1.5) when
-256 < L < 2k (k = 144 over 260, 240 over 300, 255 over 257). Eager, kernels up to 256 were right at every length tried
-(those and k = 255, 256 over 1000). So a kernel dimension above ``MAX_KERNEL = 256`` (eager ops, compiled graphs) or
-``LAZY_MAX_KERNEL = 128`` (lazy mode) is split into slices of at most that size, with exact input slicing and
-``F.pad``; a 128-wide chunk whose input is longer than 256 is then longer than twice its kernel. In lazy mode a 2-D
+256 < L < 2k (k = 144 over 260, 240 over 300, 255 over 257). The window is sharp (200 over 256 right, over 257
+wrong; 144 over 287 wrong, over 288 right) and conv1d-specific as measured: conv2d twins (H = 1 and square spot
+checks), padded conv1d and out-of-window conv1d are right, while the split backward graph itself is rejected by
+Habana's lazy compiler for EEGInceptionMI's (1, 175)/(1, 225) convs over 1000. Eager, kernels up to 256 were right
+at every length tried (those and k = 255, 256 over 1000). So a kernel dimension above ``MAX_KERNEL = 256`` is split
+(and in lazy mode also 256 and the measured conv1d band, ``_dim_needs_split``) into slices of at most 256
+(``LAZY_MAX_KERNEL = 128`` in lazy mode), with exact input slicing and ``F.pad``; a 128-wide chunk whose input is
+longer than 256 is then longer than twice its kernel. In lazy mode a 2-D
 kernel's shorter last chunk is padded with zero taps to the full chunk (native lazy (44, 44) over (54, 54) stops the
 card). One class of wider kernels runs natively and is left to the native op, which is faster (see ``NATIVE_WIDE``
 below and the README's sweep table): one input channel, wide only in the last dim, an even width at stride >= 32 in
@@ -218,6 +222,28 @@ def _native_wide(mode, input, weight, groups, strd, pad, dil):
                and (k_w % 2 == 0 or not rule["even"]) and strd[1] >= rule["stride"] for rule in NATIVE_WIDE[mode])
 
 
+def _dim_needs_split(mode, input, groups, l_in, k, s, p, d):
+    """Whether one spatial dim's kernel has to be split. Above ``MAX_KERNEL`` always; in lazy mode also at 256
+    (native graph compile fails there, measured conv1d and conv2d). The 129..255 lazy band splits only where the
+    native input gradient was measured wrong (bridge 1.21.4, ``repro/probe_conv_k_bwd.py``): conv1d with stride
+    and dilation 1, no padding, ``256 < L < 2k`` — sharp at both ends (200/256 right, 200/257 wrong, 144/287
+    wrong, 144/288 right). Conv2d twins, padded conv1d and out-of-window conv1d measured right, and the split
+    backward graph is itself rejected by Habana's lazy compiler for EEGInceptionMI's (1, 175)/(1, 225) convs, so
+    those stay native. Stride/dilation above 1, groups, other dtypes and conv3d in the band were not measured
+    and keep the split."""
+    if k <= _max_kernel(mode):
+        return False
+    if mode != "lazy" or k >= 256:
+        return True
+    if input.dtype != torch.float32 or groups != 1 or s != 1 or d != 1:
+        return True
+    if input.dim() == 4:
+        return False
+    if input.dim() != 3:
+        return True
+    return p == 0 and 256 < l_in < 2 * k
+
+
 def _large_kernel_takes(mode, input, weight, bias, stride, padding, dilation, transposed, output_padding, groups):
     if transposed or not (3 <= input.dim() <= 5) or input.dim() != weight.dim():
         return False
@@ -241,7 +267,8 @@ def _large_kernel_takes(mode, input, weight, bias, stride, padding, dilation, tr
     if (any(s <= 0 for s in strd) or any(p < 0 for p in pad) or any(d <= 0 for d in dil)
             or any(p != 0 for p in output_padding)):
         return False
-    if not any(k > _max_kernel(mode) for k in weight.shape[2:]):
+    if not any(_dim_needs_split(mode, input, groups, l_in, k, s, p, d)
+               for l_in, k, s, p, d in zip(input.shape[2:], weight.shape[2:], strd, pad, dil)):
         return False
     if _native_wide(mode, input, weight, groups, strd, pad, dil):
         count("large_conv_native")
