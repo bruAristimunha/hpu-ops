@@ -10,8 +10,8 @@ no model code changes. Counts are the Braindecode zoo (104 models) unless said o
 | mode | proven | remaining |
 |---|---|---|
 | eager | 104/104 | — |
-| compiled (`hpu_backend`, static) | 103/104 | EpiNT compiled inference (vendor recipe) |
-| lazy | 99/104 (4 of them segmented) | full recount pending; no known own-code failure |
+| compiled (`hpu_backend`, static) | 104/104 (EpiNT inference under `no_grad`, not `inference_mode`) | — |
+| lazy | 99/104 stock recount; 103/104 with segmented; every model passes some lazy route | NeuroPose fails only in the batched census (passes isolated) |
 
 ## The incompatibilities
 
@@ -25,7 +25,7 @@ no model code changes. Counts are the Braindecode zoo (104 models) unless said o
 | 6 | `glu` on a permuted intermediate is rejected in lazy inference | Habana's lazy GLU graph assumes the split dim's layout | BrainModule, FNIRS4D (lazy inference) | `composite.install_glu` at the backend key in lazy mode: `a * sigmoid(b)` (#70) | fixed |
 | 7 | `one_hot` with an inferred class count (`num_classes=-1`) is rejected | Habana's kernel requires an explicit count; ATen's composite reaches the same kernel | GCNsNet graph coarsening | `composite.install_one_hot`: equality against `arange` (#67) | fixed |
 | 8 | float64 is stored as float32; float64 `eigh` routes to the CPU | Gaudi2 has no float64 arithmetic | GBWAtt (spd_learn, 30 eigh/step) | `HPU_OPS_FLOAT64=card` (float32 precision, zero rows); a double-single Jacobi eigh prototypes at 3.4e-12 vs float64 on ill-conditioned spectra (#64) | precision decision open |
-| 9 | Whole-model compiled inference graphs fail `synStatus 26` even per-child compiled | Habana's recipe compiler rejects the inference graph; eager and lazy graphs of the same model compile | EpiNT compiled inference | none yet (manual SDPA and per-child compile both measured failing) | vendor |
+| 9 | Compiled `inference_mode` graphs fail `synStatus 26`, whole-model and per-child | Habana's recipe compiler rejects the inference-mode graph specifically; the same model compiles under `no_grad` | EpiNT compiled inference | run compiled inference under `torch.no_grad()` instead of `torch.inference_mode()` (measured passing; manual SDPA and per-child compile do not help) | workaround; vendor recipe |
 | 10 | Default-dynamic compiled inference raises `KeyError: 'output_strides'` | Habana recipe compiler bug with dynamic shapes (#63) | TensorCSPNet, GyroAtt (spd_learn) | compile with `dynamic=False` (the census does) | vendor; workaround known |
 | 11 | Traced composites returned `NotImplemented` outside inference, breaking compiled graphs | Dynamo casts the sentinel to Tensor in extrema's py kernels | SPD compiled graphs (#60) | traced decline in linalg (#62): graphs keep the aten ops, the runtime dispatches to the TPC kernels | fixed |
 | 12 | `argmax.out` layout, lazy conv band 129..255, `unfold`, `renorm`, 0-d embedding grads, `roll` of strided inputs | assorted missing or wrong Habana kernels (each with a reproducer in `repro/`) | MEGGPT, EEGInceptionMI, and the op-level sweep | composites in `hpu_ops/composite.py` (#43, #65, #66 and neighbours) | fixed |
