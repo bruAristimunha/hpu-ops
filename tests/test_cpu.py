@@ -803,6 +803,33 @@ def test_renorm_elsewhere_stays_renorm():
     assert "aten.renorm.default" in ops(nodes) and not calls["renorm"]
 
 
+# ---- one_hot with an inferred class count through ATen's composite
+
+
+def test_one_hot_inferred_classes_eager_and_inference():
+    x = torch.tensor([0, 2, 1, 2])
+    want = F.one_hot(x)
+    with cpu_as_hpu(composite.install_one_hot) as calls:
+        got = F.one_hot(x)
+        assert calls["one_hot"] == 1  # the autograd kernel (the backend is not reached)
+        explicit = F.one_hot(x, 5)
+        assert calls["one_hot"] == 1  # explicit counts go to ATen's composite
+        with torch.inference_mode():
+            inferred = F.one_hot(x)
+        assert calls["one_hot"] == 2  # below autograd, the backend kernel
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+    torch.testing.assert_close(explicit, F.one_hot(x, 5), atol=0, rtol=0)
+    torch.testing.assert_close(inferred, want, atol=0, rtol=0)
+
+
+def test_one_hot_inferred_classes_errors_match_native():
+    with cpu_as_hpu(composite.install_one_hot):
+        with pytest.raises(RuntimeError, match="non-negative"):
+            F.one_hot(torch.tensor([-1, 0]))
+        with pytest.raises(RuntimeError, match="Can not infer"):
+            F.one_hot(torch.empty(0, dtype=torch.long))
+
+
 # ---- the weight gradient of one-channel strided convolutions (EEGDINO, CodeBrain, LaBraM)
 
 

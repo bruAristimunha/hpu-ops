@@ -1,9 +1,9 @@
 """HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``), is missing (``renorm``,
-``Tensor.unfold`` in lazy mode, ``unfold_backward``) or is wrong (``embedding_dense_backward`` of a 0-d index, ``roll`` of
-a strided input by a multiple of the size).
+``Tensor.unfold`` in lazy mode, ``unfold_backward``), is wrong (``embedding_dense_backward`` of a 0-d index, ``roll`` of
+a strided input by a multiple of the size) or rejects an inferred argument (``one_hot`` with ``num_classes=-1``).
 
 Each is registered at ``AutogradHPU``, so eager calls and traced graphs both use it and autograd differentiates the
-composite; ``renorm`` is also registered at ``HPU`` for calls below autograd (inference mode). ``unfold`` and
+composite; ``renorm`` and ``one_hot`` are also registered at ``HPU`` for calls below autograd (inference mode). ``unfold`` and
 ``unfold_backward`` are registered at ``HPU`` only, below torch's own autograd kernels, which keep their formulas. Cases a composite does
 not take (odd ``glu`` halves, invalid ``renorm`` arguments) go to the op's own kernel, which raises its usual error;
 so do embedding gradients of indices with dimensions, which Gaudi gets right. The composites run with autocast off and
@@ -16,7 +16,7 @@ import torch
 from torch._C import DispatchKey
 
 from . import _strict
-from ._dispatch import REDUCED, count, register_kernels, static
+from ._dispatch import REDUCED, chain, count, override_kernels, register_kernels, static, tracing
 
 aten = torch.ops.aten
 # the most elements of any tensor unfold_backward's rewrite makes or takes on the card: a pad of 1.1e9 x 2 elements
@@ -239,6 +239,52 @@ def install_roll(device_type):
     op = aten.roll.default
     return register_kernels(device_type, [(op, "Autograd{}", _kernel(
         op, "roll_zero", roll_unshifted, _roll_takes, DispatchKey.Autograd))])
+
+
+def one_hot(input, num_classes=-1):
+    """``aten.one_hot`` as an equality against ``arange``: Habana's HPU kernel rejects an inferred count
+    ("Number of classes cannot be -1", GCNsNet's graph coarsening, eager, lazy and inference), and ATen's
+    composite — which infers it — reaches that kernel, so delegating to it recurses once the backend kernel
+    is replaced. Inferring or validating the count reads the input's min/max on the host, as ATen's composite
+    does on CPU, with its errors (Habana's explicit-count kernel silently zero-fills out-of-range classes)."""
+    if input.dtype != torch.int64:
+        raise RuntimeError("one_hot is only applicable to index tensor of type LongTensor.")
+    if input.numel():
+        lo, hi = torch.stack([input.min(), input.max()]).tolist()
+        if lo < 0:
+            raise RuntimeError("Class values must be non-negative.")
+        if num_classes < 0:
+            num_classes = hi + 1
+        elif hi >= num_classes:
+            raise RuntimeError("Class values must be smaller than num_classes.")
+    elif num_classes < 0:
+        raise RuntimeError("Can not infer total number of classes from empty tensor.")
+    return (torch.arange(num_classes, device=input.device) == input.unsqueeze(-1)).to(torch.int64)
+
+
+def _one_hot_takes(input, num_classes=-1):
+    return num_classes < 0 and not tracing(input)  # traced: the inferred count is data-dependent either way
+
+
+def install_one_hot(device_type):
+    """``one_hot`` with an inferred class count on ``device_type`` as an equality against ``arange``. Returns
+    an undo. The backend kernel computes the equality for explicit counts too (Habana's kernel there is
+    replaced, as in ``extrema``, and cannot be called any more); at the autograd key explicit counts go to
+    ATen's composite, which computes them without reaching the replaced kernel."""
+    op = aten.one_hot.default
+
+    def backend(input, num_classes=-1):
+        count("one_hot")
+        return one_hot(input, num_classes)
+
+    return chain([
+        register_kernels(device_type, [
+            # no Autograd kernel exists to decline to (the output is integral): explicit counts go to
+            # ATen's composite, which computes them without reaching the replaced backend kernel
+            (op, "Autograd{}", _kernel(op, "one_hot", one_hot, _one_hot_takes,
+                                        DispatchKey.CompositeImplicitAutograd))]),
+        override_kernels(device_type, [(op, backend)]),
+    ])
 
 
 def install_unfold(device_type):
