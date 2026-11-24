@@ -4,7 +4,11 @@ Every CPU execution that hpu-ops' strict mode (`HPU_OPS_STRICT=report`, `hpu_ops
 training step and one inference forward of each model, on one Gaudi2 card (gaudi-docker 1.21.4, bridge 1.21.4,
 torch 2.6.0), hpu-ops at 97065c2, hpu-complex at 754ff53, braindecode at dafe8339 (the G12/G13 branch),
 spd_learn at 16b39ce, November 24, 2026. BrainModule's and FNIRS4D's lazy rows were re-measured at
-hpu-ops 5bc0116 (the #70 GLU backend fix): both pass strict with zero rows.
+hpu-ops 5bc0116 (the #70 GLU backend fix): both pass strict with zero rows. Targeted rows below were
+re-measured at 7d9f8b7 (#72): CBraMod and CSBrain pass lazy after `hpu_ops.materialize`, BBL,
+BrainTokenizer and VEMG2Pose pass lazy with `--segment-topchild`, and NeuroRVQTokenizer passes eager
+and compiled after the sweep's grad-carrying target fix. These targeted passes imply eager 102/104,
+compiled 102/104 and lazy 97/104; a full census recount is still pending.
 
 - Models: the 21 `spd_diag.models.MODELS` (BNCI2014_001, 22 channels, real batch of 32, cross-entropy) and the
   braindecode models of `braindecode.models.util.models_mandatory_parameters` (104 census rows, braindecode-kernels'
@@ -27,7 +31,8 @@ that closed each: G1/G4/G14 (spd_learn#66, merged, with the LSM/AIRM syncs in sp
 (spd_learn#67 device triangular indices, spd_learn#70 `vec_to_sym` strict indices), and two lazy-only rows from
 the root hunt: EEGInceptionMI's split-conv backward graph (the lazy 129..255 band now splits only where the
 native input gradient was measured wrong, #66) and MEGGPT's argmax (a same-shape reshape before `argmax.out`,
-#65). GCNsNet's `one_hot` blocker is fixed (#67); the model now reaches the LazyLinear-class failure below.
+#65). GCNsNet's `one_hot` blocker is fixed (#67); after materialization it reaches a separate Habana
+graph-compile failure in every mode.
 
 | rank | id | CPU execution | source | impact | models | status / owner |
 |---|---|---|---|---|---|---|
@@ -37,21 +42,23 @@ native input gradient was measured wrong, #66) and MEGGPT's argmax (a same-shape
 
 ## Not CPU executions, but blockers seen on the way (each a separate issue)
 
-- Lazy braindecode: 92 ok / 11 error / 1 crashed of 104, in four measured classes. Habana's lazy fuser rejects
-  the full-step graph (BBL, BrainTokenizer; VEMG2Pose at inference, after failing
-  stock training too): syncing after each top-level module passes forward and backward, so segmentation with
-  `mark_step` is the workaround and eager/compiled pass. `HabanaParameterWrapper` breaks
-  `UninitializedParameter` materialization (#68, with a bare `nn.LazyLinear` repro): CBraMod, CSBrain and
-  GCNsNet's node biases stay `(0,)` shells; materializing before `.to("hpu")` works and trains.
-  CareSleepNet's inference graph nondeterministically hangs (>600 s) or fatals (`synStatus 31`) after training
-  steps in one process, with and without plugins and strict mode; fresh and 2-step processes pass. SyncNet's
-  census crash was the knock-on from that fatality in the same census process (it passes isolated), as do
-  Brant, NeuroPose and FNIRST, whose census errors do not reproduce alone.
+- Lazy braindecode: 92 ok / 11 error / 1 crashed in the census; targeted #72 passes raise the proven
+  total to 97/104, pending a full recount. Habana's lazy fuser rejects the full-step graph (BBL,
+  BrainTokenizer; VEMG2Pose at inference): the sweep's `--segment-topchild` mode (one `mark_step` after
+  each top-level child) passes all three. `HabanaParameterWrapper` breaks `UninitializedParameter`
+  materialization (#68, with a bare `nn.LazyLinear` repro): the sweep now calls
+  `hpu_ops.materialize(model, X)` on the CPU first, and CBraMod and CSBrain pass; GCNsNet materializes
+  but then hits the separate graph-compile failure above. CareSleepNet's lazy inference hangs both
+  after training steps and in a fresh inference-only process (training alone passes), so process
+  isolation is not a workaround. SyncNet's census crash was the knock-on from that fatality in the
+  same census process (it passes isolated), as do Brant, NeuroPose and FNIRST, whose census errors do
+  not reproduce alone.
 - EpiNT eager/compiled inference: synapse graph compile failure (also in the old inventory).
 - Default-dynamic compiled inference: Habana's recipe compiler raises `KeyError('output_strides')` (#63,
   TensorCSPNet, GyroAtt; reproduces stock, no plugins). This census compiled with `dynamic=False`.
-- Harness, not gaps: NeuroRVQTokenizer (the census loss picks the target, the first tuple element, which has
-  no grad by design).
+- Fixed harness gap: NeuroRVQTokenizer's census loss picked the target (the first tuple element, which
+  has no grad by design); the sweep now trains on the first grad-carrying tensor, and eager and
+  compiled pass (one host-sync row remains from the model's own `initialize`).
 
 ## Full table (every entry)
 
@@ -79,7 +86,7 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | AXON | 36.03 | 27.22 | 727.95 |
 | bd | AttentionBaseNet | 16.97 | 7.77 | 14.15 |
 | bd | AttnSleep | 74.28 | 42.26 | 81.47 |
-| bd | BBL | 44.62 | error: warm-up RuntimeError('[Rank:0] FATAL ERROR :: MODULE:PT_BRIDGE Exception in La | 50.15 |
+| bd | BBL | 44.62 | 47.47 (segmented, #72) | 50.15 |
 | bd | BDTCN | 20.01 | 19.95 | 23.31 |
 | bd | BENDR | 553.99 | 32.24 | 760.03 |
 | bd | BIOT | 45.31 | 30.28 | 49.71 |
@@ -87,11 +94,11 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | BrainBERT | 21.66 | 19.09 | 41.27 |
 | bd | BrainModule | 57.92 | 29.17 | 56.57 |
 | bd | BrainOmni | 183.55 | 119.33 | 278.49 |
-| bd | BrainTokenizer | 157.38 | error: warm-up RuntimeError('[Rank:0] FATAL ERROR :: MODULE:PT_BRIDGE Exception in La | 211.52 |
+| bd | BrainTokenizer | 157.38 | 102.89 (segmented, #72) | 211.52 |
 | bd | Brant | 55.03 | error: warm-up RuntimeError('[Rank:0] FATAL ERROR :: MODULE:PT_BRIDGE Exception in La | 92.18 |
-| bd | CBraMod | 476.7 | error: warm-up RuntimeError('matrix 1 and matrix 2 shapes cannot be multiplied (32x30 | 618.21 |
+| bd | CBraMod | 476.7 | 149.64 (materialized, #72) | 618.21 |
 | bd | CORTEG | 24.93 | 21.12 | 38.61 |
-| bd | CSBrain | 491.68 | error: warm-up RuntimeError('matrix 1 and matrix 2 shapes cannot be multiplied (32x30 | 651.73 |
+| bd | CSBrain | 491.68 | 155.17 (materialized, #72) | 651.73 |
 | bd | CTNet | 57.23 | 52.49 | 100.12 |
 | bd | CareSleepNet | 155.88 | 140.25, error: inference RuntimeError('[Rank:0] FATAL ERROR :: MODULE:PT_SYNHELPER synStatus 31 | 344.16 |
 | bd | CodeBrain | 549.34 | 174.37 | 684.99 |
@@ -146,7 +153,7 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | NICE | 10.03 | 8.16 | 16.15 |
 | bd | NeuroPose | 131.98 | error: warm-up RuntimeError('[Rank:0] FATAL ERROR :: MODULE:PT_BRIDGE Exception in La | 146.43 |
 | bd | NeuroRVQ | 743.22 | 97.17 | 1021.17 |
-| bd | NeuroRVQTokenizer | error: warm-up RuntimeError('element 0 of tensors does not require grad and does not  | error: warm-up RuntimeError('element 0 of tensors does not require grad and does not  | error: warm-up RuntimeError('element 0 of tensors does not require grad and does not  |
+| bd | NeuroRVQTokenizer | 919.97 (#72) | error: warm-up RuntimeError('element 0 of tensors does not require grad and does not  | 2490.31 (#72) |
 | bd | PBT | 26.29 | 21.46 | 35.66 |
 | bd | PopulationTransformer | 43.72 | 43.42 | 89.78 |
 | bd | Pratibha2 | 19.76 | 18.8 | 402.76 |
@@ -177,7 +184,7 @@ Sources: `bridge fallback` (Habana's CPU fallback), `hpu_ops route` (hpu-ops' ow
 | bd | TSception | 7.89 | 7.87 | 15.99 |
 | bd | TinyMyo | 27.35 | 18.78 | 30.81 |
 | bd | USleep | 204.96 | 96.97 | 114.98 |
-| bd | VEMG2Pose | 1218.08 | 12254.25, error: inference RuntimeError('Graph compile failed. synStatus=synStatus 26 [Generic fa | 1603.71 |
+| bd | VEMG2Pose | 1218.08 | 6435.48 (segmented, #72) | 1603.71 |
 | bd | ZUNA | 17.66 | 26.75 | 22.66 |
 | spd | CorAtt | 60.65 | 55.59 | 2006.46 |
 | spd | CorNet | 35.54 | 37.74 | 1586.23 |
