@@ -137,8 +137,8 @@ from ._strict import CPUExecutionError, strict  # noqa: F401
 from ._strict import check as strict_check, format_report as strict_format_report  # noqa: F401
 from ._strict import report as strict_report, reset as strict_reset  # noqa: F401
 
-__all__ = ["enable", "materialize", "strict", "CPUExecutionError", "strict_check", "strict_report", "strict_reset",
-           "strict_format_report"]
+__all__ = ["enable", "materialize", "segmented", "strict", "CPUExecutionError", "strict_check", "strict_report",
+           "strict_reset", "strict_format_report"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
@@ -249,3 +249,25 @@ def materialize(model, example_input):
         raise RuntimeError(f"hpu_ops.materialize: forward did not allocate {left}; "
                            "pass an input that reaches every lazy module")
     return model
+
+
+def segmented(model):
+    """One lazy graph per top-level child of ``model``: a ``mark_step`` after each child, for the
+    models whose full-step lazy graph Habana's fuser rejects or hangs on (COMPATIBILITY.md row 3).
+    Returns ``(model, undo)``; off a lazy Gaudi stack both are no-ops. Pair with ``materialize``
+    before ``.to("hpu")`` and ``enable()``: the three together are the one-call unlock for the
+    Braindecode zoo."""
+    try:
+        import habana_frameworks.torch.core as htcore
+    except ImportError:
+        return model, lambda: None
+    if not _lazy():
+        return model, lambda: None
+    handles = [child.register_forward_hook(lambda *args: htcore.mark_step())
+               for child in model.children()]
+
+    def undo():
+        for handle in handles:
+            handle.remove()
+
+    return model, undo

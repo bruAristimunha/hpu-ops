@@ -27,6 +27,14 @@ def test_plain_model_no_forward():
     assert model.weight is weight
 
 
+def test_segmented_is_noop_off_gaudi():
+    model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.ReLU())
+    out, undo = hpu_ops.segmented(model)
+    assert out is model
+    undo()  # no hooks to remove, no habana stack to mark steps on
+    assert model(torch.randn(1, 3)).shape == (1, 2)
+
+
 def test_unreached_lazy_module_raises():
     class Partial(torch.nn.Module):
         def __init__(self):
