@@ -1,6 +1,7 @@
 """HPU composites for ops whose Gaudi kernel fails under ``torch.compile`` (``glu``), is missing (``renorm``,
 ``Tensor.unfold`` in lazy mode, ``unfold_backward``), is wrong (``embedding_dense_backward`` of a 0-d index, ``roll`` of
-a strided input by a multiple of the size) or rejects an inferred argument (``one_hot`` with ``num_classes=-1``).
+a strided input by a multiple of the size), rejects an inferred argument (``one_hot`` with ``num_classes=-1``) or
+fails its graph compile for a kernel wider than the input (``max_pool1d``, ceil_mode).
 
 Each is registered at ``AutogradHPU``, so eager calls and traced graphs both use it and autograd differentiates the
 composite; ``renorm`` and ``one_hot`` are also registered at ``HPU`` for calls below autograd (inference mode),
@@ -17,7 +18,8 @@ import torch
 from torch._C import DispatchKey
 
 from . import _strict
-from ._dispatch import REDUCED, chain, count, override_kernels, register_kernels, static, tracing
+from ._dispatch import (REDUCED, chain, count, override_kernels, register_kernels, replace_py_kernels,
+                        static, tracing)
 
 aten = torch.ops.aten
 # the most elements of any tensor unfold_backward's rewrite makes or takes on the card: a pad of 1.1e9 x 2 elements
@@ -341,3 +343,63 @@ def install_unfold_backward(device_type):
         return unfold_backward(grad_in, input_sizes, dim, size, step)
 
     return register_kernels(device_type, [(op, "{}", kernel)])
+
+
+def _pool_params(kernel_size, stride, padding, dilation):
+    """max_pool1d's int-or-list arguments as plain lists (stride defaults to kernel_size)."""
+    k = [kernel_size] if isinstance(kernel_size, int) else list(kernel_size)
+    s = k[:] if not stride else ([stride] if isinstance(stride, int) else list(stride))
+    p = [padding] if isinstance(padding, int) else list(padding)
+    d = [dilation] if isinstance(dilation, int) else list(dilation)
+    return k, s, p, d
+
+
+def max_pool1d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False):
+    """``aten.max_pool1d`` with a kernel wider than the input as window maxima: each output is the
+    max of its (unpadded) window slice, which for the first window of a length-1 input is the input
+    itself. Habana's kernel fails its graph compile there (ceil_mode, kernel 2 over length 1:
+    GCNsNet's last pooling); ATen returns the window max."""
+    k, s, p, _ = _pool_params(kernel_size, stride, padding, dilation)
+    meta = torch.empty(input.shape, device="meta", dtype=input.dtype)
+    out_len = torch.nn.functional.max_pool1d(meta, kernel_size, stride, padding, dilation,
+                                             ceil_mode).shape[-1]
+    cols = []
+    for i in range(int(out_len)):
+        start = i * s[0] - p[0]
+        cols.append(input[..., max(start, 0):start + k[0]].amax(dim=-1, keepdim=True))
+    return cols[0] if len(cols) == 1 else torch.cat(cols, dim=-1)
+
+
+def _max_pool1d_takes(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False):
+    if input.dim() != 3 or not input.is_floating_point() or not ceil_mode:
+        return False
+    k, _, p, d = _pool_params(kernel_size, stride, padding, dilation)
+    return len(k) == 1 and d == [1] and p[0] >= 0 and input.shape[-1] < k[0]
+
+
+def install_max_pool1d(device_type):
+    """``max_pool1d`` whose kernel is wider than the input on ``device_type`` as window maxima.
+    Returns an undo. At the autograd key narrower kernels decline to torch's composite (the
+    ``Autograd`` key itself redispatches to this kernel, and the backend keys crash ``_op_dk``
+    for this op); at the backend key (inference) they decline to the same composite."""
+    op = aten.max_pool1d.default
+    below = DispatchKey.CompositeImplicitAutograd
+
+    def traced(original):
+        def kernel(input, kernel_size, stride=(), padding=0, dilation=1, ceil_mode=False):
+            if input.device.type == device_type and _max_pool1d_takes(
+                    input, kernel_size, stride, padding, dilation, ceil_mode):
+                count("max_pool1d_wide")
+                return max_pool1d(input, kernel_size, stride, padding, dilation, ceil_mode)
+            return original(input, kernel_size, stride, padding, dilation, ceil_mode)
+
+        return kernel
+
+    return chain([
+        register_kernels(device_type, [(op, "Autograd{}", _kernel(
+            op, "max_pool1d_wide", max_pool1d, _max_pool1d_takes,
+            DispatchKey.CompositeImplicitAutograd))]),
+        override_kernels(device_type, [(op, _kernel(
+            op, "max_pool1d_wide", max_pool1d, _max_pool1d_takes, below))]),
+        replace_py_kernels(op, (DispatchKey.CompositeImplicitAutograd,), traced),
+    ])
