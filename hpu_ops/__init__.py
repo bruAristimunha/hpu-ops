@@ -33,6 +33,9 @@ at the tensor's pickling:
   ``embedding_dense_backward`` sends it to row 0, eager and compiled (BIOT's channel tokens).
 - ``roll`` by a multiple of the size as a copy (``composite``): Gaudi's eager kernel reads a strided input of such a
   roll wrongly (EMG2QwertyNet's input gradient).
+- ``one_hot`` with an inferred class count as an equality against ``arange`` (``composite``): Habana's HPU kernel
+  rejects ``num_classes=-1`` ("Number of classes cannot be -1", GCNsNet's graph coarsening, eager, lazy and
+  inference); the count is read from the input's min/max on the host, as ATen's composite does on CPU.
 - ``Tensor.unfold`` as ``as_strided`` with ATen's sizes and strides (``composite``): in lazy mode it had no HPU kernel,
   ran on the CPU and returned a copy, not a view. hpu-ops' own one-channel conv weight gradient uses it (TensorCSPNet:
   2 fallbacks per lazy step). Eager keeps Habana's kernel.
@@ -139,7 +142,7 @@ __all__ = ["enable", "strict", "CPUExecutionError", "strict_check", "strict_repo
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
-         composite.install_embedding, composite.install_roll, composite.install_unfold,
+         composite.install_embedding, composite.install_roll, composite.install_one_hot, composite.install_unfold,
          composite.install_unfold_backward, norm.install_group_norm, dynshape.install_expand,
          dynshape.install_pad_int64, indexing.install_index,
          indexing.install_mask_fill, im2col.install,
