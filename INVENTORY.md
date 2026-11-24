@@ -9,9 +9,10 @@ re-measured at 7d9f8b7 (#72): CBraMod and CSBrain pass lazy after `hpu_ops.mater
 BrainTokenizer and VEMG2Pose pass lazy with `--segment-topchild`, and NeuroRVQTokenizer passes eager
 and compiled after the sweep's grad-carrying target fix. At 88bf934 (#74) GCNsNet passes eager,
 lazy and compiled (the wide-kernel `max_pool1d` composite), EpiNT passes eager and lazy (the
-`instance_norm` composite; compiled inference still fails), and CareSleepNet passes segmented lazy.
-These targeted passes imply eager 104/104, compiled 103/104 and lazy 99/104; a full census recount
-is still pending. Causes and fixes: `COMPATIBILITY.md`.
+`instance_norm` composite; compiled inference passes under `no_grad`), and CareSleepNet passes
+segmented lazy. Final totals: eager 104/104, compiled 104/104, lazy 99/104 in the stock recount
+(103/104 with the segmented pass; NeuroPose, the fifth stock failure, passes isolated, so every
+model has a passing lazy route). Causes and fixes: `COMPATIBILITY.md`.
 
 - Models: the 21 `spd_diag.models.MODELS` (BNCI2014_001, 22 channels, real batch of 32, cross-entropy) and the
   braindecode models of `braindecode.models.util.models_mandatory_parameters` (104 census rows, braindecode-kernels'
@@ -45,8 +46,9 @@ graph-compile failure in every mode.
 
 ## Not CPU executions, but blockers seen on the way (each a separate issue)
 
-- Lazy braindecode: 92 ok / 11 error / 1 crashed in the census; targeted #72/#74 passes raise the
-  proven total to 99/104, pending a full recount. Habana's lazy fuser rejects the full-step graph
+- Lazy braindecode: 92 ok / 11 error / 1 crashed in the original census; the full recount on the
+  current stack gives 99/104 stock and 4/4 segmented (103/104; the fifth stock failure, NeuroPose,
+  passes isolated). Habana's lazy fuser rejects the full-step graph
   (BBL, BrainTokenizer; VEMG2Pose at inference): the sweep's `--segment-topchild` mode (one
   `mark_step` after each top-level child) passes all three, and CareSleepNet segmented too (its
   unsegmented lazy inference hangs, even in a fresh process; training alone passes).
