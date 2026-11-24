@@ -1029,6 +1029,7 @@ def _b_median_whole(dev):  # median() as median(dim 0) of the flattened tensor (
 
 def _argmax_out(dev):
     def argmax(x, d, keepdim):
+        x = x.reshape(x.shape)  # Habana lazy argmax.out mis-infers output dims of a permuted input (MEGGPT chain)
         out = _empty(_reduced(x, [d], keepdim), torch.int64, x)
         return native_out(aten.argmax.out, dev)(x, d, keepdim, out=out)
 
@@ -1067,7 +1068,7 @@ def _b_arg(out_op, name, dev):
             shape = _reduced(self, dims, keepdim) if dim is not None else ([1] * self.dim() if keepdim else [])
             return native_out(out_op, dev)(self, dim, keepdim, out=_empty(shape, torch.int64, self))
         count(name)
-        x = self.reshape(-1) if dim is None else self
+        x = self.reshape(-1) if dim is None else self.reshape(self.shape)  # as in _argmax_out
         d = 0 if dim is None else _dims(self, dim)[0]
         i = native_out(out_op, dev)(x, d, True, out=_empty(_reduced(x, [d], True), torch.int64, x))
         i = _fixed_index(x, d, i, _argmax_out(dev))
