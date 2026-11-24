@@ -137,7 +137,7 @@ from ._strict import CPUExecutionError, strict  # noqa: F401
 from ._strict import check as strict_check, format_report as strict_format_report  # noqa: F401
 from ._strict import report as strict_report, reset as strict_reset  # noqa: F401
 
-__all__ = ["enable", "strict", "CPUExecutionError", "strict_check", "strict_report", "strict_reset",
+__all__ = ["enable", "materialize", "strict", "CPUExecutionError", "strict_check", "strict_report", "strict_reset",
            "strict_format_report"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
@@ -220,3 +220,31 @@ def enable():
         warnings.warn(caught.message, stacklevel=2)
     if not _attention_fused():
         warnings.warn(ATTENTION_HINT, stacklevel=2)
+
+
+def materialize(model, example_input):
+    """Allocate a model's lazy (uninitialized) parameters with one CPU forward; returns the model.
+
+    Habana's parameter wrapper turns an ``UninitializedParameter`` into a ``(0,)`` shell on
+    ``.to("hpu")`` (#68), so call this on the CPU model with one example input before moving it:
+    ``model.to("hpu")`` then keeps the allocated shapes. A model without lazy parameters is
+    returned unchanged (no forward runs). Raises ``RuntimeError`` naming the parameters a
+    forward did not reach."""
+    uninit = [name for name, p in model.named_parameters()
+              if isinstance(p, torch.nn.parameter.UninitializedParameter)]
+    if not uninit:
+        return model
+    training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            model(example_input)
+    finally:
+        if training:
+            model.train()
+    left = [name for name, p in model.named_parameters()
+            if isinstance(p, torch.nn.parameter.UninitializedParameter)]
+    if left:
+        raise RuntimeError(f"hpu_ops.materialize: forward did not allocate {left}; "
+                           "pass an input that reaches every lazy module")
+    return model
