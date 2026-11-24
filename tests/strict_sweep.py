@@ -123,8 +123,8 @@ def run(name, make, hpu_ops, compiled):
         hpu_ops.materialize(model, X)  # lazy parameters allocated on the CPU (#68)
         model = model.to(HPU).train()
         if SEGMENT and LAZY:  # one lazy graph per top-level child (BBL, BrainTokenizer, VEMG2Pose)
-            seg_handles = [child.register_forward_hook(lambda *a: htcore.mark_step())
-                           for child in model.children()]
+            _, seg_undo = hpu_ops.segmented(model)
+            seg_handles = [seg_undo]
         xb = X.to(HPU)
         yb = y.to(HPU) if y is not None else None
         fwd = torch.compile(model, backend="hpu_backend") if compiled else model
@@ -194,8 +194,8 @@ def run(name, make, hpu_ops, compiled):
         row.update(status="error", stage=stage, error=repr(e)[:500],
                    where=[f"{_short(f.filename)}:{f.lineno}" for f in traceback.extract_tb(e.__traceback__)][-5:])
     finally:
-        for handle in seg_handles:
-            handle.remove()
+        for undo in seg_handles:
+            undo()
         gc.collect()
     return row
 
