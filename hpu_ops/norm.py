@@ -16,7 +16,7 @@ import torch
 from torch._C import DispatchKey
 from torch._prims_common import suggest_memory_format
 
-from ._dispatch import count, replace_py_kernels, static
+from ._dispatch import chain, count, override_kernels, register_kernels, replace_py_kernels, static
 
 aten = torch.ops.aten
 REDUCED = (torch.float16, torch.bfloat16)
@@ -70,3 +70,75 @@ def install_group_norm(device_type):
     """While tracing, ``group_norm`` on ``device_type`` with a symbolic size as a composite. Returns an undo."""
     return replace_py_kernels(aten.group_norm.default, (DispatchKey.CompositeImplicitAutograd,),
                               lambda original: _group_norm_kernel(device_type, original))
+
+
+def instance_norm(input, weight, bias, running_mean, running_var, use_input_stats, eps):
+    """``F.instance_norm`` from views and reductions: the biased variance over each sample's and
+    channel's inner dims (or the running statistics), statistics and affine in float32 for 16-bit
+    inputs, in the input's memory format."""
+    dtype = torch.float32 if input.dtype in REDUCED else input.dtype
+    with torch.autocast(input.device.type, enabled=False):
+        x = input.reshape(input.shape[0], input.shape[1], -1).to(dtype)
+        if use_input_stats:
+            var, mean = torch.var_mean(x, dim=-1, correction=0, keepdim=True)
+        else:
+            mean = running_mean.reshape(1, -1, 1).to(dtype)
+            var = running_var.reshape(1, -1, 1).to(dtype)
+        out = ((x - mean) * torch.rsqrt(var + eps)).view(input.shape)
+        affine = (1, -1) + (1,) * (input.dim() - 2)
+        if weight is not None:
+            out = out * weight.view(affine)
+        if bias is not None:
+            out = out + bias.view(affine)
+        return out.to(input.dtype).contiguous(memory_format=suggest_memory_format(input))
+
+
+def _instance_norm_takes(input, weight, bias, running_mean, running_var, use_input_stats):
+    """Valid calls; Habana's inference recipe rejects the op (EpiNT) and its training path
+    reaches the same composite, whose var_mean autograd differentiates."""
+    if not (input.dim() >= 2 and input.is_floating_point()):
+        return False
+    stats = use_input_stats or (running_mean is not None and running_var is not None
+                                and running_mean.numel() == input.shape[1])
+    params = all(t is None or (t.dim() == 1 and t.numel() == input.shape[1] and _dtype_ok(input, t))
+                 for t in (weight, bias))
+    return stats and params
+
+
+def _instance_norm_kernel(op, device_type, fallback):
+    def kernel(input, weight=None, bias=None, running_mean=None, running_var=None,
+               use_input_stats=True, momentum=0.1, eps=1e-5, cudnn_enabled=True):
+        if input.device.type == device_type and _instance_norm_takes(
+                input, weight, bias, running_mean, running_var, use_input_stats):
+            count("instance_norm")
+            return instance_norm(input, weight, bias, running_mean, running_var, use_input_stats, eps)
+        return op._op_dk(fallback, input, weight, bias, running_mean, running_var, use_input_stats,
+                         momentum, eps, cudnn_enabled)
+
+    return kernel
+
+
+def install_instance_norm(device_type):
+    """``instance_norm`` on ``device_type`` as a composite (traced, autograd and backend keys).
+    Returns an undo."""
+    op = aten.instance_norm.default
+    below = DispatchKey.CompositeImplicitAutograd
+
+    def traced(original):
+        def kernel(input, weight=None, bias=None, running_mean=None, running_var=None,
+                   use_input_stats=True, momentum=0.1, eps=1e-5, cudnn_enabled=True):
+            if input.device.type == device_type and _instance_norm_takes(
+                    input, weight, bias, running_mean, running_var, use_input_stats):
+                count("instance_norm")
+                return instance_norm(input, weight, bias, running_mean, running_var,
+                                     use_input_stats, eps)
+            return original(input, weight, bias, running_mean, running_var, use_input_stats,
+                            momentum, eps, cudnn_enabled)
+
+        return kernel
+
+    return chain([
+        replace_py_kernels(op, (DispatchKey.CompositeImplicitAutograd,), traced),
+        register_kernels(device_type, [(op, "Autograd{}", _instance_norm_kernel(op, device_type, below))]),
+        override_kernels(device_type, [(op, _instance_norm_kernel(op, device_type, below))]),
+    ])
