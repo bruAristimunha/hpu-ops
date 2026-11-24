@@ -119,6 +119,16 @@ def test_lazy_split_band_129_to_256_is_kept(monkeypatch):
     assert route(monkeypatch, "eager", (2, 1, 4, 400), (16, 1, 4, 200), (1, 32)) == "native"
 
 
+def test_lazy_band_conv2d_and_out_of_window_conv1d_stay_native(monkeypatch):
+    """The lazy wrong-input-gradient band is measured for conv1d only (stride/dilation 1, no padding,
+    256 < L < 2k); conv2d twins and out-of-window conv1d measured right, so they keep the native op.
+    EEGInceptionMI's (1, 175) over 1000 is the conv2d case (its split backward graph is the one rejected)."""
+    assert route(monkeypatch, "lazy", (1, 48, 1, 1000), (48, 48, 1, 175), 1, (0, 87)) == "native"
+    assert route(monkeypatch, "lazy", (4, 8, 399), (16, 8, 200)) == "split"  # in the measured window
+    assert route(monkeypatch, "lazy", (4, 8, 1000), (16, 8, 175)) == "native"  # L >= 2k
+    assert route(monkeypatch, "lazy", (4, 8, 399), (16, 8, 200), 1, 100) == "native"  # padded, measured right
+
+
 def test_compiled_graphs_keep_splitting_the_default_tensorcspnet_shape():
     """Traced graphs are not in the measured class: compile keeps the split as before."""
     x_shape, w_shape, stride = TCSP_DEFAULT
