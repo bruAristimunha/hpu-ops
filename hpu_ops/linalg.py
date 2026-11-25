@@ -2742,6 +2742,65 @@ def _lu_wanted(device_type, op_name):
     return True
 
 
+def qr_householder(A, mode="reduced"):
+    """QR by Householder reflections (LAPACK's convention: ``alpha = -sign(x0) * ||x||``), as
+    differentiable torch ops. Habana's QR forward is native, but its backward is wrong
+    (relative gradient error 0.25 at n=220, well-conditioned; repro/habana_qr_n220_grad.py):
+    with the forward computed from ops, autograd supplies the exact backward instead."""
+    m, n = A.shape[-2:]
+    R = A.clone()
+    Q = torch.eye(m, dtype=A.dtype, device=A.device).expand(A.shape[:-2] + (m, m)).clone()
+    for j in range(min(m, n)):
+        x = R[..., j:, j]
+        alpha = -torch.where(x[..., :1] >= 0, 1.0, -1.0) * torch.linalg.vector_norm(
+            x, dim=-1, keepdim=True)
+        first = (torch.arange(x.shape[-1], device=A.device) == 0).reshape(
+            (1,) * (x.dim() - 1) + (-1,))
+        v = torch.where(first, x - alpha, x)  # x - alpha * e1, without an in-place update
+        vnorm = torch.linalg.vector_norm(v, dim=-1, keepdim=True)
+        # LAPACK applies no reflector when the tail below x0 is already zero (its sign
+        # convention would otherwise flip that column of Q and row of R)
+        tail = torch.linalg.vector_norm(x[..., 1:], dim=-1, keepdim=True)
+        v = torch.where(tail > 0, v / vnorm.clamp_min(torch.finfo(A.dtype).tiny), v * 0)
+        block = R[..., j:, :]
+        R = torch.cat([R[..., :j, :], block - 2 * v.unsqueeze(-1) @ (v.unsqueeze(-2) @ block)],
+                      dim=-2)
+        qblock = Q[..., :, j:]
+        Q = torch.cat([Q[..., :, :j], qblock - 2 * (qblock @ v.unsqueeze(-1)) @ v.unsqueeze(-2)],
+                      dim=-1)
+    R = torch.triu(R)
+    if mode == "reduced":
+        k = min(m, n)
+        return Q[..., :, :k], R[..., :k, :]
+    return Q, R
+
+
+def _qr_takes(A, mode="reduced"):
+    # Lazy graphs hold every reflector step until mark_step: past 64 the compile time
+    # explodes (n=220 did not finish in minutes; eager takes it in seconds)
+    cap = 64 if tpc.lazy_mode() else 300
+    return (A.is_floating_point() and A.dtype in (torch.float32, torch.float64) and A.dim() >= 2
+            and mode in ("reduced", "complete") and max(A.shape[-2:]) <= cap
+            and torch.is_grad_enabled() and A.requires_grad and static(*A.shape))
+
+
+def install_qr(device_type):
+    """``linalg.qr`` on ``device_type`` via ``qr_householder`` for gradient-needing inputs of at
+    most 300 rows/columns (64 in lazy mode, where the reflector graph compiles too slowly past
+    that; Habana's QR backward is wrong at those sizes and its forward is kept for inference
+    and larger inputs). Returns an undo."""
+    op = aten.linalg_qr.default
+
+    def kernel(*args, **kwargs):
+        A, mode = _bind(op, args, kwargs)
+        if _qr_takes(A, mode):
+            count("qr")
+            return qr_householder(A, mode)
+        return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
+
+    return register_kernels(device_type, [(op, "Autograd{}", kernel)])
+
+
 def install_lu(device_type):
     """``linalg.lu_factor`` / ``lu_factor_ex``, ``lu_solve``, ``lu_unpack`` and ``linalg.lu`` on ``device_type`` for
     square float32 matrices, through the TPC LU kernel (n <= ``tpc.SMALL_MAXN``; past it the composites, on the card), in
