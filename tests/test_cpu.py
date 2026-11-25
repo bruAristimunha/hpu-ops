@@ -795,6 +795,47 @@ def test_unique_dim_and_flat_match_aten():
     assert not composite._unique_takes(x, 0, False)  # sorted=False keeps ATen
 
 
+@pytest.mark.parametrize("alpha_val", [0.1, 0.3, 0.7, 1.0, 2.5, 10.0])
+def test_standard_gamma_distribution_matches_moments(alpha_val):
+    gen = torch.Generator(device="cpu").manual_seed(1234 + int(alpha_val * 100))
+    alpha = torch.full((4000,), alpha_val, dtype=torch.float32)
+    with cpu_as_hpu(composite.install_standard_gamma) as calls:
+        samples = torch._standard_gamma(alpha, generator=gen)
+        assert calls["standard_gamma"] == 1
+    assert samples.shape == alpha.shape
+    assert torch.isfinite(samples).all()
+    assert (samples > 0).all()
+    sample_mean = float(samples.mean().item())
+    sample_var = float(samples.var(unbiased=True).item())
+    # Standard Gamma(alpha, 1) has mean = alpha and var = alpha; check within 4.5 sigma
+    std_err_mean = (alpha_val / samples.numel()) ** 0.5
+    assert abs(sample_mean - alpha_val) < 4.5 * std_err_mean + 1e-4
+    assert abs(sample_var - alpha_val) / max(alpha_val, 0.1) < 0.25
+
+
+def test_standard_gamma_edge_values_and_bfloat16():
+    x = torch.tensor([-1.0, 0.0, float("inf"), float("nan")], dtype=torch.float32)
+    want = torch._standard_gamma(x)
+    with cpu_as_hpu(composite.install_standard_gamma) as calls:
+        got = torch._standard_gamma(x)
+        bf = torch._standard_gamma(torch.full((16,), 0.5, dtype=torch.bfloat16))
+        assert calls["standard_gamma"] == 2
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+    assert bf.dtype == torch.bfloat16
+    assert torch.isfinite(bf).all() and (bf > 0).all()
+
+
+def test_standard_gamma_declines_int_and_grad_tracking():
+    with cpu_as_hpu(composite.install_standard_gamma) as calls:
+        with pytest.raises(RuntimeError):
+            torch._standard_gamma(torch.tensor([1, 2], dtype=torch.int64))
+        x = torch.full((64,), 2.0, requires_grad=True)
+        y = torch._standard_gamma(x)
+        y.sum().backward()
+        assert calls["standard_gamma"] == 0
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
 # ---- renorm as norm, scale factor and multiply
 
 
