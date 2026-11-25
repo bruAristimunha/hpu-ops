@@ -425,6 +425,15 @@ def _traced_large_kernel(device_type, n, original):
                 count("large_conv")
                 out = _split_conv(_traced_conv, mode, batched, weight, bias, stride, padding, dilation, groups)
                 return out if batched is input else out.squeeze(0)
+            if mode == "compile" and any(s > 1 for s in stride):
+                # Habana's compiled strided-convolution backward recipe fails (synStatus 26,
+                # SEANet k8/s2); the stride-1 recipe and the slice backward compile
+                count("strided_conv")
+                out = aten.convolution.default(batched, weight, bias, [1] * n, padding, dilation,
+                                               False, [0] * n, groups)
+                index = [slice(None), slice(None)] + [slice(None, None, s) for s in stride]
+                out = out[tuple(index)]
+                return out if batched is input else out.squeeze(0)
         return original(input, weight, *rest)
 
     return kernel
