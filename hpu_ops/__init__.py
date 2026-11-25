@@ -313,7 +313,9 @@ def segmented(model):
     models whose full-step lazy graph Habana's fuser rejects or hangs on (COMPATIBILITY.md row 3).
     Returns ``(model, undo)``; off a lazy Gaudi stack both are no-ops. Pair with ``materialize``
     before ``.to("hpu")`` and ``enable()``: the three together are the one-call unlock for the
-    Braindecode zoo."""
+    Braindecode zoo. The hooks bind to the children present at call time: call it after any
+    patching that replaces children, and note a deep copy carries its own hook copies, which
+    this undo cannot remove."""
     try:
         import habana_frameworks.torch.core as htcore
     except ImportError:
