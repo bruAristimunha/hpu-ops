@@ -11,6 +11,7 @@ import argparse
 import gc
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -25,6 +26,7 @@ HPU = torch.device("hpu")
 BATCH, STEPS, TIMED = 32, 3, 5
 PER_OP = True  # --step-check: no dispatch mode, the counters read per block (the program as it runs unwatched)
 SEGMENT = False  # --segment-topchild: mark_step after each top-level child (lazy graph segmentation)
+AUTO_CHAIN = ("compiled", "lazy", "segmented")
 BRIDGE = "1.21.4"
 
 
@@ -129,7 +131,7 @@ def run(name, make, hpu_ops, compiled):
             seg_handles = [seg_undo]
         xb = X.to(HPU)
         yb = y.to(HPU) if y is not None else None
-        fwd = torch.compile(model, backend="hpu_backend") if compiled else model
+        fwd = torch.compile(model, backend="hpu_backend", dynamic=False) if compiled else model
         params = [p for p in model.parameters() if p.requires_grad]
         opt = torch.optim.Adam(params, 1e-3) if params else None
 
@@ -204,6 +206,61 @@ def run(name, make, hpu_ops, compiled):
     return row
 
 
+def _auto_row(args, name):
+    """The first working mode for one model, each in its own process (lazy mode is process-global).
+
+    The chain is compiled (static), lazy, segmented lazy. A transient device-acquire failure
+    (``synStatus 8``) is retried once after a settle delay; every other failure advances."""
+    attempts = []
+    last = None
+    for mode in AUTO_CHAIN:
+        for attempt in range(2):
+            env = dict(os.environ)
+            env["PT_HPU_LAZY_MODE"] = "0" if mode == "compiled" else "1"
+            command = [sys.executable, os.path.abspath(__file__), "--family", args.family,
+                       "--models", name]
+            if mode == "compiled":
+                command.append("--compile")
+            if mode == "segmented":
+                command.append("--segment-topchild")
+            if args.step_check:
+                command.append("--step-check")
+            try:
+                proc = subprocess.run(command, capture_output=True, text=True, timeout=3600, env=env)
+                output, code = proc.stdout + proc.stderr, proc.returncode
+            except subprocess.TimeoutExpired as e:
+                output = (e.stdout or "") + (e.stderr or "")
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                code = "timeout"
+            row = None
+            for line in output.splitlines():
+                if line.startswith("RESULT "):
+                    try:
+                        row = json.loads(line[7:])
+                    except json.JSONDecodeError:
+                        row = None
+            if row is None:
+                tail = output.strip().splitlines()[-1][:300] if output.strip() else "no output"
+                row = dict(model=name, mode=mode, batch=BATCH, bridge=BRIDGE, status="crashed",
+                           error=f"child exit {code}: {tail}")
+            attempts.append(dict(mode=mode, status=row.get("status"), ms_per_step=row.get("ms_per_step"),
+                                 error=(row.get("error") or "")[:200]))
+            last = row
+            if row.get("status") == "ok":
+                row["auto_chosen"] = mode
+                row["auto_attempts"] = attempts
+                return row
+            if attempt == 0 and "synStatus 8" in (row.get("error") or output):
+                time.sleep(20)
+                continue
+            break
+    if last is not None:
+        last["auto_chosen"] = None
+        last["auto_attempts"] = attempts
+    return last
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--family", choices=("spd", "bd"), required=True)
@@ -216,7 +273,11 @@ def main():
                         help="skip the models --out has; a model started and never finished is recorded as crashed")
     parser.add_argument("--segment-topchild", action="store_true",
                         help="lazy: mark_step after each top-level child module (one graph per child)")
+    parser.add_argument("--auto", action="store_true",
+                        help="per model, subprocesses: compiled (static), then lazy, then segmented lazy")
     args = parser.parse_args()
+    if args.auto and (args.compile or args.segment_topchild):
+        parser.error("--auto chooses the mode; it cannot be combined with --compile or --segment-topchild")
     global PER_OP, SEGMENT
     PER_OP = not args.step_check
     SEGMENT = args.segment_topchild
@@ -234,7 +295,7 @@ def main():
     names, make = (build_spd if args.family == "spd" else build_bd)(names)
     print("PLUGINS", hpu_ops.__file__, hpu_complex.__file__, "lazy", LAZY, "compile", args.compile, "models",
           len(names), flush=True)
-    mode = "compile" if args.compile else ("lazy" if LAZY else "eager")
+    mode = "auto" if args.auto else ("compile" if args.compile else ("lazy" if LAZY else "eager"))
     done, started = set(), set()
     if args.resume and os.path.exists(args.out):
         for line in open(args.out):
@@ -250,7 +311,7 @@ def main():
             if args.out:
                 with open(args.out, "a") as f:
                     f.write(json.dumps(dict(model=name, status="started")) + "\n")
-            row = dict(family=args.family, **run(name, make, hpu_ops, args.compile))
+            row = _auto_row(args, name) if args.auto else dict(family=args.family, **run(name, make, hpu_ops, args.compile))
         line = json.dumps(row, default=str)
         print("RESULT " + line, flush=True)
         if args.out:

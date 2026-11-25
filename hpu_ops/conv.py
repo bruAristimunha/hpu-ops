@@ -253,6 +253,8 @@ def _large_kernel_takes(mode, input, weight, bias, stride, padding, dilation, tr
                              or bias.dtype != input.dtype or bias.device != input.device):
         return False
     n = input.dim() - 2
+    if all(k <= _max_kernel(mode) for k in weight.shape[2:]):
+        return False
     if (len(stride) not in (1, n) or len(padding) not in (1, n)
             or len(dilation) not in (1, n) or len(output_padding) not in (1, n)):
         return False
