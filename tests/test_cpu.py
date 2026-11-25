@@ -2394,3 +2394,30 @@ def test_unfold_backward_elsewhere_keeps_the_native_kernel():
     with cpu_as_hpu(composite.install_unfold_backward) as calls:
         x.unfold(1, 2, 2).sum().backward()
     assert not calls.get("unfold_backward")
+
+
+def test_scatter_value_bool_out_of_place_inplace_and_float_autograd():
+    idx = torch.tensor([[0, 2, 4]], dtype=torch.int64)
+    xf = torch.randn(2, 4, requires_grad=True)
+    idxf = torch.tensor([[0, 2], [1, 3]], dtype=torch.int64)
+    want_yf = xf.scatter(1, idxf, 5.0)
+    want_yf.sum().backward()
+    want_grad = xf.grad.clone()
+    xf.grad = None
+
+    with cpu_as_hpu(composite.install_scatter_bool) as calls:
+        got = torch.zeros((1, 6), dtype=torch.bool).scatter(1, idx, True)
+        got_in = torch.ones((1, 6), dtype=torch.bool)
+        got_in.scatter_(1, idx, False)
+        compiled = torch.compile(lambda a, i: a.scatter(1, i, True), backend="aot_eager")
+        got_compiled = compiled(torch.zeros((1, 6), dtype=torch.bool), idx)
+        got_yf = xf.scatter(1, idxf, 5.0)
+        got_yf.sum().backward()
+        got_grad = xf.grad.clone()
+
+    assert calls["scatter_bool"] >= 2
+    assert torch.equal(got, torch.tensor([[True, False, True, False, True, False]]))
+    assert torch.equal(got_in, torch.tensor([[False, True, False, True, False, True]]))
+    assert torch.equal(got_compiled, got)
+    torch.testing.assert_close(got_yf, want_yf, rtol=0, atol=0)
+    torch.testing.assert_close(got_grad, want_grad, rtol=0, atol=0)
