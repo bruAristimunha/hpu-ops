@@ -292,16 +292,20 @@ def _transformed(*tensors):
     define no ``setup_context`` and no jvp, so those calls keep the op's own kernel."""
     if getattr(_BELOW, "on", False):  # a backend kernel: plain tensors (see _BELOW)
         return False
+    if _dispatch.forward_ad_level(*tensors) >= 0:
+        return True
     if torch.compiler.is_compiling():  # dynamo cannot trace the interpreter-stack peek (a graph break)
         return False
-    return torch._C._functorch.peek_interpreter_stack() is not None or _dispatch.forward_ad_level(*tensors) >= 0
+    return torch._C._functorch.peek_interpreter_stack() is not None
 
 
 def _raw_transformed(*tensors):
     """Whether a functorch transform or forward-mode AD is active directly (ignoring any ``_BELOW.on`` guard)."""
+    if _dispatch.forward_ad_level(*tensors) >= 0:
+        return True
     if torch.compiler.is_compiling():
         return False
-    return torch._C._functorch.peek_interpreter_stack() is not None or _dispatch.forward_ad_level(*tensors) >= 0
+    return torch._C._functorch.peek_interpreter_stack() is not None
 
 
 def _takes(device_type, name, matrix_at=0):
