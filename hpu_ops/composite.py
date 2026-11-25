@@ -428,6 +428,37 @@ def install_unfold(device_type):
     return register_kernels(device_type, [(op, "{}", kernel)])
 
 
+def gather_int64(self, dim, index, sparse_grad=False):
+    """``aten::gather`` on ``int64`` data decomposed into two ``int32`` halves via ``view(torch.int32)``.
+
+    Gaudi2's native ``gather`` (bridge 1.21.4) fails Synapse graph compilation on ``int64`` inputs
+    (``synStatus 26``), whereas ``int32`` ``gather.out`` compiles and runs on card without CPU fallback.
+    """
+    norm_dim = dim if dim >= 0 else dim + max(self.ndim, 1)
+    if (
+        self.dtype != torch.int64
+        or index.ndim != self.ndim
+        or norm_dim < 0
+        or norm_dim >= max(self.ndim, 1)
+    ):
+        out = torch.empty(index.shape, dtype=self.dtype, device=self.device)
+        return aten.gather.out(self, dim, index, sparse_grad=sparse_grad, out=out)
+    count("gather_int64")
+    x_in = self.unsqueeze(0) if self.ndim == 0 else self
+    idx_in = index.unsqueeze(0) if self.ndim == 0 else index
+    x32 = x_in.unsqueeze(-1).contiguous().view(torch.int32)
+    idx32 = idx_in.unsqueeze(-1).expand(*idx_in.shape, 2)
+    out32 = torch.empty(idx32.shape, dtype=torch.int32, device=self.device)
+    aten.gather.out(x32, norm_dim, idx32, sparse_grad=sparse_grad, out=out32)
+    out64 = out32.contiguous().view(torch.int64).squeeze(-1)
+    return out64.squeeze(0) if self.ndim == 0 else out64
+
+
+def install_gather(device_type):
+    """``aten::gather`` on ``device_type``: keep native ``.out`` for non-int64, bitcast int64 via int32."""
+    return override_kernels(device_type, [(aten.gather.default, gather_int64)])
+
+
 def _unfold_backward_on_cpu(op, grad, input_sizes, dim, size, step):
     """ATen's kernel on a CPU copy of ``grad``, the result moved back (a named hpu-ops CPU route). On the CPU stand-in
     the CPU key is the rewrite itself: inside the route it computes instead of routing again."""
