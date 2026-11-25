@@ -764,10 +764,15 @@ def test_sdpa_math_gqa_and_declines():
         got = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
         assert calls["sdpa"] == 1
     torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-6)
-    # dropout and head mismatches decline to the native kernel (its draws, its errors)
-    assert not composite._sdpa_takes(q, k, v, dropout_p=0.5)
+    # head mismatches decline to the native kernel (its errors); dropout is taken
+    # (Habana's lazy SDPA segfaults with it) and matches ATen's distribution
     assert not composite._sdpa_takes(q, k, v)
     assert composite._sdpa_takes(q, k, v, enable_gqa=True)
+    assert composite._sdpa_takes(q, q, q, dropout_p=0.5)
+    with cpu_as_hpu(composite.install_sdpa) as calls:
+        dropped = F.scaled_dot_product_attention(q, q, q, dropout_p=0.5)
+    assert calls["sdpa"] == 1 and dropped.shape == q.shape
+    assert torch.isfinite(dropped).all()
 
 
 def test_unique_dim_and_flat_match_aten():
