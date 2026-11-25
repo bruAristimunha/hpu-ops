@@ -143,7 +143,7 @@ __all__ = ["enable", "materialize", "segmented", "compile", "fuse", "strict", "C
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
-         composite.install_embedding, composite.install_roll, composite.install_one_hot, composite.install_unfold,
+         composite.install_embedding, composite.install_roll, composite.install_sdpa, composite.install_one_hot, composite.install_unfold,
          composite.install_unfold_backward, composite.install_max_pool1d, norm.install_group_norm,
          norm.install_instance_norm, dynshape.install_expand,
          dynshape.install_pad_int64, indexing.install_index,
@@ -153,7 +153,7 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
          linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, quantile.install,
          extrema.install, small.install_bincount, small.install_histc,
-         small.install_logsumexp, small.install_index_add,
+         small.install_logsumexp, small.install_index_add, small.install_scalar_dense,
          wide.install_copy_checks, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
