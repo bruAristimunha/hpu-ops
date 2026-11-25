@@ -137,6 +137,17 @@ def _compile_minlength_takes(x, weights=None, minlength=0):
             and x.numel() < BINCOUNT_MAX_NUMEL and static(*x.shape))
 
 
+def _lazy_small_takes(x, weights=None, minlength=0):
+    """Lazy mode, small input, wide static output (e.g. 96 argmax buckets into an 8192-code
+    codebook): Habana's lazy ``bincount`` kernel segfaults there, and the eager route's
+    value-range read would be a host sync. ``one_hot`` over the clamped indices is exact
+    and cheap while ``numel * minlength`` stays bounded; above-range values count into the
+    last bin (argmax/argmin buckets, the measured callers, are in range by construction)."""
+    return (_lazy() and weights is None and x.dim() == 1 and x.dtype in INTEGRAL
+            and isinstance(minlength, int) and 256 <= minlength <= 16384
+            and x.numel() * minlength <= BINCOUNT_MAX_NUMEL and static(*x.shape))
+
+
 def install_bincount(device_type):
     """``bincount`` of 1-D integer tensors on ``device_type`` through ``histc`` (eager/lazy) and ``one_hot``
     (``uint8`` with ``minlength >= 256`` under ``torch.compile``). Returns an undo."""
@@ -150,6 +161,9 @@ def install_bincount(device_type):
         if _compile_minlength_takes(x, weights, minlength):
             count("bincount")
             return bincount_histc(x.clamp(0, minlength - 1), minlength)
+        if _lazy_small_takes(x, weights, minlength):
+            count("bincount")
+            return F.one_hot(x.long().clamp(0, minlength - 1), minlength).float().sum(0).long()
         if _takes(x, weights, minlength):
             if x.dtype == torch.uint8 and minlength >= 256:  # unsigned [0..255]: no host sync needed
                 count("bincount")
