@@ -97,6 +97,10 @@ at the tensor's pickling:
   ``logsumexp`` (``numel <= 2**19``) and ``index_add`` (no-grad ``dim == 0`` float32 into at most 256 rows, with
   ``>= 40960`` source rows and (``>= 1280`` per row or rows of ``>= 128`` elements)). ``trace`` stays
   native (Python dispatcher overhead exceeds the kernel gain).
+- ``_assert_async`` (both overloads) as a host check (``assert_async``, #96): Gaudi has no kernel for it, so
+  Dynamo's guard asserts and quantile's traced range check ran through Habana's CPU fallback. The one element
+  is read on the host (one strict-mode ``host sync`` row) and ATen's errors are raised; under tracing the
+  kernel is ATen's Meta no-op and the graph keeps the node, checked when the graph runs.
 - Warnings for the 8-byte dtypes in eager mode (``wide``), at the copy to the card: float64 views with a storage
   offset read and write at twice the offset, int64 values past int32 are computed on their low 32 bits. Neither is
   fixable at the dispatcher at a cost a model would accept (see the README, "float64").
@@ -130,7 +134,7 @@ import warnings
 
 import torch
 
-from . import (composite, conv, dynshape, eigh, extrema, im2col, indexing, lazy_compile, linalg, norm,  # noqa: F401
+from . import (assert_async, composite, conv, dynshape, eigh, extrema, im2col, indexing, lazy_compile, linalg, norm,  # noqa: F401
                quantile, serialization, small, tpc, upsample, wide)
 from ._dispatch import _ENABLE_LOCK, _STATE, chain
 from ._strict import CPUExecutionError, strict  # noqa: F401
@@ -155,6 +159,7 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_qr, linalg.install_lu, quantile.install,
          extrema.install, small.install_bincount, small.install_histc,
          small.install_logsumexp, small.install_index_add, small.install_scalar_dense,
+         assert_async.install_assert_async,
          wide.install_copy_checks, serialization.install)
 ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled_dot_product_attention with a mask "
                   "runs op by op (about 5x slower, with a larger peak memory). If the model uses attention, export "
