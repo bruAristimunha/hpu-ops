@@ -319,7 +319,7 @@ def _unique_rows(rows, return_inverse, return_counts):
         return rows, empty_i, empty_i
     order = torch.arange(n, device=rows.device)
     for col in range(rows.shape[1] - 1, -1, -1):
-        order = order[torch.argsort(rows[order, col], stable=True)]
+        order = order[torch.argsort(rows[order, col], stable=(col < rows.shape[1] - 1))]
     sorted_rows = rows[order]
     first = torch.ones(n, dtype=torch.bool, device=rows.device)
     if n > 1:
@@ -347,7 +347,11 @@ def unique_dim(input, dim=0, sorted=True, return_inverse=False, return_counts=Fa
 def unique(input, sorted=True, return_inverse=False, return_counts=False):  # noqa: A002
     """``aten.unique`` (flattened): unique elements via the row sort on (numel, 1)."""
     unique, inverse, counts = _unique_rows(input.reshape(-1, 1), return_inverse, return_counts)
-    return unique.reshape(-1), inverse.reshape(input.shape), counts
+    return (
+        unique.reshape(-1),
+        inverse.reshape(input.shape) if return_inverse else inverse,
+        counts,
+    )
 
 
 def _unique_takes(input, *args, **kwargs):

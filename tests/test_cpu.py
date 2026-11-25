@@ -795,6 +795,17 @@ def test_unique_dim_and_flat_match_aten():
     assert not composite._unique_takes(x, 0, False)  # sorted=False keeps ATen
 
 
+def test_unique_default_without_inverse_on_nonempty_tensor():
+    x = torch.tensor([3, 1, 3, 2], dtype=torch.int64)
+    want = torch.unique(x)
+    with cpu_as_hpu(composite.install_unique) as calls:
+        got = torch.unique(x)
+        got_2d = torch.unique(x.reshape(2, 2))
+        assert calls["unique"] == 2
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+    torch.testing.assert_close(got_2d, want, atol=0, rtol=0)
+
+
 # ---- renorm as norm, scale factor and multiply
 
 
