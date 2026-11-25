@@ -12,6 +12,11 @@ no model code changes. Counts are the Braindecode zoo (104 models) unless said o
 | eager | 104/104 | — |
 | compiled (`hpu_backend`, static) | 104/104 (EpiNT inference under `no_grad`, not `inference_mode`) | — |
 | lazy | 99/104 stock recount; 103/104 with segmented; every model passes some lazy route | NeuroPose fails only in the batched census (passes isolated) |
+| spd zoo (13/21 timed, synced) | lazy fastest for 11, compiled-static for SPDResNet + CorNet | TensorCSPNet/GraphCSPNet compiled slower (eigh-bound, graph breaks) |
+
+Routing: `strict_sweep --auto` tries compiled (static), lazy, then segmented lazy per model in
+subprocesses and records the first working mode (`auto_chosen`); on GCNsNet the segmented pass
+also measured fastest in the latest run (85.1 vs lazy 114.4 vs compiled 129.0 ms/step).
 
 Routing: `strict_sweep --auto` tries compiled (static), lazy, then segmented lazy per model in
 subprocesses and records the first working mode (`auto_chosen`); on GCNsNet the segmented pass

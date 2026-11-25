@@ -99,25 +99,37 @@ def below_autograd():
 
 
 def _once(fn):
-    """``fn`` as an undo that runs at most once: a stale undo cannot remove a later install."""
+    """``fn`` as an undo that runs at most once: a stale undo cannot remove a later install.
+
+    A failed undo stays retryable: the flag is set only after ``fn`` succeeds."""
     done = False
+    lock = threading.Lock()
 
     def wrapped():
         nonlocal done
-        if done:
-            return
-        done = True
-        fn()
+        with lock:
+            if done:
+                return
+            fn()
+            done = True
 
     return wrapped
 
 
 def chain(undos):
-    """One undo that runs ``undos`` in reverse order."""
+    """One undo that runs ``undos`` in reverse order, continuing past a failing step and
+    re-raising the first error afterwards (the remaining steps still run)."""
 
     def undo():
+        first = None
         for step in reversed(undos):
-            step()
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001  (undo every step, then report)
+                if first is None:
+                    first = e
+        if first is not None:
+            raise first
 
     return _once(undo)
 
@@ -126,11 +138,16 @@ def replace_py_kernels(op, keys, make_kernel):
     """Swap ``op``'s Python kernels at ``keys`` for ``make_kernel(original)``. ``original`` is the kernel replaced, or
     the C++ kernel at that key when torch registers none in Python. Returns an undo."""
     originals = {key: op.py_kernels.pop(key, None) for key in keys}
+    installed = {}
     for key, original in originals.items():
-        op.py_impl(key)(make_kernel(original or functools.partial(op._op_dk, key)))  # py_impl clears the cache
+        kernel = make_kernel(original or functools.partial(op._op_dk, key))
+        installed[key] = kernel
+        op.py_impl(key)(kernel)  # py_impl clears the cache
 
     def undo():
         for key, original in originals.items():
+            if op.py_kernels.get(key) is not installed[key]:
+                continue  # a later install owns this key now; leave it alone
             op.py_kernels.pop(key, None)
             if original is not None:
                 op.py_kernels[key] = original
