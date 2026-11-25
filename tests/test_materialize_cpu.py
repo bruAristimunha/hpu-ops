@@ -43,6 +43,22 @@ def test_segmented_is_noop_off_gaudi():
     assert model(torch.randn(1, 3)).shape == (1, 2)
 
 
+def test_mixed_train_eval_modes_preserved():
+    model = torch.nn.Sequential(torch.nn.BatchNorm1d(4), torch.nn.LazyLinear(2))
+    model.train()
+    model[0].eval()
+    assert model.training and not model[0].training
+    hpu_ops.materialize(model, torch.randn(2, 4))
+    assert model.training and not model[0].training
+    assert model[1].weight.shape == (2, 4)
+
+
+def test_lazy_batchnorm_buffers_allocated():
+    model = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.LazyBatchNorm1d())
+    hpu_ops.materialize(model, torch.randn(2, 3, 5))
+    assert model[1].running_mean.shape == (15,)
+
+
 def test_unreached_lazy_module_raises():
     class Partial(torch.nn.Module):
         def __init__(self):

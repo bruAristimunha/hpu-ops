@@ -366,15 +366,18 @@ def max_pool1d(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode
     cols = []
     for i in range(int(out_len)):
         start = i * s[0] - p[0]
-        cols.append(input[..., max(start, 0):start + k[0]].amax(dim=-1, keepdim=True))
+        window = input[..., max(start, 0):start + k[0]]
+        if window.shape[-1]:
+            cols.append(window.max(dim=-1, keepdim=True).values)
     return cols[0] if len(cols) == 1 else torch.cat(cols, dim=-1)
 
 
 def _max_pool1d_takes(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False):
     if input.dim() != 3 or not input.is_floating_point() or not ceil_mode:
         return False
-    k, _, p, d = _pool_params(kernel_size, stride, padding, dilation)
-    return len(k) == 1 and d == [1] and p[0] >= 0 and input.shape[-1] < k[0]
+    k, s, p, d = _pool_params(kernel_size, stride, padding, dilation)
+    return (len(k) == 1 and d == [1] and 0 <= p[0] and 2 * p[0] <= k[0] and s[0] > 0
+            and 0 < input.shape[-1] < k[0])
 
 
 def install_max_pool1d(device_type):

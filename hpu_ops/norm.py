@@ -82,8 +82,8 @@ def instance_norm(input, weight, bias, running_mean, running_var, use_input_stat
         if use_input_stats:
             var, mean = torch.var_mean(x, dim=-1, correction=0, keepdim=True)
         else:
-            mean = running_mean.reshape(1, -1, 1).to(dtype)
-            var = running_var.reshape(1, -1, 1).to(dtype)
+            mean = running_mean.detach().reshape(1, -1, 1).to(dtype)
+            var = running_var.detach().reshape(1, -1, 1).to(dtype)
         out = ((x - mean) * torch.rsqrt(var + eps)).view(input.shape)
         affine = (1, -1) + (1,) * (input.dim() - 2)
         if weight is not None:
@@ -93,23 +93,31 @@ def instance_norm(input, weight, bias, running_mean, running_var, use_input_stat
         return out.to(input.dtype).contiguous(memory_format=suggest_memory_format(input))
 
 
-def _instance_norm_takes(input, weight, bias, running_mean, running_var, use_input_stats):
-    """Valid calls; Habana's inference recipe rejects the op (EpiNT) and its training path
-    reaches the same composite, whose var_mean autograd differentiates."""
-    if not (input.dim() >= 2 and input.is_floating_point()):
+def _instance_norm_takes(input, weight, bias, running_mean, running_var, use_input_stats, eps=1e-5):
+    """Valid calls the composite computes exactly; Habana's inference recipe rejects the op
+    (EpiNT). A training call that must update the running statistics declines: the composite
+    does not write them (ATen updates them in place with momentum)."""
+    if not (input.dim() >= 2 and input.is_floating_point() and eps >= 0):
         return False
-    stats = use_input_stats or (running_mean is not None and running_var is not None
-                                and running_mean.numel() == input.shape[1])
-    params = all(t is None or (t.dim() == 1 and t.numel() == input.shape[1] and _dtype_ok(input, t))
+    if running_mean is not None and use_input_stats and not torch.is_inference_mode_enabled():
+        return False  # running-stat update required: ATen's kernel owns it
+    channels = input.shape[1]
+    stats_ok = all(
+        t is None or (t.dim() == 1 and t.numel() == channels and _dtype_ok(input, t)
+                      and t.device == input.device)
+        for t in (running_mean, running_var))
+    if not use_input_stats and (running_mean is None or running_var is None):
+        return False
+    params = all(t is None or (t.dim() == 1 and t.numel() == channels and _dtype_ok(input, t))
                  for t in (weight, bias))
-    return stats and params
+    return stats_ok and params
 
 
 def _instance_norm_kernel(op, device_type, fallback):
     def kernel(input, weight=None, bias=None, running_mean=None, running_var=None,
                use_input_stats=True, momentum=0.1, eps=1e-5, cudnn_enabled=True):
         if input.device.type == device_type and _instance_norm_takes(
-                input, weight, bias, running_mean, running_var, use_input_stats):
+                input, weight, bias, running_mean, running_var, use_input_stats, eps):
             count("instance_norm")
             return instance_norm(input, weight, bias, running_mean, running_var, use_input_stats, eps)
         return op._op_dk(fallback, input, weight, bias, running_mean, running_var, use_input_stats,
@@ -128,7 +136,7 @@ def install_instance_norm(device_type):
         def kernel(input, weight=None, bias=None, running_mean=None, running_var=None,
                    use_input_stats=True, momentum=0.1, eps=1e-5, cudnn_enabled=True):
             if input.device.type == device_type and _instance_norm_takes(
-                    input, weight, bias, running_mean, running_var, use_input_stats):
+                    input, weight, bias, running_mean, running_var, use_input_stats, eps):
                 count("instance_norm")
                 return instance_norm(input, weight, bias, running_mean, running_var,
                                      use_input_stats, eps)

@@ -233,18 +233,29 @@ def materialize(model, example_input):
     forward did not reach."""
     uninit = [name for name, p in model.named_parameters()
               if isinstance(p, torch.nn.parameter.UninitializedParameter)]
+    uninit += [f"{name} (buffer)" for name, b in model.named_buffers()
+               if isinstance(b, torch.nn.parameter.UninitializedBuffer)]
+    shells = [name for module in model.modules()
+              if isinstance(module, torch.nn.modules.lazy.LazyModuleMixin)
+              for name, p in module.named_parameters(recurse=False)
+              if p.device.type == "hpu" and p.numel() == 0]
+    if shells and not uninit:
+        raise RuntimeError(f"hpu_ops.materialize: {shells} are already (0,) shells on the HPU; "
+                           "materialize on the CPU before .to(\"hpu\")")
     if not uninit:
         return model
-    training = model.training
+    modes = [(module, module.training) for module in model.modules()]
     model.eval()
     try:
         with torch.no_grad():
             model(example_input)
     finally:
-        if training:
-            model.train()
+        for module, training in modes:
+            module.training = training
     left = [name for name, p in model.named_parameters()
             if isinstance(p, torch.nn.parameter.UninitializedParameter)]
+    left += [f"{name} (buffer)" for name, b in model.named_buffers()
+             if isinstance(b, torch.nn.parameter.UninitializedBuffer)]
     if left:
         raise RuntimeError(f"hpu_ops.materialize: forward did not allocate {left}; "
                            "pass an input that reaches every lazy module")
@@ -263,8 +274,18 @@ def segmented(model):
         return model, lambda: None
     if not _lazy():
         return model, lambda: None
-    handles = [child.register_forward_hook(lambda *args: htcore.mark_step())
-               for child in model.children()]
+    children = list(model.children())
+    if not children:
+        raise ValueError("hpu_ops.segmented: the model has no top-level children to segment "
+                         "(a leaf module is a single lazy graph already)")
+    handles = []
+    try:
+        for child in children:
+            handles.append(child.register_forward_hook(lambda *args: htcore.mark_step()))
+    except Exception:
+        for handle in handles:
+            handle.remove()
+        raise
 
     def undo():
         for handle in handles:
@@ -281,7 +302,13 @@ def compile(model, example_input, device="hpu", dynamic=False):
     (53.95 vs 114.02) and EpiNT (37.42 vs 61.81); it is not universal — GCNsNet and VEMG2Pose
     run fastest lazy, and BrainTokenizer/BBL only segmented lazy (COMPATIBILITY.md)."""
     enable()
-    materialize(model, example_input)
+    params = list(model.parameters())
+    if params and isinstance(params[0], torch.nn.parameter.UninitializedParameter) \
+            and params[0].device.type != "cpu":
+        raise RuntimeError("hpu_ops.compile: lazy parameters are already on the device; "
+                           "materialize on the CPU before .to(\"hpu\")")
+    if not params or params[0].device.type == "cpu":
+        materialize(model, example_input)
     model = model.to(device)
-    torch._dynamo.reset()
+    torch._dynamo.reset()  # global: other compiled models in the process recompile on next call
     return torch.compile(model, backend="hpu_backend", dynamic=dynamic)
