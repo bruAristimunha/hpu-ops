@@ -447,7 +447,7 @@ def gather_int64(self, dim, index, sparse_grad=False):
     x_in = self.unsqueeze(0) if self.ndim == 0 else self
     idx_in = index.unsqueeze(0) if self.ndim == 0 else index
     x32 = x_in.unsqueeze(-1).contiguous().view(torch.int32)
-    idx32 = idx_in.unsqueeze(-1).expand(*idx_in.shape, 2)
+    idx32 = idx_in.unsqueeze(-1).expand(*idx_in.shape, 2).contiguous()  # Habana gather wants a dense index
     out32 = torch.empty(idx32.shape, dtype=torch.int32, device=self.device)
     aten.gather.out(x32, norm_dim, idx32, sparse_grad=sparse_grad, out=out32)
     out64 = out32.contiguous().view(torch.int64).squeeze(-1)
