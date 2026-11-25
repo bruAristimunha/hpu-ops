@@ -2420,4 +2420,44 @@ def test_scatter_value_bool_out_of_place_inplace_and_float_autograd():
     assert torch.equal(got_in, torch.tensor([[False, True, False, True, False, True]]))
     assert torch.equal(got_compiled, got)
     torch.testing.assert_close(got_yf, want_yf, rtol=0, atol=0)
+def test_gather_int64_bit_exact_and_edge_cases():
+    x = torch.tensor(
+        [[0, -1, -(1 << 62), (1 << 62) + 7], [42, 99, -5, 1 << 50]],
+        dtype=torch.int64,
+    ).t()
+    idx = torch.tensor([[1, 0], [0, 1], [1, 1]], dtype=torch.int64)
+    want = x.gather(-1, idx)
+    want_0d = torch.tensor(77, dtype=torch.int64).gather(0, torch.tensor(0))
+    want_empty = torch.arange(5, dtype=torch.int64).gather(0, torch.empty((0,), dtype=torch.int64))
+
+    with cpu_as_hpu(composite.install_gather) as calls:
+        got = x.gather(-1, idx)
+        got_0d = torch.tensor(77, dtype=torch.int64).gather(0, torch.tensor(0))
+        got_empty = torch.arange(5, dtype=torch.int64).gather(0, torch.empty((0,), dtype=torch.int64))
+        compiled = torch.compile(lambda a, i: a.gather(-1, i), backend="aot_eager")
+        got_compiled = compiled(x, idx)
+
+    assert calls["gather_int64"] >= 3
+    assert torch.equal(got, want)
+    assert torch.equal(got_0d, want_0d)
+    assert torch.equal(got_empty, want_empty)
+    assert torch.equal(got_compiled, want)
+
+
+def test_gather_preserves_float_autograd_and_native_passthrough():
+    x = torch.randn(3, 4, requires_grad=True)
+    idx = torch.tensor([[0, 2], [3, 1], [1, 0]], dtype=torch.int64)
+    want_y = x.gather(1, idx)
+    want_y.sum().backward()
+    want_grad = x.grad.clone()
+    x.grad = None
+
+    with cpu_as_hpu(composite.install_gather) as calls:
+        got_y = x.gather(1, idx)
+        got_y.sum().backward()
+        got_grad = x.grad.clone()
+
+    assert not calls.get("gather_int64")
+    torch.testing.assert_close(got_y, want_y, rtol=0, atol=0)
+
     torch.testing.assert_close(got_grad, want_grad, rtol=0, atol=0)
