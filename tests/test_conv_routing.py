@@ -355,4 +355,4 @@ def test_strided_conv_traced_is_stride1_plus_subsample():
     ww = w.detach().clone().requires_grad_()
     ref = f(xw, ww)
     ref.square().sum().backward()
-    torch.testing.assert_close(x.grad, xw.grad, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(x.grad, xw.grad, atol=1e-4, rtol=1e-4)  # backward summation order
