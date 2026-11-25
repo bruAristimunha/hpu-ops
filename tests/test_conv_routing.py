@@ -4,7 +4,7 @@ everything else with a kernel dim above the bound is split."""
 import pytest
 import torch
 import torch.nn.functional as F
-from test_cpu import compiled, cpu_as_hpu
+from test_cpu import compiled, cpu_as_hpu, ops
 
 from hpu_ops import conv
 
@@ -334,3 +334,25 @@ def test_16_bit_bias_where_the_device_adds_it(monkeypatch):
         got = F.conv1d(x, w, b)
     assert calls["large_conv"] == 1 and got.item() == 256.0
     assert F.conv1d(x[..., :2], w[..., [0, 257]], b).item() == 258.0  # the CPU's own convention
+
+
+def test_strided_conv_traced_is_stride1_plus_subsample():
+    torch.manual_seed(0)
+    x = torch.randn(2, 8, 64, requires_grad=True)
+    w = torch.randn(16, 8, 8, requires_grad=True)
+    f = lambda a, b: F.conv1d(a, b, stride=2, padding=3)  # noqa: E731
+    want = f(x, w)
+    nodes = []
+    with cpu_as_hpu(conv.install_large_kernel) as calls:
+        got = compiled(f, nodes)(x, w)
+        got.square().sum().backward()
+    assert calls["strided_conv"] >= 1
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)  # stride-1 summation order differs
+    convs = [n for n in nodes if "convolution" in str(n.target)]
+    assert convs and "aten.slice.Tensor" in ops(nodes), ops(nodes)
+    assert all(n.args[3] in (None, [1]) for n in convs if len(n.args) > 3), ops(nodes)
+    xw = x.detach().clone().requires_grad_()
+    ww = w.detach().clone().requires_grad_()
+    ref = f(xw, ww)
+    ref.square().sum().backward()
+    torch.testing.assert_close(x.grad, xw.grad, atol=1e-4, rtol=1e-4)  # backward summation order
