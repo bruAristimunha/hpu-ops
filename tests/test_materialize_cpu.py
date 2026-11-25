@@ -68,6 +68,21 @@ def test_segmented_deep_hooks_every_submodule(monkeypatch):
     assert marks == []
 
 
+def test_compile_children_wraps_each_child():
+    model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.ReLU())
+    with pytest.raises(Exception, match="hpu_backend"):  # off-card: backend lookup at wrap time
+        hpu_ops.compile_children(model, torch.randn(1, 3), device="cpu")
+
+
+def test_inference_freezes_and_wraps():
+    model = torch.nn.Sequential(torch.nn.Linear(3, 2))
+    model.train()
+    with pytest.raises(Exception, match="hpu_backend"):
+        hpu_ops.inference(model, torch.randn(1, 3), device="cpu")
+    assert not model.training  # frozen before the compile attempt
+    assert all(not p.requires_grad for p in model.parameters())
+
+
 def test_mixed_train_eval_modes_preserved():
     model = torch.nn.Sequential(torch.nn.BatchNorm1d(4), torch.nn.LazyLinear(2))
     model.train()

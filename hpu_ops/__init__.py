@@ -137,8 +137,9 @@ from ._strict import CPUExecutionError, strict  # noqa: F401
 from ._strict import check as strict_check, format_report as strict_format_report  # noqa: F401
 from ._strict import report as strict_report, reset as strict_reset  # noqa: F401
 
-__all__ = ["enable", "materialize", "segmented", "compile", "fuse", "strict", "CPUExecutionError",
-           "strict_check", "strict_report", "strict_reset", "strict_format_report"]
+__all__ = ["enable", "materialize", "segmented", "compile", "compile_children", "inference", "fuse",
+           "strict", "CPUExecutionError", "strict_check", "strict_report", "strict_reset",
+           "strict_format_report"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
@@ -362,8 +363,50 @@ def compile(model, example_input, device="hpu", dynamic=False):
     if not params or any(p.device.type == "cpu" for p in params):
         materialize(model, example_input)
     model = model.to(device)
+    if dynamic:
+        warnings.warn("hpu_ops.compile: dynamic=True hits Habana's recipe bug with dynamic "
+                      "shapes (KeyError: 'output_strides', #63); dynamic=False is the "
+                      "supported path", stacklevel=2)
     torch._dynamo.reset()  # global: other compiled models in the process recompile on next call
     return torch.compile(model, backend="hpu_backend", dynamic=dynamic)
+
+
+def compile_children(model, example_input=None, device="hpu"):
+    """Compile each top-level child of ``model`` separately (``dynamic=False``), leaving the
+    code between children - ``autograd.Function`` boundaries, scalar reads, optimizer-visible
+    state - in eager mode. Habana's recipe compiler rejects or fragments whole-model graphs
+    past a size/complexity limit (BrainTokenizer's training graph, the spd_learn custom
+    autograd.Function models); per-child recipes stay under it, and each island still gets
+    the compiled fast path. No ``torch._dynamo.reset()`` between children. Pair with
+    ``materialize`` semantics as in ``compile`` when ``example_input`` is given. Returns the
+    model, with its children replaced by their compiled forms."""
+    enable()
+    if example_input is not None:
+        params = list(model.parameters())
+        if not params or any(p.device.type == "cpu" for p in params):
+            materialize(model, example_input)
+    model = model.to(device)
+    for name, child in list(model.named_children()):
+        setattr(model, name, torch.compile(child, backend="hpu_backend", dynamic=False))
+    return model
+
+
+def inference(model, example_input, device="hpu"):
+    """Compiled inference that runs: ``compile`` the frozen eval model and call it under
+    ``torch.no_grad()``. Habana's recipe compiler rejects ``inference_mode`` graphs
+    (``synStatus 26``, EpiNT) while the same graph compiles under ``no_grad``; for a frozen
+    eval model the two are semantically identical, and outputs are ordinary tensors.
+    Returns a callable wrapping the compiled model."""
+    model = model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    compiled_model = compile(model, example_input, device=device, dynamic=False)
+
+    def run(*args, **kwargs):
+        with torch.no_grad():
+            return compiled_model(*args, **kwargs)
+
+    return run
 
 
 _CONVS = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)
