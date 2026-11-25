@@ -96,6 +96,8 @@ def _floating(out):
         return [out] if out.is_floating_point() else []
     if isinstance(out, dict):
         out = list(out.values())
+    if not isinstance(out, (list, tuple)):
+        return []
     found = []
     for o in out:
         found += _floating(o)
@@ -135,6 +137,8 @@ def run(name, make, hpu_ops, compiled):
             if opt is not None:
                 opt.zero_grad(set_to_none=True)
             out = first_tensor(fwd(xb))
+            if out is None:
+                raise RuntimeError("sweep: the model returned no floating tensor to train on")
             if loss_kind == "ce" and out.dim() == 2:
                 loss = torch.nn.functional.cross_entropy(out, yb)
             else:
