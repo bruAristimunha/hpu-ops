@@ -137,8 +137,8 @@ from ._strict import CPUExecutionError, strict  # noqa: F401
 from ._strict import check as strict_check, format_report as strict_format_report  # noqa: F401
 from ._strict import report as strict_report, reset as strict_reset  # noqa: F401
 
-__all__ = ["enable", "materialize", "segmented", "compile", "strict", "CPUExecutionError", "strict_check",
-           "strict_report", "strict_reset", "strict_format_report"]
+__all__ = ["enable", "materialize", "segmented", "compile", "fuse", "strict", "CPUExecutionError",
+           "strict_check", "strict_report", "strict_reset", "strict_format_report"]
 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
@@ -162,8 +162,21 @@ ATTENTION_HINT = ("Gaudi's fused attention kernel is not registered, so F.scaled
 
 
 def _install(device_type):
-    """Every rewrite, for tensors of ``device_type`` (the tests pass "cpu" in the role of "hpu"). Returns an undo."""
-    return chain([fix(device_type) for fix in FIXES])
+    """Every rewrite, for tensors of ``device_type`` (the tests pass "cpu" in the role of "hpu"). Returns an undo.
+
+    A fix that raises midway rolls back the fixes already installed, so no partial state leaks."""
+    undos = []
+    try:
+        for fix in FIXES:
+            undos.append(fix(device_type))
+    except Exception:
+        for step in reversed(undos):
+            try:
+                step()
+            except Exception:  # noqa: BLE001  (roll back every step, then report the install failure)
+                pass
+        raise
+    return chain(undos)
 
 
 def _attention_fused(device_type="hpu"):
@@ -205,36 +218,50 @@ def _enable():
         warnings.simplefilter("always")
         tpc.install_kernel_path()  # before the first HPU op: Habana reads the kernel path when the device initialises
     saved_passes = {name: os.environ.get(f"PT_HPU_DISABLE_{name}") for name in BROKEN_PASSES}
+
+    def restore_passes():
+        for name, value in saved_passes.items():
+            key = f"PT_HPU_DISABLE_{name}"
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"
-    undo = _install("hpu")
-    if _lazy():  # Habana's compile backend does not run in lazy mode: uncompiled with one warning (or raise)
-        try:
-            undo = chain([undo, lazy_compile.install(lazy_compile.NAME)])
-        except Exception:
-            undo()  # no half-enabled state: a later enable() starts clean
-            raise
+    try:
+        undo = _install("hpu")
+        if _lazy():  # Habana's compile backend does not run in lazy mode: uncompiled with one warning (or raise)
+            try:
+                undo = chain([undo, lazy_compile.install(lazy_compile.NAME)])
+            except Exception:
+                undo()  # no half-enabled state: a later enable() starts clean
+                raise
+    except Exception:
+        restore_passes()
+        raise
 
-    def undo_once():  # clears the state, so enable() after the undo installs again
+    def undo_once():  # clears the state only after a successful undo, so enable() can retry or re-install
         with _ENABLE_LOCK:
             if _STATE.get("undo") is not undo_once:
                 return
-            del _STATE["undo"]
+            if _STATE.get("enabling"):
+                raise RuntimeError("hpu_ops: undo called while enable() is still installing")
             undo()
-            for name, value in saved_passes.items():
-                key = f"PT_HPU_DISABLE_{name}"
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+            del _STATE["undo"]
+            restore_passes()
 
     _STATE["undo"] = undo_once
-    _strict_from_env()
-    for caught in path_warnings:  # last, as the attention hint: under -W error the fixes are already in
-        warnings.warn(caught.message, stacklevel=2)
-    if not _attention_fused():
-        warnings.warn(ATTENTION_HINT, stacklevel=2)
+    _STATE["enabling"] = True
+    try:
+        _strict_from_env()
+        for caught in path_warnings:  # last, as the attention hint: under -W error the fixes are already in
+            warnings.warn(caught.message, stacklevel=2)
+        if not _attention_fused():
+            warnings.warn(ATTENTION_HINT, stacklevel=2)
+    finally:
+        _STATE.pop("enabling", None)
 
 
 def materialize(model, example_input):
@@ -247,6 +274,11 @@ def materialize(model, example_input):
     forward did not reach."""
     uninit = [name for name, p in model.named_parameters()
               if isinstance(p, torch.nn.parameter.UninitializedParameter)]
+    off_cpu = [name for name, p in model.named_parameters()
+               if isinstance(p, torch.nn.parameter.UninitializedParameter) and p.device.type != "cpu"]
+    if off_cpu:
+        raise RuntimeError(f"hpu_ops.materialize: {off_cpu} are uninitialized off the CPU; "
+                           "materialize before moving the model")
     uninit += [f"{name} (buffer)" for name, b in model.named_buffers()
                if isinstance(b, torch.nn.parameter.UninitializedBuffer)]
     shells = [name for module in model.modules()
@@ -317,12 +349,58 @@ def compile(model, example_input, device="hpu", dynamic=False):
     run fastest lazy, and BrainTokenizer/BBL only segmented lazy (COMPATIBILITY.md)."""
     enable()
     params = list(model.parameters())
-    if params and isinstance(params[0], torch.nn.parameter.UninitializedParameter) \
-            and params[0].device.type != "cpu":
+    if any(isinstance(p, torch.nn.parameter.UninitializedParameter) and p.device.type != "cpu"
+           for p in params):
         raise RuntimeError("hpu_ops.compile: lazy parameters are already on the device; "
                            "materialize on the CPU before .to(\"hpu\")")
-    if not params or params[0].device.type == "cpu":
+    if not params or any(p.device.type == "cpu" for p in params):
         materialize(model, example_input)
     model = model.to(device)
     torch._dynamo.reset()  # global: other compiled models in the process recompile on next call
     return torch.compile(model, backend="hpu_backend", dynamic=dynamic)
+
+
+_CONVS = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)
+_BATCHNORMS = (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)
+
+
+def _fold_conv_bn(conv, bn):
+    if not bn.track_running_stats or bn.running_mean is None or bn.running_var is None:
+        return False
+    with torch.no_grad():
+        gamma = bn.weight if bn.weight is not None else torch.ones_like(bn.running_mean)
+        beta = bn.bias if bn.bias is not None else torch.zeros_like(bn.running_mean)
+        scale = gamma / torch.sqrt(bn.running_var + bn.eps)
+        shape = (-1,) + (1,) * (conv.weight.dim() - 1)
+        conv.weight.mul_(scale.view(shape))
+        bias = conv.bias if conv.bias is not None else torch.zeros_like(bn.running_mean)
+        folded = beta + (bias - bn.running_mean) * scale
+        if conv.bias is None:
+            conv.bias = torch.nn.Parameter(folded)
+        else:
+            conv.bias.copy_(folded)
+    return True
+
+
+def fuse(model):
+    """Fold each BatchNorm into the Conv directly before it in ``nn.Sequential`` chains
+    (inference only): the folded conv replaces the pair, the norm becomes ``Identity``.
+    One fused kernel launch instead of two, at the same precision. Models must be in eval
+    mode (running statistics are what gets folded); attribute-style blocks whose norm does
+    not sit in a Sequential next to its conv are left alone. Returns the model."""
+    if any(module.training for module in model.modules()):
+        raise RuntimeError("hpu_ops.fuse: fold in eval mode (training folds would bake the "
+                           "running statistics the optimizer still updates)")
+
+    def walk(module):
+        for child in list(module.children()):
+            walk(child)
+        if isinstance(module, torch.nn.Sequential):
+            children = list(module.children())
+            for i in range(len(children) - 1):
+                if isinstance(children[i], _CONVS) and isinstance(children[i + 1], _BATCHNORMS) \
+                        and _fold_conv_bn(children[i], children[i + 1]):
+                    module[i + 1] = torch.nn.Identity()
+
+    walk(model)
+    return model

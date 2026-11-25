@@ -225,14 +225,18 @@ def _auto_row(args, name):
                 command.append("--segment-topchild")
             if args.step_check:
                 command.append("--step-check")
+            def _text(value):
+                if value is None:
+                    return ""
+                return value.decode(errors="replace") if isinstance(value, bytes) else value
+
             try:
                 proc = subprocess.run(command, capture_output=True, text=True, timeout=3600, env=env)
                 output, code = proc.stdout + proc.stderr, proc.returncode
             except subprocess.TimeoutExpired as e:
-                output = (e.stdout or "") + (e.stderr or "")
-                if isinstance(output, bytes):
-                    output = output.decode(errors="replace")
+                output = _text(e.stdout) + _text(e.stderr)
                 code = "timeout"
+            plugins = next((line[8:] for line in output.splitlines() if line.startswith("PLUGINS ")), "")
             row = None
             for line in output.splitlines():
                 if line.startswith("RESULT "):
@@ -244,14 +248,18 @@ def _auto_row(args, name):
                 tail = output.strip().splitlines()[-1][:300] if output.strip() else "no output"
                 row = dict(model=name, mode=mode, batch=BATCH, bridge=BRIDGE, status="crashed",
                            error=f"child exit {code}: {tail}")
+            if code == "timeout":
+                row = dict(model=name, mode=mode, batch=BATCH, bridge=BRIDGE, status="crashed",
+                           error=f"child timed out after printing: {output.strip()[-200:]}")
             attempts.append(dict(mode=mode, status=row.get("status"), ms_per_step=row.get("ms_per_step"),
                                  error=(row.get("error") or "")[:200]))
             last = row
             if row.get("status") == "ok":
                 row["auto_chosen"] = mode
                 row["auto_attempts"] = attempts
+                row["auto_plugins"] = plugins
                 return row
-            if attempt == 0 and "synStatus 8" in (row.get("error") or output):
+            if attempt == 0 and "synStatus 8" in ((row.get("error") or "") + output):
                 time.sleep(20)
                 continue
             break
