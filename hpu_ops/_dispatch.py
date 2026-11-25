@@ -10,13 +10,16 @@ The rewrites read the device type they apply to as an argument, so the tests can
 """
 import collections
 import functools
+import threading
 
 import torch
 from torch._C import DispatchKey
 from torch._subclasses.fake_tensor import is_fake
+from torch._subclasses.functional_tensor import FunctionalTensor
 
 REDUCED = (torch.float16, torch.bfloat16)
 _STATE = {"calls": collections.Counter()}
+_ENABLE_LOCK = threading.RLock()
 _DUAL_PROBE = torch.empty(0)
 
 
@@ -77,14 +80,11 @@ def tracing(*tensors):
     if (torch._C._len_torch_dispatch_stack() == 0 and not torch.compiler.is_compiling()
             and all(type(t) is torch.Tensor and not torch._is_functional_tensor(t) for t in tensors)):
         return False
-    from torch._subclasses.fake_tensor import FakeTensor, is_fake
-    from torch._subclasses.functional_tensor import FunctionalTensor
-
     if (torch.compiler.is_compiling() or torch._guards.detect_fake_mode() is not None
             or torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY) is not None):
         return True
-    return any(isinstance(t, FakeTensor) or is_fake(t) or torch._is_functional_tensor(t)
-               or isinstance(t, FunctionalTensor) for t in tensors)
+    return any(is_fake(t) or torch._is_functional_tensor(t) or isinstance(t, FunctionalTensor)
+               for t in tensors)
 
 
 def concrete(t):
@@ -98,6 +98,20 @@ def below_autograd():
     return torch._C._dispatch_tls_is_dispatch_key_excluded(DispatchKey.AutogradFunctionality)
 
 
+def _once(fn):
+    """``fn`` as an undo that runs at most once: a stale undo cannot remove a later install."""
+    done = False
+
+    def wrapped():
+        nonlocal done
+        if done:
+            return
+        done = True
+        fn()
+
+    return wrapped
+
+
 def chain(undos):
     """One undo that runs ``undos`` in reverse order."""
 
@@ -105,7 +119,7 @@ def chain(undos):
         for step in reversed(undos):
             step()
 
-    return undo
+    return _once(undo)
 
 
 def replace_py_kernels(op, keys, make_kernel):
@@ -122,7 +136,7 @@ def replace_py_kernels(op, keys, make_kernel):
                 op.py_kernels[key] = original
         op._dispatch_cache.clear()
 
-    return undo
+    return _once(undo)
 
 
 def register_kernels(device_type, kernels):
@@ -145,7 +159,7 @@ def register_kernels(device_type, kernels):
         for op in touched:
             op._dispatch_cache.clear()
 
-    return undo
+    return _once(undo)
 
 
 def register_paired(device_type, groups):
@@ -186,4 +200,4 @@ def override_kernels(device_type, kernels):
         for op, _ in kernels:
             op._dispatch_cache.clear()
 
-    return undo
+    return _once(undo)

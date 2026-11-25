@@ -132,7 +132,7 @@ import torch
 
 from . import (composite, conv, dynshape, eigh, extrema, im2col, indexing, lazy_compile, linalg, norm,  # noqa: F401
                quantile, serialization, small, tpc, upsample, wide)
-from ._dispatch import _STATE, chain
+from ._dispatch import _ENABLE_LOCK, _STATE, chain
 from ._strict import CPUExecutionError, strict  # noqa: F401
 from ._strict import check as strict_check, format_report as strict_format_report  # noqa: F401
 from ._strict import report as strict_report, reset as strict_reset  # noqa: F401
@@ -190,6 +190,11 @@ _lazy = tpc.lazy_mode
 def enable():
     """Install the rewrites and turn off the broken passes. Idempotent; a no-op off a Gaudi stack. With
     ``HPU_OPS_STRICT=1`` (or ``report``) in the environment, strict mode for the whole process (``hpu_ops._strict``)."""
+    with _ENABLE_LOCK:
+        _enable()
+
+
+def _enable():
     if _STATE.get("undo"):
         return
     try:
@@ -199,6 +204,7 @@ def enable():
     with warnings.catch_warnings(record=True) as path_warnings:  # warned after the fixes are in (-W error)
         warnings.simplefilter("always")
         tpc.install_kernel_path()  # before the first HPU op: Habana reads the kernel path when the device initialises
+    saved_passes = {name: os.environ.get(f"PT_HPU_DISABLE_{name}") for name in BROKEN_PASSES}
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"
@@ -211,9 +217,17 @@ def enable():
             raise
 
     def undo_once():  # clears the state, so enable() after the undo installs again
-        if _STATE.get("undo") is undo_once:
+        with _ENABLE_LOCK:
+            if _STATE.get("undo") is not undo_once:
+                return
             del _STATE["undo"]
             undo()
+            for name, value in saved_passes.items():
+                key = f"PT_HPU_DISABLE_{name}"
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     _STATE["undo"] = undo_once
     _strict_from_env()

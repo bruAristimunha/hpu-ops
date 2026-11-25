@@ -120,7 +120,7 @@ def install_copy_checks(device_type):
         return lambda: None
 
     def kernel(self, src, non_blocking=False):
-        if self.device.type == device_type:
+        if self.device.type == device_type and (self.dtype is torch.int64 or self.dtype is torch.float64):
             copy_checks(self, src, device_type)
         return op._op_dk(DispatchKey.CompositeExplicitAutograd, self, src, non_blocking)
 
