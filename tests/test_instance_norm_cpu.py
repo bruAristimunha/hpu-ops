@@ -1,6 +1,8 @@
-"""CPU tests of the inference instance_norm composite, "cpu" standing in for "hpu": Habana's
-inference recipe fails on EpiNT's instance norm while training passes, so inference (eager,
-compiled and plain) takes the composite and training keeps the native kernel."""
+"""CPU tests of the instance_norm composite, "cpu" standing in for "hpu": Habana's inference
+recipe fails on EpiNT's instance norm, so the composite computes it (traced, autograd and
+backend keys); a training call that must update running statistics declines to ATen, which
+owns the in-place buffer update."""
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -58,6 +60,24 @@ def test_compiled_inference_traces_composite():
     with torch.inference_mode():
         want = m(x)
     assert_same([got], [want], tol=1e-12)
+
+
+def test_train_running_stats_update_stays_native():
+    m = torch.nn.InstanceNorm1d(4, affine=False, track_running_stats=True, momentum=0.5).double()
+    x = torch.randn(2, 4, 3, dtype=torch.float64)
+    with cpu_as_hpu(norm.install_instance_norm) as calls:
+        m.train()
+        m(x)
+        assert not calls["instance_norm"]
+    assert not torch.equal(m.running_mean, torch.zeros(4, dtype=torch.float64))
+
+
+def test_bogus_running_stats_decline():
+    x = torch.randn(2, 4, 10, dtype=torch.float64)
+    with cpu_as_hpu(norm.install_instance_norm) as calls:
+        with torch.inference_mode(), pytest.raises(RuntimeError, match="should contain"):
+            F.instance_norm(x, torch.zeros(99), torch.ones(99), None, None, True, 0.1, 1e-5)
+        assert not calls["instance_norm"]
 
 
 def test_running_stats_path():
