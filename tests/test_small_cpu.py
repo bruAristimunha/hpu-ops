@@ -8,6 +8,8 @@ import torch
 import hpu_ops
 from hpu_ops import small
 
+from test_cpu import compiled
+
 inf, nan = float("inf"), float("nan")
 
 
@@ -69,6 +71,32 @@ def test_bincount_chunks_count_each_boundary_value_once():
             out = torch.bincount(x)
         assert calls["bincount"] == 1
         same(out, torch.bincount(x), exact=True)
+
+
+def test_bincount_traced_minlength_no_range_read():
+    x = torch.randint(0, 512, (4096,))
+    with cpu_as_hpu(small.install_bincount) as calls:
+        out = compiled(lambda t: torch.bincount(t, minlength=512), [])(x)
+    assert calls["bincount"] >= 1  # tracing runs the kernel on fake tensors too
+    same(out, torch.bincount(x, minlength=512), exact=True)
+
+
+def test_bincount_traced_minlength_declines_in_lazy(monkeypatch):
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    x = torch.randint(0, 512, (1 << 16,))  # numel * minlength above the lazy one-hot budget
+    with cpu_as_hpu(small.install_bincount) as calls:
+        out = compiled(lambda t: torch.bincount(t, minlength=512), [])(x)
+    assert calls["bincount"] == 0  # the traced histc route is compiled-only
+    same(out, torch.bincount(x, minlength=512), exact=True)
+
+
+def test_bincount_lazy_small_wide_minlength(monkeypatch):
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    x = torch.randint(0, 8192, (96,))  # tokenizer initialize: few buckets, 8192-code codebook
+    with cpu_as_hpu(small.install_bincount) as calls:
+        out = torch.bincount(x, minlength=8192)
+    assert calls["bincount"] == 1
+    same(out, torch.bincount(x, minlength=8192), exact=True)
 
 
 def test_bincount_negative_input_raises_atens_error():
