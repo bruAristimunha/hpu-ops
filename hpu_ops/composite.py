@@ -256,6 +256,52 @@ def install_roll(device_type):
         op, "roll_zero", roll_unshifted, _roll_takes, DispatchKey.Autograd))])
 
 
+def sdpa_math(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
+              enable_gqa=False):
+    """``scaled_dot_product_attention`` as matmul/softmax/matmul (torch's math decomposition),
+    with float32 attention math for 16-bit inputs. Fully masked rows give NaN, as on the CPU."""
+    if enable_gqa or key.shape[-3] != query.shape[-3]:
+        group = query.shape[-3] // key.shape[-3]
+        key = key.repeat_interleave(group, dim=-3)
+        value = value.repeat_interleave(group, dim=-3)
+    dtype = _opmath(query.dtype)
+    with torch.autocast(query.device.type, enabled=False):
+        q, k, v = query.to(dtype), key.to(dtype), value.to(dtype)
+        scores = q @ k.transpose(-2, -1) * (scale if scale is not None else query.shape[-1] ** -0.5)
+        if is_causal:
+            causal = torch.ones(query.shape[-2], key.shape[-2], dtype=torch.bool,
+                                device=query.device).triu(1)
+            scores = scores.masked_fill(causal, float("-inf"))
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                scores = scores.masked_fill(~attn_mask, float("-inf"))
+            else:
+                scores = scores + attn_mask.to(dtype)
+        return (scores.softmax(-1) @ v).to(query.dtype)
+
+
+def _sdpa_takes(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
+                enable_gqa=False):
+    # dropout draws and head-mismatch errors keep the native kernel (and its semantics)
+    heads_ok = query.shape[-3] % key.shape[-3] == 0 and (enable_gqa or query.shape[-3] == key.shape[-3])
+    return (query.is_floating_point() and query.dim() >= 2 and dropout_p == 0.0 and heads_ok
+            and (attn_mask is None or attn_mask.dtype == torch.bool or attn_mask.is_floating_point()))
+
+
+def install_sdpa(device_type):
+    """``scaled_dot_product_attention`` on ``device_type`` as ``sdpa_math`` where Habana has no
+    fused kernel to register (bridge 1.21 without the override setting: attention then runs
+    through the bridge's slower decomposition, and its fused kernel is wrong for some view
+    layouts). Registrations only fill keys Habana left empty, so a working fused kernel -
+    and every call this declines (dropout, head errors) - keeps the native path. Returns an undo."""
+    op = aten.scaled_dot_product_attention.default
+    return register_kernels(device_type, [
+        (op, "Autograd{}", _kernel(op, "sdpa", sdpa_math, _sdpa_takes, DispatchKey.Autograd)),
+        (op, "{}", _kernel(op, "sdpa", sdpa_math, _sdpa_takes,
+                           DispatchKey.CompositeExplicitAutograd)),
+    ])
+
+
 def one_hot(input, num_classes=-1):
     """``aten.one_hot`` as an equality against ``arange``: Habana's HPU kernel rejects an inferred count
     ("Number of classes cannot be -1", GCNsNet's graph coarsening, eager, lazy and inference), and ATen's

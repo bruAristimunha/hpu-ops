@@ -729,6 +729,47 @@ def test_glu_elsewhere_stays_glu():
     assert "aten.glu.default" in ops(nodes) and not calls["glu"]
 
 
+def test_sdpa_math_matches_aten_eager_inference_and_gradients():
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 6, 8, requires_grad=True)
+    k = torch.randn(2, 4, 6, 8, requires_grad=True)
+    v = torch.randn(2, 4, 6, 8, requires_grad=True)
+    mask = torch.rand(2, 1, 6, 6) > 0.3
+    want = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    want.sum().backward()
+    grads = [t.grad.clone() for t in (q, k, v)]
+    for t in (q, k, v):
+        t.grad = None
+    with cpu_as_hpu(composite.install_sdpa) as calls:
+        got = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        got.sum().backward()
+        assert calls["sdpa"] >= 1
+        with torch.inference_mode():
+            inferred = F.scaled_dot_product_attention(q.detach(), k.detach(), v.detach(), is_causal=True)
+    torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-6)
+    for t, grad in zip((q, k, v), grads):
+        torch.testing.assert_close(t.grad, grad, atol=1e-5, rtol=1e-5)
+    with torch.no_grad():
+        causal = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    torch.testing.assert_close(inferred, causal, atol=1e-6, rtol=1e-6)
+
+
+def test_sdpa_math_gqa_and_declines():
+    torch.manual_seed(0)
+    q = torch.randn(1, 4, 5, 8)
+    k = torch.randn(1, 2, 5, 8)
+    v = torch.randn(1, 2, 5, 8)
+    want = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+    with cpu_as_hpu(composite.install_sdpa) as calls:
+        got = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+        assert calls["sdpa"] == 1
+    torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-6)
+    # dropout and head mismatches decline to the native kernel (its draws, its errors)
+    assert not composite._sdpa_takes(q, k, v, dropout_p=0.5)
+    assert not composite._sdpa_takes(q, k, v)
+    assert composite._sdpa_takes(q, k, v, enable_gqa=True)
+
+
 # ---- renorm as norm, scale factor and multiply
 
 

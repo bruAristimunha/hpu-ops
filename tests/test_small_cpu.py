@@ -99,6 +99,37 @@ def test_bincount_lazy_small_wide_minlength(monkeypatch):
     same(out, torch.bincount(x, minlength=8192), exact=True)
 
 
+def test_scalar_dense_lazy_segments_then_reads(monkeypatch):
+    steps = []
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    monkeypatch.setattr(small, "_mark_step", lambda: steps.append(1))
+    x = torch.tensor([3.5])
+    with cpu_as_hpu(small.install_scalar_dense) as calls:
+        assert x.item() == 3.5
+        assert bool(torch.tensor([1.0])) is True
+    assert steps == [1, 1]  # one graph flush per lazy scalar read
+    assert calls["scalar_dense"] == 2
+
+
+def test_scalar_dense_lazy_segments_in_inference_mode(monkeypatch):
+    steps = []
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    monkeypatch.setattr(small, "_mark_step", lambda: steps.append(1))
+    with cpu_as_hpu(small.install_scalar_dense) as calls:
+        with torch.inference_mode():
+            assert torch.tensor([1.0]).item() == 1.0
+    assert steps == [1] and calls["scalar_dense"] == 1  # the backend key carries inference reads
+
+
+def test_scalar_dense_eager_does_not_segment(monkeypatch):
+    steps = []
+    monkeypatch.setattr(small, "_lazy", lambda: False)
+    monkeypatch.setattr(small, "_mark_step", lambda: steps.append(1))
+    with cpu_as_hpu(small.install_scalar_dense) as calls:
+        assert torch.tensor([2.0]).item() == 2.0
+    assert steps == [] and calls["scalar_dense"] == 0
+
+
 def test_bincount_negative_input_raises_atens_error():
     x = torch.randint(0, 10, (1 << 16,))
     x[5] = -1

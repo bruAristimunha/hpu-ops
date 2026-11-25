@@ -52,6 +52,7 @@ INDEX_ADD_MAX_SELF_ROWS = 256  # Habana's lazy accumulating index_put into more 
 INDEX_ADD_MIN_PER_ROW = 1280  # source rows per row of self below a wide row (measured: 640 is parity, 320 loses)
 INDEX_ADD_WIDE_ROW = 128  # elements per row of self from which the rewrite wins at every contention measured
 _MODE = {}
+_SCALAR_TLS = threading.local()
 
 
 def _lazy():
@@ -65,6 +66,59 @@ def _lazy():
             return False
         _MODE["lazy"] = bool(is_lazy())
     return _MODE["lazy"]
+
+
+def _mark_step():
+    """Flush the pending lazy graph (no-op off a lazy Gaudi stack)."""
+    if "mark_step" not in _MODE:
+        try:
+            from habana_frameworks.torch.core import mark_step
+
+            _MODE["mark_step"] = mark_step
+        except ImportError:
+            _MODE["mark_step"] = None
+    if _MODE["mark_step"] is not None:
+        _MODE["mark_step"]()
+
+
+def install_scalar_dense(device_type):
+    """``.item()`` / ``bool()`` / ``int()`` of a device scalar (``aten::_local_scalar_dense``).
+
+    The read itself stays Habana's kernel: a Python scalar cannot be produced without
+    reading the device. In lazy mode the pending graph is flushed first, so the graph
+    built after the read starts fresh. Habana's lazy compiler segfaults when a long
+    data-dependent loop (the Braindecode quantizers' 8192-code k-means ``initialize``,
+    entered right after ``bool(self.initted.item())``) is fused into the graph that
+    produced its input; the same loop as its own graph compiles and runs (bridge
+    1.21.4). Any model whose forward reads a scalar therefore runs stock in lazy mode;
+    removing the per-forward sync itself still needs the value mirrored in Python,
+    which only the model can know is safe."""
+    op = aten._local_scalar_dense.default
+
+    def kernel(x):
+        if _lazy() and _concrete(x):
+            _mark_step()
+            count("scalar_dense")
+        _SCALAR_TLS.below = True  # the backend kernel below must not flush a second time
+        try:
+            return op._op_dk(DispatchKey.Autograd, x)
+        finally:
+            _SCALAR_TLS.below = False
+
+    def backend_kernel(x):
+        # The backend key is the only one inference-mode reads reach (autograd's keys
+        # are excluded there). The native read is a copy to the host: _local_scalar_dense
+        # has no second overload to fall through to, and redispatching it would recurse.
+        if not getattr(_SCALAR_TLS, "below", False) and _lazy() and _concrete(x):
+            _mark_step()
+            count("scalar_dense")
+        host = torch.empty(x.shape, dtype=x.dtype, device="cpu")
+        with torch._C._AutoDispatchBelowADInplaceOrView():
+            aten.copy_.default(host, x)
+        return host.numpy().item()
+
+    return chain([register_kernels(device_type, [(op, "Autograd{}", kernel)]),
+                  override_kernels(device_type, [(op, backend_kernel)])])
 
 
 def _concrete(x):
