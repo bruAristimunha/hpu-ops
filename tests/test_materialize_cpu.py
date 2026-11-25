@@ -74,6 +74,21 @@ def test_compile_children_wraps_each_child():
         hpu_ops.compile_children(model, torch.randn(1, 3), device="cpu")
 
 
+def test_compile_children_depth_and_match_select_modules():
+    # depth/match selection is pure tree walking: capture the compile calls
+    compiled = []
+    real_compile = hpu_ops.torch.compile
+    monkey = lambda child, **kw: compiled.append(child) or child  # noqa: E731
+    hpu_ops.torch.compile = monkey
+    try:
+        model = torch.nn.Sequential(
+            torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.ReLU()), torch.nn.Linear(2, 1))
+        hpu_ops.compile_children(model, device="cpu", depth=2, match="0.0")
+    finally:
+        hpu_ops.torch.compile = real_compile
+    assert compiled == [model[0][0]]  # only the depth-2 Linear under "0."
+
+
 def test_inference_freezes_and_wraps():
     model = torch.nn.Sequential(torch.nn.Linear(3, 2))
     model.train()

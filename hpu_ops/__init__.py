@@ -371,23 +371,33 @@ def compile(model, example_input, device="hpu", dynamic=False):
     return torch.compile(model, backend="hpu_backend", dynamic=dynamic)
 
 
-def compile_children(model, example_input=None, device="hpu"):
-    """Compile each top-level child of ``model`` separately (``dynamic=False``), leaving the
-    code between children - ``autograd.Function`` boundaries, scalar reads, optimizer-visible
-    state - in eager mode. Habana's recipe compiler rejects or fragments whole-model graphs
-    past a size/complexity limit (BrainTokenizer's training graph, the spd_learn custom
-    autograd.Function models); per-child recipes stay under it, and each island still gets
-    the compiled fast path. No ``torch._dynamo.reset()`` between children. Pair with
-    ``materialize`` semantics as in ``compile`` when ``example_input`` is given. Returns the
-    model, with its children replaced by their compiled forms."""
+def compile_children(model, example_input=None, device="hpu", depth=1, match=None):
+    """Compile the modules at ``depth`` of ``model`` separately (``dynamic=False``; depth 1 is
+    the top-level children), leaving the code between them - ``autograd.Function`` boundaries,
+    scalar reads, optimizer-visible state - in eager mode. Habana's recipe compiler rejects
+    or fragments whole-model graphs past a size/complexity limit (BrainTokenizer's training
+    graph, the spd_learn custom autograd.Function models); per-module recipes stay under it,
+    and each island still gets the compiled fast path. Deeper levels isolate failures that
+    sit inside one child (a residual block's two convolution branches fan into one backward
+    the recipe rejects; each branch alone compiles). No ``torch._dynamo.reset()`` between
+    modules. Pair with ``materialize`` semantics as in ``compile`` when ``example_input`` is
+    given. Returns the model, with those modules replaced by their compiled forms."""
     enable()
     if example_input is not None:
         params = list(model.parameters())
         if not params or any(p.device.type == "cpu" for p in params):
             materialize(model, example_input)
     model = model.to(device)
-    for name, child in list(model.named_children()):
-        setattr(model, name, torch.compile(child, backend="hpu_backend", dynamic=False))
+
+    def walk(module, level, prefix=""):
+        for name, child in list(module.named_children()):
+            qualified = f"{prefix}{name}"
+            if level == depth and (match is None or match in qualified):
+                setattr(module, name, torch.compile(child, backend="hpu_backend", dynamic=False))
+            else:
+                walk(child, level + 1, qualified + ".")
+
+    walk(model, 1)
     return model
 
 
