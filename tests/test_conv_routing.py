@@ -347,7 +347,7 @@ def test_strided_conv_traced_is_stride1_plus_subsample():
         got = compiled(f, nodes)(x, w)
         got.square().sum().backward()
     assert calls["strided_conv"] >= 1
-    torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)  # stride-1 summation order differs
     convs = [n for n in nodes if "convolution" in str(n.target)]
     assert convs and "aten.slice.Tensor" in ops(nodes), ops(nodes)
     assert all(n.args[3] in (None, [1]) for n in convs if len(n.args) > 3), ops(nodes)
