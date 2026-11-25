@@ -419,6 +419,70 @@ def install_one_hot(device_type):
     ])
 
 
+_STANDARD_GAMMA_CANDIDATES = 24
+
+
+def standard_gamma(input, generator=None):  # noqa: A002
+    """``aten::_standard_gamma`` via vectorized Marsaglia-Tsang (24 candidates/element).
+
+    The first accepted candidate is the exact rejection-sampling draw (candidates are iid);
+    the chance none of 24 is accepted is <~1e-30 (per-candidate acceptance >=~0.95), so the
+    argmax fallback to candidate 0 in that case is below float precision. ``alpha < 1`` uses
+    the standard boost Gamma(a) = Gamma(a+1) * U**(1/a). Non-positive/NaN alpha gives
+    ``finfo.tiny`` and ``+inf`` gives ``inf``, matching ATen's CPU kernel."""
+    dtype = _opmath(input.dtype)
+    tiny = torch.finfo(dtype).tiny
+    with torch.autocast(input.device.type, enabled=False):
+        a = input.to(dtype)
+        finite_pos = (a > 0.0) & torch.isfinite(a)
+        boost_mask = finite_pos & (a < 1.0)
+        a_eff = torch.where(boost_mask, a + 1.0, torch.where(finite_pos, a, 1.0))
+        d = a_eff - (1.0 / 3.0)
+        c = 1.0 / torch.sqrt(9.0 * d)
+        cand_shape = (*a.shape, _STANDARD_GAMMA_CANDIDATES)
+        z = torch.randn(cand_shape, device=a.device, dtype=dtype, generator=generator)
+        u = (
+            1.0 - torch.rand(cand_shape, device=a.device, dtype=dtype, generator=generator)
+        ).clamp_min(tiny)
+        v_base = 1.0 + c.unsqueeze(-1) * z
+        v_pos = v_base > 0.0
+        v = v_base * v_base * v_base
+        v_safe = torch.where(v_pos, v, 1.0)
+        rhs = 0.5 * (z * z) + d.unsqueeze(-1) * (1.0 - v_safe + torch.log(v_safe))
+        accepted = v_pos & (torch.log(u) < rhs)
+        first_idx = accepted.to(torch.int64).argmax(dim=-1, keepdim=True)
+        sample = (d.unsqueeze(-1) * v_safe).gather(-1, first_idx).squeeze(-1)
+        u_boost = (
+            1.0 - torch.rand(a.shape, device=a.device, dtype=dtype, generator=generator)
+        ).clamp_min(tiny)
+        boosted = sample * torch.pow(u_boost, 1.0 / torch.where(boost_mask, a, 1.0))
+        out = torch.where(boost_mask, boosted, sample)
+        out = torch.where(finite_pos, out.clamp_min(tiny), tiny)
+        out = torch.where(torch.isinf(a) & (a > 0.0), float("inf"), out)
+        return out.to(input.dtype)
+
+
+def _standard_gamma_takes(input, generator=None):  # noqa: A002
+    # ATen's backward is an implicit-reparameterization gradient, not the pathwise
+    # derivative of the rejection sampler, so grad-tracking calls keep ATen's kernel.
+    return input.is_floating_point() and not (
+        torch.is_grad_enabled() and isinstance(input, torch.Tensor) and input.requires_grad)
+
+
+def install_standard_gamma(device_type):
+    """``aten::_standard_gamma`` on ``device_type`` via vectorized Marsaglia-Tsang, avoiding CPU fallback.
+
+    Non-floating and grad-tracking calls decline to ATen's own kernel (and its usual
+    errors/backward). Returns an undo."""
+    op = aten._standard_gamma.default
+    return register_kernels(device_type, [
+        (op, "Autograd{}", _kernel(op, "standard_gamma", standard_gamma, _standard_gamma_takes,
+                                   DispatchKey.Autograd)),
+        (op, "{}", _kernel(op, "standard_gamma", standard_gamma, _standard_gamma_takes,
+                           DispatchKey.CompositeExplicitAutograd)),
+    ])
+
+
 def install_unfold(device_type):
     """``Tensor.unfold`` on ``device_type`` as ``as_strided``, at the backend key, below torch's own autograd kernel
     (whose backward is ``unfold_backward``). Habana's eager stack has its own kernel there, which is left alone, so
