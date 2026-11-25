@@ -43,6 +43,31 @@ def test_segmented_is_noop_off_gaudi():
     assert model(torch.randn(1, 3)).shape == (1, 2)
 
 
+def test_segmented_deep_hooks_every_submodule(monkeypatch):
+    import sys
+    import types
+
+    marks = []
+    fake = types.ModuleType("habana_frameworks.torch.core")
+    fake.mark_step = lambda: marks.append(1)
+    for name in ("habana_frameworks", "habana_frameworks.torch"):
+        pkg = types.ModuleType(name)
+        pkg.__path__ = []
+        monkeypatch.setitem(sys.modules, name, pkg)
+    monkeypatch.setitem(sys.modules, "habana_frameworks.torch.core", fake)
+    monkeypatch.setattr(hpu_ops, "_lazy", lambda: True)
+    model = torch.nn.Sequential(torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.ReLU()),
+                                torch.nn.Linear(2, 1))
+    out, undo = hpu_ops.segmented(model, deep=True)
+    assert out is model
+    model(torch.randn(1, 3))
+    assert len(marks) == 4  # inner Sequential, its Linear and ReLU, and the outer Linear
+    undo()
+    marks.clear()
+    model(torch.randn(1, 3))
+    assert marks == []
+
+
 def test_mixed_train_eval_modes_preserved():
     model = torch.nn.Sequential(torch.nn.BatchNorm1d(4), torch.nn.LazyLinear(2))
     model.train()

@@ -121,6 +121,23 @@ def test_cholesky_and_qr_backward_use_the_composite():
         assert calls["solve_triangular"] >= 1, dict(calls)
 
 
+def test_qr_householder_matches_aten_outputs_and_gradients():
+    compare(torch.linalg.qr, linalg.install_qr, general(2, n=16), name="qr")
+    compare(lambda a: torch.linalg.qr(a, mode="complete"), linalg.install_qr,
+            general(n=8), name="qr")
+    tall = torch.randn(20, 8, dtype=torch.float64) + torch.eye(20, 8, dtype=torch.float64)
+    compare(torch.linalg.qr, linalg.install_qr, tall, name="qr")
+
+
+def test_qr_householder_declines_without_grad():
+    A = general(n=8)
+    with cpu_as_hpu(linalg.install_qr) as calls:
+        with torch.no_grad():
+            Q, R = torch.linalg.qr(A)
+    assert calls["qr"] == 0  # inference keeps Habana's (correct) forward
+    torch.testing.assert_close(Q @ R, A)
+
+
 def test_takes_declines_float64_on_hpu_and_warns_once():
     linalg._WARNED.clear()
     A = torch.randn(3, 3, dtype=torch.float64)

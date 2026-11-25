@@ -302,6 +302,67 @@ def install_sdpa(device_type):
     ])
 
 
+def _unique_rows(rows, return_inverse, return_counts):
+    """Unique rows of a (N, D) tensor, sorted lexicographically (stable sort per column, last
+    column first), with ATen's inverse (unique id per input row) and counts. NaN rows stay
+    distinct, as in ATen. Row selection is a bool-mask index: Habana executes it on the card,
+    where its own ``unique`` copies to the CPU."""
+    n = rows.shape[0]
+    empty_i = torch.empty(0, dtype=torch.int64, device=rows.device)
+    if n == 0:
+        return rows, empty_i, empty_i
+    order = torch.arange(n, device=rows.device)
+    for col in range(rows.shape[1] - 1, -1, -1):
+        order = order[torch.argsort(rows[order, col], stable=True)]
+    sorted_rows = rows[order]
+    first = torch.ones(n, dtype=torch.bool, device=rows.device)
+    if n > 1:
+        first[1:] = (sorted_rows[1:] != sorted_rows[:-1]).any(-1)
+    unique = sorted_rows[first]
+    inverse = counts = None
+    if return_inverse or return_counts:
+        ids = torch.cumsum(first.to(torch.int64), 0) - 1  # unique id of each sorted row
+        inverse = torch.empty(n, dtype=torch.int64, device=rows.device)
+        inverse[order] = ids
+        if return_counts:
+            full = torch.bincount(ids, minlength=n)
+            counts = full[full > 0]  # ids are 0..U-1, all present
+    return unique, inverse if return_inverse else empty_i, counts if return_counts else empty_i
+
+
+def unique_dim(input, dim=0, sorted=True, return_inverse=False, return_counts=False):  # noqa: A002
+    """``aten.unique_dim``: unique slices along ``dim`` via lexicographic row sort."""
+    moved = input.movedim(dim, 0)
+    unique, inverse, counts = _unique_rows(moved.reshape(moved.shape[0], -1),
+                                           return_inverse, return_counts)
+    return (unique.reshape(-1, *moved.shape[1:]).movedim(0, dim), inverse, counts)
+
+
+def unique(input, sorted=True, return_inverse=False, return_counts=False):  # noqa: A002
+    """``aten.unique`` (flattened): unique elements via the row sort on (numel, 1)."""
+    unique, inverse, counts = _unique_rows(input.reshape(-1, 1), return_inverse, return_counts)
+    return unique.reshape(-1), inverse.reshape(input.shape), counts
+
+
+def _unique_takes(input, *args, **kwargs):
+    sorted_flag = kwargs.get("sorted", args[1] if len(args) > 1 else True)
+    return (input.dim() >= 1 and not input.is_complex() and sorted_flag and not tracing(input))
+
+
+def install_unique(device_type):
+    """``unique`` / ``unique_dim`` on ``device_type`` via row sort and bool-mask selection, instead
+    of Habana's CPU fallback. Data-dependent output shapes cannot be traced, so traced calls
+    decline. Returns an undo."""
+    undos = []
+    for op, fn in ((aten.unique_dim.default, unique_dim), (aten._unique2.default, unique)):
+        undos.append(register_kernels(device_type, [
+            (op, "Autograd{}", _kernel(op, "unique", fn, _unique_takes, DispatchKey.Autograd)),
+            (op, "{}", _kernel(op, "unique", fn, _unique_takes,
+                               DispatchKey.CompositeExplicitAutograd)),
+        ]))
+    return chain(undos)
+
+
 def one_hot(input, num_classes=-1):
     """``aten.one_hot`` as an equality against ``arange``: Habana's HPU kernel rejects an inferred count
     ("Number of classes cannot be -1", GCNsNet's graph coarsening, eager, lazy and inference), and ATen's

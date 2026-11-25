@@ -770,6 +770,26 @@ def test_sdpa_math_gqa_and_declines():
     assert composite._sdpa_takes(q, k, v, enable_gqa=True)
 
 
+def test_unique_dim_and_flat_match_aten():
+    torch.manual_seed(0)
+    x = torch.randint(0, 3, (40, 5)).float()
+    x[::7] = x[1]  # duplicate rows
+    want = torch.unique(x, dim=0, return_inverse=True, return_counts=True)
+    flat_want = torch.unique(x, return_inverse=True, return_counts=True)
+    with cpu_as_hpu(composite.install_unique) as calls:
+        got = torch.unique(x, dim=0, return_inverse=True, return_counts=True)
+        flat = torch.unique(x, return_inverse=True, return_counts=True)
+        assert calls["unique"] == 2
+        with torch.inference_mode():
+            inferred = torch.unique(x, dim=1)
+    for a, b in zip(got, want):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+    for a, b in zip(flat, flat_want):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+    torch.testing.assert_close(inferred, torch.unique(x, dim=1), atol=0, rtol=0)
+    assert not composite._unique_takes(x, 0, False)  # sorted=False keeps ATen
+
+
 # ---- renorm as norm, scale factor and multiply
 
 

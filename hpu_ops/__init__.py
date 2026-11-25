@@ -143,7 +143,7 @@ __all__ = ["enable", "materialize", "segmented", "compile", "fuse", "strict", "C
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
-         composite.install_embedding, composite.install_roll, composite.install_sdpa, composite.install_one_hot, composite.install_unfold,
+         composite.install_embedding, composite.install_roll, composite.install_sdpa, composite.install_unique, composite.install_one_hot, composite.install_unfold,
          composite.install_unfold_backward, composite.install_max_pool1d, norm.install_group_norm,
          norm.install_instance_norm, dynshape.install_expand,
          dynshape.install_pad_int64, indexing.install_index,
@@ -151,7 +151,7 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          linalg.install_solve_triangular, linalg.install_cholesky_solve,
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
-         linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_lu, quantile.install,
+         linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_qr, linalg.install_lu, quantile.install,
          extrema.install, small.install_bincount, small.install_histc,
          small.install_logsumexp, small.install_index_add, small.install_scalar_dense,
          wide.install_copy_checks, serialization.install)
@@ -308,13 +308,16 @@ def materialize(model, example_input):
     return model
 
 
-def segmented(model):
+def segmented(model, deep=False):
     """One lazy graph per top-level child of ``model``: a ``mark_step`` after each child, for the
     models whose full-step lazy graph Habana's fuser rejects or hangs on (COMPATIBILITY.md row 3).
+    With ``deep=True``, a ``mark_step`` after *every* submodule: the graph segments at the
+    finest module boundaries, for models whose failure sits inside one top-level child (a
+    quantizer stack, an autoregressive unroll) where child-level segments stay too large.
     Returns ``(model, undo)``; off a lazy Gaudi stack both are no-ops. Pair with ``materialize``
     before ``.to("hpu")`` and ``enable()``: the three together are the one-call unlock for the
-    Braindecode zoo. The hooks bind to the children present at call time: call it after any
-    patching that replaces children, and note a deep copy carries its own hook copies, which
+    Braindecode zoo. The hooks bind to the modules present at call time: call it after any
+    patching that replaces modules, and note a deep copy carries its own hook copies, which
     this undo cannot remove."""
     try:
         import habana_frameworks.torch.core as htcore
@@ -322,13 +325,14 @@ def segmented(model):
         return model, lambda: None
     if not _lazy():
         return model, lambda: None
-    children = list(model.children())
-    if not children:
-        raise ValueError("hpu_ops.segmented: the model has no top-level children to segment "
-                         "(a leaf module is a single lazy graph already)")
+    modules = [m for m in model.modules() if m is not model] if deep else list(model.children())
+    if not modules:
+        raise ValueError("hpu_ops.segmented: the model has no "
+                         + ("submodules" if deep else "top-level children")
+                         + " to segment (a leaf module is a single lazy graph already)")
     handles = []
     try:
-        for child in children:
+        for child in modules:
             handles.append(child.register_forward_hook(lambda *args: htcore.mark_step()))
     except Exception:
         for handle in handles:
