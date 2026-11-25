@@ -56,14 +56,14 @@ _MODE = {}
 
 def _lazy():
     """Whether Habana's bridge runs in lazy mode (read once; fixed when the bridge loads). Off a Gaudi stack, False
-    (the CPU tests patch this)."""
+    (the CPU tests patch this). A failed import is not cached: gates that enable a route on ``not _lazy()`` must not
+    keep a pre-bridge ``False`` for the rest of a lazy process."""
     if "lazy" not in _MODE:
         try:
             from habana_frameworks.torch.utils.internal import is_lazy
-
-            _MODE["lazy"] = bool(is_lazy())
         except ImportError:
-            _MODE["lazy"] = False
+            return False
+        _MODE["lazy"] = bool(is_lazy())
     return _MODE["lazy"]
 
 
@@ -124,6 +124,19 @@ def _compile_uint8_takes(x, weights=None, minlength=0):
             and x.numel() < BINCOUNT_MAX_NUMEL and static(*x.shape))
 
 
+def _compile_minlength_takes(x, weights=None, minlength=0):
+    """Traced bincount with a static output length: ``histc`` over ``[0, minlength)`` with no
+    value-range read (the read is the host sync strict mode counts). Values at or above
+    ``minlength`` count into the last bin instead of extending the output - the shape a
+    compiled graph must have anyway; argmin-produced buckets (the measured caller) are in
+    range by construction. Negative values (ATen raises on them) count into bin 0: a compiled
+    graph cannot raise on data, and no measured caller produces them."""
+    tracing = torch.compiler.is_compiling() or _is_fake(x) or torch._guards.detect_fake_mode() is not None
+    return (tracing and not _lazy() and weights is None and x.dim() == 1 and x.dtype in INTEGRAL
+            and isinstance(minlength, int) and 256 <= minlength <= BINCOUNT_MAX_BINS
+            and x.numel() < BINCOUNT_MAX_NUMEL and static(*x.shape))
+
+
 def install_bincount(device_type):
     """``bincount`` of 1-D integer tensors on ``device_type`` through ``histc`` (eager/lazy) and ``one_hot``
     (``uint8`` with ``minlength >= 256`` under ``torch.compile``). Returns an undo."""
@@ -134,6 +147,9 @@ def install_bincount(device_type):
             count("bincount")
             counts = F.one_hot(x.long(), 256).float().sum(0).long()
             return counts if minlength == 256 else F.pad(counts, (0, minlength - 256))
+        if _compile_minlength_takes(x, weights, minlength):
+            count("bincount")
+            return bincount_histc(x.clamp(0, minlength - 1), minlength)
         if _takes(x, weights, minlength):
             if x.dtype == torch.uint8 and minlength >= 256:  # unsigned [0..255]: no host sync needed
                 count("bincount")
