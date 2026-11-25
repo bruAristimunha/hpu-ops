@@ -15,6 +15,7 @@ import math
 import threading
 
 import torch
+import torch.nn.functional as F
 from torch._C import DispatchKey
 
 from . import _strict
@@ -277,14 +278,19 @@ def sdpa_math(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
                 scores = scores.masked_fill(~attn_mask, float("-inf"))
             else:
                 scores = scores + attn_mask.to(dtype)
-        return (scores.softmax(-1) @ v).to(query.dtype)
+        weights = scores.softmax(-1)
+        if dropout_p:
+            # Habana's lazy SDPA segfaults with dropout (TransformerEncoderLayer in train
+            # mode); the math path drops on the softmax weights, as ATen does
+            weights = F.dropout(weights, dropout_p, training=torch.is_grad_enabled())
+        return (weights @ v).to(query.dtype)
 
 
 def _sdpa_takes(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
                 enable_gqa=False):
-    # dropout draws and head-mismatch errors keep the native kernel (and its semantics)
+    # head-mismatch errors keep the native kernel (and its semantics)
     heads_ok = query.shape[-3] % key.shape[-3] == 0 and (enable_gqa or query.shape[-3] == key.shape[-3])
-    return (query.is_floating_point() and query.dim() >= 2 and dropout_p == 0.0 and heads_ok
+    return (query.is_floating_point() and query.dim() >= 2 and heads_ok
             and (attn_mask is None or attn_mask.dtype == torch.bool or attn_mask.is_floating_point()))
 
 
@@ -293,7 +299,7 @@ def install_sdpa(device_type):
     fused kernel to register (bridge 1.21 without the override setting: attention then runs
     through the bridge's slower decomposition, and its fused kernel is wrong for some view
     layouts). Registrations only fill keys Habana left empty, so a working fused kernel -
-    and every call this declines (dropout, head errors) - keeps the native path. Returns an undo."""
+    and every call this declines (head errors) - keeps the native path. Returns an undo."""
     op = aten.scaled_dot_product_attention.default
     return register_kernels(device_type, [
         (op, "Autograd{}", _kernel(op, "sdpa", sdpa_math, _sdpa_takes, DispatchKey.Autograd)),
