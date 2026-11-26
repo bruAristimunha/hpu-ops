@@ -373,6 +373,57 @@ def install_unique(device_type):
     return chain(undos)
 
 
+def addmm_reduced(input, mat1, mat2, beta=1, alpha=1):
+    """``addmm``/``baddbmm`` in float32 for 16-bit inputs: Habana's kernel rounds the matmul
+    to 16 bits before the ``beta * input`` add (2.9e-3 relative error even at beta=alpha=1,
+    3.3e-3 at Muon's Newton-Schulz coefficients, amplified over the 5 NS steps to 4e-2);
+    ATen accumulates and adds in float32 and rounds once, which this reproduces."""
+    dtype = _opmath(input.dtype)
+    with torch.autocast(input.device.type, enabled=False):
+        out = input.to(dtype) * beta + (mat1.to(dtype) @ mat2.to(dtype)) * alpha
+    return out.to(input.dtype)
+
+
+def _addmm_takes(input, mat1, mat2, beta=1, alpha=1):
+    return (input.dtype in REDUCED and mat1.dtype == input.dtype and mat2.dtype == input.dtype
+            and beta != 0)
+
+
+def install_addmm(device_type):
+    """``addmm`` and ``baddbmm`` on ``device_type`` through ``addmm_reduced`` for 16-bit inputs
+    with ``beta != 0`` (see above); ``beta == 0`` and full-precision calls keep the native
+    kernel. Registered at the autograd and backend keys and at the traced key, so compiled
+    graphs decompose the same way. Returns an undo."""
+    undos = []
+    for op, out_op in ((aten.addmm.default, aten.addmm.out), (aten.baddbmm.default, aten.baddbmm.out)):
+        def traced(original):
+            def kernel(input, mat1, mat2, beta=1, alpha=1):
+                if input.device.type == device_type and _addmm_takes(input, mat1, mat2, beta, alpha):
+                    count("addmm")
+                    return addmm_reduced(input, mat1, mat2, beta, alpha)
+                return original(input, mat1, mat2, beta=beta, alpha=alpha)
+
+            return kernel
+
+        def backend(input, mat1, mat2, beta=1, alpha=1, _out_op=out_op):
+            if _addmm_takes(input, mat1, mat2, beta, alpha):
+                count("addmm")
+                return addmm_reduced(input, mat1, mat2, beta, alpha)
+            out = torch.empty(torch.broadcast_shapes(input.shape, (mat1 @ mat2).shape),
+                              dtype=input.dtype, device=input.device)
+            with torch._C._AutoDispatchBelowADInplaceOrView():
+                return _out_op(input, mat1, mat2, beta=beta, alpha=alpha, out=out)
+
+        undos += [
+            register_kernels(device_type, [
+                (op, "Autograd{}", _kernel(op, "addmm", addmm_reduced, _addmm_takes,
+                                           DispatchKey.Autograd))]),
+            override_kernels(device_type, [(op, backend)]),
+            replace_py_kernels(op, (DispatchKey.CompositeImplicitAutograd,), traced),
+        ]
+    return chain(undos)
+
+
 def one_hot(input, num_classes=-1):
     """``aten.one_hot`` as an equality against ``arange``: Habana's HPU kernel rejects an inferred count
     ("Number of classes cannot be -1", GCNsNet's graph coarsening, eager, lazy and inference), and ATen's
