@@ -775,6 +775,31 @@ def test_sdpa_math_gqa_and_declines():
     assert torch.isfinite(dropped).all()
 
 
+def test_addmm_reduced_matches_aten_and_declines():
+    torch.manual_seed(0)
+    inp = torch.randn(16, 16, dtype=torch.bfloat16)
+    a = torch.randn(16, 16, dtype=torch.bfloat16, requires_grad=True)
+    b = torch.randn(16, 16, dtype=torch.bfloat16, requires_grad=True)
+    want = torch.addmm(inp, a, b, beta=-4.7750, alpha=2.0315)
+    want.sum().backward()
+    ga, gb = a.grad.clone(), b.grad.clone()
+    a.grad = b.grad = None
+    with cpu_as_hpu(composite.install_addmm) as calls:
+        got = torch.addmm(inp, a, b, beta=-4.7750, alpha=2.0315)
+        got.sum().backward()
+        assert calls["addmm"] >= 1
+        with torch.inference_mode():
+            inferred = torch.addmm(inp, a.detach(), b.detach(), beta=3.4445)
+        zero_beta = torch.addmm(inp, a, b, beta=0)  # declined: native is exact there
+        assert calls["addmm"] >= 1
+    torch.testing.assert_close(got.float(), want.float(), atol=0, rtol=0)  # same fp32 math, one rounding
+    torch.testing.assert_close(a.grad, ga, atol=6e-2, rtol=2e-2)  # bf16 ulps: ATen rounds its grads to bf16
+    torch.testing.assert_close(b.grad, gb, atol=6e-2, rtol=2e-2)
+    assert inferred.dtype == torch.bfloat16
+    assert not composite._addmm_takes(inp, a, b, beta=0)
+    assert not composite._addmm_takes(inp.float(), a.float(), b.float(), beta=1)
+
+
 def test_unique_dim_and_flat_match_aten():
     torch.manual_seed(0)
     x = torch.randint(0, 3, (40, 5)).float()
