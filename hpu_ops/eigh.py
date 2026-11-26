@@ -222,6 +222,11 @@ try:
         return V @ inner @ V.mH, None, None
 
     eigh_card.register_autograd(_eigh_card_backward, setup_context=_eigh_card_setup)
+
+    @eigh_card.register_kernel("hpu")
+    def _eigh_card_hpu(A, UPLO, compute_v):
+        # the backend kernel Habana's recipe compiler lowers the custom op to
+        return Eigh.compute(A, UPLO, compute_v)
 except Exception:  # noqa: BLE001  (already registered on reimport, or an older torch)
     eigh_card = torch.ops.hpu_ops.eigh_card
 
