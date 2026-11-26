@@ -18,7 +18,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from . import tpc
+from . import ds_eigh, tpc
 from .extrema import internal_sort
 from .linalg import _function, _kernels, _takes, _tracing, register_paired
 
@@ -251,6 +251,17 @@ def _device_name():
         return None
 
 
+def _ds_route(A, UPLO, compute_v):
+    """The #64 opt-in: float32 Jacobi forward + double-single inverse-iteration refinement
+    of the eigenvectors and their Rayleigh quotients."""
+    from . import ds_eigh
+
+    count("eigh_ds")
+    w, V = Eigh.compute(A.float(), UPLO, True)
+    w, V = ds_eigh.ds_refine_vectors(A, w, V)
+    return w, V if compute_v else V.new_empty(0)
+
+
 def install_eigh(device_type):
     """``linalg.eigh`` and ``eigvalsh`` on ``device_type``: the TPC Jacobi kernel on HPU (declined without it, then
     hpu-ops' CPU route), parallel Jacobi composites on the CPU stand-in. In traced graphs the
@@ -274,13 +285,18 @@ def install_eigh(device_type):
         if takes(*args, **kwargs):
             count("eigh")
             A, UPLO, compute_v = _bind(op, args, kwargs)
+            if A.dtype == torch.float64 and ds_eigh.ds_enabled():
+                return _ds_route(A, UPLO, compute_v)
             return eigh_card(A, UPLO, compute_v)  # custom op: dynamo records one opaque node (#83)
         return op._op_dk(torch._C.DispatchKey.Autograd, *args, **kwargs)
 
     def backend_kernel(*args, **kwargs):  # below autograd: inference mode, tracers' decompositions
         if takes(*args, **kwargs):
             count("eigh")
-            return Eigh.compute(*_bind(op, args, kwargs))
+            A, UPLO, compute_v = _bind(op, args, kwargs)
+            if A.dtype == torch.float64 and ds_eigh.ds_enabled():
+                return _ds_route(A, UPLO, compute_v)
+            return Eigh.compute(A, UPLO, compute_v)
         return _on_cpu(op, args, kwargs)
 
     entries = [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
