@@ -810,6 +810,117 @@ class CholeskySolve(torch.autograd.Function):
         return gB.sum_to_size(ctx.B_shape), gL, None
 
 
+def _cholesky_grad(L, grad):
+    """Gradient of a lower Cholesky factor: ``L^-T Phi(L^T grad) L^-1``, where ``Phi``
+    symmetrizes the lower triangle and halves its diagonal (Smith's formula, checked
+    against ATen for full upstream matrices)."""
+    M = L.mT @ grad
+    T = torch.tril(M)
+    phi = 0.5 * (T + T.mT - torch.diag_embed(torch.diagonal(M, dim1=-2, dim2=-1)))
+    Li = tri_inverse(L, False)
+    return Li.mT @ phi @ Li
+
+
+@_function
+class Cholesky(torch.autograd.Function):
+    """``linalg.cholesky`` with a rank guard for the 3-D ``batch == matrix dim`` case
+    Habana turns into NaNs. The factorization remains ATen's (the distinct ``.out``
+    overload, with a singleton batch dimension inserted for that case); the backward is
+    the explicit Smith formula above, since delegating to ATen's autograd from inside
+    this op's own Autograd kernel loops on this op."""
+
+    @staticmethod
+    def compute(A, upper=False):
+        # Below AD (and autocast off, as the other linalg backend kernels): training calls
+        # reach the backend through ATen's autograd kernel with tracked tensors, and .out
+        # forbids those. The .out overload is not overridden here, so it reaches ATen.
+        with torch._C._AutoDispatchBelowADInplaceOrView(), torch.autocast(A.device.type, enabled=False):
+            if A.dim() == 3 and A.shape[0] == A.shape[-1]:
+                A = A.unsqueeze(1)
+                out = torch.empty_like(A)
+                aten.linalg_cholesky.out(A, upper=upper, out=out)
+                return out.squeeze(1)
+            out = torch.empty_like(A)
+            aten.linalg_cholesky.out(A, upper=upper, out=out)
+            return out
+
+    @staticmethod
+    def forward(ctx, A, upper=False):
+        L = Cholesky.compute(A, upper)
+        ctx.save_for_backward(L)
+        ctx.upper = upper
+        return L
+
+    @staticmethod
+    def backward(ctx, grad):
+        L, = ctx.saved_tensors
+        if not ctx.needs_input_grad[0]:
+            return None, None
+        if ctx.upper:
+            return _cholesky_grad(L.mT, grad.mT).mT, None
+        return _cholesky_grad(L, grad), None
+
+
+def _cholesky_jvp(L, gA):
+    """The forward derivative of a lower Cholesky factor (see ``_TracedCholesky.jvp``)."""
+    Li = tri_inverse(L, False)
+    S = Li @ gA @ Li.mT
+    Y = torch.tril(S) - 0.5 * torch.diag_embed(torch.diagonal(S, dim1=-2, dim2=-1))
+    return L @ Y
+
+
+@_function
+class _TracedCholesky(torch.autograd.Function):
+    """A traced ``linalg_cholesky`` that ``takes`` declined: the op's forward below autograd
+    (a plain graph node), ``Cholesky``'s backward. Without it the declined traced call falls
+    back through the Autograd key, which for this op redispatches into the Python kernel
+    itself (compiled calls segfault in the resulting dispatcher recursion)."""
+
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(op, A, upper=False):
+        if A.dim() == 3 and A.shape[0] == A.shape[-1]:
+            # in the graph itself, so Habana's recipe compiler sees the 4-D factorization
+            return _below_autograd(op, A.unsqueeze(1), upper=upper).squeeze(1)
+        return _below_autograd(op, A, upper=upper)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        ctx.save_for_backward(output)
+        ctx.save_for_forward(output)
+        ctx.upper = inputs[2]
+
+    @staticmethod
+    def backward(ctx, grad):
+        L, = ctx.saved_tensors
+        if grad is None:
+            return None, None, None
+        if ctx.upper:
+            return None, _cholesky_grad(L.mT, grad.mT).mT, None
+        return None, _cholesky_grad(L, grad), None
+
+    @staticmethod
+    def jvp(ctx, _op, gA, _gupper=None):
+        if gA is None:
+            return None, None, None
+        L, = ctx.saved_for_forward
+        # dA = dL L^T + L dL^T (lower; upper by transposition), so with S = L^-1 gA L^-T
+        # (symmetric), dL = L Y with Y + Y^T = S: Y is S's lower triangle, diagonal halved
+        if ctx.upper:
+            return None, _cholesky_jvp(L.mT, gA).mT, None
+        return None, _cholesky_jvp(L, gA), None
+
+
+def install_cholesky(device_type):
+    """``linalg.cholesky`` on ``device_type``: Habana's native kernel returns NaNs for
+    3-D inputs whose batch equals the matrix dimension, so that case is factorized with a
+    singleton batch dimension inserted (see ``Cholesky``). Returns an undo."""
+    takes = _decline_traced(device_type, _takes(device_type, "cholesky"))
+    return register_paired(device_type, [_kernels(device_type, aten.linalg_cholesky.default, "cholesky", Cholesky, takes,
+                                                  traced=_TracedCholesky)])
+
+
 def install_cholesky_solve(device_type):
     """``cholesky_solve`` on ``device_type``: on HPU, float32 with n <= ``tpc.MAXN`` as two TPC substitutions
     (``tpc.tri_solve``), other calls through hpu-ops' CPU route; on the CPU stand-in, the composite (two matmuls with

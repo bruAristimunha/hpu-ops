@@ -154,7 +154,7 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          norm.install_instance_norm, dynshape.install_expand,
          dynshape.install_pad_int64, indexing.install_index,
          indexing.install_mask_fill, im2col.install,
-         linalg.install_solve_triangular, linalg.install_cholesky_solve,
+         linalg.install_solve_triangular, linalg.install_cholesky, linalg.install_cholesky_solve,
          linalg.install_solve, linalg.install_inv_det, eigh.install_eigh,
          linalg.install_svd, linalg.install_pinv, linalg.install_lstsq, linalg.install_matrix_rank,
          linalg.install_matrix_exp, linalg.install_householder_product, linalg.install_qr, linalg.install_lu, quantile.install,
