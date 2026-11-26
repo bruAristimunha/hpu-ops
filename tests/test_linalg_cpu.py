@@ -664,6 +664,15 @@ def test_eigh_degenerate(diagonal):
     torch.testing.assert_close(V @ torch.diag(w) @ V.mT, D, rtol=0, atol=1e-12)
 
 
+def test_eigh_declines_on_first_generation_gaudi(monkeypatch):
+    monkeypatch.setattr(jacobi, "_device_name", lambda: "GAUDI")
+    with pytest.warns(UserWarning, match="first-generation Gaudi"):
+        undo = jacobi.install_eigh("hpu")
+    undo()  # a no-op: Habana's native kernel was left alone (#110)
+    assert not torch._C._dispatch_has_kernel_for_dispatch_key(
+        "aten::_linalg_eigh", "AutogradHPU")
+
+
 def test_eigh_compiled_routes_through_custom_op():
     """#83: in a compiled graph eigh is the hpu_ops::eigh_card custom op (one opaque node
     with a registered backward), not the autograd.Function dynamo breaks on."""

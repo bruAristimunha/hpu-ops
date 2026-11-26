@@ -243,12 +243,29 @@ def _eigh_traced(device_type):
     return traced
 
 
+def _device_name():
+    """The Gaudi generation string ('GAUDI' first-gen HL-205, 'GAUDI2' HL-325), or None."""
+    try:
+        return torch.hpu.get_device_name(0)
+    except Exception:  # noqa: BLE001  (off a Gaudi stack, or an older bridge)
+        return None
+
+
 def install_eigh(device_type):
     """``linalg.eigh`` and ``eigvalsh`` on ``device_type``: the TPC Jacobi kernel on HPU (declined without it, then
     hpu-ops' CPU route), parallel Jacobi composites on the CPU stand-in. In traced graphs the
     call decomposes to the ``hpu_ops::eigh_card`` custom op (#83). Returns an undo."""
     from ._dispatch import chain, count, replace_py_kernels
     from .linalg import _bind, _on_cpu
+
+    if device_type == "hpu" and _device_name() == "GAUDI":
+        # First-generation Gaudi (HL-205): the TPC Jacobi kernel fails at graph load there
+        # (synStatus 30, #110) while Habana's native eigh works - leave the op alone.
+        import warnings as _warnings
+
+        _warnings.warn("hpu_ops: first-generation Gaudi detected; linalg.eigh keeps Habana's "
+                       "native kernel (the TPC Jacobi route is Gaudi2-only, #110)", stacklevel=3)
+        return lambda: None
 
     op = aten._linalg_eigh.default
     takes = _tpc_takes(device_type)
