@@ -519,3 +519,40 @@ def install_max_pool1d(device_type):
             op, "max_pool1d_wide", max_pool1d, _max_pool1d_takes, below))]),
         replace_py_kernels(op, (DispatchKey.CompositeImplicitAutograd,), traced),
     ])
+
+
+def scatter_value_bool(self, dim, index, value):
+    """``aten::scatter.value`` on ``bool`` tensors via ``aten::scatter.src`` with a bool tensor source.
+
+    Gaudi2 (bridge 1.21.4) rejects ``aten::scatter.value`` on ``bool`` (``Schema not found for node``),
+    whereas ``aten::scatter.src`` on ``bool`` compiles and runs on card without CPU fallback.
+    This overload has no ``reduce`` argument: ``reduce='add'/'multiply'`` calls dispatch to the
+    separate ``scatter.value_reduce`` overload, which is deliberately not rewritten (plain
+    ``scatter.src`` overwrites, whereas add is OR-with-self and multiply is AND-with-self on bool).
+    """
+    if self.dtype == torch.bool:
+        count("scatter_bool")
+        src = torch.full(index.shape, bool(value), dtype=torch.bool, device=self.device)
+        return aten.scatter.src(self, dim, index, src)
+    out = torch.empty_like(self)
+    return aten.scatter.value_out(self, dim, index, value, out=out)
+
+
+def scatter_value_inplace_bool(self, dim, index, value):
+    """In-place ``aten::scatter_.value`` on ``bool`` tensors via ``aten::scatter_.src``."""
+    if self.dtype == torch.bool:
+        count("scatter_bool")
+        src = torch.full(index.shape, bool(value), dtype=torch.bool, device=self.device)
+        return aten.scatter_.src(self, dim, index, src)
+    return aten.scatter.value_out(self, dim, index, value, out=self)
+
+
+def install_scatter_bool(device_type):
+    """``aten::scatter.value`` / ``scatter_.value`` on ``device_type``: rewrite bool via ``.src`` at the
+    backend key only (``override_kernels``). The ``.value_out``/``.value_reduce``/``.value_reduce_out``
+    overloads are not registered, so bool ``out=`` and bool ``reduce=`` calls keep the native path.
+    Returns an undo."""
+    return override_kernels(device_type, [
+        (aten.scatter.value, scatter_value_bool),
+        (aten.scatter_.value, scatter_value_inplace_bool),
+    ])
