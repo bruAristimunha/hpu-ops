@@ -237,6 +237,9 @@ def _enable():
     for name in BROKEN_PASSES:
         if not os.environ.get(f"PT_HPU_DISABLE_{name}"):  # unset or empty; an explicit user setting wins
             os.environ[f"PT_HPU_DISABLE_{name}"] = "True"
+    from . import habana_patch
+
+    habana_patch.patch_recipe_compiler()  # #63: dynamic-compile KeyError in Habana's backend
     try:
         undo = _install("hpu")
         if _lazy():  # Habana's compile backend does not run in lazy mode: uncompiled with one warning (or raise)
