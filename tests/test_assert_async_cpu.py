@@ -99,6 +99,7 @@ def test_assert_async_traced_is_a_noop():
 
 
 def test_assert_async_host_read_is_one_strict_host_sync_row():
+    hpu_ops.strict_reset()  # the report is process-global: start from a clean one
     with cpu_as_hpu(assert_async.install_assert_async):
         with hpu_ops.strict("report", watch_cpu_ops=False):
             torch._assert_async(torch.tensor(True), "unused")
@@ -107,3 +108,4 @@ def test_assert_async_host_read_is_one_strict_host_sync_row():
                 torch._assert_async(torch.tensor(True), "unused")
     rows = hpu_ops.strict_report()
     assert [(row[0], row[3]) for row in rows] == [("host sync", 1)], rows
+    hpu_ops.strict_reset()  # leave the process-global report clean for later tests
