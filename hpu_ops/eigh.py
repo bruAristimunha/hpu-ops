@@ -18,7 +18,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from . import tpc
+from . import ds_eigh, tpc
 from .extrema import internal_sort
 from .linalg import _function, _kernels, _takes, _tracing, register_paired
 
@@ -222,6 +222,11 @@ try:
         return V @ inner @ V.mH, None, None
 
     eigh_card.register_autograd(_eigh_card_backward, setup_context=_eigh_card_setup)
+
+    @eigh_card.register_kernel("hpu")
+    def _eigh_card_hpu(A, UPLO, compute_v):
+        # the backend kernel Habana's recipe compiler lowers the custom op to
+        return Eigh.compute(A, UPLO, compute_v)
 except Exception:  # noqa: BLE001  (already registered on reimport, or an older torch)
     eigh_card = torch.ops.hpu_ops.eigh_card
 
@@ -251,6 +256,18 @@ def _device_name():
         return None
 
 
+def _ds_route(A, UPLO, compute_v):
+    """The #64 opt-in: float32 Jacobi forward + double-single inverse-iteration refinement
+    of the eigenvectors and their Rayleigh quotients."""
+    from . import ds_eigh
+    from ._dispatch import count
+
+    count("eigh_ds")
+    w, V = Eigh.compute(A.float(), UPLO, True)
+    w, V = ds_eigh.ds_refine_vectors(A, w, V)
+    return w, V if compute_v else V.new_empty(0)
+
+
 def install_eigh(device_type):
     """``linalg.eigh`` and ``eigvalsh`` on ``device_type``: the TPC Jacobi kernel on HPU (declined without it, then
     hpu-ops' CPU route), parallel Jacobi composites on the CPU stand-in. In traced graphs the
@@ -271,16 +288,21 @@ def install_eigh(device_type):
     takes = _tpc_takes(device_type)
 
     def autograd_kernel(*args, **kwargs):
+        A, UPLO, compute_v = _bind(op, args, kwargs)
+        if A.dtype == torch.float64 and ds_eigh.ds_enabled():
+            return _ds_route(A, UPLO, compute_v)  # #64 opt-in, ahead of the float64 decline
         if takes(*args, **kwargs):
             count("eigh")
-            A, UPLO, compute_v = _bind(op, args, kwargs)
             return eigh_card(A, UPLO, compute_v)  # custom op: dynamo records one opaque node (#83)
         return op._op_dk(torch._C.DispatchKey.Autograd, *args, **kwargs)
 
     def backend_kernel(*args, **kwargs):  # below autograd: inference mode, tracers' decompositions
+        A, UPLO, compute_v = _bind(op, args, kwargs)
+        if A.dtype == torch.float64 and ds_eigh.ds_enabled():
+            return _ds_route(A, UPLO, compute_v)
         if takes(*args, **kwargs):
             count("eigh")
-            return Eigh.compute(*_bind(op, args, kwargs))
+            return Eigh.compute(A, UPLO, compute_v)
         return _on_cpu(op, args, kwargs)
 
     entries = [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
