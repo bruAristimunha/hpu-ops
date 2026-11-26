@@ -260,6 +260,7 @@ def _ds_route(A, UPLO, compute_v):
     """The #64 opt-in: float32 Jacobi forward + double-single inverse-iteration refinement
     of the eigenvectors and their Rayleigh quotients."""
     from . import ds_eigh
+    from ._dispatch import count
 
     count("eigh_ds")
     w, V = Eigh.compute(A.float(), UPLO, True)
@@ -287,20 +288,20 @@ def install_eigh(device_type):
     takes = _tpc_takes(device_type)
 
     def autograd_kernel(*args, **kwargs):
+        A, UPLO, compute_v = _bind(op, args, kwargs)
+        if A.dtype == torch.float64 and ds_eigh.ds_enabled():
+            return _ds_route(A, UPLO, compute_v)  # #64 opt-in, ahead of the float64 decline
         if takes(*args, **kwargs):
             count("eigh")
-            A, UPLO, compute_v = _bind(op, args, kwargs)
-            if A.dtype == torch.float64 and ds_eigh.ds_enabled():
-                return _ds_route(A, UPLO, compute_v)
             return eigh_card(A, UPLO, compute_v)  # custom op: dynamo records one opaque node (#83)
         return op._op_dk(torch._C.DispatchKey.Autograd, *args, **kwargs)
 
     def backend_kernel(*args, **kwargs):  # below autograd: inference mode, tracers' decompositions
+        A, UPLO, compute_v = _bind(op, args, kwargs)
+        if A.dtype == torch.float64 and ds_eigh.ds_enabled():
+            return _ds_route(A, UPLO, compute_v)
         if takes(*args, **kwargs):
             count("eigh")
-            A, UPLO, compute_v = _bind(op, args, kwargs)
-            if A.dtype == torch.float64 and ds_eigh.ds_enabled():
-                return _ds_route(A, UPLO, compute_v)
             return Eigh.compute(A, UPLO, compute_v)
         return _on_cpu(op, args, kwargs)
 
