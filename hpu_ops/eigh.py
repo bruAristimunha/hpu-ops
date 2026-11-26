@@ -37,6 +37,23 @@ def _use_tpc(A):
     return _EIGH is not None or (A.device.type == "hpu" and A.dtype == torch.float32 and tpc.ready())
 
 
+_GAUDI1 = {}
+
+
+def _is_gaudi1():
+    """Whether the card is first-generation Gaudi (HL-205), resolved on first use and cached.
+    Asking at install time initializes the HPU runtime in processes that only set up hpu-ops
+    before spawning device workers (#117); at first eigh call the device is in use anyway."""
+    if "v" not in _GAUDI1:
+        _GAUDI1["v"] = _device_name() == "GAUDI"
+        if _GAUDI1["v"]:
+            import warnings as _warnings
+
+            _warnings.warn("hpu_ops: first-generation Gaudi detected; linalg.eigh keeps Habana's "
+                           "native kernel (the TPC Jacobi route is Gaudi2-only, #110)", stacklevel=3)
+    return _GAUDI1["v"]
+
+
 def _tpc_takes(device_type):
     """``_takes`` for eigh, and on ``hpu`` also: the TPC kernel ready (n <= ``tpc.EIGH_MAXN`` the Jacobi kernel, past it
     the block Jacobi of ``hpu_ops.jacobi`` on the card). Otherwise the call is declined and takes hpu-ops' own CPU
@@ -44,6 +61,8 @@ def _tpc_takes(device_type):
     takes = _takes(device_type, "eigh")
 
     def tpc_takes(*args, **kwargs):
+        if device_type == "hpu" and _is_gaudi1():
+            return False  # Gaudi1: the TPC Jacobi kernel fails at graph load there (#110)
         if not takes(*args, **kwargs):
             return False
         if device_type == "hpu" and _tracing(args[0]):
@@ -239,7 +258,8 @@ def _eigh_traced(device_type):
 
     def traced(original):
         def kernel(A, UPLO="L", compute_v=True):
-            if A.device.type == device_type and A.is_floating_point() and not A.is_complex():
+            if (A.device.type == device_type and A.is_floating_point() and not A.is_complex()
+                    and not (device_type == "hpu" and _is_gaudi1())):
                 return eigh_card(A, UPLO, compute_v)
             return original(A, UPLO, compute_v)
 
@@ -275,20 +295,13 @@ def install_eigh(device_type):
     from ._dispatch import chain, count, replace_py_kernels
     from .linalg import _bind, _on_cpu
 
-    if device_type == "hpu" and _device_name() == "GAUDI":
-        # First-generation Gaudi (HL-205): the TPC Jacobi kernel fails at graph load there
-        # (synStatus 30, #110) while Habana's native eigh works - leave the op alone.
-        import warnings as _warnings
-
-        _warnings.warn("hpu_ops: first-generation Gaudi detected; linalg.eigh keeps Habana's "
-                       "native kernel (the TPC Jacobi route is Gaudi2-only, #110)", stacklevel=3)
-        return lambda: None
-
     op = aten._linalg_eigh.default
     takes = _tpc_takes(device_type)
 
     def autograd_kernel(*args, **kwargs):
         A, UPLO, compute_v = _bind(op, args, kwargs)
+        if device_type == "hpu" and _is_gaudi1():
+            return op._op_dk(torch._C.DispatchKey.Autograd, *args, **kwargs)
         if A.dtype == torch.float64 and ds_eigh.ds_enabled():
             return _ds_route(A, UPLO, compute_v)  # #64 opt-in, ahead of the float64 decline
         if takes(*args, **kwargs):

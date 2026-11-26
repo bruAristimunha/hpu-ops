@@ -519,6 +519,28 @@ def test_eigh_routes_through_the_hook(n, eigh_hook):
     torch.testing.assert_close(V.mT @ V, torch.eye(n, dtype=S.dtype).expand_as(V), rtol=0, atol=1e-10)
 
 
+def test_install_eigh_does_not_touch_the_device(monkeypatch):
+    """#117: enable() in a launcher parent must not initialize the HPU runtime;
+    the Gaudi generation is resolved on first eigh call, not at install."""
+    def boom():
+        raise AssertionError("device touched at install")
+    monkeypatch.setattr(jacobi, "_device_name", boom)
+    jacobi._GAUDI1.clear()
+    undo = jacobi.install_eigh("hpu")
+    undo()
+    jacobi._GAUDI1.clear()
+
+
+def test_gaudi1_resolution_is_cached_and_warns_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(jacobi, "_device_name", lambda: calls.append(1) or "GAUDI")
+    jacobi._GAUDI1.clear()
+    with pytest.warns(UserWarning, match="first-generation Gaudi"):
+        assert jacobi._is_gaudi1()
+    assert jacobi._is_gaudi1() and calls == [1]
+    jacobi._GAUDI1.clear()
+
+
 def test_eigvalsh_routes_through_the_hook_and_skips_v(eigh_hook):
     torch.manual_seed(0)
     S = spd(2, n=6)
@@ -666,11 +688,12 @@ def test_eigh_degenerate(diagonal):
 
 def test_eigh_declines_on_first_generation_gaudi(monkeypatch):
     monkeypatch.setattr(jacobi, "_device_name", lambda: "GAUDI")
+    jacobi._GAUDI1.clear()
+    undo = jacobi.install_eigh("hpu")  # silent at install: no device resolution (#117)
+    undo()
     with pytest.warns(UserWarning, match="first-generation Gaudi"):
-        undo = jacobi.install_eigh("hpu")
-    undo()  # a no-op: Habana's native kernel was left alone (#110)
-    assert not torch._C._dispatch_has_kernel_for_dispatch_key(
-        "aten::_linalg_eigh", "AutogradHPU")
+        assert not jacobi._tpc_takes("hpu")(spd(2, n=4))  # resolved and declined at first use
+    jacobi._GAUDI1.clear()
 
 
 def test_eigh_compiled_routes_through_custom_op():
