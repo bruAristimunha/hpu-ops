@@ -795,6 +795,57 @@ def test_unique_dim_and_flat_match_aten():
     assert not composite._unique_takes(x, 0, False)  # sorted=False keeps ATen
 
 
+def test_unique_default_without_inverse_on_nonempty_tensor():
+    x = torch.tensor([3, 1, 3, 2], dtype=torch.int64)
+    want = torch.unique(x)
+    with cpu_as_hpu(composite.install_unique) as calls:
+        got = torch.unique(x)
+        got_2d = torch.unique(x.reshape(2, 2))
+        assert calls["unique"] == 2
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+    torch.testing.assert_close(got_2d, want, atol=0, rtol=0)
+@pytest.mark.parametrize("alpha_val", [0.1, 0.3, 0.7, 1.0, 2.5, 10.0])
+def test_standard_gamma_distribution_matches_moments(alpha_val):
+    gen = torch.Generator(device="cpu").manual_seed(1234 + int(alpha_val * 100))
+    alpha = torch.full((4000,), alpha_val, dtype=torch.float32)
+    with cpu_as_hpu(composite.install_standard_gamma) as calls:
+        samples = torch._standard_gamma(alpha, generator=gen)
+        assert calls["standard_gamma"] == 1
+    assert samples.shape == alpha.shape
+    assert torch.isfinite(samples).all()
+    assert (samples > 0).all()
+    sample_mean = float(samples.mean().item())
+    sample_var = float(samples.var(unbiased=True).item())
+    # Standard Gamma(alpha, 1) has mean = alpha and var = alpha; check within 4.5 sigma
+    std_err_mean = (alpha_val / samples.numel()) ** 0.5
+    assert abs(sample_mean - alpha_val) < 4.5 * std_err_mean + 1e-4
+    assert abs(sample_var - alpha_val) / max(alpha_val, 0.1) < 0.25
+
+
+def test_standard_gamma_edge_values_and_bfloat16():
+    x = torch.tensor([-1.0, 0.0, float("inf"), float("nan")], dtype=torch.float32)
+    want = torch._standard_gamma(x)
+    with cpu_as_hpu(composite.install_standard_gamma) as calls:
+        got = torch._standard_gamma(x)
+        bf = torch._standard_gamma(torch.full((16,), 0.5, dtype=torch.bfloat16))
+        assert calls["standard_gamma"] == 2
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+    assert bf.dtype == torch.bfloat16
+    assert torch.isfinite(bf).all() and (bf > 0).all()
+
+
+def test_standard_gamma_declines_int_and_grad_tracking():
+    with cpu_as_hpu(composite.install_standard_gamma) as calls:
+        with pytest.raises(RuntimeError):
+            torch._standard_gamma(torch.tensor([1, 2], dtype=torch.int64))
+        x = torch.full((64,), 2.0, requires_grad=True)
+        y = torch._standard_gamma(x)
+        y.sum().backward()
+        assert calls["standard_gamma"] == 0
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
+
 # ---- renorm as norm, scale factor and multiply
 
 
@@ -2409,4 +2460,45 @@ def test_scatter_value_bool_out_of_place_inplace_and_float_autograd():
     assert torch.equal(got_in, torch.tensor([[False, True, False, True, False, True]]))
     assert torch.equal(got_compiled, got)
     torch.testing.assert_close(got_yf, want_yf, rtol=0, atol=0)
+def test_gather_int64_bit_exact_and_edge_cases():
+    x = torch.tensor(
+        [[0, -1, -(1 << 62), (1 << 62) + 7], [42, 99, -5, 1 << 50]],
+        dtype=torch.int64,
+    ).t()
+    idx = torch.tensor([[1, 0], [0, 1], [1, 1]], dtype=torch.int64)
+    want = x.gather(-1, idx)
+    want_0d = torch.tensor(77, dtype=torch.int64).gather(0, torch.tensor(0))
+    want_empty = torch.arange(5, dtype=torch.int64).gather(0, torch.empty((0,), dtype=torch.int64))
+
+    with cpu_as_hpu(composite.install_gather) as calls:
+        got = x.gather(-1, idx)
+        got_0d = torch.tensor(77, dtype=torch.int64).gather(0, torch.tensor(0))
+        got_empty = torch.arange(5, dtype=torch.int64).gather(0, torch.empty((0,), dtype=torch.int64))
+        compiled = torch.compile(lambda a, i: a.gather(-1, i), backend="aot_eager")
+        got_compiled = compiled(x, idx)
+
+    assert calls["gather_int64"] >= 3
+    assert torch.equal(got, want)
+    assert torch.equal(got_0d, want_0d)
+    assert torch.equal(got_empty, want_empty)
+    assert torch.equal(got_compiled, want)
+
+
+def test_gather_preserves_float_autograd_and_native_passthrough():
+    x = torch.randn(3, 4, requires_grad=True)
+    idx = torch.tensor([[0, 2], [3, 1], [1, 0]], dtype=torch.int64)
+    want_y = x.gather(1, idx)
+    want_y.sum().backward()
+    want_grad = x.grad.clone()
+    x.grad = None
+
+    with cpu_as_hpu(composite.install_gather) as calls:
+        got_y = x.gather(1, idx)
+        got_y.sum().backward()
+        got_grad = x.grad.clone()
+
+    assert not calls.get("gather_int64")
+    torch.testing.assert_close(got_y, want_y, rtol=0, atol=0)
+
+
     torch.testing.assert_close(got_grad, want_grad, rtol=0, atol=0)

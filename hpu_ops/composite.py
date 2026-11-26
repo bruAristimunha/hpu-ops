@@ -319,7 +319,7 @@ def _unique_rows(rows, return_inverse, return_counts):
         return rows, empty_i, empty_i
     order = torch.arange(n, device=rows.device)
     for col in range(rows.shape[1] - 1, -1, -1):
-        order = order[torch.argsort(rows[order, col], stable=True)]
+        order = order[torch.argsort(rows[order, col], stable=(col < rows.shape[1] - 1))]
     sorted_rows = rows[order]
     first = torch.ones(n, dtype=torch.bool, device=rows.device)
     if n > 1:
@@ -347,7 +347,11 @@ def unique_dim(input, dim=0, sorted=True, return_inverse=False, return_counts=Fa
 def unique(input, sorted=True, return_inverse=False, return_counts=False):  # noqa: A002
     """``aten.unique`` (flattened): unique elements via the row sort on (numel, 1)."""
     unique, inverse, counts = _unique_rows(input.reshape(-1, 1), return_inverse, return_counts)
-    return unique.reshape(-1), inverse.reshape(input.shape), counts
+    return (
+        unique.reshape(-1),
+        inverse.reshape(input.shape) if return_inverse else inverse,
+        counts,
+    )
 
 
 def _unique_takes(input, *args, **kwargs):
@@ -415,6 +419,70 @@ def install_one_hot(device_type):
     ])
 
 
+_STANDARD_GAMMA_CANDIDATES = 24
+
+
+def standard_gamma(input, generator=None):  # noqa: A002
+    """``aten::_standard_gamma`` via vectorized Marsaglia-Tsang (24 candidates/element).
+
+    The first accepted candidate is the exact rejection-sampling draw (candidates are iid);
+    the chance none of 24 is accepted is <~1e-30 (per-candidate acceptance >=~0.95), so the
+    argmax fallback to candidate 0 in that case is below float precision. ``alpha < 1`` uses
+    the standard boost Gamma(a) = Gamma(a+1) * U**(1/a). Non-positive/NaN alpha gives
+    ``finfo.tiny`` and ``+inf`` gives ``inf``, matching ATen's CPU kernel."""
+    dtype = _opmath(input.dtype)
+    tiny = torch.finfo(dtype).tiny
+    with torch.autocast(input.device.type, enabled=False):
+        a = input.to(dtype)
+        finite_pos = (a > 0.0) & torch.isfinite(a)
+        boost_mask = finite_pos & (a < 1.0)
+        a_eff = torch.where(boost_mask, a + 1.0, torch.where(finite_pos, a, 1.0))
+        d = a_eff - (1.0 / 3.0)
+        c = 1.0 / torch.sqrt(9.0 * d)
+        cand_shape = (*a.shape, _STANDARD_GAMMA_CANDIDATES)
+        z = torch.randn(cand_shape, device=a.device, dtype=dtype, generator=generator)
+        u = (
+            1.0 - torch.rand(cand_shape, device=a.device, dtype=dtype, generator=generator)
+        ).clamp_min(tiny)
+        v_base = 1.0 + c.unsqueeze(-1) * z
+        v_pos = v_base > 0.0
+        v = v_base * v_base * v_base
+        v_safe = torch.where(v_pos, v, 1.0)
+        rhs = 0.5 * (z * z) + d.unsqueeze(-1) * (1.0 - v_safe + torch.log(v_safe))
+        accepted = v_pos & (torch.log(u) < rhs)
+        first_idx = accepted.to(torch.int64).argmax(dim=-1, keepdim=True)
+        sample = (d.unsqueeze(-1) * v_safe).gather(-1, first_idx).squeeze(-1)
+        u_boost = (
+            1.0 - torch.rand(a.shape, device=a.device, dtype=dtype, generator=generator)
+        ).clamp_min(tiny)
+        boosted = sample * torch.pow(u_boost, 1.0 / torch.where(boost_mask, a, 1.0))
+        out = torch.where(boost_mask, boosted, sample)
+        out = torch.where(finite_pos, out.clamp_min(tiny), tiny)
+        out = torch.where(torch.isinf(a) & (a > 0.0), float("inf"), out)
+        return out.to(input.dtype)
+
+
+def _standard_gamma_takes(input, generator=None):  # noqa: A002
+    # ATen's backward is an implicit-reparameterization gradient, not the pathwise
+    # derivative of the rejection sampler, so grad-tracking calls keep ATen's kernel.
+    return input.is_floating_point() and not (
+        torch.is_grad_enabled() and isinstance(input, torch.Tensor) and input.requires_grad)
+
+
+def install_standard_gamma(device_type):
+    """``aten::_standard_gamma`` on ``device_type`` via vectorized Marsaglia-Tsang, avoiding CPU fallback.
+
+    Non-floating and grad-tracking calls decline to ATen's own kernel (and its usual
+    errors/backward). Returns an undo."""
+    op = aten._standard_gamma.default
+    return register_kernels(device_type, [
+        (op, "Autograd{}", _kernel(op, "standard_gamma", standard_gamma, _standard_gamma_takes,
+                                   DispatchKey.Autograd)),
+        (op, "{}", _kernel(op, "standard_gamma", standard_gamma, _standard_gamma_takes,
+                           DispatchKey.CompositeExplicitAutograd)),
+    ])
+
+
 def install_unfold(device_type):
     """``Tensor.unfold`` on ``device_type`` as ``as_strided``, at the backend key, below torch's own autograd kernel
     (whose backward is ``unfold_backward``). Habana's eager stack has its own kernel there, which is left alone, so
@@ -426,6 +494,37 @@ def install_unfold(device_type):
         return unfold(input, dimension, size, step)
 
     return register_kernels(device_type, [(op, "{}", kernel)])
+
+
+def gather_int64(self, dim, index, sparse_grad=False):
+    """``aten::gather`` on ``int64`` data decomposed into two ``int32`` halves via ``view(torch.int32)``.
+
+    Gaudi2's native ``gather`` (bridge 1.21.4) fails Synapse graph compilation on ``int64`` inputs
+    (``synStatus 26``), whereas ``int32`` ``gather.out`` compiles and runs on card without CPU fallback.
+    """
+    norm_dim = dim if dim >= 0 else dim + max(self.ndim, 1)
+    if (
+        self.dtype != torch.int64
+        or index.ndim != self.ndim
+        or norm_dim < 0
+        or norm_dim >= max(self.ndim, 1)
+    ):
+        out = torch.empty(index.shape, dtype=self.dtype, device=self.device)
+        return aten.gather.out(self, dim, index, sparse_grad=sparse_grad, out=out)
+    count("gather_int64")
+    x_in = self.unsqueeze(0) if self.ndim == 0 else self
+    idx_in = index.unsqueeze(0) if self.ndim == 0 else index
+    x32 = x_in.unsqueeze(-1).contiguous().view(torch.int32)
+    idx32 = idx_in.unsqueeze(-1).expand(*idx_in.shape, 2).contiguous()  # Habana gather wants a dense index
+    out32 = torch.empty(idx32.shape, dtype=torch.int32, device=self.device)
+    aten.gather.out(x32, norm_dim, idx32, sparse_grad=sparse_grad, out=out32)
+    out64 = out32.contiguous().view(torch.int64).squeeze(-1)
+    return out64.squeeze(0) if self.ndim == 0 else out64
+
+
+def install_gather(device_type):
+    """``aten::gather`` on ``device_type``: keep native ``.out`` for non-int64, bitcast int64 via int32."""
+    return override_kernels(device_type, [(aten.gather.default, gather_int64)])
 
 
 def _unfold_backward_on_cpu(op, grad, input_sizes, dim, size, step):
