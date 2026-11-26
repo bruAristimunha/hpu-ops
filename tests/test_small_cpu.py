@@ -121,6 +121,13 @@ def test_scalar_dense_lazy_segments_in_inference_mode(monkeypatch):
     assert steps == [1] and calls["scalar_dense"] == 1  # the backend key carries inference reads
 
 
+def test_scalar_dense_backend_reads_bfloat16():
+    with cpu_as_hpu(small.install_scalar_dense):
+        with torch.inference_mode():  # the backend key: .numpy() would raise on bf16 (#102)
+            assert torch.tensor([2.5], dtype=torch.bfloat16).item() == 2.5
+            assert torch.tensor([3.5], dtype=torch.float16).item() == 3.5
+
+
 def test_scalar_dense_eager_does_not_segment(monkeypatch):
     steps = []
     monkeypatch.setattr(small, "_lazy", lambda: False)
