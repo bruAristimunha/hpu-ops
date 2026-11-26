@@ -26,6 +26,7 @@ Ops where native Habana wins or no exact rewrite beats it through the dispatcher
 ``where``, ``lerp``, ``cumsum``, ``cumprod``, ``allclose``) stay native.
 """
 import math
+import struct
 import threading
 
 import torch
@@ -115,6 +116,11 @@ def install_scalar_dense(device_type):
         host = torch.empty(x.shape, dtype=x.dtype, device="cpu")
         with torch._C._AutoDispatchBelowADInplaceOrView():
             aten.copy_.default(host, x)
+        if x.dtype == torch.bfloat16:
+            # NumPy has no bfloat16 (#102), and .item() would redispatch to this kernel:
+            # bf16 is the high half of float32, so widen the bits directly
+            bits = int.from_bytes(bytes(host.untyped_storage()[:2]), "little")
+            return struct.unpack("f", struct.pack("I", bits << 16))[0]
         return host.numpy().item()
 
     return chain([register_kernels(device_type, [(op, "Autograd{}", kernel)]),
