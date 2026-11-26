@@ -551,6 +551,21 @@ def _kernels(device_type, op, name, function, takes, backend=True, traced=None):
             return function.apply(*_bind(op, args, kwargs))
         if traced is not None and _traced_with_grad(args, kwargs):
             return traced.apply(op, *_bind(op, args, kwargs))
+        tensors = [x for x in pytree.tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor)]
+        if (any(x.dtype == torch.float64 for x in tensors) and not _transformed(*tensors)
+                and not any(_tracing(t) for t in tensors)):
+            # Habana has no Autograd kernel below this one for the linalg ops, so
+            # redispatching at the Autograd key recurses into this kernel until the
+            # stack overflows (segfault on every declined float64 call, e.g.
+            # linalg.cholesky in GraphCSPNet.fit_graph). With grad required, the
+            # CPU route called here (its device copies stay in the autograd graph,
+            # as Habana's own float64 fallback behaves); without, below autograd,
+            # where the backend kernel routes float64 to the same CPU route.
+            # Transformed calls (vmap, forward-mode AD) keep the Autograd
+            # fallthrough: their tangents and batching rules live there.
+            if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
+                return _on_cpu(op, args, kwargs)
+            return _below_autograd(op, *args, **kwargs)
         return op._op_dk(DispatchKey.Autograd, *args, **kwargs)
 
     def backend_kernel(*args, **kwargs):  # below autograd: inference mode, tracers' decompositions
