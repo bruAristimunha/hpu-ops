@@ -392,19 +392,10 @@ def _addmm_takes(input, mat1, mat2, beta=1, alpha=1):
 def install_addmm(device_type):
     """``addmm`` and ``baddbmm`` on ``device_type`` through ``addmm_reduced`` for 16-bit inputs
     with ``beta != 0`` (see above); ``beta == 0`` and full-precision calls keep the native
-    kernel. Registered at the autograd and backend keys and at the traced key, so compiled
+    kernel. Registered at the autograd and backend keys; AOT decomposes through the autograd kernel, so compiled
     graphs decompose the same way. Returns an undo."""
     undos = []
     for op, out_op in ((aten.addmm.default, aten.addmm.out), (aten.baddbmm.default, aten.baddbmm.out)):
-        def traced(original):
-            def kernel(input, mat1, mat2, beta=1, alpha=1):
-                if input.device.type == device_type and _addmm_takes(input, mat1, mat2, beta, alpha):
-                    count("addmm")
-                    return addmm_reduced(input, mat1, mat2, beta, alpha)
-                return original(input, mat1, mat2, beta=beta, alpha=alpha)
-
-            return kernel
-
         def backend(input, mat1, mat2, beta=1, alpha=1, _out_op=out_op):
             if _addmm_takes(input, mat1, mat2, beta, alpha):
                 count("addmm")
@@ -414,12 +405,15 @@ def install_addmm(device_type):
             with torch._C._AutoDispatchBelowADInplaceOrView():
                 return _out_op(input, mat1, mat2, beta=beta, alpha=alpha, out=out)
 
+        # No traced (CompositeImplicitAutograd) kernel: addmm has no C++ kernel there, so a
+        # Python kernel at that key redispatches into itself under AOT (compiled segfault
+        # on card). AOT already decomposes through the Autograd kernel below; a declined
+        # call there falls through to ATen's own Autograd kernel, which exists for addmm.
         undos += [
             register_kernels(device_type, [
                 (op, "Autograd{}", _kernel(op, "addmm", addmm_reduced, _addmm_takes,
                                            DispatchKey.Autograd))]),
             override_kernels(device_type, [(op, backend)]),
-            replace_py_kernels(op, (DispatchKey.CompositeImplicitAutograd,), traced),
         ]
     return chain(undos)
 

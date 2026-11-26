@@ -800,6 +800,24 @@ def test_addmm_reduced_matches_aten_and_declines():
     assert not composite._addmm_takes(inp.float(), a.float(), b.float(), beta=1)
 
 
+def test_addmm_compiled_declines_without_recursion():
+    # full-precision addmm in a compiled graph: the traced kernel must reach ATen through
+    # the .out overload (original() redispatches into itself for this op - stack overflow)
+    x = torch.randn(16, 16, requires_grad=True)
+    w = torch.randn(16, 16, requires_grad=True)
+    bias = torch.randn(16)
+    nodes = []
+    with cpu_as_hpu(composite.install_addmm):
+        got = compiled(lambda a, b, c: torch.addmm(c, a, b), nodes)(x, w, bias)
+        got.sum().backward()
+    want_x = x.detach().clone().requires_grad_()
+    want_w = w.detach().clone().requires_grad_()
+    want = torch.addmm(bias, want_x, want_w)
+    want.sum().backward()
+    torch.testing.assert_close(got, want)
+    torch.testing.assert_close(x.grad, want_x.grad)
+
+
 def test_unique_dim_and_flat_match_aten():
     torch.manual_seed(0)
     x = torch.randint(0, 3, (40, 5)).float()
