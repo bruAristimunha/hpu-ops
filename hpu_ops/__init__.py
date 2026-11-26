@@ -150,6 +150,7 @@ FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.inst
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
          composite.install_embedding, composite.install_roll, composite.install_sdpa, composite.install_unique, composite.install_one_hot, composite.install_unfold,
          composite.install_unfold_backward, composite.install_max_pool1d, composite.install_scatter_bool, composite.install_gather, composite.install_standard_gamma, norm.install_group_norm,
+
          norm.install_instance_norm, dynshape.install_expand,
          dynshape.install_pad_int64, indexing.install_index,
          indexing.install_mask_fill, im2col.install,

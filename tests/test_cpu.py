@@ -2500,4 +2500,5 @@ def test_gather_preserves_float_autograd_and_native_passthrough():
     assert not calls.get("gather_int64")
     torch.testing.assert_close(got_y, want_y, rtol=0, atol=0)
 
+
     torch.testing.assert_close(got_grad, want_grad, rtol=0, atol=0)
