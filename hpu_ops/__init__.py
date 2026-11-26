@@ -92,8 +92,10 @@ at the tensor's pickling:
   edges are found on the host, the card only compares (bucketize) and counts; bit for bit ATen's one-thread result,
   eager, lazy, compiled and in inference mode.
 - ``bincount`` of 1-D integer inputs (65536 to 2**24 - 1 elements, or 4096..65535 when ``minlength >= 256`` eager /
-  ``>= 128`` lazy) with at most 4096 bins and no weights through ``aminmax`` + chunked ``histc``, and ``uint8``
-  with ``minlength >= 256`` under ``torch.compile`` via ``one_hot`` (``small``, #21); scoped lazy-mode rewrites for
+  ``>= 128`` lazy) with at most 4096 bins and no weights through ``aminmax`` + chunked ``histc``, ``uint8``
+  with ``minlength >= 256`` under ``torch.compile`` via ``one_hot``, and wide static ``minlength`` (256..16384)
+  in lazy mode via chunked, graph-segmented ``one_hot`` at any numel below 2**24 within a 256-chunk cap -
+  Habana's lazy kernel segfaults on that shape (``small``, #21); scoped lazy-mode rewrites for
   ``logsumexp`` (``numel <= 2**19``) and ``index_add`` (no-grad ``dim == 0`` float32 into at most 256 rows, with
   ``>= 40960`` source rows and (``>= 1280`` per row or rows of ``>= 128`` elements)). ``trace`` stays
   native (Python dispatcher overhead exceeds the kernel gain).

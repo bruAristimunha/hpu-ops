@@ -99,6 +99,53 @@ def test_bincount_lazy_small_wide_minlength(monkeypatch):
     same(out, torch.bincount(x, minlength=8192), exact=True)
 
 
+def test_bincount_lazy_wide_minlength_above_one_hot_budget(monkeypatch):
+    """NeuroRVQTokenizer.initialize in lazy mode: n_samples > 2048 assignments into an 8192-code
+    codebook. numel * minlength past the single one_hot budget must still take the lazy route
+    (chunked), never Habana's native lazy bincount, which segfaults on this shape."""
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    torch.manual_seed(0)
+    x = torch.randint(0, 8192, (5000,))
+    with cpu_as_hpu(small.install_bincount) as calls:
+        out = torch.bincount(x, minlength=8192)
+    assert calls["bincount"] == 1
+    same(out, torch.bincount(x, minlength=8192), exact=True)
+
+
+def test_bincount_lazy_wide_minlength_multi_chunk(monkeypatch):
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    torch.manual_seed(0)
+    x = torch.randint(0, 256, (200_000,))  # 4 chunks at 256 bins
+    with cpu_as_hpu(small.install_bincount) as calls:
+        out = torch.bincount(x, minlength=256)
+    assert calls["bincount"] == 1
+    same(out, torch.bincount(x, minlength=256), exact=True)
+
+
+def test_bincount_lazy_wide_minlength_declines_past_chunk_cap(monkeypatch):
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    cap = small.BINCOUNT_LAZY_MAX_CHUNKS * (small.BINCOUNT_MAX_NUMEL // 8192)
+    x = torch.zeros(cap + 1, dtype=torch.int64)
+    with cpu_as_hpu(small.install_bincount) as calls:
+        out = torch.bincount(x, minlength=8192)
+    assert calls["bincount"] == 0  # an unbounded chunk list would explode the lazy graph
+    same(out, torch.bincount(x, minlength=8192), exact=True)
+
+
+def test_bincount_lazy_route_segments_graph(monkeypatch):
+    """The lazy counting graph must start fresh: fused into the graph that produced its input
+    (the tokenizer's 10-iteration k-means loop), Habana's lazy compiler segfaults."""
+    steps = []
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    monkeypatch.setattr(small, "_mark_step", lambda: steps.append(1))
+    x = torch.randint(0, 8192, (96,))
+    with cpu_as_hpu(small.install_bincount) as calls:
+        torch.bincount(x, minlength=8192)
+        torch.bincount(x, minlength=8192)
+    assert calls["bincount"] == 2
+    assert steps == [1, 1]  # one graph flush per lazy wide-minlength bincount
+
+
 def test_scalar_dense_lazy_segments_then_reads(monkeypatch):
     steps = []
     monkeypatch.setattr(small, "_lazy", lambda: True)
