@@ -183,8 +183,90 @@ class Eigh(torch.autograd.Function):
         return V @ inner @ V.mH, None, None
 
 
+try:
+
+    @torch.library.custom_op("hpu_ops::eigh_card", mutates_args=())
+    def eigh_card(A: torch.Tensor, UPLO: str, compute_v: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        """``_linalg_eigh`` as a custom op (#83): dynamo traces it as one opaque node with a
+        registered fake and backward, where the ``autograd.Function`` it replaces broke compiled
+        graphs into fragments (GraphCSPNet: ~80 breaks/step). The compute is ``Eigh.compute``."""
+        return Eigh.compute(A, UPLO, compute_v)
+
+    @eigh_card.register_fake
+    def _eigh_card_fake(A, UPLO, compute_v):
+        w = A.new_empty(A.shape[:-1])
+        V = A.new_empty(A.shape) if compute_v else A.new_empty(0)
+        return w, V
+
+    def _eigh_card_setup(ctx, inputs, output):
+        A, UPLO, compute_v = inputs
+        w, V = output
+        ctx.save_for_backward(w, V)
+        if hasattr(ctx, "set_materialize_grads"):
+            ctx.set_materialize_grads(False)
+
+    def _eigh_card_backward(ctx, gw, gV):
+        w, V = ctx.saved_tensors
+        if gw is None and gV is None:
+            return None, None, None
+        if V.device.type == "hpu" and V.shape[-1] > tpc.EIGH_MAXN:
+            tpc._flush()
+        if gV is None:
+            return (V * gw.unsqueeze(-2)) @ V.mH, None, None
+        gw = torch.zeros_like(w) if gw is None else gw
+        VhgV = V.mH @ gV
+        VhgV = 0.5 * (VhgV - VhgV.mH)
+        eye = torch.eye(w.shape[-1], dtype=torch.bool, device=w.device)
+        E = torch.where(eye, 1.0, w.unsqueeze(-2) - w.unsqueeze(-1))
+        inner = torch.where(eye, 0.0, VhgV / E) + torch.diag_embed(gw)
+        return V @ inner @ V.mH, None, None
+
+    eigh_card.register_autograd(_eigh_card_backward, setup_context=_eigh_card_setup)
+except Exception:  # noqa: BLE001  (already registered on reimport, or an older torch)
+    eigh_card = torch.ops.hpu_ops.eigh_card
+
+
+def _eigh_traced(device_type):
+    """The traced (compiled-graph) route to ``eigh_card``: on ``device_type`` tensors the graph
+    node becomes the custom op, whose registered backward replaces the Functions AOT's own
+    derivative would have called. Other devices keep the aten op."""
+    op = aten._linalg_eigh.default
+
+    def traced(original):
+        def kernel(A, UPLO="L", compute_v=True):
+            if A.device.type == device_type and A.is_floating_point() and not A.is_complex():
+                return eigh_card(A, UPLO, compute_v)
+            return original(A, UPLO, compute_v)
+
+        return kernel
+
+    return traced
+
+
 def install_eigh(device_type):
     """``linalg.eigh`` and ``eigvalsh`` on ``device_type``: the TPC Jacobi kernel on HPU (declined without it, then
-    hpu-ops' CPU route), parallel Jacobi composites on the CPU stand-in. Returns an undo."""
+    hpu-ops' CPU route), parallel Jacobi composites on the CPU stand-in. In traced graphs the
+    call decomposes to the ``hpu_ops::eigh_card`` custom op (#83). Returns an undo."""
+    from ._dispatch import chain, count, replace_py_kernels
+    from .linalg import _bind, _on_cpu
+
     op = aten._linalg_eigh.default
-    return register_paired(device_type, [_kernels(device_type, op, "eigh", Eigh, _tpc_takes(device_type))])
+    takes = _tpc_takes(device_type)
+
+    def autograd_kernel(*args, **kwargs):
+        if takes(*args, **kwargs):
+            count("eigh")
+            A, UPLO, compute_v = _bind(op, args, kwargs)
+            return eigh_card(A, UPLO, compute_v)  # custom op: dynamo records one opaque node (#83)
+        return op._op_dk(torch._C.DispatchKey.Autograd, *args, **kwargs)
+
+    def backend_kernel(*args, **kwargs):  # below autograd: inference mode, tracers' decompositions
+        if takes(*args, **kwargs):
+            count("eigh")
+            return Eigh.compute(*_bind(op, args, kwargs))
+        return _on_cpu(op, args, kwargs)
+
+    entries = [(op, "Autograd{}", autograd_kernel), (op, "{}", backend_kernel)]
+    return chain([register_paired(device_type, [entries]),
+                  replace_py_kernels(op, (torch._C.DispatchKey.CompositeImplicitAutograd,),
+                                     _eigh_traced(device_type))])

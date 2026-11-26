@@ -629,6 +629,20 @@ def test_eigh_degenerate(diagonal):
     torch.testing.assert_close(V @ torch.diag(w) @ V.mT, D, rtol=0, atol=1e-12)
 
 
+def test_eigh_compiled_routes_through_custom_op():
+    """#83: in a compiled graph eigh is the hpu_ops::eigh_card custom op (one opaque node
+    with a registered backward), not the autograd.Function dynamo breaks on."""
+    torch.manual_seed(0)
+    S = spd(3, n=8).requires_grad_()
+    nodes = []
+    with cpu_as_hpu(jacobi.install_eigh):
+        w, V = compiled(torch.linalg.eigh, nodes)(S)
+        (w.sum() + V.square().sum()).backward()
+    assert "hpu_ops.eigh_card.default" in ops(nodes), ops(nodes)
+    torch.testing.assert_close(w, torch.linalg.eigvalsh(S.detach()), rtol=0, atol=1e-10)
+    assert S.grad is not None and torch.isfinite(S.grad).all()
+
+
 def test_eigh_compiled_has_no_native_op():
     torch.manual_seed(0)
     S = spd(3, n=8)
