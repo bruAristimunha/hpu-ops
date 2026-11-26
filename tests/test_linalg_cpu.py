@@ -121,6 +121,41 @@ def test_cholesky_and_qr_backward_use_the_composite():
         assert calls["solve_triangular"] >= 1, dict(calls)
 
 
+@pytest.mark.parametrize("upper", [False, True])
+@pytest.mark.parametrize("n", [16, 22, 32])
+def test_cholesky_batch_equals_dim_matches_torch(n, upper):
+    torch.manual_seed(0)
+    A = spd(n, n=n, dtype=torch.float32)
+    f = lambda a: torch.linalg.cholesky(a, upper=upper)  # noqa: E731
+    compare(f, linalg.install_cholesky, A, name="cholesky")
+
+
+def test_cholesky_compiled_batch_equals_dim_matches_torch():
+    torch.manual_seed(0)
+    A = spd(22, n=22, dtype=torch.float32)
+    leaf = A.clone().requires_grad_()
+    nodes = []
+    with cpu_as_hpu(linalg.install_cholesky):
+        got = compiled(torch.linalg.cholesky, nodes)(leaf)
+        got.square().sum().backward()
+    want_A = A.clone().requires_grad_()
+    want = torch.linalg.cholesky(want_A)
+    want.square().sum().backward()
+    torch.testing.assert_close(got, want)
+    torch.testing.assert_close(leaf.grad, want_A.grad)
+    assert "aten.unsqueeze.default" in ops(nodes), ops(nodes)  # the rank guard is in the graph
+
+
+def test_cholesky_unaffected_shapes_match_torch():
+    # the wrapper takes every call its gate accepts (its Autograd fallback would loop on
+    # this op); forward is ATen's .out and the backward the explicit formula, so
+    # unaffected shapes must match torch exactly too
+    A = spd(3, n=8, dtype=torch.float32)
+    compare(torch.linalg.cholesky, linalg.install_cholesky, A, name="cholesky")
+    B = spd(n=8, dtype=torch.float32)
+    compare(torch.linalg.cholesky, linalg.install_cholesky, B, name="cholesky")
+
+
 def test_qr_householder_matches_aten_outputs_and_gradients():
     compare(torch.linalg.qr, linalg.install_qr, general(2, n=16), name="qr")
     compare(lambda a: torch.linalg.qr(a, mode="complete"), linalg.install_qr,
