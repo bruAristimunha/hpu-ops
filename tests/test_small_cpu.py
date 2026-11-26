@@ -132,6 +132,22 @@ def test_bincount_lazy_wide_minlength_declines_past_chunk_cap(monkeypatch):
     same(out, torch.bincount(x, minlength=8192), exact=True)
 
 
+def test_bincount_lazy_tokenizer_initialize_loop(monkeypatch):
+    """The measured caller end to end: 10 k-means iterations, assignments of varying
+    numel into an 8192-code codebook, each counted in its own lazy graph segment."""
+    steps = []
+    monkeypatch.setattr(small, "_lazy", lambda: True)
+    monkeypatch.setattr(small, "_mark_step", lambda: steps.append(1))
+    torch.manual_seed(0)
+    cases = [(a, torch.bincount(a, minlength=8192))
+             for a in (torch.randint(0, 8192, (n,)) for n in (96, 2048, 2049, 5000, 96, 2048, 2049, 5000, 96, 5000))]
+    with cpu_as_hpu(small.install_bincount) as calls:
+        for assignments, expected in cases:
+            same(torch.bincount(assignments, minlength=8192), expected, exact=True)
+    assert calls["bincount"] == 10
+    assert steps == [1] * 10
+
+
 def test_bincount_lazy_route_segments_graph(monkeypatch):
     """The lazy counting graph must start fresh: fused into the graph that produced its input
     (the tokenizer's 10-iteration k-means loop), Habana's lazy compiler segfaults."""
