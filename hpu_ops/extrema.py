@@ -1380,7 +1380,14 @@ def install(device_type, exact_sort=None):
     undo_backend = override_kernels(device_type, _backend_kernels(device_type))
     _BACKEND[device_type] = True
     undo_autograd = register_kernels(device_type, k)
-    composites = traced + [(op, kernel) for op, key, kernel in k[len(traced):family] if op not in OUT_OPS]
+    # vector_norm / norm keep no traced composite: Dynamo traces the Python kernel frame
+    # per input shape, so a compiled step calling it on many shapes (clip_grad_norm_ over
+    # every parameter) exhausts cache_size_limit on that one code object (#115). Without
+    # it the graph holds the aten op, whose runtime dispatch reaches the Autograd and
+    # backend kernels below - both carry the NaN fix (as install_addmm relies on).
+    _no_traced = {aten.linalg_vector_norm.default, aten.norm.ScalarOpt_dim, aten.norm.Scalar}
+    composites = traced + [(op, kernel) for op, key, kernel in k[len(traced):family]
+                           if op not in OUT_OPS and op not in _no_traced]
     undo_traced = chain([replace_py_kernels(op, (DispatchKey.CompositeImplicitAutograd,),
                                             functools.partial(_inference_traced, device_type, composite))
                          for op, composite in composites])
