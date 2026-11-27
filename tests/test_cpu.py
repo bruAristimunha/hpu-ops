@@ -800,6 +800,53 @@ def test_addmm_reduced_matches_aten_and_declines():
     assert not composite._addmm_takes(inp.float(), a.float(), b.float(), beta=1)
 
 
+def test_mm_reduced_matches_aten_and_declines():
+    """#114: bf16 mm/bmm accumulate in float32 (Muon NS5 gram products); fp32 declines."""
+    torch.manual_seed(0)
+    a = torch.randn(16, 16, dtype=torch.bfloat16, requires_grad=True)
+    b = torch.randn(16, 16, dtype=torch.bfloat16, requires_grad=True)
+    want = a @ b
+    want.sum().backward()
+    ga, gb = a.grad.clone(), b.grad.clone()
+    a.grad = b.grad = None
+    with cpu_as_hpu(composite.install_mm) as calls:
+        got = a @ b
+        got.sum().backward()
+        assert calls["mm"] >= 1
+        batched = torch.bmm(a.detach().unsqueeze(0), b.detach().unsqueeze(0))
+        with torch.inference_mode():
+            inferred = torch.mm(a.detach(), b.detach())
+    torch.testing.assert_close(got.float(), want.float(), atol=0, rtol=0)  # same fp32 math, one rounding
+    torch.testing.assert_close(a.grad, ga, atol=6e-2, rtol=2e-2)
+    torch.testing.assert_close(b.grad, gb, atol=6e-2, rtol=2e-2)
+    assert batched.dtype == torch.bfloat16 and inferred.dtype == torch.bfloat16
+    assert not composite._mm_takes(a.float(), b.float())
+    assert composite._mm_takes(a.detach(), b.detach())
+
+
+def test_bf16_ns5_five_steps_match_aten():
+    """#114 reproducer shape: five Newton-Schulz iterations in bf16 stay on ATen's result
+    (stand-in tolerance is trajectory noise: bf16 rounding flips with summation order;
+    the < 5e-3 bar against Habana's kernel is card-measured)."""
+    torch.manual_seed(0)
+    g = torch.randn(128, 128, dtype=torch.bfloat16)
+    want = _ns5(g)
+    with cpu_as_hpu(composite.install_mm), cpu_as_hpu(composite.install_addmm):
+        got = _ns5(g)
+    rel = float((got.float() - want.float()).norm() / want.float().norm())
+    assert rel < 1e-2, rel
+
+
+def _ns5(g):
+    a, b, c = 3.4445, -4.7750, 2.0315
+    u = g / g.norm().clamp(min=1e-7)
+    for _ in range(5):
+        gram = u @ u.T
+        gram_update = torch.addmm(gram, gram, gram, beta=b, alpha=c)
+        u = torch.addmm(u, gram_update, u, beta=a)
+    return u
+
+
 def test_addmm_compiled_declines_without_recursion():
     # full-precision addmm in a compiled graph: the traced kernel must reach ATen through
     # the .out overload (original() redispatches into itself for this op - stack overflow)
