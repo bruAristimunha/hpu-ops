@@ -418,6 +418,45 @@ def install_addmm(device_type):
     return chain(undos)
 
 
+def mm_reduced(mat1, mat2):
+    """``mm``/``bmm`` in float32 for 16-bit inputs: Habana's kernel accumulates in
+    16 bits (Muon NS5 gram products drift 0.7-1.9% over the 5 iterations, #114);
+    ATen accumulates in float32 and rounds once, which this reproduces."""
+    dtype = _opmath(mat1.dtype)
+    with torch.autocast(mat1.device.type, enabled=False):
+        return (mat1.to(dtype) @ mat2.to(dtype)).to(mat1.dtype)
+
+
+def _mm_takes(mat1, mat2):
+    return mat1.dtype in REDUCED and mat2.dtype == mat1.dtype
+
+
+def install_mm(device_type):
+    """``mm`` and ``bmm`` on ``device_type`` through ``mm_reduced`` for 16-bit inputs;
+    full-precision calls keep the native kernel. Registered at the autograd and backend
+    keys like ``install_addmm`` (no traced kernel: AOT decomposes through the autograd
+    kernel). Returns an undo."""
+    undos = []
+    for op, out_op in ((aten.mm.default, aten.mm.out), (aten.bmm.default, aten.bmm.out)):
+        def backend(mat1, mat2, _out_op=out_op):
+            if _mm_takes(mat1, mat2):
+                count("mm")
+                return mm_reduced(mat1, mat2)
+            shape = ((mat1.shape[0], mat2.shape[1]) if mat1.dim() == 2
+                     else (mat1.shape[0], mat1.shape[1], mat2.shape[2]))
+            out = torch.empty(shape, dtype=mat1.dtype, device=mat1.device)
+            with torch._C._AutoDispatchBelowADInplaceOrView():
+                return _out_op(mat1, mat2, out=out)
+
+        undos += [
+            register_kernels(device_type, [
+                (op, "Autograd{}", _kernel(op, "mm", mm_reduced, _mm_takes,
+                                           DispatchKey.Autograd))]),
+            override_kernels(device_type, [(op, backend)]),
+        ]
+    return chain(undos)
+
+
 def one_hot(input, num_classes=-1):
     """``aten.one_hot`` as an equality against ``arange``: Habana's HPU kernel rejects an inferred count
     ("Number of classes cannot be -1", GCNsNet's graph coarsening, eager, lazy and inference), and ATen's

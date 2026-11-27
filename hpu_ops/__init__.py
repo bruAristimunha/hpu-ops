@@ -150,7 +150,7 @@ __all__ = ["enable", "materialize", "segmented", "compile", "compile_children", 
 BROKEN_PASSES = ("pass_remove_unnecessary_bmm_view", "pass_batch_as_strided_groups", "pass_weight_permutation")
 FIXES = (upsample.install_linear, upsample.install_linear_forward, upsample.install_nearest, conv.install,
          conv.install_weight_grad, conv.install_large_kernel, composite.install_glu, composite.install_renorm,
-         composite.install_embedding, composite.install_roll, composite.install_sdpa, composite.install_addmm, composite.install_unique, composite.install_one_hot, composite.install_unfold,
+         composite.install_embedding, composite.install_roll, composite.install_sdpa, composite.install_addmm, composite.install_mm, composite.install_unique, composite.install_one_hot, composite.install_unfold,
          composite.install_unfold_backward, composite.install_max_pool1d, composite.install_scatter_bool, composite.install_gather, composite.install_standard_gamma, norm.install_group_norm,
 
          norm.install_instance_norm, dynshape.install_expand,
