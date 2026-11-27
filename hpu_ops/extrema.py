@@ -399,9 +399,17 @@ def _inf_norm(self, dim, keepdim, fn, name):
 
 def _vector_norm_kernel(op, name):
     def kernel(self, ord=2, dim=None, keepdim=False, *, dtype=None):
-        fn = native(op)
-        if not _inf(ord) or not _floating(self) or self.is_complex():
-            return fn(self, ord, dim, keepdim, dtype=dtype)
+        if self.device.type == "hpu" and _traced((self,), {}):
+            # Traced (CompositeImplicitAutograd): the native call is a PyCapsule Dynamo
+            # cannot trace (graph break, #115). Declined calls keep the aten op;
+            # the inf-norm decomposition calls the aten op, which the tracer records.
+            if not _inf(ord) or not _floating(self) or self.is_complex():
+                return NotImplemented
+            fn = lambda x, o, d, k, dtype=None: aten.linalg_vector_norm.default(x, o, d, k, dtype=dtype)  # noqa: E731
+        else:
+            fn = native(op)
+            if not _inf(ord) or not _floating(self) or self.is_complex():
+                return fn(self, ord, dim, keepdim, dtype=dtype)
         if dtype not in (None, self.dtype):  # the inf-norm is the largest |x|: exact in either dtype
             self = self.to(dtype)
         return _inf_norm(self, dim, keepdim, lambda x: fn(x, ord, dim, keepdim), name)
@@ -411,10 +419,16 @@ def _vector_norm_kernel(op, name):
 
 def _norm_kernel(op, name, with_dim):
     def kernel(self, p=2, dim=None, keepdim=False):
-        fn = native(op)
         args = (p, dim, keepdim) if with_dim else (p,)
-        if not _inf(p) or not _floating(self) or self.is_complex():
-            return fn(self, *args)
+        if self.device.type == "hpu" and _traced((self,), {}):
+            # Traced: as _vector_norm_kernel - declined calls keep the aten op (#115)
+            if not _inf(p) or not _floating(self) or self.is_complex():
+                return NotImplemented
+            fn = lambda x, *a: op(x, *a)  # noqa: E731  the aten op, recorded by the tracer
+        else:
+            fn = native(op)
+            if not _inf(p) or not _floating(self) or self.is_complex():
+                return fn(self, *args)
         return _inf_norm(self, dim if with_dim else None, keepdim if with_dim else False,
                          lambda x: fn(x, *args), name)
 
@@ -981,14 +995,10 @@ def _reduced(x, dims, keepdim):
         [n for d, n in enumerate(x.shape) if d not in dims]
 
 
-def _empty(shape, dtype, like):
-    return torch.empty(shape, dtype=dtype, device=like.device)
-
-
 def _b_amax(out_op, name, dev):
     def kernel(self, dim=(), keepdim=False):
         dims = _dims(self, dim)
-        out = _empty(_reduced(self, dims, keepdim), self.dtype, self)
+        out = torch.empty(_reduced(self, dims, keepdim), dtype=self.dtype, device=self.device)
         native_out(out_op, dev)(self, dim, keepdim, out=out)
         if not _floating(self):
             return out
@@ -1000,7 +1010,7 @@ def _b_amax(out_op, name, dev):
 
 def _b_whole(out_op, name, dev):  # max() / min() as amax / amin over every dim (Gaudi has no max.unary_out)
     def kernel(self):
-        out = _empty((), self.dtype, self)
+        out = torch.empty((), dtype=self.dtype, device=self.device)
         native_out(out_op, dev)(self, [], False, out=out)
         if not _floating(self):
             return out
@@ -1016,7 +1026,7 @@ def _b_median_whole(dev):  # median() as median(dim 0) of the flattened tensor (
             return torch.full((), NAN, dtype=self.dtype, device=self.device)
         # keepdim, then a reshape: Gaudi's median(dim) of a 1-D tensor to a 0-d one fails graph compile (measured,
         # its own op too: x.reshape(-1).median(0))
-        v, i = _empty([1], self.dtype, self), _empty([1], torch.int64, self)
+        v, i = torch.empty([1], dtype=self.dtype, device=self.device), torch.empty([1], dtype=torch.int64, device=self.device)
         native_out(aten.median.dim_values, dev)(self.reshape(-1), 0, True, values=v, indices=i)
         v = v.reshape(())
         if not _floating(self):
@@ -1030,7 +1040,7 @@ def _b_median_whole(dev):  # median() as median(dim 0) of the flattened tensor (
 def _argmax_out(dev):
     def argmax(x, d, keepdim):
         x = x.reshape(x.shape)  # Habana lazy argmax.out mis-infers output dims of a permuted input (MEGGPT chain)
-        out = _empty(_reduced(x, [d], keepdim), torch.int64, x)
+        out = torch.empty(_reduced(x, [d], keepdim), dtype=torch.int64, device=x.device)
         return native_out(aten.argmax.out, dev)(x, d, keepdim, out=out)
 
     return argmax
@@ -1050,7 +1060,7 @@ def _b_select(out_op, name, dev):
             return v.reshape(()), i.reshape(())
         d = _dims(self, dim)[0]
         kept = _reduced(self, [d], True)
-        v, i = _empty(kept, self.dtype, self), _empty(kept, torch.int64, self)
+        v, i = torch.empty(kept, dtype=self.dtype, device=self.device), torch.empty(kept, dtype=torch.int64, device=self.device)
         native_out(out_op, dev)(self, d, True, **{values_name: v, index_name: i})
         if _floating(self):
             count(name)
@@ -1066,11 +1076,11 @@ def _b_arg(out_op, name, dev):
         if not _floating(self) or self.dim() == 0 or self.numel() == 0:
             dims = _dims(self, dim) if dim is not None else list(range(self.dim()))
             shape = _reduced(self, dims, keepdim) if dim is not None else ([1] * self.dim() if keepdim else [])
-            return native_out(out_op, dev)(self, dim, keepdim, out=_empty(shape, torch.int64, self))
+            return native_out(out_op, dev)(self, dim, keepdim, out=torch.empty(shape, dtype=torch.int64, device=self.device))
         count(name)
         x = self.reshape(-1) if dim is None else self.reshape(self.shape)  # as in _argmax_out
         d = 0 if dim is None else _dims(self, dim)[0]
-        i = native_out(out_op, dev)(x, d, True, out=_empty(_reduced(x, [d], True), torch.int64, x))
+        i = native_out(out_op, dev)(x, d, True, out=torch.empty(_reduced(x, [d], True), dtype=torch.int64, device=x.device))
         i = _fixed_index(x, d, i, _argmax_out(dev))
         if dim is None:
             return i.reshape([1] * self.dim()) if keepdim else i.reshape(())
@@ -1083,7 +1093,7 @@ def _b_aminmax(dev):
     def kernel(self, *, dim=None, keepdim=False):
         dims = _dims(self, dim)
         shape = _reduced(self, dims, keepdim) if dim is not None else ([1] * self.dim() if keepdim else [])
-        lo, hi = _empty(shape, self.dtype, self), _empty(shape, self.dtype, self)
+        lo, hi = torch.empty(shape, dtype=self.dtype, device=self.device), torch.empty(shape, dtype=self.dtype, device=self.device)
         native_out(aten.aminmax.out, dev)(self, dim=dim, keepdim=keepdim, min=lo, max=hi)
         if not _floating(self):
             return lo, hi
@@ -1104,7 +1114,8 @@ def _on(dev, *ts):
 
 
 def _binary_out(out_op, dev, a, b):
-    out = _empty(torch.broadcast_shapes(a.shape, b.shape), torch.result_type(a, b), _on(dev, a, b))
+    out = torch.empty(torch.broadcast_shapes(a.shape, b.shape), dtype=torch.result_type(a, b),
+                      device=_on(dev, a, b).device)
     return native_out(out_op, dev)(a, b, out=out)
 
 
@@ -1132,8 +1143,8 @@ def _clamp_dtype(x, bounds):
 def _b_clamp(out_op, name, dev):
     def fixed(self, *bounds):
         ts = [b for b in bounds if isinstance(b, torch.Tensor)]
-        out = _empty(torch.broadcast_shapes(self.shape, *[b.shape for b in ts]), _clamp_dtype(self, bounds),
-                     _on(dev, self, *ts))
+        out = torch.empty(torch.broadcast_shapes(self.shape, *[b.shape for b in ts]),
+                          dtype=_clamp_dtype(self, bounds), device=_on(dev, self, *ts).device)
         native_out(out_op, dev)(self, *bounds, out=out)
         if not out.is_floating_point():
             return out
@@ -1164,7 +1175,7 @@ def _norm_dtype(x, dtype):
 def _b_vector_norm(dev):
     def kernel(self, ord=2, dim=None, keepdim=False, *, dtype=None):
         dims = _dims(self, dim)
-        out = _empty(_reduced(self, dims, keepdim), _norm_dtype(self, dtype), self)
+        out = torch.empty(_reduced(self, dims, keepdim), dtype=_norm_dtype(self, dtype), device=self.device)
         native_out(aten.linalg_vector_norm.out, dev)(self, ord, dim, keepdim, dtype=dtype, out=out)
         if not _inf(ord) or not _floating(self) or self.is_complex():
             return out
@@ -1178,7 +1189,7 @@ def _b_norm(dev, with_dim):
     def kernel(self, p=2, dim=None, keepdim=False):
         dims = _dims(self, dim if with_dim else None)
         keepdim = keepdim if with_dim else False
-        out = _empty(_reduced(self, dims, keepdim), _norm_dtype(self, None), self)
+        out = torch.empty(_reduced(self, dims, keepdim), dtype=_norm_dtype(self, None), device=self.device)
         if with_dim:
             native_out(aten.norm.out, dev)(self, p, dim, keepdim, out=out)
         else:  # norm.Scalar has no .out: the vector norm over every dim (the same values)
@@ -1197,7 +1208,7 @@ POOL_META = {2: aten.max_pool2d_with_indices.default, 3: aten.max_pool3d_with_in
 def _b_pool(out_op, name, dev, nd):
     def fn(x, *args):  # Gaudi's pool into fresh outputs (shapes from the meta kernel)
         out, idx = POOL_META[nd](torch.empty(x.shape, dtype=x.dtype, device="meta"), *args)
-        out, idx = _empty(out.shape, x.dtype, x), _empty(idx.shape, torch.int64, x)
+        out, idx = torch.empty(out.shape, dtype=x.dtype, device=x.device), torch.empty(idx.shape, dtype=torch.int64, device=x.device)
         native_out(out_op, dev)(x, *args, out=out, indices=idx)
         return out, idx
 
