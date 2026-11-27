@@ -39,7 +39,10 @@ at the tensor's pickling:
   inference); the count is read from the input's min/max on the host, as ATen's composite does on CPU.
 - ``Tensor.unfold`` as ``as_strided`` with ATen's sizes and strides (``composite``): in lazy mode it had no HPU kernel,
   ran on the CPU and returned a copy, not a view. hpu-ops' own one-channel conv weight gradient uses it (TensorCSPNet:
-  2 fallbacks per lazy step). Eager keeps Habana's kernel.
+  2 fallbacks per lazy step). Eager keeps Habana's kernel. Under ``torch.compile(backend="hpu_backend")``, Habana's
+  ``unfold`` and ``diagonal`` decompositions emit ``as_strided`` with PyTorch's pre-materialization strides/offset on
+  dense Synapse buffers, scrambling non-contiguous inputs or crashing ``strided_view`` (``habana_patch``, #121);
+  ``enable()`` wraps them to clone non-contiguous or offset HPU inputs first (zero-overhead on contiguous inputs).
 - Advanced indexing by integer tensors, ``X[..., rows, cols]``, as one ``index_select`` of the indexed dims
   flattened (``indexing``): with CPU index tensors Gaudi's eager kernel ran on the CPU, and in lazy mode its
   backward, the accumulating ``_index_put_impl_`` with indices that do not lead, returns wrong sums from batch 2 to
@@ -244,12 +247,15 @@ def _enable():
     habana_patch.patch_recipe_compiler()  # #63: dynamic-compile KeyError in Habana's backend
     try:
         undo = _install("hpu")
-        if _lazy():  # Habana's compile backend does not run in lazy mode: uncompiled with one warning (or raise)
-            try:
+        try:
+            # #121: Habana's compiled unfold/diagonal decompositions emit as_strided on dense
+            # Synapse buffers using PyTorch's pre-materialization strides/offset.
+            undo = chain([undo, habana_patch.patch_as_strided_decompositions()])
+            if _lazy():  # Habana's compile backend does not run in lazy mode: uncompiled with one warning (or raise)
                 undo = chain([undo, lazy_compile.install(lazy_compile.NAME)])
-            except Exception:
-                undo()  # no half-enabled state: a later enable() starts clean
-                raise
+        except Exception:
+            undo()  # no half-enabled state: a later enable() starts clean
+            raise
     except Exception:
         restore_passes()
         raise
