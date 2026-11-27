@@ -1365,10 +1365,16 @@ def install(device_type, exact_sort=None):
         k.append((aten.topk.default, "Autograd{}", _topk_kernel(aten.topk.default, "topk")))
         k.append((aten.kthvalue.default, "Autograd{}", _kthvalue_kernel(aten.kthvalue.default, "kthvalue")))
     if not nan:
-        return chain([register_kernels(device_type, k[family:]), undo_select])
-    undo_backend = override_kernels(device_type, _backend_kernels(device_type))
+        return chain([register_kernels(device_type, [(op, key, torch.compiler.disable(fn)) for op, key, fn in k[family:]]),
+                      undo_select])
+    # Wrap Autograd{} and backend {} Python kernels with torch.compiler.disable so that when a compiled user frame
+    # breaks and resumes eagerly (e.g. clip_grad_norm_ after _group_tensors_by_device_and_dtype), C++ dispatch into
+    # these Python kernels does not re-enter Dynamo's eval-frame hook (which hit SkipFunctionVariable on native(op)
+    # and cache_size_limit=8 on _empty across distinct parameter shapes, #115). AOT/FakeTensor tracing and the
+    # CompositeImplicitAutograd _inference_traced kernels run outside eval-frame and are unaffected.
+    undo_backend = override_kernels(device_type, [(op, torch.compiler.disable(fn)) for op, fn in _backend_kernels(device_type)])
     _BACKEND[device_type] = True
-    undo_autograd = register_kernels(device_type, k)
+    undo_autograd = register_kernels(device_type, [(op, key, torch.compiler.disable(fn)) for op, key, fn in k])
     composites = traced + [(op, kernel) for op, key, kernel in k[len(traced):family] if op not in OUT_OPS]
     undo_traced = chain([replace_py_kernels(op, (DispatchKey.CompositeImplicitAutograd,),
                                             functools.partial(_inference_traced, device_type, composite))

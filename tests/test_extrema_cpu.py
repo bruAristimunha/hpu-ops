@@ -1099,3 +1099,52 @@ def test_out_dtype_messages_are_torch_s_on_this_platform(card):
     with pytest.raises(RuntimeError) as got:
         torch.sort(x, -1, out=(torch.empty(0), torch.empty(0, dtype=torch.int32)))
     assert str(got.value).splitlines()[0] == str(want.value).splitlines()[0]
+
+
+def test_resumed_compiled_frame_does_not_trace_extrema_kernels(card):
+    """#115: after a graph break inside torch.compile (e.g. clip_grad_norm_), C++ dispatch into Python Autograd/backend
+    kernels must not re-enter Dynamo's eval-frame hook (previously hit SkipFunctionVariable on native(op) and
+    cache_size_limit=8 on _empty across distinct parameter shapes)."""
+    torch.manual_seed(0)
+    grads = [torch.randn(10 + i, 16) for i in range(16)]
+    ref_params = []
+    got_params = []
+    for g in grads:
+        p1 = torch.nn.Parameter(torch.randn_like(g))
+        p1.grad = g.clone()
+        ref_params.append(p1)
+        p2 = torch.nn.Parameter(p1.detach().clone())
+        p2.grad = g.clone()
+        got_params.append(p2)
+
+    want = _reference(lambda: torch.nn.utils.clip_grad_norm_(ref_params, 1.0))
+
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+
+    @torch.compile(backend="eager", dynamic=False)
+    def run_clip(params):
+        return torch.nn.utils.clip_grad_norm_(params, 1.0)
+
+    got = run_clip(got_params)
+    breaks = dict(torch._dynamo.utils.counters.get("graph_break", {}))
+    unimpl = dict(torch._dynamo.utils.counters.get("unimplemented", {}))
+    assert not any("unsupported builtin" in k or "PyCapsule.." in k or "pybind11" in k for k in breaks), breaks
+    assert unimpl == {}, unimpl
+    torch.testing.assert_close(got, want)
+
+    # Multi-shape extrema ops after an explicit graph break also avoid cache_size_limit and keep NaN propagation.
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    xs = [torch.tensor([1.0, NAN] + [float(j) for j in range(i + 2)]) for i in range(16)]
+
+    @torch.compile(backend="eager", dynamic=False)
+    def run_extrema(tensors):
+        torch._dynamo.graph_break()
+        return [(t.amax(-1), torch.linalg.vector_norm(t, 2.0), torch.linalg.vector_norm(t, INF)) for t in tensors]
+
+    outs = run_extrema(xs)
+    unimpl = dict(torch._dynamo.utils.counters.get("unimplemented", {}))
+    assert unimpl == {}, unimpl
+    for a, _, linf in outs:
+        assert torch.isnan(a) and torch.isnan(linf)
